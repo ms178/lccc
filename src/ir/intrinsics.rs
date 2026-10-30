@@ -104,6 +104,10 @@ pub enum IntrinsicOp {
     SetEpi8,
     /// Set all dwords to value (splat)
     SetEpi32,
+    /// Scalar 32-bit unsigned saturating subtract: `max(lhs-rhs, 0)`.
+    /// Late canonicalization uses this for exact select/compare/subtract
+    /// graphs after vectorization; both x86 backends lower it without SIMD.
+    UsubSat32,
     /// BMI2 parallel bit deposit/extract (`args`: source, mask). The x86-64
     /// backend emits `pdep`/`pext` only where the function may use BMI2 and
     /// an exact portable loop elsewhere, so the op is legal in any function.
@@ -365,6 +369,16 @@ pub enum IntrinsicOp {
     /// 0, 2, 4 and 6 of an I32x8 result; the odd lanes are zero. Unlike a
     /// full-width load, this does not touch the intervening objects.
     VecLoadStrided2I32x8,
+    /// Read exactly two dwords at offsets 0 and 8 from
+    /// `base + byte_offset + optional_displacement`, placing them in lanes
+    /// 0 and 2 of an I32x4 result; the odd lanes are zero. The intervening
+    /// bytes are not accessed.
+    VecLoadStrided2I32x4,
+    /// Compact four stride-8B dwords from a proven contiguous 32-byte window
+    /// into lanes 0, 1, 2 and 3 of an I32x4 result. Unlike the exact strided
+    /// loads, this form reads the intervening bytes and is therefore emitted
+    /// only after the reducer's private-object/extent proof succeeds.
+    VecLoadStrided2CompactI32x4,
     /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 4×I32
     /// args[0] = base pointer, args[1] = byte offset; dest = vector value
     VecLoadI32x4,
@@ -2232,7 +2246,7 @@ impl IntrinsicOp {
             | Gf2p8mulb128 | Aesenc128 | Aesenclast128 | Aesdec128
             | Aesdeclast128 | Aesimc128 | Aeskeygenassist128 | Pclmulqdq128
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
-            | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
+            | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecLoadStrided2I32x4 | VecLoadStrided2CompactI32x4 | VecAddF64x2
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
             | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2 | VecRoundF64x2 | VecXorF64x2
             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
@@ -2311,6 +2325,7 @@ impl IntrinsicOp {
             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
             IntrinsicOp::F16ToF32 | IntrinsicOp::F32ToF16 |
+            IntrinsicOp::UsubSat32 |
             IntrinsicOp::Pdep32 | IntrinsicOp::Pdep64 |
             IntrinsicOp::Pext32 | IntrinsicOp::Pext64 |
             IntrinsicOp::VecWidenAddI32x4ToI64x4
@@ -2506,6 +2521,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadF64x2
                 | IntrinsicOp::VecLoadI32x8
                 | IntrinsicOp::VecLoadStrided2I32x8
+                | IntrinsicOp::VecLoadStrided2I32x4
+                | IntrinsicOp::VecLoadStrided2CompactI32x4
                 | IntrinsicOp::VecLoadI32x4
                 | IntrinsicOp::VecLoadF32x8
                 | IntrinsicOp::VecLoadF32x4
@@ -2561,6 +2578,8 @@ impl IntrinsicOp {
             IntrinsicOp::VecLoadF64x4
             | IntrinsicOp::VecLoadI32x8
             | IntrinsicOp::VecLoadStrided2I32x8
+            | IntrinsicOp::VecLoadStrided2I32x4
+            | IntrinsicOp::VecLoadStrided2CompactI32x4
             | IntrinsicOp::VecLoadF32x8
             | IntrinsicOp::VecLoadI8x32
             | IntrinsicOp::VecLoadI64x4
@@ -2607,6 +2626,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadF64x2
                 | IntrinsicOp::VecLoadI32x8
                 | IntrinsicOp::VecLoadStrided2I32x8
+                | IntrinsicOp::VecLoadStrided2I32x4
+                | IntrinsicOp::VecLoadStrided2CompactI32x4
                 | IntrinsicOp::VecLoadI32x4
                 | IntrinsicOp::VecPackssdwI16x16
                 | IntrinsicOp::VecLoadF32x8
@@ -2854,6 +2875,20 @@ mod vector_width_tests {
         ] {
             assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
             assert_eq!(op.vector_result_width(), Some(width), "{op:?} result");
+        }
+    }
+
+    #[test]
+    fn strided_loads_report_their_actual_vector_widths() {
+        for (op, width) in [
+            (IntrinsicOp::VecLoadStrided2I32x4, 16),
+            (IntrinsicOp::VecLoadStrided2CompactI32x4, 16),
+            (IntrinsicOp::VecLoadStrided2I32x8, 32),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(width), "{op:?} result");
+            assert!(op.produces_vector_value(), "{op:?} vector value");
+            assert!(op.may_read_memory(), "{op:?} exact memory reads");
         }
     }
 
@@ -3209,6 +3244,8 @@ mod vector_width_tests {
             "VecLoadI32x4" => IntrinsicOp::VecLoadI32x4,
             "VecLoadI32x8" => IntrinsicOp::VecLoadI32x8,
             "VecLoadStrided2I32x8" => IntrinsicOp::VecLoadStrided2I32x8,
+            "VecLoadStrided2I32x4" => IntrinsicOp::VecLoadStrided2I32x4,
+            "VecLoadStrided2CompactI32x4" => IntrinsicOp::VecLoadStrided2CompactI32x4,
             "VecLoadI64x2" => IntrinsicOp::VecLoadI64x2,
             "VecLoadI64x4" => IntrinsicOp::VecLoadI64x4,
             "VecLoadWidenI32ToI64x2" => IntrinsicOp::VecLoadWidenI32ToI64x2,
@@ -3559,6 +3596,8 @@ mod memory_classification_tests {
             O::VecLoadI32x4,
             O::VecLoadI32x8,
             O::VecLoadStrided2I32x8,
+            O::VecLoadStrided2I32x4,
+            O::VecLoadStrided2CompactI32x4,
             O::VecLoadI64x2,
             O::VecLoadI64x4,
             O::VecLoadI16x8,
@@ -3632,6 +3671,8 @@ mod vec_mem_offset_tests {
             O::VecLoadF64x4,
             O::VecLoadI32x8,
             O::VecLoadStrided2I32x8,
+            O::VecLoadStrided2I32x4,
+            O::VecLoadStrided2CompactI32x4,
             O::VecLoadF32x8,
             O::VecLoadI8x32,
             O::VecLoadI64x4,

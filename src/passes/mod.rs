@@ -81,6 +81,7 @@ pub(crate) mod recursion_to_iter;
 pub(crate) mod redundant_loads;
 mod resolve_asm;
 pub(crate) mod round_cap;
+pub(crate) mod saturating_sub;
 pub(crate) mod sccp;
 pub(crate) mod set_membership;
 pub(crate) mod simplify;
@@ -4080,6 +4081,28 @@ pub(crate) fn run_passes(
             changed
         });
         verify::verify_after_pass(module, "vecaddr");
+    }
+
+    // Late scalar usub_sat canonicalization. This deliberately runs after
+    // every vectorizer: packed U16 maps keep their proven select/min-max
+    // input, while scalar remainders and i686 (whose vector backend has a
+    // different, stack-based contract) can use the same pure 32-bit IR
+    // operation. Signed compares require the pass's nonnegative-domain proof;
+    // shared compare/subtract nodes and all other widths stay unchanged.
+    // Pass name for CCC_DISABLE_PASSES: "satsub".
+    if matches!(
+        target,
+        crate::backend::Target::X86_64 | crate::backend::Target::I686
+    ) && !pass_disabled(&disabled, "satsub")
+    {
+        module.for_each_function(|f| {
+            let changed = saturating_sub::run(f);
+            if changed != 0 && !pass_disabled(&disabled, "dce") {
+                dce::eliminate_dead_code(f);
+            }
+            changed
+        });
+        verify::verify_after_pass(module, "satsub");
     }
 
     // Phase 11f: FMA operand-negation peel. LAST IR transform: after every

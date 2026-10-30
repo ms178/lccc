@@ -3,7 +3,7 @@
   "fns_over_300": 234,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 542,
+  "knob_literals": 543,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -269,6 +269,7 @@
     "CCC_NO_LOGICAL_TEST_FOLD",
     "CCC_NO_LOOP_ALIGN",
     "CCC_NO_LOOP_CARRIED_FWD",
+    "CCC_NO_LOOP_DOWNCOUNT",
     "CCC_NO_LOOP_IDIOM",
     "CCC_NO_LOOP_INVERT",
     "CCC_NO_LOOP_MEM_PROMOTE",
@@ -548,8 +549,8 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 268,
-  "panic_sites": 924,
+  "knobs_undocumented": 266,
+  "panic_sites": 917,
   "panic_sites_hot": 101,
   "unsafe_sites": 25
 }

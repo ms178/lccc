@@ -70,8 +70,10 @@
 //! becomes the loop guard, executed once. The back edge becomes `T -> B`.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
 use crate::ir::instruction::{Instruction, Terminator};
-use crate::ir::reexports::{BlockId, IrFunction, Operand, Value};
+use crate::ir::reexports::{BlockId, IrConst, IrFunction, Operand, Value};
+use crate::passes::CfgAnalysis;
 
 /// Duplicating more than a handful of instructions trades I-cache for branches.
 /// A counted loop's test is one or two instructions; anything much larger is
@@ -113,6 +115,9 @@ pub(crate) struct LoopInvertConfig {
     pub affine_fold: bool,
     /// Report the fold through `CCC_DEBUG_AFFINE_FOLD`, resolved the same way.
     pub affine_fold_debug: bool,
+    /// Replace a dead, constant-trip +1 induction with a zero-tested countdown.
+    /// The driver resolves `CCC_NO_LOOP_DOWNCOUNT` once, alongside `enabled`.
+    pub downcount: bool,
 }
 
 impl LoopInvertConfig {
@@ -128,12 +133,14 @@ impl LoopInvertConfig {
         debug: bool,
         affine_fold: bool,
         affine_fold_debug: bool,
+        downcount: bool,
     ) -> Self {
         Self {
             enabled,
             debug,
             affine_fold,
             affine_fold_debug,
+            downcount,
         }
     }
 
@@ -145,6 +152,7 @@ impl LoopInvertConfig {
             debug: false,
             affine_fold: true,
             affine_fold_debug: false,
+            downcount: true,
         }
     }
 
@@ -155,6 +163,7 @@ impl LoopInvertConfig {
             debug: false,
             affine_fold: true,
             affine_fold_debug: false,
+            downcount: true,
         }
     }
 
@@ -165,6 +174,15 @@ impl LoopInvertConfig {
             debug: false,
             affine_fold: false,
             affine_fold_debug: false,
+            downcount: true,
+        }
+    }
+
+    #[cfg(test)]
+    const fn no_downcount() -> Self {
+        Self {
+            downcount: false,
+            ..Self::testing()
         }
     }
 }
@@ -199,6 +217,9 @@ pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) ->
         apply(func, &plan);
         if cfg.affine_fold {
             fold_value_bound_after_invert(func, &plan, cfg.affine_fold_debug);
+        }
+        if cfg.downcount {
+            downcount_after_invert(func, &plan, debug);
         }
         rotated += 1;
         if rotated > 64 {
@@ -761,6 +782,246 @@ fn fold_value_bound_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool
     true
 }
 
+/// Prove and fold a dead, constant-trip up-counter after inversion.
+///
+/// For `iv = 0; do { body; next = iv + 1; iv = next; } while (iv < N)`
+/// with unsigned `N > 0`, the recurrence has exactly N iterations and
+/// `remaining = N - iv`.  If both SSA values are otherwise dead, replacing
+/// the initial value by N, the increment by a decrement and the latch test by
+/// `remaining != 0` preserves every observable event.  The entry test is
+/// true on the first iteration and is removed with its compare.
+///
+/// This intentionally accepts only the fully materialised two-Copy shape
+/// left by phi elimination.  All definitions, uses, constants, CFG edges and
+/// instruction positions are checked before the first mutation.
+fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bool {
+    use crate::ir::reexports::{IrBinOp, IrCmpOp};
+    use crate::passes::loop_rotate::{integer_constant, integer_type_bounds};
+
+    let (h, t) = (plan.header, plan.latch);
+    if h == t {
+        return false;
+    }
+    let body = func.blocks[t].label;
+    let (guard_cond, exit) = match func.blocks[h].terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(c),
+            true_label,
+            false_label,
+        } if true_label == body => (c, false_label),
+        _ => return false,
+    };
+    let latch_cond = match func.blocks[t].terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(c),
+            true_label,
+            false_label,
+        } if true_label == body && false_label == exit => c,
+        _ => return false,
+    };
+    if guard_cond == latch_cond || func.blocks[h].instructions.len() != 1 {
+        return false;
+    }
+
+    // Inversion must have left exactly one explicit preheader edge.  In
+    // particular, do not infer an entry value from a block with another edge.
+    let cfg = CfgAnalysis::build(func);
+    let preds = cfg.preds.row(h);
+    if preds.len() != 1 {
+        return false;
+    }
+    let p = preds[0] as usize;
+    if p == h
+        || p == t
+        || !matches!(
+            &func.blocks[p].terminator,
+            Terminator::Branch(label) if *label == func.blocks[h].label
+        )
+    {
+        return false;
+    }
+
+    fn cmp_shape(inst: &Instruction, dest: Value) -> Option<(Value, IrConst, IrType)> {
+        match inst {
+            Instruction::Cmp {
+                dest: d,
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(iv),
+                rhs: Operand::Const(limit),
+                ty,
+            } if *d == dest && matches!(ty, IrType::U32 | IrType::U64) => Some((*iv, *limit, *ty)),
+            _ => None,
+        }
+    }
+    // The header gate above (`instructions.len() != 1`) has already proven the
+    // header holds exactly this compare, so the site is a constant and every
+    // later rewrite can address it by index.
+    const GUARD_CMP: usize = 0;
+    let guard_cmp = GUARD_CMP;
+    let Some((iv, limit_const, ty)) =
+        cmp_shape(&func.blocks[h].instructions[guard_cmp], guard_cond)
+    else {
+        return false;
+    };
+    let Some(latch_cmp) = func.blocks[t]
+        .instructions
+        .iter()
+        .position(|inst| matches!(inst, Instruction::Cmp { dest, .. } if *dest == latch_cond))
+    else {
+        return false;
+    };
+    let Some((latch_iv, latch_limit, latch_ty)) =
+        cmp_shape(&func.blocks[t].instructions[latch_cmp], latch_cond)
+    else {
+        return false;
+    };
+    if latch_iv != iv || latch_ty != ty {
+        return false;
+    }
+    let Some(limit) = integer_constant(limit_const, ty) else {
+        return false;
+    };
+    if integer_constant(latch_limit, ty) != Some(limit)
+        || limit <= 0
+        || integer_type_bounds(ty).is_none_or(|(_, hi)| limit > hi)
+    {
+        return false;
+    }
+
+    let mut iv_defs = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if inst.dest() == Some(iv) {
+                iv_defs.push((bi, ii));
+            }
+        }
+    }
+    if iv_defs.len() != 2 {
+        return false;
+    }
+    let Some(&(_, init)) = iv_defs.iter().find(|(bi, _)| *bi == p) else {
+        return false;
+    };
+    let Some(&(_, copy)) = iv_defs.iter().find(|(bi, _)| *bi == t) else {
+        return false;
+    };
+    if !matches!(
+        func.blocks[p].instructions[init],
+        Instruction::Copy {
+            src: Operand::Const(k),
+            ..
+        } if integer_constant(k, ty) == Some(0)
+    ) {
+        return false;
+    }
+    let next = match func.blocks[t].instructions[copy] {
+        Instruction::Copy {
+            src: Operand::Value(next),
+            ..
+        } => next,
+        _ => return false,
+    };
+    if next == iv {
+        return false;
+    }
+
+    let mut next_defs = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if inst.dest() == Some(next) {
+                next_defs.push((bi, ii));
+            }
+        }
+    }
+    if next_defs.len() != 1 || next_defs[0].0 != t {
+        return false;
+    }
+    let update = next_defs[0].1;
+    if !matches!(
+        func.blocks[t].instructions[update],
+        Instruction::BinOp {
+            op: IrBinOp::Add,
+            lhs: Operand::Value(lhs),
+            rhs: Operand::Const(step),
+            ty: update_ty,
+            ..
+        } if lhs == iv && update_ty == ty && integer_constant(step, ty) == Some(1)
+    ) || update >= copy
+        || copy >= latch_cmp
+    {
+        return false;
+    }
+
+    // No semantic use may survive outside the three recurrence sites.  This
+    // also rejects live-out values, asm outputs, hidden pointer uses and a
+    // second condition consuming either compare result.
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let site = (bi, ii);
+            let mut valid = true;
+            inst.for_each_used_value(|v| {
+                if v == iv.0
+                    && site != (h, guard_cmp)
+                    && site != (t, update)
+                    && site != (t, latch_cmp)
+                {
+                    valid = false;
+                }
+                if v == next.0 && site != (t, copy) {
+                    valid = false;
+                }
+                if (v == guard_cond.0 && site != (h, guard_cmp))
+                    || (v == latch_cond.0 && site != (t, latch_cmp))
+                {
+                    valid = false;
+                }
+            });
+            if !valid {
+                return false;
+            }
+        }
+        let mut valid = true;
+        terminator_uses(&block.terminator, &mut |v| {
+            if v == iv.0
+                || v == next.0
+                || (v == guard_cond.0 && bi != h)
+                || (v == latch_cond.0 && bi != t)
+            {
+                valid = false;
+            }
+        });
+        if !valid {
+            return false;
+        }
+    }
+
+    // All obligations are proven; mutate only now.
+    func.blocks[p].instructions[init] = Instruction::Copy {
+        dest: iv,
+        src: Operand::Const(limit_const),
+    };
+    let guard = &mut func.blocks[h];
+    if guard.source_spans.len() == guard.instructions.len() {
+        guard.source_spans.remove(guard_cmp);
+    }
+    guard.instructions.remove(guard_cmp);
+    func.blocks[h].terminator = Terminator::Branch(body);
+    if let Instruction::BinOp { op, .. } = &mut func.blocks[t].instructions[update] {
+        *op = IrBinOp::Sub;
+    }
+    if let Instruction::Cmp { op, rhs, .. } = &mut func.blocks[t].instructions[latch_cmp] {
+        *op = IrCmpOp::Ne;
+        *rhs = Operand::Const(IrConst::from_i64(0, ty));
+    }
+    if debug {
+        eprintln!(
+            "[LOOP-DOWNCOUNT] {}: v{} 0..{} -> N..0 in .LBB{}",
+            func.name, iv.0, limit, body.0
+        );
+    }
+    true
+}
+
 fn set_dest(inst: &mut Instruction, new: Value) {
     macro_rules! d {
         ($($v:ident),+ $(,)?) => {
@@ -851,6 +1112,223 @@ mod tests {
         let mut f = IrFunction::new("t".into(), IrType::Void, Vec::new(), false);
         f.blocks = blocks;
         f
+    }
+
+    /// Post-phi counted-loop input for the dead-IV downcount proof:
+    ///   0: iv = 0 -> 1
+    ///   1: c = iv < limit; c ? 2 : 3
+    ///   2: next = iv + 1; iv = next -> 1
+    ///   3: return
+    fn dead_counted_loop(limit: i64, ty: IrType) -> IrFunction {
+        func_of(vec![
+            blk(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(20),
+                    src: Operand::Const(IrConst::from_i64(0, ty)),
+                }],
+                br(1),
+            ),
+            blk(
+                1,
+                vec![Instruction::Cmp {
+                    dest: Value(10),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(20)),
+                    rhs: Operand::Const(IrConst::from_i64(limit, ty)),
+                    ty,
+                }],
+                cond(10, 2, 3),
+            ),
+            blk(
+                2,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(26),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(20)),
+                        rhs: Operand::Const(IrConst::from_i64(1, ty)),
+                        ty,
+                    },
+                    Instruction::Copy {
+                        dest: Value(20),
+                        src: Operand::Value(Value(26)),
+                    },
+                ],
+                br(1),
+            ),
+            blk(3, vec![], ret()),
+        ])
+    }
+
+    fn assert_downcounted(f: &IrFunction, limit: i64, ty: IrType) {
+        assert!(f.blocks[1].instructions.is_empty());
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+        assert!(matches!(
+            f.blocks[0].instructions[0],
+            Instruction::Copy {
+                src: Operand::Const(k),
+                ..
+            } if k == IrConst::from_i64(limit, ty)
+        ));
+        assert!(matches!(
+            f.blocks[2].instructions[0],
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                ..
+            }
+        ));
+        assert!(f.blocks[2].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Cmp {
+                op: IrCmpOp::Ne,
+                rhs: Operand::Const(k),
+                ..
+            } if *k == IrConst::from_i64(0, ty)
+        )));
+    }
+
+    #[test]
+    fn dead_constant_trip_loop_downcounts_and_removes_guard() {
+        let mut f = dead_counted_loop(8, IrType::U32);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert_downcounted(&f, 8, IrType::U32);
+    }
+
+    #[test]
+    fn downcount_handles_one_and_maximum_u32_trips() {
+        for limit in [1, u32::MAX as i64] {
+            let mut f = dead_counted_loop(limit, IrType::U32);
+            assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+            assert_downcounted(&f, limit, IrType::U32);
+        }
+    }
+
+    #[test]
+    fn downcount_handles_u64_max_trip_bit_pattern() {
+        // U64 constants use the I64 bit pattern; the mathematical domain in
+        // the matcher is i128, so -1 here means 2^64 - 1, not a signed limit.
+        let mut f = dead_counted_loop(-1, IrType::U64);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert_downcounted(&f, -1, IrType::U64);
+    }
+
+    #[test]
+    fn downcount_is_idempotent() {
+        let mut f = dead_counted_loop(8, IrType::U64);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert_downcounted(&f, 8, IrType::U64);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
+        assert_downcounted(&f, 8, IrType::U64);
+    }
+
+    #[test]
+    fn downcount_refuses_zero_trip_loop() {
+        let mut f = dead_counted_loop(0, IrType::U32);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::CondBranch { .. }
+        ));
+        assert!(matches!(
+            f.blocks[2].instructions[0],
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn downcount_refuses_live_out_iv_and_next() {
+        for live in [20, 26] {
+            let mut f = dead_counted_loop(8, IrType::U32);
+            f.blocks[3].terminator = Terminator::Return(Some(Operand::Value(Value(live))));
+            assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+            assert!(matches!(
+                f.blocks[1].terminator,
+                Terminator::CondBranch { .. }
+            ));
+            assert!(matches!(
+                f.blocks[2].instructions[0],
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn downcount_refuses_unproven_recurrences() {
+        let mut signed = dead_counted_loop(8, IrType::I32);
+        for inst in &mut signed.blocks[1].instructions {
+            if let Instruction::Cmp { op, .. } = inst {
+                *op = IrCmpOp::Slt;
+            }
+        }
+
+        let mut step_two = dead_counted_loop(8, IrType::U32);
+        for inst in &mut step_two.blocks[2].instructions {
+            if let Instruction::BinOp { rhs, .. } = inst {
+                *rhs = Operand::Const(IrConst::from_i64(2, IrType::U32));
+            }
+        }
+
+        let mut variable_limit = dead_counted_loop(8, IrType::U32);
+        variable_limit.blocks[0]
+            .instructions
+            .push(Instruction::Copy {
+                dest: Value(30),
+                src: Operand::Const(IrConst::from_i64(8, IrType::U32)),
+            });
+        for inst in &mut variable_limit.blocks[1].instructions {
+            if let Instruction::Cmp { rhs, .. } = inst {
+                *rhs = Operand::Value(Value(30));
+            }
+        }
+
+        for (name, mut f) in [
+            ("signed", signed),
+            ("step two", step_two),
+            ("variable limit", variable_limit),
+        ] {
+            assert_eq!(
+                invert_loops_with(&mut f, LoopInvertConfig::testing()),
+                1,
+                "{name}"
+            );
+            assert!(
+                matches!(f.blocks[1].terminator, Terminator::CondBranch { .. }),
+                "{name}: entry guard was removed"
+            );
+            assert!(
+                matches!(
+                    f.blocks[2].instructions[0],
+                    Instruction::BinOp {
+                        op: IrBinOp::Add,
+                        ..
+                    }
+                ),
+                "{name}: recurrence was changed"
+            );
+        }
+    }
+
+    #[test]
+    fn downcount_obeys_its_kill_switch() {
+        let mut f = dead_counted_loop(8, IrType::U32);
+        assert_eq!(
+            invert_loops_with(&mut f, LoopInvertConfig::no_downcount()),
+            1
+        );
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::CondBranch { .. }
+        ));
     }
 
     /// The canonical counted loop, exactly the `k_memchr` shape:

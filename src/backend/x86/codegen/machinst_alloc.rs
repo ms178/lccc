@@ -896,6 +896,29 @@ pub(crate) enum WindowWriteKind {
     ScratchOrClobber,
 }
 
+/// Homes whose pre-call contents survive a typed call: its explicit
+/// save/restore pairs and the IPA-RA registers proved preserved by the
+/// callee. Both last-write classifiers must use the same set; treating an
+/// IPA-kept home as clobbered makes every later coalesced member stale even
+/// though the call and its verifier preserve the register.
+fn call_preserved_homes(inst: &MachInst) -> FxHashSet<u8> {
+    let MachInst::CallTyped {
+        caller_saves,
+        ipa_keep,
+        ..
+    } = inst
+    else {
+        return FxHashSet::default();
+    };
+    let mut preserved: FxHashSet<u8> = caller_saves.iter().map(|(p, _)| p.0).collect();
+    for &(family, id) in &super::ipa_ra::KEEP_PHYS {
+        if ipa_keep & family != 0 {
+            preserved.insert(id);
+        }
+    }
+    preserved
+}
+
 /// Per-register LAST-write classification for a window that contains no
 /// allocated vregs: every destination-position register write is a
 /// pre-colored definition, and only the architecture-implied writes
@@ -945,9 +968,9 @@ pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, Windo
                 // SysV integer caller-clobber set (rax is not a home; the
                 // six argument registers and r10/r11 are). CallTyped's
                 // embedded save/restore pair PRESERVES every register in
-                // `caller_saves` across the call — the pre-call state
-                // remains the register's truth for those, so no event is
-                // recorded for them (kernel calculate_imbalance: a saved
+                // `caller_saves` and `ipa_keep` across the call — the
+                // pre-call state remains the register's truth for those, so
+                // no event is recorded for them (kernel calculate_imbalance: a saved
                 // r11 would otherwise be misclassified as clobbered and
                 // poison a sound alias read downstream).  CallTyped's
                 // embedded ret-move targets its own dst AFTER the call —
@@ -955,14 +978,9 @@ pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, Windo
                 // positions, so classify the ret home as a Precolor write
                 // at this index explicitly (recorded after the clobbers,
                 // and the equal-index rule prefers Precolor).
-                let saved: FxHashSet<u8> = match inst {
-                    MachInst::CallTyped { caller_saves, .. } => {
-                        caller_saves.iter().map(|(p, _)| p.0).collect()
-                    }
-                    _ => FxHashSet::default(),
-                };
+                let preserved = call_preserved_homes(inst);
                 for r in [14u8, 15, 16, 12, 13, 10, 11] {
-                    if !saved.contains(&r) {
+                    if !preserved.contains(&r) {
                         record(r, idx, WindowWriteKind::ScratchOrClobber, &mut last);
                     }
                 }
@@ -1364,18 +1382,14 @@ pub(crate) fn allocate_window(
                 }
             }
             MachInst::Call { .. } | MachInst::CallTyped { .. } => {
-                // Same save-aware law as the core classifier: registers in
-                // CallTyped's caller_saves are preserved by the embedded
-                // restore — their pre-call state stays true, so they keep
-                // whatever event preceded the call.
-                let saved: FxHashSet<u8> = match inst {
-                    MachInst::CallTyped { caller_saves, .. } => {
-                        caller_saves.iter().map(|(p, _)| p.0).collect()
-                    }
-                    _ => FxHashSet::default(),
-                };
+                // Same save/IPA-aware law as the core classifier: registers
+                // in caller_saves are preserved by the embedded restore and
+                // ipa_keep registers by the verified callee — their pre-call
+                // state stays true, so they keep whatever event preceded the
+                // call.
+                let preserved = call_preserved_homes(inst);
                 for r in [14u8, 15, 16, 12, 13, 10, 11] {
-                    if !saved.contains(&r) {
+                    if !preserved.contains(&r) {
                         last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
                     }
                 }
@@ -2480,5 +2494,41 @@ mod tests {
             !vreg_writers.contains_key(&2) && !vreg_writers.contains_key(&3),
             "core relay dsts must not be tagged as inserted vreg writes, got: {vreg_writers:?}"
         );
+    }
+
+    #[test]
+    fn typed_call_write_state_preserves_saved_and_ipa_homes() {
+        let r8_family = super::super::ipa_ra::KEEP_PHYS
+            .iter()
+            .find_map(|&(family, id)| (id == 12).then_some(family))
+            .expect("r8 must be an IPA keep candidate");
+        let call = MachInst::CallTyped {
+            caller_saves: vec![(crate::backend::regalloc::PhysReg(13), -8)],
+            args: Vec::new(),
+            target: CallTarget::Direct("callee".to_string()),
+            ret: None,
+            gp_arg_count: Some(0),
+            ipa_keep: r8_family,
+        };
+        let preserved = call_preserved_homes(&call);
+        assert!(preserved.contains(&12), "IPA-kept r8 must survive");
+        assert!(preserved.contains(&13), "saved/restored r9 must survive");
+        assert!(!preserved.contains(&14), "rdi remains caller-clobbered");
+
+        let writes = window_last_writes_core(&[
+            MachInst::Mov {
+                src: MachOperand::Imm(7),
+                dst: MachOperand::Reg(phys(12)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Imm(9),
+                dst: MachOperand::Reg(phys(14)),
+                size: OpSize::S64,
+            },
+            call,
+        ]);
+        assert_eq!(writes.get(&12), Some(&WindowWriteKind::Precolor));
+        assert_eq!(writes.get(&14), Some(&WindowWriteKind::ScratchOrClobber));
     }
 }

@@ -389,9 +389,12 @@ gate "vex-flag-reads" fast \
 gate "load-cast-fold" fast \
     env CCC="$LCCC" bash tests/regression/check_load_cast_fold.sh
 
-# Fold only the exact dead-temporary shr/movsbl form. The skip arm keeps the
-# structural control honest, while all 256 high bytes times six low-bit
-# patterns check signed results against both the unfolded code and GCC 16.
+gate "andq-narrow-width" fast \
+    env CCC="$LCCC" bash tests/regression/check_andq_narrow_width.sh
+
+# Unit tests pin the exact dead-temporary shr/movsbl form, CFG reachability
+# and skip controls. The C harness checks all 256 high bytes times six
+# low-bit patterns against both unfolded code and GCC 16.
 gate "shift-signext-fold" fast \
     env CCC="$LCCC" GCC=gcc-16 bash tests/regression/check_shift_signext_fold.sh
 
@@ -1914,6 +1917,9 @@ gate "pointer-ring-indexing" fast \
 
 gate "affine-loop-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_affine_loop_fold.sh
+
+gate "loop-downcount" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_downcount.sh
 
 gate "unsigned-affine-loop" fast \
     env CCC="$LCCC" bash tests/regression/check_unsigned_affine_loop.sh

@@ -97,8 +97,17 @@ src=tests/benchmark/programs/byte_load_reassembly.c
 if [ ! -f "$src" ]; then
     bad "byte_load_reassembly.c missing"
 else
-    "$LCCC" -O2 -S -o "$work/on.s" "$src" 2>/dev/null || bad "byte_load_reassembly: compile failed"
-    CCC_PEEPHOLE_SKIP=lea_narrow "$LCCC" -O2 -S -o "$work/off.s" "$src" 2>/dev/null ||
+    # The strided SSE2 reducer now vectorizes this program's decode loop, which
+    # removes the scalar `leaq` + truncating `movl` carrier this fold needs.
+    # That is a win, not a folded-away regression: the same source runs 4.33 ms
+    # on the pre-reducer tree, 4.30 ms with `CCC_NO_STRIDED_REDUCE=1` and
+    # 2.27 ms with it (GCC 16.2 -O2: 2.66 ms, best of 7).  Pin the peephole on
+    # the scalar shape it owns, so neither change can hide the other's
+    # disappearance.
+    NOVEC="CCC_NO_STRIDED_REDUCE=1"
+    env "$NOVEC" "$LCCC" -O2 -S -o "$work/on.s" "$src" 2>/dev/null ||
+        bad "byte_load_reassembly: compile failed"
+    env "$NOVEC" CCC_PEEPHOLE_SKIP=lea_narrow "$LCCC" -O2 -S -o "$work/off.s" "$src" 2>/dev/null ||
         bad "byte_load_reassembly: compile with the skip failed"
     if [ -s "$work/on.s" ] && [ -s "$work/off.s" ]; then
         if cmp -s "$work/on.s" "$work/off.s"; then

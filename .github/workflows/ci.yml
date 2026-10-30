@@ -654,6 +654,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
     - name: Verify W2 load->cast fold structure and runtime
       run: bash tests/regression/check_load_cast_fold.sh
+    - name: Verify ANDQ narrow-width facts and boundaries
+      run: bash tests/regression/check_andq_narrow_width.sh
     - name: Verify exact shift and byte sign-extension fold
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_shift_signext_fold.sh
     - name: ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle
@@ -2833,6 +2835,7 @@ jobs:
         bash tests/regression/check_minmax_reduction.sh
         bash tests/regression/check_volatile_reduction.sh
         bash tests/regression/check_affine_loop_fold.sh
+        bash tests/regression/check_loop_downcount.sh
         # T6: IR verifier clean on the fixed gate subset (mirrors ci_local.sh).
         bash tests/regression/check_verify_ir_clean.sh
         python3 scripts/audit_census.py --check

@@ -4,6 +4,34 @@ Keep unimplemented opportunities here only when a reproducible workload or
 assembly witness exists. Move completed work to its change review with measured
 results; do not turn unmeasured expectations into claims.
 
+## Unsigned saturating subtract: scalar work closed, extensions still proof-gated
+
+The exact late scalar matcher, x86-64 CMOV lowering, baseline-i686
+SBB/NOT/AND lowering, and secondary-cache correctness fix are implemented.
+The [S62–S70 review](../engineering/FOLLOWUP-2026-10-29-saturating-sub.md)
+contains the legality argument, negative controls, and complete receipts.
+On the final rebased compiler, same-compiler `satsub` on/off measurement of
+`zlib_ng_slide_hash` gives median ratios **0.9010041577** for scalar x86-64
+(31 paired process rounds) and **0.6766923942** for i686 (21 rounds), with
+stdout checked in every run. Callgrind Ir ratios are 0.8953274073 and
+0.8941186746 respectively; these simulated counts are not PMU or timing data.
+
+This is not an open request to broaden the pattern indiscriminately:
+
+- New compare/subtract/select forms still need exact operand identity,
+  single-use rules, and the signed/narrow nonnegative-domain proof.
+- SSE2 and AVX2 objects for this workload are byte-identical with the late
+  scalar pass on/off. Do not manufacture a timing result from identical
+  binaries; a new vector-tail workload is required for further work there.
+- Packed saturation remains x86-64/U16. Do not open i686 packed lowering by
+  merely widening a gate, and do not restore the slower x86-64 mask chain.
+- Other generic RCX-staging emitters require individual cache-lifetime audits
+  and direct regressions, not a mass edit based on textual similarity.
+
+The historical whole-candidate S66 table and the explanation of which packed
+parts are now upstream are kept in the review rather than reused as claims
+about only the remaining scalar patch.
+
 ## Remaining gaps after the fresh worst-ten investigation
 
 [The 56-workload screen and 31-round follow-up](../engineering/evidence/worst-ten-runtime-2026-10-25/README.md)

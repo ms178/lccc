@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Execute exact boundary, tail, overlap and negative-control cases, and pin the
-# SSE2/AVX2 lowering without permitting SIMD when the target forbids it.
+# Execute exact boundary, tail, overlap and negative-control cases. Pin packed
+# SSE2/AVX2 lowering and the late scalar x86-64/i686 intrinsic without
+# permitting SIMD when the target forbids it.
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$root/target/fastbuild/lccc}
@@ -19,11 +20,12 @@ function_body() {
 }
 
 for opt in -O2 -O3; do
-    for mode in sse2 avx2 scalar; do
+    for mode in sse2 avx2 scalar i686; do
         case "$mode" in
             sse2) flags=(-march=x86-64) ;;
             avx2) flags=(-march=x86-64-v3) ;;
             scalar) flags=(-mno-sse -mno-sse2 -mno-mmx -mno-avx) ;;
+            i686) flags=(-m32 -march=i686) ;;
         esac
         label="${opt#-}-$mode"
         "$ccc" "$opt" "${flags[@]}" -S "$src" -o "$tmp/$label.s" || fail "$label assembly failed"
@@ -40,8 +42,11 @@ for opt in -O2 -O3; do
         cmp "$tmp/$label.out" "$tmp/$label-gcc.out" || fail "$label disagrees with GCC"
         function_body sat_ge "$tmp/$label.s" > "$tmp/$label-sat.s"
         function_body sat_max_select "$tmp/$label.s" > "$tmp/$label-sat-max.s"
+        function_body sat_u32 "$tmp/$label.s" > "$tmp/$label-sat32.s"
         function_body signed_compare "$tmp/$label.s" > "$tmp/$label-signed.s"
+        function_body signed_max_minus "$tmp/$label.s" > "$tmp/$label-signed-max.s"
         function_body nonzero_fallback "$tmp/$label.s" > "$tmp/$label-nonzero.s"
+        function_body different_subtrahend "$tmp/$label.s" > "$tmp/$label-different.s"
         if [[ "$mode" == sse2 ]]; then
             grep -Eq '\bpsubusw\b' "$tmp/$label-sat.s" || fail "$label lacks SSE2 saturation"
             grep -Eq '\bpsubusw\b' "$tmp/$label-sat-max.s" || fail "$label lacks SSE2 compare/select max saturation"
@@ -53,10 +58,22 @@ for opt in -O2 -O3; do
             grep -Eq '\bvpsubusw\b.*%ymm' "$tmp/$label-sat-max.s" || fail "$label lacks AVX2 compare/select max saturation"
         else
             if grep -Eq '\b[xyz]mm[0-9]+\b|\bv?psubusw\b' "$tmp/$label.s"; then
-                fail "$label emitted SIMD with SIMD disabled"
+                fail "$label emitted SIMD on a scalar-only target"
+            fi
+            if [[ "$mode" == scalar ]]; then
+                grep -Eq '\bcmovcl\b' "$tmp/$label-sat.s" || fail "$label lacks x86-64 scalar U16 saturation"
+                grep -Eq '\bcmovcl\b' "$tmp/$label-sat32.s" || fail "$label lacks x86-64 scalar U32 saturation"
+            else
+                grep -Eq '\bsbbl\b' "$tmp/$label-sat.s" || fail "$label lacks i686 scalar U16 saturation"
+                grep -Eq '\bsbbl\b' "$tmp/$label-sat32.s" || fail "$label lacks i686 scalar U32 saturation"
+            fi
+            if grep -Eq '^\.Lsel_(true|end)_' "$tmp/$label-sat.s" "$tmp/$label-sat32.s"; then
+                fail "$label kept the branchy select lowering"
             fi
         fi
-        if grep -Eq '\bv?psubusw\b' "$tmp/$label-signed.s" "$tmp/$label-nonzero.s"; then
+        if grep -Eq '\bv?psubusw\b|\bsbbl\b' \
+            "$tmp/$label-signed.s" "$tmp/$label-signed-max.s" \
+            "$tmp/$label-nonzero.s" "$tmp/$label-different.s"; then
             fail "$label used unsigned saturation for a negative control"
         fi
     done

@@ -1469,22 +1469,23 @@ fn update_facts(t: &str, facts: &mut ExtFacts<'_>) {
         update_facts_for_cmov(t, facts);
         return;
     }
-    // 64-bit masked AND with a nonnegative imm32 mask bounds the RESULT width
-    // independently of the source (`x & m <= m`): a byte mask proves a byte
-    // value, a word mask a 16-bit value, any other in-range mask at least a
-    // zero upper half. The sign-extension boundary (m < 0x8000_0000) is
-    // enforced inside the shared predicate, matching GAS's imm32 encoding.
-    // This lets a following re-extension or 32-bit copy into a 64-bit reader
-    // fold (the revvarint `movzbl; andq $127; movl ...; orq` shape).
-    if op == "andq" {
+    // An immediate-masked AND bounds the RESULT width independently of the
+    // source (`x & m <= m`): a byte mask proves a byte value, a word mask a
+    // 16-bit value, and every accepted wider mask at least a zero upper half.
+    // The shared predicate distinguishes ANDQ's sign-extended imm32 from
+    // ANDL's always-zero-extended dword result. Handling both keeps the facts
+    // intact when an earlier pass narrows the producer opcode. This lets a
+    // following re-extension or 32-bit copy into a 64-bit reader fold (the
+    // revvarint `movzbl; andq $127; movl ...; orq` shape).
+    if op == "andq" || op == "andl" {
         if let DstKind::Reg(df) = classify_dst(t) {
-            if let Some(width) = super::relay_and_lea::andq_imm_narrow_width(t, df) {
+            if let Some(width) = super::relay_and_lea::and_imm_narrow_width(t, df) {
                 facts.set_zero_extended(df, width, ext16_enabled());
                 return;
             }
         }
-        // An unrecognised andq (register mask, odd text) must not keep any
-        // stale fact about its destination; the catch-all below clears it.
+        // An unrecognised AND must not keep stale narrow facts. ANDL falls
+        // through to the generic dword-zero rule; ANDQ reaches the catch-all.
     }
 
     // Any other 32-bit ALU write (addl, subl, andl, orl, leal, imull, shifts)
@@ -2530,24 +2531,32 @@ mod tests {
         assert!(out.contains("movzbl %al, %eax"), "asm was:\n{out}");
     }
 
-    // ── masked 64-bit AND establishes narrow facts (PERF-5 residue) ───────
+    // ── masked immediate AND establishes narrow facts (PERF-5 residue) ────
 
     #[test]
-    fn andq_mask_establishes_width_facts_in_the_ledger() {
+    fn and_mask_establishes_width_facts_in_the_ledger() {
         // r10 is GP family 10. Vectors: [upper32, byte, is16, sext32, sext8,
         // sext16]. A byte/word mask must establish the matching zero-extended
-        // width fact without inventing any sign-extension fact.
-        let f = ledger_after("andq $127, %r10", false);
-        assert!(f[0][10], "upper32 zero: {f:?}");
-        assert!(f[1][10], "byte-width value: {f:?}");
-        assert!(f[2][10], "16-bit-width value: {f:?}");
-        assert!(!f[3][10] && !f[4][10] && !f[5][10], "no sext fact: {f:?}");
+        // width fact without inventing any sign-extension fact, regardless of
+        // whether an earlier pass selected ANDQ or the narrower ANDL opcode.
+        for (mnemonic, dst) in [("andq", "%r10"), ("andl", "%r10d")] {
+            for mask in [127, 128, 254, 255] {
+                let f = ledger_after(&format!("{mnemonic} ${mask}, {dst}"), false);
+                assert!(f[0][10], "upper32 zero after mask {mask}: {f:?}");
+                assert!(f[1][10], "byte-width value after mask {mask}: {f:?}");
+                assert!(f[2][10], "16-bit-width value after mask {mask}: {f:?}");
+                assert!(
+                    !f[3][10] && !f[4][10] && !f[5][10],
+                    "no sext fact after mask {mask}: {f:?}"
+                );
+            }
 
-        let f = ledger_after("andq $65535, %r10", false);
-        assert!(f[0][10] && !f[1][10] && f[2][10], "word mask: {f:?}");
+            let f = ledger_after(&format!("{mnemonic} $65535, {dst}"), false);
+            assert!(f[0][10] && !f[1][10] && f[2][10], "word mask: {f:?}");
 
-        let f = ledger_after("andq $1048575, %r10", false);
-        assert!(f[0][10] && !f[1][10] && !f[2][10], "dword mask: {f:?}");
+            let f = ledger_after(&format!("{mnemonic} $1048575, {dst}"), false);
+            assert!(f[0][10] && !f[1][10] && !f[2][10], "dword mask: {f:?}");
+        }
     }
 
     #[test]
@@ -2562,17 +2571,49 @@ mod tests {
     }
 
     #[test]
-    fn andq_byte_fact_removes_a_following_byte_re_extension() {
-        // The byte-mask fact makes the second movzbl a provable no-op, the
-        // same way a byte load would.
-        let out = run(concat!(
-            "foo:\n",
-            "    movzbl (%rdi), %r10d\n",
-            "    andq $127, %r10\n",
-            "    movzbl %r10b, %r10d\n",
-            "    movl %r10d, %eax\n",
-            "    ret\n",
-        ));
-        assert!(!out.contains("movzbl %r10b, %r10d"), "asm was:\n{out}");
+    fn andl_sign_spelled_mask_keeps_the_dword_zero_fact() {
+        // Unlike ANDQ, ANDL always zero-extends its dword result. A negative
+        // imm32 spelling cannot produce a byte/word fact, but it must not
+        // discard the architecture-guaranteed upper-zero fact either.
+        for spelling in ["-2147483648", "-1", "0xffffffff"] {
+            let f = ledger_after(&format!("andl ${spelling}, %r10d"), true);
+            assert!(f[0][10] && !f[1][10] && !f[2][10], "{spelling}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn and_byte_fact_removes_a_following_byte_re_extension() {
+        // Every mask in the unsigned-byte range makes the second movzbl a
+        // provable no-op, including results 0x80..0xff whose low-byte sign
+        // bit is set. The rule must survive an upstream ANDQ -> ANDL opcode
+        // selection and must not depend on signed-byte positivity.
+        for (mnemonic, dst) in [("andq", "%r10"), ("andl", "%r10d")] {
+            for mask in [127, 128, 254, 255] {
+                let asm = format!(
+                    "foo:\n    movzbl (%rdi), %r10d\n    {mnemonic} ${mask}, {dst}\n    movzbl %r10b, %r10d\n    movl %r10d, %eax\n    ret\n"
+                );
+                let out = run(&asm);
+                assert!(
+                    !out.contains("movzbl %r10b, %r10d"),
+                    "{mnemonic} mask {mask}: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn and_word_only_mask_keeps_a_byte_re_extension() {
+        // 0x100 proves a 16-bit value, not a byte value: the source can be
+        // 0x100, whose low byte is zero but whose full value is nonzero.
+        for (mnemonic, dst) in [("andq", "%r10"), ("andl", "%r10d")] {
+            let asm = format!(
+                "foo:\n    movq %rdi, %r10\n    {mnemonic} $256, {dst}\n    movzbl %r10b, %r10d\n    movl %r10d, %eax\n    ret\n"
+            );
+            let out = run_maybe(&asm);
+            assert!(
+                out.contains("movzbl %r10b, %r10d"),
+                "{mnemonic}: asm was:\n{out}"
+            );
+        }
     }
 }

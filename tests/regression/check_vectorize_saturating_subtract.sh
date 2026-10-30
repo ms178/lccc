@@ -58,6 +58,13 @@ for fn in ("slide_w_ge", "slide_w_gt"):
         if "pcmpgtw" in b or "pmaxuw" in b:
             raise SystemExit(
                 f"{fn} ({label}): still expands the saturating subtract")
+        # The constant-trip slide map has no scalar remainder: four independent
+        # packed operations must share one loop backedge. This pins the
+        # register-bounded unroll policy, not merely the arithmetic fold.
+        subs = len(re.findall(r"\bv?psubusw\b", b))
+        if subs != 4:
+            raise SystemExit(
+                f"{fn} ({label}): expected four-way slide-map unroll, got {subs}")
 
 # Byte lanes never reach the map emitter today (a byte map is admitted only
 # for 0/1 reduction trees), so this one is a correctness-only fixture: the

@@ -296,7 +296,7 @@ impl ArmCodegen {
                     self.state.emit("    str q0, [x0]");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -314,7 +314,7 @@ impl ArmCodegen {
                     self.emit_neon_binary_128(dptr, args, "cmeq");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -335,7 +335,7 @@ impl ArmCodegen {
                     self.state.emit("    str q0, [x0]");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -344,7 +344,7 @@ impl ArmCodegen {
                     self.emit_neon_binary_128(dptr, args, "uqsub");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -353,7 +353,7 @@ impl ArmCodegen {
                     self.emit_neon_binary_128(dptr, args, "sqsub");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -362,7 +362,7 @@ impl ArmCodegen {
                     self.emit_neon_binary_128(dptr, args, "orr");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -371,7 +371,7 @@ impl ArmCodegen {
                     self.emit_neon_binary_128(dptr, args, "and");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -380,7 +380,7 @@ impl ArmCodegen {
                     self.emit_neon_binary_128(dptr, args, "eor");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -418,7 +418,7 @@ impl ArmCodegen {
                     self.state.emit("    str q0, [x0]");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -430,7 +430,7 @@ impl ArmCodegen {
                     self.state.emit("    str q0, [x0]");
                 } else if dest.is_some() {
                     panic!(
-                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "arm emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -1252,6 +1252,8 @@ fn unsupported_arm_vector_intrinsic(op: &IntrinsicOp) -> bool {
         IntrinsicOp::VecLoadF64x4
             | IntrinsicOp::VecLoadI32x8
             | IntrinsicOp::VecLoadStrided2I32x8
+            | IntrinsicOp::VecLoadStrided2I32x4
+            | IntrinsicOp::VecLoadStrided2CompactI32x4
             | IntrinsicOp::VecAddF64x4
             | IntrinsicOp::VecMulF64x4
             | IntrinsicOp::VecAddI32x8
@@ -1334,6 +1336,8 @@ mod prefetch_prfop_tests {
     fn x86_only_vector_forms_are_not_silent_aarch64_operations() {
         for op in [
             IntrinsicOp::VecLoadStrided2I32x8,
+            IntrinsicOp::VecLoadStrided2I32x4,
+            IntrinsicOp::VecLoadStrided2CompactI32x4,
             IntrinsicOp::VecLoadI32x8,
             IntrinsicOp::VecMulF64x4,
             IntrinsicOp::VecStoreI32x8,
@@ -1393,7 +1397,17 @@ mod intrinsic_destination_contract_tests {
                 &[Operand::Value(Value(0)), Operand::Value(Value(1))],
             );
         }));
-        assert!(result.is_err(), "ARM silently accepted the SSA form again");
+        let payload = result.expect_err("ARM silently accepted the SSA form again");
+        let text = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
+        assert!(
+            text.contains("Psubusb128"),
+            "diagnostic lost the operation name: {text}"
+        );
+        assert!(!text.contains("{op:?}"), "literal format hole: {text}");
     }
 
     #[test]

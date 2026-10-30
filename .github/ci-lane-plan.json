@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 412.13,
+      "predicted_gate_seconds": 412.88,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -324,7 +324,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 421.878,
+      "predicted_gate_seconds": 426.208,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -661,6 +661,10 @@
           "name": "bash tests/regression/check_affine_loop_fold.sh"
         },
         {
+          "measured_s": 4.33,
+          "name": "bash tests/regression/check_loop_downcount.sh"
+        },
+        {
           "measured_s": 3.98,
           "name": "bash tests/regression/check_verify_ir_clean.sh"
         },
@@ -973,7 +977,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 273.41,
+      "predicted_gate_seconds": 274.21,
       "shards": 3,
       "steps": [
         {
@@ -1119,6 +1123,10 @@
         {
           "measured_s": 0.25,
           "name": "Verify W2 load->cast fold structure and runtime"
+        },
+        {
+          "measured_s": 0.8,
+          "name": "Verify ANDQ narrow-width facts and boundaries"
         },
         {
           "measured_s": 0.25,
@@ -1550,8 +1558,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/audit/backend_contracts_costs.tsv",
-      "measured_seconds_total": 830.058,
-      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24); count-observations 8.908 s measured with both pinned vendors and extra frozen-baseline mechanism leg (conservative hosted scheduling estimate, 2026-10-25); ipa-ra-interposition 0.7 s measured fresh by a timed run of tests/regression/check_ipa_ra_interposition.sh (2026-10-24); redundant-self-zext 0.14 s measured fresh by scripts/ci_gate_costs.py --only redundant_self_zext (2026-10-29)"
+      "measured_seconds_total": 834.388,
+      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24); count-observations 8.908 s measured with both pinned vendors and extra frozen-baseline mechanism leg (conservative hosted scheduling estimate, 2026-10-25); ipa-ra-interposition 0.7 s measured fresh by a timed run of tests/regression/check_ipa_ra_interposition.sh (2026-10-24); redundant-self-zext 0.14 s measured fresh by scripts/ci_gate_costs.py --only redundant_self_zext (2026-10-29); loop-downcount 4.33 s measured fresh by scripts/ci_gate_costs.py --only check_loop_downcount.sh (2026-10-28)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",
@@ -1560,8 +1568,8 @@
     },
     "frontend": {
       "costs": "/tmp/frontend-costs.tsv",
-      "measured_seconds_total": 816.83,
-      "source": "measured: previous plan measured_s (GitHub Actions run 40479214961 frontend step timings; floor/store-forwarding/x86-execute gates at their initial estimates; GCC 16.2 diagnostic severity parity 2.45 s: 1.67 s as recorded by #992 plus 0.78 s for the check_operand_diagnostics.sh leg #993 appended, measured locally); trapv ABI legs 2.0 s each: the 1,999 s / 1,953 s hosted on 09724bee2 were the runner's core_pattern handler (910 SIGABRTs per leg), gone since the matrix became non-dumpable (1.24 s / 1.36 s locally under a 50 ms pipe handler); attribute/asm-operand/lexer/UCN diagnostic gates 0.5/0.75/0.25/1.0 s: local maxima 0.35/0.52/0.22/0.99 s measured on the fastbuild compiler, rounded up to the next quarter second (2026-10-28)"
+      "measured_seconds_total": 817.63,
+      "source": "measured: previous plan measured_s (GitHub Actions run 40479214961 frontend step timings; floor/store-forwarding/x86-execute gates at their initial estimates; GCC 16.2 diagnostic severity parity 2.45 s: 1.67 s as recorded by #992 plus 0.78 s for the check_operand_diagnostics.sh leg #993 appended, measured locally); trapv ABI legs 2.0 s each: the 1,999 s / 1,953 s hosted on 09724bee2 were the runner's core_pattern handler (910 SIGABRTs per leg), gone since the matrix became non-dumpable (1.24 s / 1.36 s locally under a 50 ms pipe handler); attribute/asm-operand/lexer/UCN diagnostic gates 0.5/0.75/0.25/1.0 s: local maxima 0.35/0.52/0.22/0.99 s measured on the fastbuild compiler, rounded up to the next quarter second (2026-10-28); ANDQ narrow-width 0.80 s measured fresh by scripts/ci_gate_costs.py --only check_andq_narrow_width.sh (2026-10-28)"
     }
   }
 }

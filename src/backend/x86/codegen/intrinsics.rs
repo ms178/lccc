@@ -2648,6 +2648,23 @@ impl X86Codegen {
                     self.sse_store_dest(dptr, "xmm0");
                 }
             }
+            IntrinsicOp::UsubSat32 => {
+                // SUB leaves the exact difference and sets CF precisely for
+                // unsigned lhs < rhs.  A zero materialization preserves those
+                // flags; CMOVC then replaces only a borrowing difference by
+                // zero.  x86-64 guarantees CMOV, and this avoids the longer
+                // SBB/NOT/AND dependency chain required by baseline i686.
+                self.operand_to_rax_i32(&args[0]);
+                self.operand_to_reg(&args[1], "rcx");
+                self.state.emit("    subl %ecx, %eax");
+                self.state.emit("    movl $0, %ecx");
+                self.state.emit("    cmovcl %ecx, %eax");
+                self.state.reg_cache.invalidate_sec();
+                self.state.reg_cache.invalidate_acc();
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
             IntrinsicOp::Pdep32
             | IntrinsicOp::Pdep64
             | IntrinsicOp::Pext32
@@ -3226,7 +3243,7 @@ impl X86Codegen {
                     self.emit_sse_shuffle_imm_128(dptr, args, "pshufd");
                 } else if dest.is_some() {
                     panic!(
-                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -4000,7 +4017,7 @@ impl X86Codegen {
                     self.sse_store_dest(dptr, "xmm0");
                 } else if dest.is_some() {
                     panic!(
-                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -4254,7 +4271,7 @@ impl X86Codegen {
                     self.emit_sse_shuffle_imm_128(dptr, args, inst);
                 } else if dest.is_some() {
                     panic!(
-                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -4722,7 +4739,7 @@ impl X86Codegen {
                     self.state.emit("    vmovupd %ymm0, (%rdx)"); // Store to %rdx
                 } else if dest.is_some() {
                     panic!(
-                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -4738,7 +4755,7 @@ impl X86Codegen {
                     self.state.emit("    movupd %xmm0, (%rdx)"); // Store to %rdx
                 } else if dest.is_some() {
                     panic!(
-                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -4754,7 +4771,7 @@ impl X86Codegen {
                     self.state.emit("    vmovdqu %ymm0, (%rdx)"); // Store to %rdx
                 } else if dest.is_some() {
                     panic!(
-                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -4770,7 +4787,7 @@ impl X86Codegen {
                     self.state.emit("    movdqu %xmm0, (%rdx)"); // Store to %rdx
                 } else if dest.is_some() {
                     panic!(
-                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "x86 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -5011,6 +5028,62 @@ impl X86Codegen {
                     self.state.vector_values.insert(d.0);
                     if !loaded_home {
                         self.sse_store_dest(d, "xmm0");
+                    }
+                }
+            }
+            IntrinsicOp::VecLoadStrided2I32x4 => {
+                // Two exact-width reads, never the gap at +4. `movd` zeroes
+                // the rest of its destination, so no separate zeroing op is
+                // needed. SSE2 has no pinsrd; shift the second dword to lane
+                // 2 in the reserved xmm1 scratch and merge it.
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
+                self.state.emit_fmt(format_args!("    leaq {}, %rax", mem));
+                self.state.reg_cache.invalidate_acc();
+                let dst_home = dest.and_then(|d| self.dest_xmm_home_name(&d));
+                let work = dst_home.unwrap_or("xmm0");
+                debug_assert_ne!(work, "xmm1");
+                self.state
+                    .emit_fmt(format_args!("    movd (%rax), %{}", work));
+                self.state.emit("    movd 8(%rax), %xmm1");
+                self.state.emit("    pslldq $8, %xmm1");
+                self.state
+                    .emit_fmt(format_args!("    por %xmm1, %{}", work));
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(home) = dst_home {
+                        self.sse_commit_dest_direct(&d, home);
+                    } else {
+                        self.sse_store_dest(&d, "xmm0");
+                    }
+                }
+            }
+            IntrinsicOp::VecLoadStrided2CompactI32x4 => {
+                // The reducer has proved the full 32-byte window readable.
+                // Compact dword lanes 0/2 from each 16-byte half into one
+                // full XMM value: [0, 8, 16, 24] -> lanes [0, 1, 2, 3].
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
+                self.state.emit_fmt(format_args!("    leaq {}, %rax", mem));
+                self.state.reg_cache.invalidate_acc();
+                let dst_home = dest.and_then(|d| self.dest_xmm_home_name(&d));
+                let work = dst_home.unwrap_or("xmm0");
+                self.state
+                    .emit_fmt(format_args!("    movdqu (%rax), %{}", work));
+                // The extent proof does not imply 16-byte alignment. Keep
+                // the second half in a register: legacy SHUFPS may fault on
+                // an unaligned m128 operand even though MOVDQU is unaligned.
+                self.state.emit("    movdqu 16(%rax), %xmm1");
+                self.state
+                    .emit_fmt(format_args!("    shufps $0x88, %xmm1, %{}", work));
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(home) = dst_home {
+                        self.sse_commit_dest_direct(&d, home);
+                    } else {
+                        self.sse_store_dest(&d, "xmm0");
                     }
                 }
             }
@@ -11984,6 +12057,65 @@ mod vector_address_contract_tests {
     }
 
     #[test]
+    fn strided_load_sse2_reads_only_two_dwords() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, super::super::machinst::R12);
+        cg.reg_assignments.insert(1, super::super::machinst::R13);
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6
+        cg.emit_intrinsic_impl(
+            &Some(Value(2)),
+            &IntrinsicOp::VecLoadStrided2I32x4,
+            &None,
+            &[
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(16)),
+            ],
+        );
+        let out = &cg.state.out.buf;
+        for inst in [
+            "leaq 16(%r12,%r13), %rax",
+            "movd (%rax), %xmm6",
+            "movd 8(%rax), %xmm1",
+            "pslldq $8, %xmm1",
+            "por %xmm1, %xmm6",
+        ] {
+            assert!(out.contains(inst), "missing {inst}: {out}");
+        }
+        assert!(!out.contains("movdqu"), "{out}");
+        assert!(!out.contains("movdqa %xmm0, %xmm6"), "{out}");
+    }
+
+    #[test]
+    fn strided_load_sse2_compacts_two_proven_wide_halves() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, super::super::machinst::R12);
+        cg.reg_assignments.insert(1, super::super::machinst::R13);
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6
+        cg.emit_intrinsic_impl(
+            &Some(Value(2)),
+            &IntrinsicOp::VecLoadStrided2CompactI32x4,
+            &None,
+            &[
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(32)),
+            ],
+        );
+        let out = &cg.state.out.buf;
+        for inst in [
+            "leaq 32(%r12,%r13), %rax",
+            "movdqu (%rax), %xmm6",
+            "movdqu 16(%rax), %xmm1",
+            "shufps $0x88, %xmm1, %xmm6",
+        ] {
+            assert!(out.contains(inst), "missing {inst}: {out}");
+        }
+        assert!(!out.contains("movd "), "{out}");
+        assert!(!out.contains("movdqa %xmm0, %xmm6"), "{out}");
+    }
+
+    #[test]
     fn unfused_packed_update_keeps_two_roundings_and_hoisted_factor() {
         for disp in [0, 32, 96, i64::from(i32::MAX) + 1, i64::MIN] {
             let mut cg = X86Codegen::new();
@@ -13076,10 +13208,70 @@ mod intrinsic_destination_contract_tests {
                     &[Operand::Value(Value(0)), Operand::Value(Value(1))],
                 );
             }));
+            let payload = result.expect_err("{op:?} silently accepted the SSA form again");
+            let text = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default();
             assert!(
-                result.is_err(),
-                "{op:?} silently accepted the SSA form again"
+                text.contains(&format!("{op:?}")),
+                "diagnostic lost the operation name: {text}"
+            );
+            assert!(!text.contains("{op:?}"), "literal format hole: {text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod scalar_saturation_cache_tests {
+    use super::*;
+
+    #[test]
+    fn usub_sat32_invalidates_secondary_value_cache() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, PhysReg(2));
+        cg.reg_assignments.insert(1, PhysReg(3));
+        cg.value_types.insert(0, IrType::U32);
+        cg.value_types.insert(1, IrType::U32);
+        cg.state.reg_cache.set_sec(77, false);
+        cg.emit_intrinsic_impl(
+            &None,
+            &IntrinsicOp::UsubSat32,
+            &None,
+            &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+        );
+        assert!(
+            !cg.state.reg_cache.sec_has(77, false),
+            "UsubSat32 clobbers %rcx and must not retain a stale secondary value:\n{}",
+            cg.state.out.buf
+        );
+    }
+
+    #[test]
+    fn generic_rcx_staging_drops_the_previous_secondary_value() {
+        for op in [Operand::Const(IrConst::I32(9)), Operand::Value(Value(0))] {
+            let mut cg = X86Codegen::new();
+            cg.reg_assignments.insert(0, PhysReg(7));
+            cg.value_types.insert(0, IrType::I64);
+            cg.state.reg_cache.set_sec(77, false);
+            cg.operand_to_reg(&op, "rcx");
+            assert!(
+                !cg.state.reg_cache.sec_has(77, false),
+                "generic %rcx staging retained the old value:\n{}",
+                cg.state.out.buf
             );
         }
+    }
+
+    #[test]
+    fn generic_rcx_staging_reuses_an_exact_secondary_hit() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, PhysReg(7));
+        cg.value_types.insert(0, IrType::I64);
+        cg.state.park_sec(0, false);
+        cg.operand_to_reg(&Operand::Value(Value(0)), "rcx");
+        assert!(cg.state.reg_cache.sec_has(0, false));
+        assert_eq!(cg.state.out.buf, "");
     }
 }
