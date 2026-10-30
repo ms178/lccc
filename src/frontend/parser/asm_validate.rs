@@ -213,8 +213,35 @@ fn check_constraint(
             return;
         }
     }
-    // Explicit register (`{rax}`), condition code (`@cc`), or matching (`0`).
-    if body.starts_with('{') || body.starts_with('[') || body.starts_with("@cc") {
+    // Explicit register (`{rax}`) and matching (`0`) constraints have their own
+    // grammar and are not letter lists.
+    if body.starts_with('{') || body.starts_with('[') {
+        return;
+    }
+    // Condition-code operands (`=@cc<suffix>`). Measured against gcc 16.2: every
+    // suffix in the shared `asm_constraints::CONDITION_CODES` table is accepted,
+    // and everything else -- a missing suffix, `pe`/`po`, or junk -- is rejected
+    // with `unknown 'asm' flag output '<constraint>'`; an `@cc` on an input is
+    // rejected with `invalid punctuation '@' in constraint` everywhere.
+    //
+    // This check is what makes `gcc_cc_to_x86` total. Before it, an unknown
+    // suffix was silently reclassified as `equal`, so `=@ccqq` compiled to
+    // `sete` -- a miscompile of a program no other compiler accepts.
+    if let Some(suffix) = body.strip_prefix("@cc") {
+        if !is_output {
+            problems.push(Diagnostic::error(
+                "invalid punctuation '@' in constraint",
+                Some(index),
+            ));
+        } else if is_x86 && crate::common::asm_constraints::cond_code(suffix).is_none() {
+            // Non-x86 targets are left alone for the reason in the module
+            // header: their condition-code support is not measured here and
+            // must not be second-guessed.
+            problems.push(Diagnostic::error(
+                format!("unknown 'asm' flag output '{constraint}'"),
+                Some(index),
+            ));
+        }
         return;
     }
     if body.is_empty() || body.chars().next().is_some_and(|c| c.is_ascii_digit()) {
@@ -318,10 +345,6 @@ fn check_template(
             continue;
         }
         if code.is_ascii_digit() || MODIFIED_CODES.contains(code as char) {
-            if code.is_ascii_digit() && code != b'0' {
-                // A plain `%<digit>` index: only the single leading digit forms
-                // an index in GCC's x86 syntax.
-            }
             let has_number = if code.is_ascii_digit() {
                 true
             } else {
@@ -335,14 +358,27 @@ fn check_template(
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            // `%10` is not operand ten in GCC's x86 syntax: a single digit
-            // follows the `%` (or the modifier), so only the first digit counts.
-            let index: usize = template[start..start + 1].parse().unwrap_or(usize::MAX);
+            // Two different index grammars, both measured against gcc:
+            //   * a *label* reference consumes the whole decimal number
+            //     (`%l13` names label 13, with 13 operands before it);
+            //   * a plain operand reference consumes exactly one digit --
+            //     x86 gcc answers `%10` with "operand number missing after
+            //     %-letter" instead of reading operand ten.
+            // A single rule for both silently mis-indexes one of them, and this
+            // parser used to read one digit for both, so it rejected every
+            // `asm goto` whose label index reached ten.
+            let is_label = matches!(code, b'l' | b'L');
+            let digits = &template[start..i];
+            let index: usize = if is_label {
+                digits.parse().unwrap_or(usize::MAX)
+            } else {
+                digits[..1].parse().unwrap_or(usize::MAX)
+            };
             // A `+` output occupies an output position and an input position
             // in GCC's label numbering, but LCCC's regular operand map keeps
             // it as one operand. Label references start after this extra
             // read/write position; ordinary `%N` references do not.
-            let out_of_range = if matches!(code, b'l' | b'L') {
+            let out_of_range = if is_label {
                 let label_start = operand_count + readwrite_count;
                 index < label_start || index >= label_start + label_count
             } else {
@@ -666,6 +702,74 @@ mod tests {
         // A plain `asm` labels nothing, so the same template is out of range.
         let p = validate("jmp %l0", &[], &[], 0, true);
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
+    }
+
+    #[test]
+    fn label_indices_are_multi_digit_like_gcc() {
+        // Measured: with 13 inputs, `gcc -S` accepts `%l13` (it emits the
+        // label's own name) and rejects `%l12`. Reading a single digit would
+        // accept `%l12` (as label 2) and reject `%l13` (as label 1), i.e. it
+        // would invert both answers and false-reject valid `asm goto` code that
+        // names a label with a two-digit index.
+        let inputs: Vec<Operand<'_>> = (0..13).map(|_| op("r", Constness::Unknown)).collect();
+        assert!(validate("jmp %l13", &[], &inputs, 1, true).is_empty());
+        let p = validate("jmp %l12", &[], &inputs, 1, true);
+        assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
+        let p = validate("jmp %l14", &[], &inputs, 1, true);
+        assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
+    }
+
+    #[test]
+    fn plain_operand_indices_stay_single_digit_like_gcc() {
+        // x86 gcc answers `%10` with "operand number missing after %-letter",
+        // so only one digit forms a plain operand index. With two operands
+        // `%1` is in range and `%2` is not.
+        let p = validate(
+            "mov %1, %0",
+            &[op("=r", Constness::Unknown)],
+            &[op("r", Constness::Unknown)],
+            0,
+            true,
+        );
+        assert!(p.is_empty());
+        let p = validate(
+            "mov %2, %0",
+            &[op("=r", Constness::Unknown)],
+            &[op("r", Constness::Unknown)],
+            0,
+            true,
+        );
+        assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
+    }
+
+    #[test]
+    fn flag_output_suffixes_are_exactly_the_measured_gcc_set() {
+        // Every suffix in the shared table is accepted by gcc 16.2 (and by
+        // clang); the table is what the validator, `setcc` emission and the
+        // asm-goto fusion all read, so this pins that they cannot disagree.
+        for suffix in [
+            "e", "z", "ne", "nz", "s", "ns", "o", "no", "c", "nc", "a", "nbe", "ae", "nb", "b",
+            "nae", "be", "na", "g", "nle", "ge", "nl", "l", "nge", "le", "ng", "p", "np",
+        ] {
+            let constraint = format!("=@cc{suffix}");
+            let p = validate("", &[op(&constraint, Constness::Unknown)], &[], 0, true);
+            assert!(p.is_empty(), "{constraint} must be accepted");
+        }
+        // gcc: `unknown 'asm' flag output '<constraint>'` for all four.
+        for bad in ["=@cc", "=@ccxx", "=@ccpe", "=@ccpo"] {
+            let p = validate("", &[op(bad, Constness::Unknown)], &[], 0, true);
+            let want = format!("unknown 'asm' flag output '{bad}'");
+            assert_eq!(messages(&p), [want.as_str()], "{bad}");
+        }
+        // gcc: `invalid punctuation '@' in constraint` on an input operand.
+        let p = validate(
+            "",
+            &[op("=r", Constness::Unknown)],
+            &[op("@ccz", Constness::Unknown)],
+            0,
+            true,
+        );
+        assert_eq!(messages(&p), ["invalid punctuation '@' in constraint"]);
     }
 
     #[test]
