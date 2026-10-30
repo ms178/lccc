@@ -2424,11 +2424,7 @@ impl Driver {
             let bytes = if self.opt_level == 0 {
                 0
             } else if self.target == Target::X86_64 && isa.simd {
-                if isa.ymm {
-                    32
-                } else {
-                    16
-                }
+                if isa.ymm { 32 } else { 16 }
             } else if self.target == Target::I686 && self.resolved_i686_sse2() {
                 16
             } else {

@@ -64,7 +64,7 @@ W
 if "$ccc" -O2 -S "$tmp/w.c" -o "$tmp/w.s" 2>"$tmp/w.err"; then
     for spec in 'paddb:w_add8' 'paddw:w_add16' 'pmulhw:w_mulhi' 'pcmpeqb:w_cmpeq' 'psllw:w_sll'; do
         op=${spec%%:*} fn=${spec##*:}
-        if ! awk -v fn="$fn:" '$0==fn{on=1;next} on&&/ret/{exit} on' "$tmp/w.s" | grep -q "$op"; then
+        if [ "$(awk -v fn="$fn:" '$0==fn{on=1;next} on&&/ret/{exit} on' "$tmp/w.s" | grep -c "$op")" -eq 0 ]; then
             fail "packed witness: $fn does not emit $op"
         fi
     done

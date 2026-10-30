@@ -1735,32 +1735,44 @@ impl I686Codegen {
             // Broadcasts / zeros (the family table's zero ops and the
             // halfword/byte families that spell zero as a broadcast).
             IntrinsicOp::VecBroadcastI8x16 => {
-                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                let d = dest
+                    .clone()
+                    .expect("i686 VecBroadcast: value form expected");
                 self.vec_splat_operand(&args[0], 1, "xmm0");
                 self.vec_store_result(&d, "xmm0");
             }
             IntrinsicOp::VecBroadcastI16x8 => {
-                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                let d = dest
+                    .clone()
+                    .expect("i686 VecBroadcast: value form expected");
                 self.vec_splat_operand(&args[0], 2, "xmm0");
                 self.vec_store_result(&d, "xmm0");
             }
             IntrinsicOp::VecBroadcastI32x4 => {
-                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                let d = dest
+                    .clone()
+                    .expect("i686 VecBroadcast: value form expected");
                 self.vec_splat_operand(&args[0], 4, "xmm0");
                 self.vec_store_result(&d, "xmm0");
             }
             IntrinsicOp::VecBroadcastI64x2 => {
-                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                let d = dest
+                    .clone()
+                    .expect("i686 VecBroadcast: value form expected");
                 self.vec_splat_operand(&args[0], 8, "xmm0");
                 self.vec_store_result(&d, "xmm0");
             }
             IntrinsicOp::VecBroadcastF32x4 => {
-                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                let d = dest
+                    .clone()
+                    .expect("i686 VecBroadcast: value form expected");
                 self.vec_splat_operand(&args[0], 4, "xmm0");
                 self.vec_store_result(&d, "xmm0");
             }
             IntrinsicOp::VecBroadcastF64x2 => {
-                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                let d = dest
+                    .clone()
+                    .expect("i686 VecBroadcast: value form expected");
                 self.vec_splat_operand(&args[0], 8, "xmm0");
                 self.vec_store_result(&d, "xmm0");
             }
@@ -2969,8 +2981,7 @@ impl I686Codegen {
                     } else {
                         self.state.emit("    movzwl %ax, %eax");
                     }
-                    self.state
-                        .emit_fmt(format_args!("    movd %eax, %{}", reg));
+                    self.state.emit_fmt(format_args!("    movd %eax, %{}", reg));
                 }
                 _ => unreachable!("i686 Vec splat: lane {} unsupported", lane),
             },
@@ -2985,14 +2996,12 @@ impl I686Codegen {
         match lane {
             8 => unreachable!("i686 Vec splat: qword staging returns early"),
             4 => {
-                self.state
-                    .emit_fmt(format_args!("    movd %eax, %{}", reg));
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", reg));
                 self.state
                     .emit_fmt(format_args!("    pshufd $0x00, %{}, %{}", reg, reg));
             }
             2 => {
-                self.state
-                    .emit_fmt(format_args!("    movd %eax, %{}", reg));
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", reg));
                 // 1 -> 2 -> 4 -> 8 replicated words (each interleave doubles
                 // the replicated prefix out of the low 64 bits).
                 for _ in 0..3 {
@@ -3001,8 +3010,7 @@ impl I686Codegen {
                 }
             }
             _ => {
-                self.state
-                    .emit_fmt(format_args!("    movd %eax, %{}", reg));
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", reg));
                 for _ in 0..4 {
                     self.state
                         .emit_fmt(format_args!("    punpcklbw %{}, %{}", reg, reg));
@@ -3084,19 +3092,22 @@ impl I686Codegen {
         self.vec_load_image(&args[0], "xmm0"); // a
         self.vec_load_image(&args[1], "xmm1"); // b
         if unsigned {
-            // bias = the sign bit replicated per lane: pcmpeqd (all ones),
-            // then a per-lane left shift by lane_bits-1.
-            self.state.emit("    pcmpeqd %xmm2, %xmm2");
-            self.state.emit_fmt(format_args!(
-                "    psll{} ${}, %xmm2",
-                match lane {
-                    1 => 'b',
-                    2 => 'w',
-                    4 => 'd',
-                    _ => panic!("i686 Vec cmp: lane {} has no packed bias shift", lane),
-                },
-                lane as i64 * 8 - 1
-            ));
+            // bias = the sign bit replicated per lane (0x8080_8080 /
+            // 0x8000_8000 / 0x8000_0000), staged as ONE dword through
+            // %eax + pshufd: SSE2 has no per-lane byte `psllb` (the 0F 73
+            // /6 encoding is PSLLDQ, a whole-register shift), which is
+            // exactly why x86-64 loads the bias from a .rodata constant
+            // instead of shifting ones.
+            let bias_dword: u32 = match lane {
+                1 => 0x8080_8080,
+                2 => 0x8000_8000,
+                4 => 0x8000_0000,
+                _ => panic!("i686 Vec cmp: lane {} has no packed sign-bit bias", lane),
+            };
+            self.state
+                .emit_fmt(format_args!("    movl ${:#x}, %eax", bias_dword));
+            self.state.emit("    movd %eax, %xmm2");
+            self.state.emit("    pshufd $0x00, %xmm2, %xmm2");
             self.state.emit("    pxor %xmm2, %xmm0"); // a'
             self.state.emit("    pxor %xmm2, %xmm1"); // b'
         }
@@ -3118,7 +3129,8 @@ impl I686Codegen {
         };
         if invert {
             self.state.emit("    pcmpeqd %xmm2, %xmm2");
-            self.state.emit_fmt(format_args!("    pxor %xmm2, %{}", result));
+            self.state
+                .emit_fmt(format_args!("    pxor %xmm2, %{}", result));
         }
         self.vec_store_result(&d, result);
     }
@@ -3126,12 +3138,7 @@ impl I686Codegen {
     /// FP packed compare: the raw `cmpps`/`cmppd` predicate immediate has
     /// the frontend's exact vocabulary (0 eq, 1 lt, 2 le, 4 neq) — no
     /// integer-style decode.
-    fn emit_vec_cmp_fp_i686(
-        &mut self,
-        dest: Option<Value>,
-        args: &[Operand],
-        inst: &'static str,
-    ) {
+    fn emit_vec_cmp_fp_i686(&mut self, dest: Option<Value>, args: &[Operand], inst: &'static str) {
         let d = dest.expect("i686 Vec cmp: value form expected");
         assert!(args.len() == 3, "i686 Vec cmp: expects lhs, rhs, predicate");
         let imm = match &args[2] {
