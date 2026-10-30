@@ -4,6 +4,17 @@ Keep unimplemented opportunities here only when a reproducible workload or
 assembly witness exists. Move completed work to its change review with measured
 results; do not turn unmeasured expectations into claims.
 
+## Split-latch diamond coalescing: exact witness closed
+
+The load-before-if/latch-copy case in `zlib_ng_slide_hash` is implemented and
+measured in [the S81 review](../engineering/FOLLOWUP-2026-10-30-phi-latch-diamond.md):
+S81/S80 is **0.9774543992** (CI95 [0.9719785956, 0.9790335418]) and
+S81/GCC is **0.8503659416** (CI95 [0.8418807346, 0.8571916937]) over 11
+output-checked batched rounds. Callgrind removes exactly one move per hash
+insert. Clang and ICX remain faster, so this is not a best-oracle result.
+Full diamonds and arbitrary multi-arm regions remain rejected; do not treat
+this exact proof as permission for broader coalescing or IV replacement.
+
 ## Unsigned saturating subtract: scalar work closed, extensions still proof-gated
 
 The exact late scalar matcher, x86-64 CMOV lowering, baseline-i686

@@ -195,6 +195,28 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     )
 }
 
+/// Whether an intrinsic participates in the SIMD location pipeline. Central
+/// result metadata covers every vector producer, including newly added load
+/// forms. Horizontal reductions are the explicit exception: their result is
+/// scalar, but their SIMD inputs still require the same location machinery.
+fn has_vector_location_contract(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    op.vector_result_width().is_some()
+        || matches!(
+            op,
+            O::VecHorizontalAddF64x4
+                | O::VecHorizontalAddF64x2
+                | O::VecHorizontalAddI32x8
+                | O::VecHorizontalAddI32x4
+                | O::VecHorizontalAddF32x8
+                | O::VecHorizontalAddF32x4
+                | O::HorizontalAddF64x4
+                | O::HorizontalAddF64x2
+                | O::HorizontalAddI32x8
+                | O::HorizontalAddI32x4
+        )
+}
+
 /// [`run_regalloc_and_merge_clobbers_ex`] plus the x86-64 IPA-RA inputs:
 /// `ipa_regs` (caller-saved registers every call of `func` preserves, see
 /// `RegAllocConfig::ipa_regs`) and, on return, `ipa_used` (those the
@@ -247,65 +269,7 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
             let Instruction::Intrinsic { op, .. } = inst else {
                 return false;
             };
-            use crate::ir::intrinsics::IntrinsicOp;
-            matches!(
-                op,
-                IntrinsicOp::VecZeroF64x4
-                    | IntrinsicOp::VecZeroF64x2
-                    | IntrinsicOp::VecZeroI32x8
-                    | IntrinsicOp::VecZeroI32x4
-                    | IntrinsicOp::VecZeroF32x8
-                    | IntrinsicOp::VecZeroF32x4
-                    | IntrinsicOp::VecLoadF64x4
-                    | IntrinsicOp::VecLoadF64x2
-                    | IntrinsicOp::VecLoadI32x8
-                    | IntrinsicOp::VecLoadI32x4
-                    | IntrinsicOp::VecLoadI8x32
-                    | IntrinsicOp::VecLoadI16x16
-                    | IntrinsicOp::VecLoadF32x8
-                    | IntrinsicOp::VecLoadF32x4
-                    | IntrinsicOp::VecAddF64x4
-                    | IntrinsicOp::VecAddF64x2
-                    | IntrinsicOp::VecAddI32x8
-                    | IntrinsicOp::VecAddI32x4
-                    | IntrinsicOp::VecAddI8x32
-                    | IntrinsicOp::VecMulI32x8
-                    | IntrinsicOp::VecMulI32x4
-                    | IntrinsicOp::VecZeroI64x2
-                    | IntrinsicOp::VecLoadI64x2
-                    | IntrinsicOp::VecLoadI32x4Pair
-                    | IntrinsicOp::VecPackI32x4Pair
-                    | IntrinsicOp::VecAddI64x2
-                    | IntrinsicOp::VecMulI64x2
-                    | IntrinsicOp::VecAddF32x8
-                    | IntrinsicOp::VecAddF32x4
-                    | IntrinsicOp::VecMulF64x4
-                    | IntrinsicOp::VecMulF64x2
-                    | IntrinsicOp::VecMulF32x8
-                    | IntrinsicOp::VecMulF32x4
-                    | IntrinsicOp::VecFmaF64x4
-                    | IntrinsicOp::VecFmaF32x8
-                    | IntrinsicOp::VecHorizontalAddF64x4
-                    | IntrinsicOp::VecHorizontalAddF64x2
-                    | IntrinsicOp::VecHorizontalAddI32x8
-                    | IntrinsicOp::VecHorizontalAddI32x4
-                    | IntrinsicOp::VecHorizontalAddF32x8
-                    | IntrinsicOp::VecHorizontalAddF32x4
-                    | IntrinsicOp::LoadF64x4
-                    | IntrinsicOp::LoadF64x2
-                    | IntrinsicOp::LoadI32x8
-                    | IntrinsicOp::LoadI32x4
-                    | IntrinsicOp::AddF64x4
-                    | IntrinsicOp::AddF64x2
-                    | IntrinsicOp::MulF64x4
-                    | IntrinsicOp::MulF64x2
-                    | IntrinsicOp::AddI32x8
-                    | IntrinsicOp::AddI32x4
-                    | IntrinsicOp::HorizontalAddF64x4
-                    | IntrinsicOp::HorizontalAddF64x2
-                    | IntrinsicOp::HorizontalAddI32x8
-                    | IntrinsicOp::HorizontalAddI32x4
-            )
+            has_vector_location_contract(op)
         })
     });
     // The mature accumulator backend has a complete stack path for scalar FP,
@@ -835,5 +799,90 @@ mod static_chain_reservation_tests {
         assert_eq!(c, pool);
         assert_eq!(ca, pool);
         assert_eq!(it, pool);
+    }
+}
+
+#[cfg(test)]
+mod vector_location_contract_tests {
+    use super::has_vector_location_contract;
+    use crate::ir::intrinsics::IntrinsicOp as O;
+
+    /// Preserve every member of the former hand-maintained list while the
+    /// production predicate moves to central result metadata. The three
+    /// strided forms are the newly covered regression cases; stores and a
+    /// genuine scalar operation are negative controls.
+    #[test]
+    fn central_classifier_preserves_old_set_and_covers_strided_loads() {
+        let former_and_strided = [
+            O::VecZeroF64x4,
+            O::VecZeroF64x2,
+            O::VecZeroI32x8,
+            O::VecZeroI32x4,
+            O::VecZeroF32x8,
+            O::VecZeroF32x4,
+            O::VecLoadF64x4,
+            O::VecLoadF64x2,
+            O::VecLoadI32x8,
+            O::VecLoadI32x4,
+            O::VecLoadStrided2I32x8,
+            O::VecLoadStrided2I32x4,
+            O::VecLoadStrided2CompactI32x4,
+            O::VecLoadI8x32,
+            O::VecLoadI16x16,
+            O::VecLoadF32x8,
+            O::VecLoadF32x4,
+            O::VecAddF64x4,
+            O::VecAddF64x2,
+            O::VecAddI32x8,
+            O::VecAddI32x4,
+            O::VecAddI8x32,
+            O::VecMulI32x8,
+            O::VecMulI32x4,
+            O::VecZeroI64x2,
+            O::VecLoadI64x2,
+            O::VecLoadI32x4Pair,
+            O::VecPackI32x4Pair,
+            O::VecAddI64x2,
+            O::VecMulI64x2,
+            O::VecAddF32x8,
+            O::VecAddF32x4,
+            O::VecMulF64x4,
+            O::VecMulF64x2,
+            O::VecMulF32x8,
+            O::VecMulF32x4,
+            O::VecFmaF64x4,
+            O::VecFmaF32x8,
+            O::VecHorizontalAddF64x4,
+            O::VecHorizontalAddF64x2,
+            O::VecHorizontalAddI32x8,
+            O::VecHorizontalAddI32x4,
+            O::VecHorizontalAddF32x8,
+            O::VecHorizontalAddF32x4,
+            O::LoadF64x4,
+            O::LoadF64x2,
+            O::LoadI32x8,
+            O::LoadI32x4,
+            O::AddF64x4,
+            O::AddF64x2,
+            O::MulF64x4,
+            O::MulF64x2,
+            O::AddI32x8,
+            O::AddI32x4,
+            O::HorizontalAddF64x4,
+            O::HorizontalAddF64x2,
+            O::HorizontalAddI32x8,
+            O::HorizontalAddI32x4,
+        ];
+        for op in former_and_strided {
+            assert!(has_vector_location_contract(&op), "lost {op:?}");
+        }
+        // Central metadata intentionally also covers SIMD producers that the
+        // old incomplete list omitted. This only strengthens the guard around
+        // the explicitly enabled scalar-FP stack experiment; the default RA
+        // configuration does not consult that experiment's opt-in flag.
+        assert!(has_vector_location_contract(&O::VecSubI32x4));
+        assert!(!has_vector_location_contract(&O::VecStoreI32x4));
+        assert!(!has_vector_location_contract(&O::VecStoreI64x2));
+        assert!(!has_vector_location_contract(&O::SqrtF64));
     }
 }

@@ -70,8 +70,35 @@ if [[ $actual_out != "$expected_out" ]]; then
     fail "strided i32 SSE2 reduction arithmetic" \
         "output differs from GCC (lccc: $actual_out / gcc: $expected_out)"
 fi
+
+# The dedicated pre-unroll reducer is intentionally O2+ and disabled for
+# size. O1/Os therefore pin correct scalar-fallback behavior, not a packed
+# shape. Exercise both x86 ISA modes and let GAS enforce the baseline SSE2
+# ceiling instead of maintaining an incomplete opcode denylist here.
+for opt in -O1 -Os; do
+    for arch in x86-64 x86-64-v3; do
+        tag="${opt#-}-${arch}"
+        level_flags=("$opt" "-march=$arch" -ffast-math -ffp-contract=fast)
+        "$CCC" "${level_flags[@]}" -S "$strided_src" -o "$tmp/strided-$tag.s"
+        if [[ $arch == x86-64 ]]; then
+            "${AS:-as}" --64 -march=generic64 "$tmp/strided-$tag.s" \
+                -o "$tmp/strided-$tag-gas.o" \
+                || fail "strided $tag baseline ISA" "GAS rejected a non-SSE2 instruction"
+        fi
+        "$CCC" "${level_flags[@]}" "$strided_src" -o "$tmp/strided-$tag"
+        actual_out=$(timeout 60 "$tmp/strided-$tag")
+        if [[ $actual_out != "$expected_out" ]]; then
+            fail "strided i32 $tag arithmetic" \
+                "output differs from GCC (lccc: $actual_out / gcc: $expected_out)"
+        fi
+    done
+done
+"${AS:-as}" --64 -march=generic64 "$tmp/strided-sse2.s" -o "$tmp/strided-sse2-gas.o" \
+    || fail "strided O2 SSE2 baseline ISA" "GAS rejected a non-SSE2 instruction"
 "$CCC" "${sse2_flags[@]}" -c "$dir/fixtures/strided_exact/kernel.c" -o "$tmp/watch-kernel-sse2.o"
 "$CCC" "${sse2_flags[@]}" -S "$dir/fixtures/strided_exact/kernel.c" -o "$tmp/watch-kernel-sse2.s"
+"${AS:-as}" --64 -march=generic64 "$tmp/watch-kernel-sse2.s" -o "$tmp/watch-kernel-sse2-gas.o" \
+    || fail "strided O2 SSE2 watch kernel ISA" "GAS rejected a non-SSE2 instruction"
 ${GCC_BIN:-gcc} -O2 "$dir/fixtures/strided_exact/watch_driver.c" "$tmp/watch-kernel-sse2.o" \
     -o "$tmp/watch-sse2"
 timeout 30 "$tmp/watch-sse2" || fail "strided SSE2 exact-access watchpoint" \

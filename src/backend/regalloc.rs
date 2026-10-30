@@ -4715,7 +4715,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // One CFG for the whole candidate loop: the caller-saved window check
     // needs the predecessor sets, and deriving them inside the check turned
     // a linear scan into O(candidates x (V+E)) on every function.
-    let mut cfg_preds: Option<analysis::FlatAdj> = None;
+    let mut cfg: Option<(analysis::FlatAdj, analysis::FlatAdj)> = None;
     for candidate in &phi_coalesce {
         let src_has_other_consumers = uses_excluding(
             func,
@@ -4723,11 +4723,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             candidate.block_idx,
             candidate.copy_idx,
         ) > 0;
-        let preds = cfg_preds.get_or_insert_with(|| {
-            let labels = analysis::build_label_map(func);
-            analysis::build_cfg(func, &labels).0
-        });
-        if !phi_window_clobbers_caller_saved(func, candidate, preds) && !src_has_other_consumers {
+        let (preds, succs) = {
+            let (preds, succs) = cfg.get_or_insert_with(|| {
+                let labels = analysis::build_label_map(func);
+                analysis::build_cfg(func, &labels)
+            });
+            (&*preds, &*succs)
+        };
+        if !phi_window_clobbers_caller_saved(func, candidate, preds, succs)
+            && !src_has_other_consumers
+        {
             if config.ra_config.debug_phi_coalesce {
                 eprintln!(
                     "[PHI_COALESCE] fn={} HOMELESS src=v{} (dest=v{} block={} copy_idx={})",
@@ -12635,24 +12640,6 @@ fn source_home_survives_dest_redefs_in(
     true
 }
 
-fn terminator_targets_label(term: &Terminator, label: crate::ir::reexports::BlockId) -> bool {
-    match term {
-        Terminator::Branch(target) => *target == label,
-        Terminator::CondBranch {
-            true_label,
-            false_label,
-            ..
-        } => *true_label == label || *false_label == label,
-        Terminator::Switch { cases, default, .. } => {
-            *default == label || cases.iter().any(|&(_, t)| t == label)
-        }
-        Terminator::IndirectBranch {
-            possible_targets, ..
-        } => possible_targets.contains(&label),
-        Terminator::Return(_) | Terminator::Unreachable => false,
-    }
-}
-
 /// Longest single-predecessor chain (in intermediate blocks) that the phi
 /// coalescer will reason through. Both the liveness gate and the
 /// caller-saved-clobber window use this one bound: a longer reach on one
@@ -12696,16 +12683,78 @@ fn single_pred_chain(
     None
 }
 
-/// [`single_pred_chain`] plus the loop-depth admissibility policy: every
+/// Blocks between a destructive update and its latch copy.
+///
+/// Besides a single-predecessor chain, accept the precise split-latch
+/// diamond `source -> {middle, copy}`, `middle -> copy`.  The source defines
+/// the incoming value before the branch; both arms then converge on the
+/// latch copy.  This is the shape of `last = load(...); if (...) store(last)`
+/// followed by `phi = last`.  The direct source-to-copy edge is essential:
+/// a full two-arm diamond has a second, uninspected middle block and stays
+/// rejected.  Exact predecessor/successor counts prevent an outside path
+/// from bypassing the source definition or entering the inspected window.
+///
+/// The caller-saved window and the liveness gate deliberately consume this
+/// ONE shape function.  In particular, the direct edge must not cause the
+/// clobber check to skip the middle arm.
+fn phi_update_region(
+    preds: &analysis::FlatAdj,
+    succs: &analysis::FlatAdj,
+    source_block: usize,
+    copy_block: usize,
+) -> Option<Vec<usize>> {
+    if let Some(mids) = single_pred_chain(preds, source_block, copy_block) {
+        return Some(mids);
+    }
+    if source_block == copy_block || succs.len(source_block) != 2 {
+        return None;
+    }
+
+    let mut direct = false;
+    let mut middle = None;
+    for &s in succs.row(source_block) {
+        let s = s as usize;
+        if s == copy_block {
+            if std::mem::replace(&mut direct, true) {
+                return None;
+            }
+        } else if middle.replace(s).is_some() {
+            return None;
+        }
+    }
+    if !direct {
+        return None;
+    }
+    let middle = middle?;
+    if middle == source_block {
+        return None;
+    }
+
+    let copy_preds = preds.row(copy_block);
+    if copy_preds.len() != 2
+        || !copy_preds.iter().any(|&p| p as usize == source_block)
+        || !copy_preds.iter().any(|&p| p as usize == middle)
+        || preds.len(middle) != 1
+        || preds.row(middle)[0] as usize != source_block
+        || succs.len(middle) != 1
+        || succs.row(middle)[0] as usize != copy_block
+    {
+        return None;
+    }
+    Some(vec![middle])
+}
+
+/// [`phi_update_region`] plus the loop-depth admissibility policy: every
 /// intermediate block must sit at least as deep as the copy block, so the
 /// source is born on the same loop-carried path rather than in a preheader.
-fn single_pred_chain_blocks(
+fn phi_update_region_blocks(
     preds: &analysis::FlatAdj,
+    succs: &analysis::FlatAdj,
     liveness: &LivenessResult,
     source_block: usize,
     copy_block: usize,
 ) -> Option<Vec<usize>> {
-    let mids = single_pred_chain(preds, source_block, copy_block)?;
+    let mids = phi_update_region(preds, succs, source_block, copy_block)?;
     let min_depth = liveness
         .block_loop_depth
         .get(copy_block)
@@ -12721,18 +12770,18 @@ fn single_pred_chain_blocks(
 }
 
 /// True iff a caller-saved instruction can execute between the source's
-/// definition and the latch copy on *every* path the coalescer reasons
-/// about: the source block's tail, the sole single-predecessor chain of
-/// intermediate blocks (`single_pred_chain`, the same shape the liveness
-/// gate admits), and the copy block's prefix.
+/// definition and the latch copy on *any* path the coalescer reasons about:
+/// the source block's tail, every intermediate block in [`phi_update_region`]
+/// (the same shape the liveness gate admits), and the copy block's prefix.
 ///
-/// `preds` is the CFG the caller already has. Rebuilding it per candidate
-/// here made this check O(candidates x (V+E)) on every function's register
-/// allocation; the caller now builds one CFG for the whole candidate loop.
+/// `preds`/`succs` are the CFG the caller already has. Rebuilding either per
+/// candidate made this check O(candidates x (V+E)) on every function's
+/// register allocation; callers build one CFG for the whole candidate loop.
 fn phi_window_clobbers_caller_saved(
     func: &IrFunction,
     cand: &PhiCoalesceCandidate,
     preds: &analysis::FlatAdj,
+    succs: &analysis::FlatAdj,
 ) -> bool {
     let Some(copy_block) = func.blocks.get(cand.block_idx) else {
         return false;
@@ -12760,12 +12809,10 @@ fn phi_window_clobbers_caller_saved(
         {
             return true;
         }
-        // The direct-edge case needs no walk: the source tail above already
-        // covers every instruction on that path. When the edge is absent,
-        // every intermediate block of the chain is in the window.
-        if !terminator_targets_label(&src_block.terminator, copy_block.label)
-            && let Some(mids) = single_pred_chain(preds, cand.source_block_idx, cand.block_idx)
-        {
+        // Walk the region even when source -> copy is a direct edge: the
+        // split-latch diamond has that edge AND a middle arm whose calls are
+        // just as destructive as calls on the direct path.
+        if let Some(mids) = phi_update_region(preds, succs, cand.source_block_idx, cand.block_idx) {
             return mids.iter().any(|&m| {
                 func.blocks[m]
                     .instructions
@@ -12996,13 +13043,14 @@ fn apply_phi_coalesce_assignments_with_config(
             }
         }
 
-        let preds = &cfg
-            .get_or_insert_with(|| {
+        let (preds, succs) = {
+            let (preds, succs) = cfg.get_or_insert_with(|| {
                 let label_to_idx = analysis::build_label_map(func);
                 analysis::build_cfg(func, &label_to_idx)
-            })
-            .0;
-        if phi_window_clobbers_caller_saved(func, candidate, preds)
+            });
+            (&*preds, &*succs)
+        };
+        if phi_window_clobbers_caller_saved(func, candidate, preds, succs)
             && !callee_saved.iter().any(|r| r.0 == reg.0)
         {
             if ra_config.debug_phi_coalesce {
@@ -13764,18 +13812,18 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             // observed after the source's definition along ANY path out of
             // the source block, not merely along the latch.
             let mid_blocks = if !same_block {
-                single_pred_chain_blocks(&preds, liveness, source_block, block_idx)
+                phi_update_region_blocks(&preds, &succs, liveness, source_block, block_idx)
             } else {
                 None
             };
-            let pred_is_unique = mid_blocks.is_some();
+            let pred_region_ok = mid_blocks.is_some();
             let mid_blocks = mid_blocks.unwrap_or_default();
             // Part 2 proves its predecessor structure in `detect_part2_chain`
             // (`u`'s block is a pred of the copy block and every other pred
             // carries the passthrough), so it bypasses this gate; the
             // single-def path keeps it unchanged.
             let part2_pred_ok = part2.is_some();
-            if !part2_pred_ok && !(same_block && source_def_idx < copy_idx || pred_is_unique) {
+            if !part2_pred_ok && !(same_block && source_def_idx < copy_idx || pred_region_ok) {
                 if debug {
                     eprintln!(
                         "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): def block/index {}:{} cannot feed copy {}:{}",
@@ -15487,9 +15535,9 @@ mod phi_coalesce_tests {
             source_def_idx: 0,
             copy_idx: 2,
         };
-        let (preds, _) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
+        let (preds, succs) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
         assert!(
-            phi_window_clobbers_caller_saved(&func, &cand, &preds),
+            phi_window_clobbers_caller_saved(&func, &cand, &preds, &succs),
             "strtol in the (def, copy) window must be a caller-saved clobber"
         );
 
@@ -15900,9 +15948,9 @@ mod phi_coalesce_tests {
             source_def_idx: 0,
             copy_idx: 0,
         };
-        let (preds, _) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
+        let (preds, succs) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
         assert!(
-            !phi_window_clobbers_caller_saved(&func, &cand, &preds),
+            !phi_window_clobbers_caller_saved(&func, &cand, &preds, &succs),
             "precondition: the call sits in the exit block, outside the (def, copy) window"
         );
 
@@ -19148,6 +19196,178 @@ mod scalar_lane_class_tests {
             "expected (10, 11) phi coalesce across 2-hop latch chain, got {cands:?}"
         );
     }
+
+    #[derive(Default)]
+    struct SplitLatchDiamondShape {
+        old_phi_read: bool,
+        middle_call: bool,
+    }
+
+    fn split_latch_diamond(shape: SplitLatchDiamondShape) -> IrFunction {
+        let SplitLatchDiamondShape {
+            old_phi_read,
+            middle_call,
+        } = shape;
+        use crate::common::types::AddressSpace;
+        use crate::ir::reexports::IrCmpOp;
+        let block = |label: u32, instructions, terminator| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+        };
+        let mut middle = vec![Instruction::Store {
+            val: Operand::Value(Value(11)),
+            ptr: Value(40),
+            ty: IrType::U32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }];
+        if old_phi_read {
+            middle.push(Instruction::Store {
+                val: Operand::Value(Value(10)),
+                ptr: Value(40),
+                ty: IrType::U32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+        }
+        if middle_call {
+            middle.push(Instruction::Call {
+                func: "strtol".into(),
+                info: crate::ir::reexports::CallInfo::default(),
+            });
+        }
+        let mut f = IrFunction::new("split_latch_diamond".into(), IrType::U32, vec![], false);
+        f.blocks.push(block(
+            0,
+            vec![
+                Instruction::Copy {
+                    dest: Value(10),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::Copy {
+                    dest: Value(30),
+                    src: Operand::Const(IrConst::I32(4)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(40),
+                    name: "diamond_data".into(),
+                },
+            ],
+            Terminator::Branch(BlockId(1)),
+        ));
+        f.blocks.push(block(
+            1,
+            vec![
+                Instruction::Load {
+                    dest: Value(11),
+                    ptr: Value(40),
+                    ty: IrType::U32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(11)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::U32,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(12)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        f.blocks
+            .push(block(2, middle, Terminator::Branch(BlockId(3))));
+        f.blocks.push(block(
+            3,
+            vec![
+                Instruction::Copy {
+                    dest: Value(10),
+                    src: Operand::Value(Value(11)),
+                },
+                Instruction::BinOp {
+                    dest: Value(31),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(30)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::U32,
+                },
+                Instruction::Copy {
+                    dest: Value(30),
+                    src: Operand::Value(Value(31)),
+                },
+                Instruction::Cmp {
+                    dest: Value(32),
+                    op: IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(31)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::U32,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(32)),
+                true_label: BlockId(1),
+                false_label: BlockId(4),
+            },
+        ));
+        f.blocks.push(block(
+            4,
+            vec![],
+            Terminator::Return(Some(Operand::Value(Value(10)))),
+        ));
+        f.next_value_id = 41;
+        f
+    }
+
+    #[test]
+    fn phi_coalesce_admits_split_latch_if_diamond() {
+        let f = split_latch_diamond(SplitLatchDiamondShape::default());
+        let liveness = compute_live_intervals(&f);
+        let cands = detect_phi_coalesce_groups(&f, &liveness);
+        assert!(
+            cands
+                .iter()
+                .any(|c| c.phi_dest == 10 && c.backedge_src == 11),
+            "load before the if must feed the joined latch copy: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn phi_coalesce_diamond_guards_old_phi_and_middle_calls() {
+        let f = split_latch_diamond(SplitLatchDiamondShape {
+            old_phi_read: true,
+            ..SplitLatchDiamondShape::default()
+        });
+        let liveness = compute_live_intervals(&f);
+        let cands = detect_phi_coalesce_groups(&f, &liveness);
+        assert!(
+            !cands
+                .iter()
+                .any(|c| c.phi_dest == 10 && c.backedge_src == 11),
+            "the middle arm reads the OLD phi and must block coalescing: {cands:?}"
+        );
+
+        let f = split_latch_diamond(SplitLatchDiamondShape {
+            middle_call: true,
+            ..SplitLatchDiamondShape::default()
+        });
+        let liveness = compute_live_intervals(&f);
+        let cands = detect_phi_coalesce_groups(&f, &liveness);
+        let cand = cands
+            .iter()
+            .find(|c| c.phi_dest == 10 && c.backedge_src == 11)
+            .expect("call does not remove the candidate; it constrains its home");
+        let (preds, succs) = analysis::build_cfg(&f, &analysis::build_label_map(&f));
+        assert!(
+            phi_window_clobbers_caller_saved(&f, cand, &preds, &succs),
+            "a call on the middle arm is inside the destructive-update window"
+        );
+    }
 }
 
 /// Tests for the single definition of the phi-coalescer's chain shape.
@@ -19180,8 +19400,39 @@ mod phi_chain_shape_tests {
         f
     }
 
+    fn cfg_of(f: &IrFunction) -> (analysis::FlatAdj, analysis::FlatAdj) {
+        analysis::build_cfg(f, &analysis::build_label_map(f))
+    }
+
     fn preds_of(f: &IrFunction) -> analysis::FlatAdj {
-        analysis::build_cfg(f, &analysis::build_label_map(f)).0
+        cfg_of(f).0
+    }
+
+    fn latch_diamond() -> IrFunction {
+        let mut f = IrFunction::new("latch_diamond".into(), IrType::U64, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        f
     }
 
     #[test]
@@ -19190,6 +19441,27 @@ mod phi_chain_shape_tests {
         let preds = preds_of(&f);
         assert_eq!(single_pred_chain(&preds, 0, 1), Some(Vec::new()));
         assert_eq!(single_pred_chain(&preds, 1, 2), Some(Vec::new()));
+    }
+
+    #[test]
+    fn split_latch_diamond_is_one_update_region() {
+        let f = latch_diamond();
+        let (preds, succs) = cfg_of(&f);
+        assert_eq!(single_pred_chain(&preds, 0, 2), None);
+        assert_eq!(phi_update_region(&preds, &succs, 0, 2), Some(vec![1]));
+    }
+
+    #[test]
+    fn split_latch_diamond_rejects_an_outside_predecessor() {
+        let mut f = latch_diamond();
+        f.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        });
+        let (preds, succs) = cfg_of(&f);
+        assert_eq!(phi_update_region(&preds, &succs, 0, 2), None);
     }
 
     #[test]
@@ -19243,11 +19515,14 @@ mod phi_chain_shape_tests {
             terminator: Terminator::Return(None),
             source_spans: vec![],
         });
-        let preds = preds_of(&f);
+        let (preds, succs) = cfg_of(&f);
         assert_eq!(preds.len(3), 2, "precondition: block 3 is a join");
-        // No chain may END at a join: block 3 has two predecessors.
+        // No chain may END at a join: block 3 has two predecessors. The
+        // split-latch exception also refuses this FULL diamond because the
+        // source has no direct edge to the join and block 2 is uninspected.
         assert_eq!(single_pred_chain(&preds, 1, 3), None);
         assert_eq!(single_pred_chain(&preds, 0, 3), None);
+        assert_eq!(phi_update_region(&preds, &succs, 0, 3), None);
         // The diamond arms are still directly reachable from the entry, so
         // those ARE empty chains -- reachability, not topology, decides.
         assert_eq!(single_pred_chain(&preds, 0, 1), Some(Vec::new()));
