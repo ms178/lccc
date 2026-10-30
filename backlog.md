@@ -1623,7 +1623,12 @@ score went from 32/51 to 41/51 with the remaining ten accounted for below.
   silent well-formed `cleanup`), and `DiagnosticEngine::note` makes the
   `expected 1, found N` note a first-class emission.
 
-Remaining measured deltas, kept explicit: when an attribute sits on a later
+Remaining measured deltas, kept explicit: `cleanup` on a block-scope object
+with static storage duration, or on a block-scope function declaration, takes
+`'cleanup' attribute ignored` in GCC while LCCC is silent (the ignored-target
+rule covers file-scope objects only), and neither `cleanup argument not a
+function` nor the prototype-arity/pointer-compatibility checks are emitted —
+they need the symbol table; when an attribute sits on a later
 line than the declaration, GCC's caret lands on that line's first token while
 LCCC reports the declaration start (the same rule decides
 `'x' attribute directive ignored`, which still points at the name token);
