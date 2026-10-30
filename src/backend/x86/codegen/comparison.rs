@@ -1327,19 +1327,6 @@ impl X86Codegen {
         }
     }
 
-    /// Full `jcc` mnemonic for a GCC condition-code suffix, so a fused
-    /// `asm goto` flag output branches on the condition the template produced.
-    #[inline]
-    fn asm_cc_jcc(cond: &str) -> &'static str {
-        match crate::common::asm_constraints::cond_code(cond) {
-            Some(entry) => entry.jcc,
-            // The fusion analysis certifies only suffixes from the shared table,
-            // so an unknown one here is an internal invariant violation rather
-            // than a property of the input program.
-            None => unreachable!("asm_cc_jcc: unsupported condition code {cond}"),
-        }
-    }
-
     pub(super) fn emit_cond_branch_blocks_impl(
         &mut self,
         cond: &Operand,
@@ -1373,7 +1360,11 @@ impl X86Codegen {
         // trampoline preserve EFLAGS, so this branch can consume them here.
         if let Operand::Value(value) = cond {
             if let Some(cc) = self.state.asm_cc_branch_values.remove(&value.0) {
-                let jcc = Self::asm_cc_jcc(&cc);
+                // The analysis stores the full `jcc` mnemonic, so this reads the
+                // condition the template produced without re-parsing a suffix:
+                // one fewer table lookup and one fewer unreachable site than
+                // mapping a string back through the shared table here.
+                let jcc = cc.as_str();
                 let jcc_hot = if pref_true {
                     jcc
                 } else {
