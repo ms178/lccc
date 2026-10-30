@@ -221,6 +221,40 @@ are Callgrind counts (modeled, not hardware).
 * **Ir gaps to GCC 16.2:** reduction_vecreg 3278 vs 1721, popcount 5801
   vs 4728, nbody 3385 vs 2965, switch_dispatch 978 vs 766, zstd
   `double_fast` 2823.5 vs 2686.2.
+* **i686 aggregate/32-byte stack ABI (oracle table, 2026-10-30).** The
+  vector-extension m32 differential (`check_vector_ext_codegen.sh`, first
+  -m32 run ever) exposed the exact position rule GCC 16.2 `-m32` uses for
+  stack structs whose TYPE carries a vector-member alignment, measured from
+  callee `%ebp` reads with the sret pointer at `ebp+8`:
+  `struct { double d[2]; } __attribute__((aligned(16)))` -> `ebp+12`
+  (attribute alignment stays 4-granular: compat mode), `struct { v16i;
+  int; }` -> `ebp+24` (natural 16 honoured across the sret pointer),
+  `struct { v32f; }` -> `ebp+40` (natural 32 honoured), raw `v32f` argument
+  -> `ebp+8` with caller-side 32-byte alignment (already correct: the
+  `[Memory, NoClass]` marker path).  LCCC packs every struct 4-granular, so
+  `sadd`, `s4i_add`, `cf_wrap_phi` (and, through other classes,
+  `sh_vs_shr_ul`/`st_v32l`) mismatch the GCC-built driver — the gate names
+  them in the closed `LCCC_M32_KNOWN_ABI_GAPS` list in `vector_ext/driver.c`
+  (printed as `KNOWN-ABI`, any other divergence still fails; the list must
+  shrink to empty when the fix lands).  The fix direction: honour
+  `align_ctx` on i686 stack struct arguments exactly when the type
+  `contains_gnu_vector && !has_user_align` (both predicates already exist on
+  `CType` in `common/types.rs`), keeping the 4-granular cap for
+  attribute-aligned and ordinary records — one placement rule shared by the
+  outgoing (`I686Codegen::stack_arg_align`) and incoming (prologue param
+  capture) paths, oracle-checked against the table above before landing.
+* **SSE2-baseline vector value reuse (hot-instruction evidence,
+  2026-10-30).** `hotdiff --bench double_reduction` attributes the 1.104 Ir
+  ratio to the legacy (non-VEX) path re-reading images from slots per use:
+  `movdqu +167,772,160`, `pshufd +134,217,728` versus GCC 16.2 (which folds
+  the multi-use loads into `pmuludq`-mem and selects odd lanes with
+  `psrlq`+`punpckldq`).  `zlib_ng_adler32` (1.036) attributes to the byte
+  loop's structure: `lea +39,852,227`, `mov +12,776,255`, `sub +12,582,921`
+  — its 8x-unrolled body computes the a/b chains through `lea`+register
+  moves where GCC uses straight `addl` chains with one branch per 8 bytes.
+  Both are register/callocation quality (the §5.1 ownership note), measured
+  with `scripts/hotdiff.py`; fix candidates: legacy-path value caching for
+  the SSE2 emitter and lea→add/mov fusion in the unrolled byte loop.
 * **Unsigned-exit reductions** (`for (size_t i...) s += x[i]`) stay scalar
   under the Slt/Sgt restriction of the reduction recognizer. A census of 74
   benchmark programs at `-O2` and `-O3 -march=x86-64-v3` found no

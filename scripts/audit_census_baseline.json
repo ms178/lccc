@@ -551,7 +551,7 @@
     "LCCC_WHY_NOT_VECTORIZE"
   ],
   "knobs_undocumented": 265,
-  "panic_sites": 919,
+  "panic_sites": 881,
   "panic_sites_hot": 101,
   "unsafe_sites": 25
 }
