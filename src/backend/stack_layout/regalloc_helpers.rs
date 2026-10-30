@@ -885,4 +885,30 @@ mod vector_location_contract_tests {
         assert!(!has_vector_location_contract(&O::VecStoreI64x2));
         assert!(!has_vector_location_contract(&O::SqrtF64));
     }
+
+    /// The metadata widening is inert unless the scalar-FP stack experiment is
+    /// explicitly enabled: this predicate feeds only `disable_scalar_fp_xmm`,
+    /// and `ra_config_tests::parser_covers_every_boolean_ra_switch_without_process_environment`
+    /// already pins that switch to default-off. What is pinned HERE is the
+    /// other half of the argument: every newly covered producer is a genuine
+    /// vector *result*, so the widening cannot smuggle in a store or a
+    /// scalar-result intrinsic that only has SIMD inputs.
+    #[test]
+    fn central_classifier_covering_new_producers_implies_vector_results() {
+        for op in [O::AddPs128, O::BroadcastLoadF64, O::VecSubI32x4] {
+            assert!(has_vector_location_contract(&op), "{op:?} must be covered");
+            assert!(
+                op.vector_result_width().is_some(),
+                "{op:?} must reach the contract through result metadata"
+            );
+        }
+        // A store has SIMD operands but no result, and must stay out.
+        for op in [O::VecStoreI32x4, O::VecStoreI64x2] {
+            assert!(
+                op.vector_result_width().is_none(),
+                "{op:?} must not report a vector result"
+            );
+            assert!(!has_vector_location_contract(&op), "{op:?} must stay out");
+        }
+    }
 }
