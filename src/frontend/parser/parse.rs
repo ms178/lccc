@@ -187,10 +187,26 @@ pub(super) mod parsed_attr_flag {
     pub const PERSISTENT: u64 = 1 << 35;
     /// `__attribute__((nocommon))` — tentative definition is not a common block.
     pub const NO_COMMON_ATTR: u64 = 1 << 36;
+    /// `__attribute__((noplt))` — calls to this function go through the GOT
+    /// instead of the PLT. Applies to the *declaration* being parsed; GCC only
+    /// honours it for functions not defined in the same translation unit
+    /// (measured 2026-10-30: a same-TU definition still gets `R_X86_64_PLT32`).
+    pub const NOPLT: u64 = 1 << 37;
     /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
     /// `auto` is NESTED_FN). `register` is not tracked.
     pub const STORAGE_CLASSES: u64 =
         TYPEDEF | STATIC | EXTERN | THREAD_LOCAL | NESTED_FN | CONSTEXPR | CONSTEXPR_LAST;
+}
+
+/// Why a `cleanup` attribute cannot be honoured. Both forms are hard errors
+/// in gcc-16.2 (measured), reported at the declaration's location.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CleanupDiagnosis {
+    /// Zero arguments (bare `cleanup` or `cleanup()`) or more than one.
+    WrongArgumentCount(usize),
+    /// The single argument is not a bare identifier (`cleanup(1)`,
+    /// `cleanup("f")`).
+    NotAnIdentifier,
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -218,6 +234,17 @@ pub(super) struct ParsedDeclAttrs {
         crate::common::source::Span,
         super::attribute_registry::AttributeTarget,
     )>,
+    /// Location of the declarator name being parsed, when it is a plain
+    /// identifier. GCC reports `-Wstrict-prototypes` for a *definition* at
+    /// the name (`int k() {}` → the `k`), unlike a declaration, which it
+    /// reports at the declaration's start.
+    pub(super) last_decl_name_span: Option<crate::common::source::Span>,
+    /// Location of the FIRST `__attribute__((...))` list of the declaration
+    /// being parsed. GCC reports every placement verdict at the declaration's
+    /// own location, which includes a leading attribute list: for
+    /// `__attribute__((noreturn)) int x;` it points at column 1, not at the
+    /// attribute or at `int` (measured on gcc-16.2.0).
+    pub(super) first_attr_span: Option<crate::common::source::Span>,
 
     /// `__seg_gs` or `__seg_fs` qualifier encountered.
     pub parsing_address_space: AddressSpace,
@@ -439,6 +466,14 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_retain(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::RETAIN, v)
+    }
+    #[inline]
+    pub fn parsing_noplt(&self) -> bool {
+        self.flags & parsed_attr_flag::NOPLT != 0
+    }
+    #[inline]
+    pub fn set_noplt(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NOPLT, v)
     }
     #[inline]
     pub fn parsing_noinit(&self) -> bool {
@@ -740,6 +775,17 @@ pub struct Parser {
     pub(super) typedef_base_volatile: FxHashSet<String>,
     /// Typedef names shadowed by local variable declarations in the current scope.
     pub(super) shadowed_typedefs: FxHashSet<String>,
+    /// Names declared as a FUNCTION (anywhere, any linkage): a designator of one
+    /// of these is a link-time constant, which is what `asm "i"(fn)` needs.
+    ///
+    /// The distinction that matters is function vs object, not scope: GCC
+    /// accepts `"i"(f)` for a *block-scope* function declaration too, and
+    /// rejects it once a block-scope object shadows the name
+    /// (`void target(void){}` then `int x;` → `"i"(target)` is still a symbol,
+    /// `"i"(x)` is not). `shadowed_typedefs` is the precedent for the storage
+    /// and its block save/restore; the removal on object declaration mirrors
+    /// how a typedef name is hidden by a variable of the same name.
+    pub(super) function_names: FxHashSet<String>,
     /// Accumulated declaration attributes from the current parse_type_specifier pass.
     /// Reset at the start of each top-level or local declaration.
     pub(super) attrs: ParsedDeclAttrs,
@@ -754,6 +800,20 @@ pub struct Parser {
     /// Current default visibility from #pragma GCC visibility push(...).
     /// None means default visibility (no pragma active).
     pub(super) pragma_default_visibility: Option<String>,
+    /// Unhonourable `cleanup` attributes seen while parsing the current
+    /// declaration, drained by the declaration funnel and reported there at
+    /// the declaration's own location: gcc-16 anchors `wrong number of
+    /// arguments specified for 'cleanup' attribute` and `cleanup argument not
+    /// an identifier` at the declaration, not at the attribute (measured with
+    /// the attribute written first and after the type specifier). Kept on the
+    /// parser and not on the attribute state because that state is
+    /// snapshot-and-restored by parameter declarators and speculative parses,
+    /// which dropped the record for block-scope declarations.
+    pub(super) cleanup_diagnoses: Vec<(CleanupDiagnosis, crate::common::source::Span)>,
+    /// Attributes already reported, so a declaration parsed twice (a
+    /// speculative pass followed by the real one) reports each `cleanup`
+    /// verdict exactly once.
+    pub(super) reported_cleanup_attrs: crate::common::fx_hash::FxHashSet<u32>,
     /// S13: file-scope function names whose DECLARATION carried
     /// `no_instrument_function`. GCC merges declaration attributes into the
     /// definition (C redeclaration rules); the torture suite writes
@@ -803,6 +863,25 @@ pub struct Parser {
     pub(super) enum_scope_log: Vec<(String, Option<i64>, bool)>,
     /// Compound-statement nesting: zero at file scope, where nothing is undone.
     pub(super) block_depth: u32,
+    /// True while parsing the body of a function that GCC re-instantiates after
+    /// expansion (`inline`, `__inline__`, `always_inline`, `gnu_inline`).  The
+    /// parser judges an `asm` immediate operand strictly (`constness` returns
+    /// `NonConstant` for a parameter), but GCC defers exactly that judgement to
+    /// instantiation, where the operand has already been substituted — so a
+    /// body that is never instantiated here, or is instantiated with a
+    /// constant, must not be rejected at parse time.  See `asm_validate`'s
+    /// module docs for the measured matrix.
+    pub(super) asm_deferred_instantiation: bool,
+    /// Parser-visible integer constants introduced by an *initialised local
+    /// object*: `__auto_type __flags = 1 | (2 << 8);` then `"i" (__flags)`.
+    /// GCC accepts that because it folds the local before re-checking the
+    /// `asm` statement at instantiation; the parser has no constant
+    /// propagation, so it keeps this small map and drops every entry when the
+    /// enclosing block ends.  A name that is ever assigned (or whose address is
+    /// taken) is removed, so a stale value can never licence a wrong fold.
+    /// Only integer scalars with a self-contained constant initializer are
+    /// recorded; anything else is simply absent, which keeps the diagnostic.
+    pub(super) local_constants: FxHashMap<String, i64>,
     /// `_Static_assert`s from struct member lists awaiting sema, emitted after
     /// the enclosing file-scope or block item (the members are not in scope
     /// as identifiers, so the assertion means the same there).
@@ -858,6 +937,7 @@ impl Parser {
             typedef_object_volatile: FxHashSet::default(),
             typedef_base_volatile: FxHashSet::default(),
             shadowed_typedefs: FxHashSet::default(),
+            function_names: FxHashSet::default(),
             attrs: ParsedDeclAttrs::default(),
             pragma_pack_stack: Vec::with_capacity(4),
             pragma_pack_align: None,
@@ -866,6 +946,8 @@ impl Parser {
             func_decl_no_instrument: FxHashSet::default(),
             func_decl_stack_protect: FxHashSet::default(),
             func_decl_no_stack_protector: FxHashSet::default(),
+            cleanup_diagnoses: Vec::new(),
+            reported_cleanup_attrs: crate::common::fx_hash::FxHashSet::default(),
             func_decl_noinline: FxHashSet::default(),
             error_count: 0,
             parser_frame_depth: 0,
@@ -876,6 +958,8 @@ impl Parser {
             unevaluable_enum_constants: FxHashSet::default(),
             enum_scope_log: Vec::new(),
             block_depth: 0,
+            asm_deferred_instantiation: false,
+            local_constants: FxHashMap::default(),
             deferred_static_asserts: Vec::new(),
             struct_tag_alignments: FxHashMap::default(),
         }
@@ -1625,7 +1709,8 @@ impl Parser {
     // === GCC extension helpers ===
 
     pub(super) fn skip_gcc_extensions(&mut self) {
-        let (_, aligned, _, _, _) = self.parse_gcc_attributes();
+        // `_spec`: records stay for the enclosing declaration's check.
+        let (_, aligned, _, _, _) = self.parse_gcc_attributes_spec();
         if let Some(a) = aligned {
             self.attrs.parsed_alignas =
                 Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
@@ -1793,6 +1878,18 @@ impl Parser {
                     }
                     "noreturn" | "_Noreturn" => {
                         self.attrs.set_noreturn(true);
+                        // C23 spells the verdict differently from the GNU
+                        // namespace: `int a [[noreturn]];` reports
+                        // `standard 'noreturn' attribute can only be applied to
+                        // functions`, while `[[gnu::noreturn]]` reports the
+                        // generic sentence (both measured on gcc-16.2.0). The
+                        // marker prefix keeps the two wordings apart in the
+                        // shared placement check.
+                        self.attrs.parsing_attr_targets.push((
+                            "standard:noreturn".to_string(),
+                            self.peek_span(),
+                            crate::frontend::parser::attribute_registry::AttributeTarget::Function,
+                        ));
                         self.advance();
                         if matches!(self.peek(), TokenKind::LParen) {
                             self.skip_balanced_parens();
@@ -1840,6 +1937,20 @@ impl Parser {
                     }
                 },
                 Some("gnu") => {
+                    // `[[gnu::noreturn]] int x;` is the same mistake as
+                    // `__attribute__((noreturn)) int x;` and carries the same
+                    // verdict, so the C23 spelling records the placement the
+                    // one funnel checks (measured: `'noreturn' attribute
+                    // ignored`, `'packed' attribute ignored`).
+                    use crate::frontend::parser::attribute_registry as registry;
+                    let target = registry::target(&attr_name);
+                    if target != registry::AttributeTarget::Any {
+                        self.attrs.parsing_attr_targets.push((
+                            registry::canonical(&attr_name).to_string(),
+                            self.peek_span(),
+                            target,
+                        ));
+                    }
                     self.dispatch_gcc_attribute(
                         &attr_name,
                         is_packed,
@@ -1878,6 +1989,7 @@ impl Parser {
     ) -> (bool, Option<usize>, Option<ModeKind>, bool, Option<bool>) {
         let result = self.parse_gcc_attributes_inner();
         self.attrs.parsing_attr_targets.clear();
+        self.attrs.first_attr_span = None;
         result
     }
 
@@ -1895,6 +2007,7 @@ impl Parser {
                     self.advance();
                 }
                 TokenKind::LBracket if self.is_c23_attr_start() => {
+                    self.attrs.first_attr_span.get_or_insert(self.peek_span());
                     self.parse_c23_attribute_specifier(
                         &mut is_packed,
                         &mut aligned,
@@ -1904,6 +2017,7 @@ impl Parser {
                     );
                 }
                 TokenKind::Attribute => {
+                    self.attrs.first_attr_span.get_or_insert(self.peek_span());
                     self.advance();
                     if matches!(self.peek(), TokenKind::LParen) {
                         self.advance(); // outer (
@@ -2098,11 +2212,100 @@ impl Parser {
         );
     }
 
+    /// Report the declaration-level verdicts recorded while the declarators
+    /// were parsed: `-Wstrict-prototypes` and a malformed `cleanup`
+    /// attribute. Both belong to the declaration as a whole, and gcc-16
+    /// reports them at the declaration's own location -- except for a
+    /// function *definition*, where `-Wstrict-prototypes` points at the name.
+    /// `decl_start` must already include a leading attribute list when the
+    /// declaration has one (`__attribute__((cleanup)) void *p;` anchors at
+    /// the attribute, measured).
+    pub(super) fn flush_declarator_verdicts(
+        &mut self,
+        decl_start: crate::common::source::Span,
+        definition_name: Option<crate::common::source::Span>,
+        unprototyped: bool,
+        cleanup_auto_object: bool,
+    ) {
+        self.attrs.last_decl_name_span = None;
+        if unprototyped && !self.c23 {
+            let span = definition_name.unwrap_or(decl_start);
+            self.diagnostics.warning_with_kind(
+                "function declaration isn't a prototype",
+                span,
+                crate::common::error::WarningKind::StrictPrototypes,
+            );
+        }
+        // One report per attribute: a block-scope declaration can be parsed
+        // speculatively and then for real, and both passes record the same
+        // attribute. The argument count is checked before the argument's
+        // shape, so an arity verdict wins over an identifier verdict for the
+        // same attribute (measured: `cleanup` and `cleanup()` report the
+        // count, `cleanup(1)` reports the shape).
+        let mut by_attr: crate::common::fx_hash::FxHashMap<u32, CleanupDiagnosis> =
+            crate::common::fx_hash::FxHashMap::default();
+        for (diagnosis, attr_span) in std::mem::take(&mut self.cleanup_diagnoses) {
+            let entry = by_attr.entry(attr_span.start);
+            entry
+                .and_modify(|existing| {
+                    if matches!(diagnosis, CleanupDiagnosis::WrongArgumentCount(_))
+                        && !matches!(existing, CleanupDiagnosis::WrongArgumentCount(_))
+                    {
+                        *existing = diagnosis;
+                    }
+                })
+                .or_insert(diagnosis);
+        }
+        for (attr_start, diagnosis) in by_attr {
+            if !self.reported_cleanup_attrs.insert(attr_start) {
+                continue;
+            }
+            match diagnosis {
+                CleanupDiagnosis::WrongArgumentCount(found) => {
+                    self.diagnostics.error(
+                        "wrong number of arguments specified for 'cleanup' attribute",
+                        decl_start,
+                    );
+                    self.diagnostics
+                        .note(format!("expected 1, found {found}"), decl_start);
+                }
+                // GCC checks the argument's *shape* only for a target the
+                // attribute can actually apply to. On a function, or on an object
+                // with static storage duration, the attribute is ignored and the
+                // only diagnostic is the `'cleanup' attribute ignored` warning
+                // (measured: `__attribute__((cleanup(1))) void f(void)` and
+                // `__attribute__((cleanup(1))) void *g;` are warning-only, while
+                // the same argument on a local is an error).
+                CleanupDiagnosis::NotAnIdentifier if cleanup_auto_object => {
+                    self.diagnostics
+                        .error("cleanup argument not an identifier", decl_start);
+                }
+                CleanupDiagnosis::NotAnIdentifier => {}
+            }
+        }
+    }
+
+    /// The dedupe key for a verdict about one written attribute.
+    ///
+    /// Two attribute lists on one declaration are two occurrences and keep
+    /// two verdicts (gcc reports both), while the same occurrence judged by
+    /// two call sites stays one. The bias keeps a first-byte attribute out of
+    /// the "no salt" value.
+    pub(super) fn attribute_dedup_salt(span: crate::common::source::Span) -> u64 {
+        u64::from(span.start) + 1
+    }
+
     /// The declaration-kind half of the applicability rule: once the
     /// specifier and first declarator are known, each recorded
     /// placement-checked attribute either matches or warns exactly as GCC
     /// 16.2 does (measured phrasings, including `naked`'s dedicated wording
     /// and `const`/`pure` on a void-returning function).
+    ///
+    /// `start` is the declaration's own location and is what GCC reports for
+    /// every one of these verdicts, whichever position the attribute was
+    /// written in (measured: `int x __attribute__((noreturn));` and
+    /// `__attribute__((noreturn)) int x;` both point at the declaration).
+    #[track_caller]
     pub(super) fn check_attribute_targets(
         &mut self,
         type_spec: &TypeSpecifier,
@@ -2112,11 +2315,19 @@ impl Parser {
             crate::common::source::Span,
             attribute_registry::AttributeTarget,
         )],
+        start: crate::common::source::Span,
     ) {
         use super::attribute_registry::AttributeTarget;
         if recorded.is_empty() {
             return;
         }
+        // GCC's location for these verdicts is the declaration; a leading
+        // attribute list is part of it, so the earliest list wins when it
+        // starts before the specifier.
+        let start = match self.attrs.first_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
         // The final derived layer names the declaration kind: `void *f(int)`
         // is a function, while `int (*fp)(void)` is an object. This also
         // covers glibc's pointer-returning `__gnu_inline__` prototypes.
@@ -2134,11 +2345,35 @@ impl Parser {
             && crate::frontend::parser::ast::DerivedDeclarator::return_pointer_depth(derived) == 0;
         for (name, span, target) in recorded {
             if returns_void && is_function && matches!(name.as_str(), "const" | "pure") {
-                self.diagnostics.warning_with_kind(
+                self.diagnostics.warning_with_kind_salted(
                     format!("\'{name}\' attribute on function returning 'void'"),
-                    *span,
+                    start,
                     crate::common::error::WarningKind::Attributes,
+                    Self::attribute_dedup_salt(*span),
                 );
+                continue;
+            }
+            // `noreturn` on a declaration that names a function *type* --
+            // a function, or any object of function-pointer type -- applies
+            // to that function type, and gcc-16.2 is silent for it:
+            // `int (*fp)(void) __attribute__((noreturn));` and
+            // `typedef void (*handler)(int) __attribute__((noreturn));`
+            // produce no diagnostic, while `int *ordinary` does (measured).
+            // The attribute is carried by the type, not the object, so the
+            // object-target verdict does not apply.
+            if name == "noreturn" && Self::declares_function_type(derived) {
+                continue;
+            }
+            // A `cleanup` list with the wrong number of arguments is an error,
+            // and gcc reports only that error: the applicability warning is
+            // suppressed (measured on a function target, where the warning
+            // would otherwise also apply).
+            if name == "cleanup"
+                && self
+                    .cleanup_diagnoses
+                    .iter()
+                    .any(|(d, _)| matches!(d, CleanupDiagnosis::WrongArgumentCount(_)))
+            {
                 continue;
             }
             let ok = match target {
@@ -2148,19 +2383,42 @@ impl Parser {
                 AttributeTarget::Record => is_record || is_typedef,
             };
             if !ok {
-                let message = if name == "naked" {
-                    // GCC's dedicated wording (measured on gcc-16.2.0).
-                    format!("\'{name}\' attribute only applies to functions")
-                } else {
-                    format!("\'{name}\' attribute ignored")
+                // Two names have dedicated wordings, both measured on
+                // gcc-16.2.0; every other misapplied attribute reuses the
+                // generic sentence.
+                let message = match name.as_str() {
+                    "naked" => format!("\'{name}\' attribute only applies to functions"),
+                    "noplt" => format!("\'{name}\' attribute is only applicable on functions"),
+                    "standard:noreturn" => {
+                        "standard 'noreturn' attribute can only be applied to functions".to_string()
+                    }
+                    _ => format!("\'{name}\' attribute ignored"),
                 };
-                self.diagnostics.warning_with_kind(
+                // One verdict per attribute list: gcc-16.2 reports
+                // `__attribute__((noreturn)) __attribute__((noreturn)) int x;`
+                // twice, so the record's own span salts the dedupe key while
+                // both diagnostics still point at the declaration.
+                self.diagnostics.warning_with_kind_salted(
                     message,
-                    *span,
+                    start,
                     crate::common::error::WarningKind::Attributes,
+                    Self::attribute_dedup_salt(*span),
                 );
             }
         }
+    }
+
+    /// Whether the declarator declares a function *type* rather than a plain
+    /// object: a function, or an object whose type involves a function
+    /// declarator (`int (*fp)(void)`, `typedef void (*handler)(int)`).
+    fn declares_function_type(derived: &[crate::frontend::parser::ast::DerivedDeclarator]) -> bool {
+        derived.iter().any(|d| {
+            matches!(
+                d,
+                crate::frontend::parser::ast::DerivedDeclarator::Function(..)
+                    | crate::frontend::parser::ast::DerivedDeclarator::FunctionPointer(..)
+            )
+        })
     }
 
     /// Dispatch a single GCC attribute by name.
@@ -2282,6 +2540,15 @@ impl Parser {
             //   persistent-> `.persistent` (PROGBITS); diagnosed on an uninitialized one
             "retain" | "__retain__" => {
                 self.attrs.set_retain(true);
+                self.advance();
+            }
+            // `noplt` is a property of the *callee*: it selects a GOT-indirect
+            // call sequence for that symbol instead of a PLT stub. Recorded on
+            // the declaration and honoured by the backends through
+            // `BackendState::noplt_symbols`; GCC keeps it silent in every
+            // placement `TARGETS` allows.
+            "noplt" | "__noplt__" => {
+                self.attrs.set_noplt(true);
                 self.advance();
             }
             "noinit" | "__noinit__" => {
@@ -2693,16 +2960,74 @@ impl Parser {
     }
 
     fn parse_cleanup_attr(&mut self) {
+        let attr_span = self.peek_span();
         if !matches!(self.peek(), TokenKind::LParen) {
+            // `__attribute__((cleanup))`: GCC counts zero arguments.
+            self.cleanup_diagnoses
+                .push((CleanupDiagnosis::WrongArgumentCount(0), attr_span));
             return;
         }
-        self.advance();
-        if let TokenKind::Identifier(func_name) = self.peek() {
-            self.attrs.parsing_cleanup_fn = Some(func_name.clone());
-            self.advance();
+        self.advance(); // '('
+        // Split the argument list on top-level commas and keep the tokens of
+        // each argument. The previous version consumed at most one identifier
+        // and then gave up, which left the remaining tokens in the stream
+        // (cascading parse errors for `cleanup()`) or accepted a malformed
+        // attribute without a word (`cleanup(1)`).
+        let mut groups: Vec<Vec<TokenKind>> = Vec::new();
+        let mut current: Vec<TokenKind> = Vec::new();
+        let mut depth = 0i32;
+        loop {
+            match self.peek().clone() {
+                TokenKind::Eof => break,
+                TokenKind::RParen if depth == 0 => {
+                    self.advance();
+                    break;
+                }
+                TokenKind::Comma if depth == 0 => {
+                    self.advance();
+                    groups.push(std::mem::take(&mut current));
+                }
+                tk @ (TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace) => {
+                    depth += 1;
+                    current.push(tk);
+                    self.advance();
+                }
+                tk @ (TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace) => {
+                    depth -= 1;
+                    current.push(tk);
+                    self.advance();
+                }
+                tk => {
+                    current.push(tk);
+                    self.advance();
+                }
+            }
         }
-        if matches!(self.peek(), TokenKind::RParen) {
-            self.advance();
+        if !current.is_empty() || !groups.is_empty() {
+            groups.push(current);
+        }
+        match groups.len() {
+            1 if groups[0].len() == 1 => {
+                if let TokenKind::Identifier(name) = &groups[0][0] {
+                    self.attrs.parsing_cleanup_fn = Some(name.clone());
+                } else {
+                    self.attrs.parsing_cleanup_fn = None;
+                    self.cleanup_diagnoses
+                        .push((CleanupDiagnosis::NotAnIdentifier, attr_span));
+                }
+            }
+            1 => {
+                // Several tokens that are not a bare identifier: `cleanup((f))`,
+                // `cleanup(a b)`, `cleanup("f")`.
+                self.attrs.parsing_cleanup_fn = None;
+                self.cleanup_diagnoses
+                    .push((CleanupDiagnosis::NotAnIdentifier, attr_span));
+            }
+            n => {
+                self.attrs.parsing_cleanup_fn = None;
+                self.cleanup_diagnoses
+                    .push((CleanupDiagnosis::WrongArgumentCount(n), attr_span));
+            }
         }
     }
 

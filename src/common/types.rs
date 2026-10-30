@@ -2982,7 +2982,7 @@ impl CType {
 
     /// Whether a GCC `vector_size` type occurs inside this type (directly, as
     /// an array element, or as a record member at any depth).
-    fn contains_gnu_vector(&self, ctx: &dyn StructLayoutProvider) -> bool {
+    pub(crate) fn contains_gnu_vector(&self, ctx: &dyn StructLayoutProvider) -> bool {
         match self {
             CType::Vector(..) => true,
             CType::Array(elem, _) => elem.contains_gnu_vector(ctx),

@@ -119,6 +119,12 @@ impl InlineAsmEmitter for I686Codegen {
         }
     }
 
+    fn can_store_condition_code_output_direct(&self, ptr: &Value, ty: IrType) -> bool {
+        matches!(ty, IrType::I8 | IrType::U8)
+            && self.state.is_alloca(ptr.0)
+            && self.state.get_slot(ptr.0).is_some()
+    }
+
     fn setup_operand_metadata(&self, op: &mut AsmOperand, val: &Operand, _is_output: bool) {
         if op
             .constraint
@@ -683,18 +689,31 @@ impl InlineAsmEmitter for I686Codegen {
         }
         // =@cc<cond> condition code outputs
         if let AsmOperandKind::ConditionCode(ref cond) = op.kind {
+            let ty = op.operand_type;
+            if matches!(ty, IrType::I8 | IrType::U8)
+                && self.state.is_alloca(ptr.0)
+                && let Some(slot) = self.state.get_slot(ptr.0)
+            {
+                let sr = self.slot_ref(slot);
+                let x86_cond = Self::gcc_cc_to_x86(cond);
+                self.state
+                    .emit_fmt(format_args!("    set{} {}", x86_cond, sr));
+                return;
+            }
             let reg = &op.reg;
             let reg8 = Self::reg_to_8l(reg);
             let x86_cond = Self::gcc_cc_to_x86(cond);
             self.state
                 .emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
-            self.state.emit_fmt(format_args!(
-                "    movzbl %{}, %{}",
-                reg8,
-                Self::reg_to_32(reg)
-            ));
+            let ty = op.operand_type;
+            if self.output_is_value_home(ptr) || !matches!(ty, IrType::I8 | IrType::U8) {
+                self.state.emit_fmt(format_args!(
+                    "    movzbl %{}, %{}",
+                    reg8,
+                    Self::reg_to_32(reg)
+                ));
+            }
             if let Some(slot) = self.state.get_slot(ptr.0) {
-                let ty = op.operand_type;
                 if self.state.is_direct_slot(ptr.0) {
                     let sr = self.slot_ref(slot);
                     if self.output_is_value_home(ptr) {

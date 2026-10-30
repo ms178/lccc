@@ -2312,6 +2312,27 @@ impl IntrinsicOp {
         }
     }
 
+    /// Pairwise horizontal reductions consume two vector images and produce
+    /// a scalar (or a narrower partial sum that the reducer finishes in GPRs).
+    /// They deliberately have no full-width vector home/result metadata; the
+    /// register allocator must not treat them as ordinary lane-wise Vec ops.
+    pub fn is_horizontal_vector_reduce(&self) -> bool {
+        matches!(
+            self,
+            IntrinsicOp::VecHorizontalAddI32x8
+                | IntrinsicOp::VecHorizontalAddI32x4
+                | IntrinsicOp::VecHorizontalAddI64x4
+                | IntrinsicOp::VecHorizontalAddI64x2
+                | IntrinsicOp::VecHorizontalAddF32x8
+                | IntrinsicOp::VecHorizontalAddF32x4
+                | IntrinsicOp::VecHorizontalAddF64x4
+                | IntrinsicOp::VecHorizontalAddF64x2
+                | IntrinsicOp::VecHorizontalMaxI32x4
+                | IntrinsicOp::VecHorizontalMaxI32x8
+                | IntrinsicOp::VecHorizontalMinI32x8
+        )
+    }
+
     /// Returns true if this intrinsic is a pure function (no side effects, result depends
     /// only on inputs). Pure intrinsics can be dead-code eliminated if their result is unused.
     pub fn is_pure(&self) -> bool {
@@ -3118,7 +3139,9 @@ mod vector_width_tests {
         let mut checked = 0usize;
         for name in names {
             // Home-metadata exceptions; none of these grants a store a result.
-            let exempt_none = name.contains("Horizontal")
+            let op: IntrinsicOp = names_to_op(name)
+                .unwrap_or_else(|| panic!("unhandled Vec* variant {name}: add it to names_to_op"));
+            let exempt_none = op.is_horizontal_vector_reduce()
                 || (name.starts_with("VecStore")
                     && name != "VecStoreI64x2"
                     // The half-wide Pair store declares the FULL register
@@ -3139,8 +3162,6 @@ mod vector_width_tests {
                 continue; // no shape token: grammar cannot judge (VecAdd, ...)
             };
             let expected = if exempt_none { None } else { Some(ty * lanes) };
-            let op: IntrinsicOp = names_to_op(name)
-                .unwrap_or_else(|| panic!("unhandled Vec* variant {name}: add it to names_to_op"));
             assert_eq!(
                 op.vector_home_width(),
                 expected,

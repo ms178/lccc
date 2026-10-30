@@ -208,8 +208,13 @@ fn has_vector_location_contract(op: &crate::ir::intrinsics::IntrinsicOp) -> bool
                 | O::VecHorizontalAddF64x2
                 | O::VecHorizontalAddI32x8
                 | O::VecHorizontalAddI32x4
+                | O::VecHorizontalAddI64x4
+                | O::VecHorizontalAddI64x2
                 | O::VecHorizontalAddF32x8
                 | O::VecHorizontalAddF32x4
+                | O::VecHorizontalMaxI32x4
+                | O::VecHorizontalMaxI32x8
+                | O::VecHorizontalMinI32x8
                 | O::HorizontalAddF64x4
                 | O::HorizontalAddF64x2
                 | O::HorizontalAddI32x8
@@ -909,6 +914,56 @@ mod vector_location_contract_tests {
                 "{op:?} must not report a vector result"
             );
             assert!(!has_vector_location_contract(&op), "{op:?} must stay out");
+        }
+    }
+
+    #[test]
+    fn every_horizontal_reduction_keeps_vector_location_contract() {
+        use std::collections::BTreeSet;
+
+        let horizontal = [
+            O::VecHorizontalAddF64x4,
+            O::VecHorizontalAddF64x2,
+            O::VecHorizontalAddI32x8,
+            O::VecHorizontalAddI32x4,
+            O::VecHorizontalAddI64x4,
+            O::VecHorizontalAddI64x2,
+            O::VecHorizontalAddF32x8,
+            O::VecHorizontalAddF32x4,
+            O::VecHorizontalMaxI32x4,
+            O::VecHorizontalMaxI32x8,
+            O::VecHorizontalMinI32x8,
+            O::HorizontalAddF64x4,
+            O::HorizontalAddF64x2,
+            O::HorizontalAddI32x8,
+            O::HorizontalAddI32x4,
+        ];
+
+        // Keep this admission exhaustive as IntrinsicOp evolves.  Parse only
+        // variant tokens from the enum, excluding its documentation comments.
+        let source = include_str!("../../ir/intrinsics.rs");
+        let enum_body = source
+            .split_once("pub enum IntrinsicOp")
+            .expect("IntrinsicOp enum")
+            .1
+            .split_once("\n}\n")
+            .expect("end of IntrinsicOp enum")
+            .0;
+        let expected: BTreeSet<String> = enum_body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.split([',', '|']))
+            .map(str::trim)
+            .filter(|token| {
+                token.contains("Horizontal")
+                    && token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+            .map(str::to_owned)
+            .collect();
+        let actual: BTreeSet<String> = horizontal.iter().map(|op| format!("{op:?}")).collect();
+        assert_eq!(actual, expected, "horizontal intrinsic coverage drifted");
+        for op in horizontal {
+            assert!(has_vector_location_contract(&op), "lost {op:?}");
         }
     }
 }

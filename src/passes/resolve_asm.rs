@@ -14,6 +14,27 @@
 //! This module traces such chains and sets `input_symbols[i] = "boot_cpu_data+74"`
 //! so the backend can emit correct symbol references in inline assembly.
 //!
+//! ## Constant immediates are substituted here, too
+//!
+//! GCC re-checks an `asm` statement *after* expansion, when the operand has
+//! already been substituted and folded; that is why
+//!
+//! ```c
+//! do { __auto_type __flags = BUGFLAG_WARNING | (flags);
+//!      asm volatile(… : : "i" (__FILE__), "i" (__LINE__), "i" (__flags), …); } while (0)
+//! ```
+//!
+//! is accepted (the Linux kernel's `__WARN_FLAGS`, expanded at every
+//! `WARN_ON_ONCE()`), even though `__flags` is a *local object* whose value
+//! only becomes constant after the initializer is folded.  LCCC parses the
+//! statement once, so the front end cannot know it.  This pass runs after
+//! mem2reg and constant folding, where `__flags` has become a plain constant
+//! operand — the same point in the pipeline where GCC performs its own check,
+//! so resolving it here is the faithful analogue, not a relaxation.
+//!
+//! `immediates[i]` is the resolved value; a non-immediate constraint is left
+//! with `None` and keeps the register path.
+//!
 //! ## Optimizations
 //! - Zero-Allocation Fast Path: Exits in single-digit nanoseconds if a function
 //!   contains no inline assembly with unresolved immediate operands (99.9% of functions).
@@ -23,7 +44,8 @@
 //! - Extended Arithmetic Coverage: Resolves `GlobalAddr`, `GEP`, `Add`, `Sub`, `Cast`,
 //!   `Copy`, and constant-valued `Value` operands with overflow protection.
 
-use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, IrModule, Operand, Value};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, IrModule, Operand, Value};
 
 /// Resolve InlineAsm input symbols across all functions in the module.
 pub(crate) fn resolve_inline_asm_symbols(module: &mut IrModule) {
@@ -146,11 +168,15 @@ fn resolve_in_function(func: &mut IrFunction) {
     // resolution scan must be immutable; mutations are applied after the
     // borrow ends. (Fixes E0502 introduced by the flat-defs refactor.)
     let mut resolutions: Vec<(usize, usize, usize, String)> = Vec::new();
+    // Constant-immediate substitutions, see the module docs.
+    let mut imm_resolutions: Vec<(usize, usize, usize, IrConst)> = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Instruction::InlineAsm {
+                outputs,
                 inputs,
                 input_symbols,
+                operand_types,
                 ..
             } = inst
             {
@@ -164,10 +190,31 @@ fn resolve_in_function(func: &mut IrFunction) {
                     if !crate::backend::inline_asm::constraint_is_immediate_only(constraint) {
                         continue;
                     }
+                    // A symbol wins over a value: `&obj` reaches here as a
+                    // GlobalAddr chain, never as a folded constant.
                     if let Operand::Value(v) = operand {
                         if let Some(sym) = try_resolve_global_symbol(v, &defs) {
                             resolutions.push((bi, ii, i, sym));
+                            continue;
                         }
+                    }
+                    if let Some(val) = eval_const_operand(operand, &defs, 0) {
+                        // The operand type decides the literal's width so that
+                        // `%0` prints `$17` for an `int` and `$17` for a
+                        // `long` alike (the back end reads `imm_value`).
+                        // `operand_types` is ordered as outputs followed by
+                        // inputs, matching the template's operand numbering.
+                        let input_type_index = outputs.len() + i;
+                        let wide = matches!(
+                            operand_types.get(input_type_index),
+                            Some(IrType::I64 | IrType::U64 | IrType::Ptr)
+                        );
+                        let c = if wide {
+                            IrConst::I64(val)
+                        } else {
+                            IrConst::I32(val as i32)
+                        };
+                        imm_resolutions.push((bi, ii, i, c));
                     }
                 }
             }
@@ -182,6 +229,17 @@ fn resolve_in_function(func: &mut IrFunction) {
         {
             if i < input_symbols.len() {
                 input_symbols[i] = Some(sym);
+            }
+        }
+    }
+    for (bi, ii, i, c) in imm_resolutions {
+        if let Some(Instruction::InlineAsm { inputs, .. }) = func
+            .blocks
+            .get_mut(bi)
+            .and_then(|b| b.instructions.get_mut(ii))
+        {
+            if let Some(slot) = inputs.get_mut(i) {
+                slot.1 = Operand::Const(c);
             }
         }
     }

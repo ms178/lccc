@@ -113,7 +113,10 @@ impl Parser {
 
         let mut pre_aligned: Option<usize> = None;
         let mut is_packed = false;
-        let (pre_packed, pre_align, _, _, _) = self.parse_gcc_attributes();
+        // `_spec` keeps the placement records for the declaration's
+        // `-Wattributes` verdict; the clearing variant is for attribute
+        // lists that belong to something other than a declaration.
+        let (pre_packed, pre_align, _, _, _) = self.parse_gcc_attributes_spec();
         is_packed = is_packed || pre_packed;
         if let Some(a) = pre_align {
             pre_aligned = Some(pre_aligned.map_or(a, |prev: usize| prev.max(a)));
@@ -142,12 +145,6 @@ impl Parser {
         // repro tests/regression/pointer_const_multi_level_relro.c).
         // Bounded: see POINTER_DEPTH_BUDGET. The span is taken BEFORE
         // consuming so the diagnostic points at the offending `*`.
-        let mut star_depth = 0u32;
-        // Space written after the most recent `*`. After the loop it is the
-        // space after the LAST `*`, the one adjacent to the name: that pointer
-        // is the declared object (`long *__seg_gs p` puts `p` in %gs), while a
-        // qualifier on an earlier `*` belongs to the pointee (`long *__seg_gs *p`).
-        let mut object_space = AddressSpace::Default;
         // `volatile` written before the first `*` belongs to the specifier
         // (not one an earlier declarator's star left in the flag).
         let spec_volatile = self.attrs.parsing_volatile() && !self.attrs.volatile_from_stars;
@@ -155,61 +152,11 @@ impl Parser {
         let spec_restrict = self.attrs.parsing_restrict();
         let typedef_use = self.attrs.parsing_typedef_use();
         let typedef_object_volatile = self.attrs.parsing_typedef_object_volatile();
-        // `volatile` written after the most recent `*` (the last one is the
-        // object's own qualifier).
-        let mut last_star_volatile: Option<bool> = None;
         // `_Atomic` in the specifiers, and `restrict`/`_Atomic` after the
         // most recent `*`, by the same rule.
         let spec_atomic = self.attrs.parsing_atomic();
-        let mut last_star_restrict = false;
-        let mut last_star_atomic = false;
-        loop {
-            let star_span = self.peek_span();
-            if !self.consume_if(&TokenKind::Star) {
-                break;
-            }
-            star_depth += 1;
-            if !self.enter_pointer_level(star_depth, star_span) {
-                break;
-            }
-            // Only the outermost level's qualifiers describe the object.
-            self.attrs.set_pointer_const(false);
-            // The base-specifier space already sits in the slot; keep it, and
-            // collect only the qualifier written after this `*`.
-            let base_space =
-                std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
-            // Isolate this star's `volatile` so the last star's can be read
-            // back; the declaration-wide flag keeps the union, as before.
-            let outer_volatile = self.attrs.parsing_volatile();
-            self.attrs.set_volatile(false);
-            // Likewise `restrict`/`_Atomic`: the specifiers' `_Atomic` is the
-            // pointee's (`_Atomic int *p`), not this star's.
-            self.attrs.set_restrict(false);
-            self.attrs.set_atomic(false);
-            self.skip_cv_qualifiers();
-            let star_volatile = self.attrs.parsing_volatile();
-            self.attrs.set_volatile(outer_volatile || star_volatile);
-            if star_volatile && !outer_volatile {
-                self.attrs.volatile_from_stars = true;
-            }
-            last_star_volatile = Some(star_volatile);
-            last_star_restrict = self.attrs.parsing_restrict();
-            last_star_atomic = self.attrs.parsing_atomic();
-            self.attrs.set_restrict(spec_restrict);
-            self.attrs.set_atomic(spec_atomic);
-            let star_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
-            // Each star keeps its own qualifiers (see `DerivedDeclarator::Pointer`):
-            // the space and the CVR run written after it. A middle level's
-            // `const` (`int *const *p`) is invisible in `CType`, so it has to
-            // ride on the declarator or the read-only check cannot see it.
-            let star_cvr = u8::from(self.attrs.parsing_pointer_const())
-                | (u8::from(star_volatile) << 1)
-                | (u8::from(last_star_restrict) << 2);
-            // The last star's is also the declared object's space.
-            derived.push(DerivedDeclarator::Pointer(star_space, star_cvr));
-            object_space = star_space;
-            self.skip_gcc_extensions();
-        }
+        let (object_space, last_star_volatile, last_star_restrict, last_star_atomic) =
+            self.parse_pointer_prefix(&mut derived, spec_restrict, spec_atomic);
 
         // Parse the direct-declarator part
         // Space of the object declared by a parenthesised inner declarator
@@ -221,6 +168,10 @@ impl Parser {
         let mut inner_object_quals = (false, false);
         let (name, inner_derived) = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
+            // A *definition* reports `-Wstrict-prototypes` at its name, a
+            // declaration at its start (gcc-16, measured). Parameter lists
+            // parsed below would overwrite this, so they save and restore it.
+            self.attrs.last_decl_name_span = Some(self.peek_span());
             self.advance();
             (Some(n), Vec::new())
         } else if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
@@ -303,7 +254,19 @@ impl Parser {
                         open_paren,
                     );
                     innermost_suffix_is_function = Some(true);
+                    let saved_name_span = self.attrs.last_decl_name_span;
                     let (params, variadic, has_prototype) = self.parse_param_list();
+                    self.attrs.last_decl_name_span = saved_name_span;
+                    // `-Wstrict-prototypes`: `int f();` declares a function but
+                    // not a prototype. GCC's verdict belongs to the whole
+                    // declaration (it also fires for an unprototyped type
+                    // nested in a parameter) and is reported at the
+                    // declaration's location, so the fact is recorded here and
+                    // reported by the declaration funnel. C23 makes `()` a
+                    // prototype, which is why the flag is only set for the
+                    // older dialects (measured: `-std=gnu17` warns,
+                    // `-std=c23` does not).
+                    let _ = has_prototype;
                     outer_suffixes.push(DerivedDeclarator::Function(
                         params,
                         variadic,
@@ -317,7 +280,8 @@ impl Parser {
         // Combine using inside-out rule
         let combined = self.combine_declarator_parts(derived, inner_derived, outer_suffixes);
 
-        let (post_packed, post_aligned, mode_kind, has_common, _) = self.parse_gcc_attributes();
+        let (post_packed, post_aligned, mode_kind, has_common, _) =
+            self.parse_gcc_attributes_spec();
         is_packed = is_packed || post_packed;
         let aligned = match (pre_aligned, post_aligned) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -383,6 +347,84 @@ impl Parser {
             object_space
         };
         (name, combined, mode_kind, has_common, aligned, is_packed)
+    }
+
+    /// Consume the leading `*` levels of a declarator and return the declared
+    /// object's address space plus the qualifier run of the last (outermost)
+    /// star.  Each level keeps its own CVR/address-space bits in `derived`;
+    /// only the last level describes the object itself.  The caller supplies
+    /// the specifier-level `restrict`/`_Atomic` flags to restore after each
+    /// star, so a pointee qualifier cannot leak into the next level.
+    fn parse_pointer_prefix(
+        &mut self,
+        derived: &mut Vec<DerivedDeclarator>,
+        spec_restrict: bool,
+        spec_atomic: bool,
+    ) -> (AddressSpace, Option<bool>, bool, bool) {
+        let mut star_depth = 0u32;
+        // Space written after the most recent `*`. After the loop it is the
+        // space after the LAST `*`, the one adjacent to the name: that pointer
+        // is the declared object (`long *__seg_gs p` puts `p` in %gs), while a
+        // qualifier on an earlier `*` belongs to the pointee (`long *__seg_gs *p`).
+        let mut object_space = AddressSpace::Default;
+        // `volatile` written after the most recent `*` (the last one is the
+        // object's own qualifier).
+        let mut last_star_volatile: Option<bool> = None;
+        let mut last_star_restrict = false;
+        let mut last_star_atomic = false;
+        loop {
+            let star_span = self.peek_span();
+            if !self.consume_if(&TokenKind::Star) {
+                break;
+            }
+            star_depth += 1;
+            if !self.enter_pointer_level(star_depth, star_span) {
+                break;
+            }
+            // Only the outermost level's qualifiers describe the object.
+            self.attrs.set_pointer_const(false);
+            // The base-specifier space already sits in the slot; keep it, and
+            // collect only the qualifier written after this `*`.
+            let base_space =
+                std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
+            // Isolate this star's `volatile` so the last star's can be read
+            // back; the declaration-wide flag keeps the union, as before.
+            let outer_volatile = self.attrs.parsing_volatile();
+            self.attrs.set_volatile(false);
+            // Likewise `restrict`/`_Atomic`: the specifiers' `_Atomic` is the
+            // pointee's (`_Atomic int *p`), not this star's.
+            self.attrs.set_restrict(false);
+            self.attrs.set_atomic(false);
+            self.skip_cv_qualifiers();
+            let star_volatile = self.attrs.parsing_volatile();
+            self.attrs.set_volatile(outer_volatile || star_volatile);
+            if star_volatile && !outer_volatile {
+                self.attrs.volatile_from_stars = true;
+            }
+            last_star_volatile = Some(star_volatile);
+            last_star_restrict = self.attrs.parsing_restrict();
+            last_star_atomic = self.attrs.parsing_atomic();
+            self.attrs.set_restrict(spec_restrict);
+            self.attrs.set_atomic(spec_atomic);
+            let star_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
+            // Each star keeps its own qualifiers (see `DerivedDeclarator::Pointer`):
+            // the space and the CVR run written after it. A middle level's
+            // `const` (`int *const *p`) is invisible in `CType`, so it has to
+            // ride on the declarator or the read-only check cannot see it.
+            let star_cvr = u8::from(self.attrs.parsing_pointer_const())
+                | (u8::from(star_volatile) << 1)
+                | (u8::from(last_star_restrict) << 2);
+            // The last star's is also the declared object's space.
+            derived.push(DerivedDeclarator::Pointer(star_space, star_cvr));
+            object_space = star_space;
+            self.skip_gcc_extensions();
+        }
+        (
+            object_space,
+            last_star_volatile,
+            last_star_restrict,
+            last_star_atomic,
+        )
     }
 
     /// Determine if a '(' starts a parenthesized declarator vs. a parameter list.

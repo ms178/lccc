@@ -137,6 +137,12 @@ impl InlineAsmEmitter for X86Codegen {
         }
     }
 
+    fn can_store_condition_code_output_direct(&self, ptr: &Value, ty: IrType) -> bool {
+        matches!(ty, IrType::I8 | IrType::U8)
+            && self.state.get_slot(ptr.0).is_some()
+            && (self.state.is_alloca(ptr.0) || self.state.is_direct_slot(ptr.0))
+    }
+
     fn setup_operand_metadata(&self, op: &mut AsmOperand, val: &Operand, _is_output: bool) {
         if matches!(op.kind, AsmOperandKind::Memory) {
             if let Operand::Value(v) = val {
@@ -842,87 +848,8 @@ impl InlineAsmEmitter for X86Codegen {
             }
             return;
         }
-        // Handle =@cc<cond> condition code outputs: emit SETcc + movzbl
         if let AsmOperandKind::ConditionCode(ref cond) = op.kind {
-            // `ptr` may be an address value with no stack slot (e.g., a
-            // register-resident pointer from cpuid.h's `__cpuid(level, *a, ...)`
-            // pattern); store through it instead of silently dropping the
-            // result. Emit SETcc + movzbl first, then the through-pointer store.
-            if self.state.get_slot(ptr.0).is_none() {
-                let reg = &op.reg;
-                let reg8 = Self::reg_to_8l(reg);
-                let x86_cond = Self::gcc_cc_to_x86(cond);
-                self.state
-                    .emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
-                self.state
-                    .out
-                    .emit_instr_reg_reg("    movzbl", &reg8, &Self::reg_to_32(reg));
-                self.store_reg_through_ptr_value(reg, IrType::I32, ptr, all_output_regs);
-                return;
-            }
-            let reg = &op.reg;
-            let reg8 = Self::reg_to_8l(reg);
-            // Map GCC condition suffix to x86 SETcc instruction suffix
-            let x86_cond = Self::gcc_cc_to_x86(cond);
-            self.state
-                .emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
-            self.state
-                .out
-                .emit_instr_reg_reg("    movzbl", &reg8, &Self::reg_to_32(reg));
-            // Store the result (0 or 1) to the output variable
-            if let Some(slot) = self.state.get_slot(ptr.0) {
-                let ty = op.operand_type;
-                if self.state.is_alloca(ptr.0) {
-                    // True alloca: typed store
-                    let store_instr = Self::mov_store_for_type(ty);
-                    let src_reg = match ty {
-                        IrType::I8 | IrType::U8 => format!("%{}", Self::reg_to_8l(reg)),
-                        IrType::I16 | IrType::U16 => format!("%{}", Self::reg_to_16(reg)),
-                        IrType::I32 | IrType::U32 | IrType::F32 => {
-                            format!("%{}", Self::reg_to_32(reg))
-                        }
-                        _ => format!("%{}", reg),
-                    };
-                    {
-                        let sr = self.slot_ref(slot.0);
-                        self.state
-                            .emit_fmt(format_args!("    {} {}, {}", store_instr, src_reg, sr));
-                    }
-                } else if self.state.is_direct_slot(ptr.0) {
-                    // Promoted asm output: movzbl already zero-extended, use
-                    // full 8-byte store to match value_to_reg's movq load.
-                    {
-                        let sr = self.slot_ref(slot.0);
-                        self.state
-                            .emit_fmt(format_args!("    movq %{}, {}", reg, sr));
-                    }
-                } else {
-                    let scratch = self.asm_output_scratch(all_output_regs, reg);
-                    let preserve = all_output_regs.contains(&scratch.as_str());
-                    if preserve {
-                        self.state.out.emit_instr_reg("    pushq", &scratch);
-                    }
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    movq", slot.0, &scratch);
-                    let store_instr = Self::mov_store_for_type(ty);
-                    let src_reg = match ty {
-                        IrType::I8 | IrType::U8 => format!("%{}", Self::reg_to_8l(reg)),
-                        IrType::I16 | IrType::U16 => format!("%{}", Self::reg_to_16(reg)),
-                        IrType::I32 | IrType::U32 | IrType::F32 => {
-                            format!("%{}", Self::reg_to_32(reg))
-                        }
-                        _ => format!("%{}", reg),
-                    };
-                    self.state.emit_fmt(format_args!(
-                        "    {} {}, (%{})",
-                        store_instr, src_reg, scratch
-                    ));
-                    if preserve {
-                        self.state.out.emit_instr_reg("    popq", &scratch);
-                    }
-                }
-            }
+            self.store_condition_code_output(op, ptr, cond, all_output_regs);
             return;
         }
         let reg = &op.reg;
@@ -1066,6 +993,131 @@ impl InlineAsmEmitter for X86Codegen {
 }
 
 impl X86Codegen {
+    /// Store one `=@cc<cond>` output operand.
+    ///
+    /// Three shapes, in the order the proof allows them:
+    ///
+    ///   1. the branch analysis proved every read of this object is a fused
+    ///      `jcc`, so neither `setcc` nor a store is observable -- emit
+    ///      nothing here and in each output-edge trampoline;
+    ///   2. a byte-typed output with a stack home takes `setcc` written
+    ///      straight to that home, which needs no temporary GPR;
+    ///   3. otherwise the historical `setcc` + `movzbl` + typed store, with
+    ///      the through-pointer form for a register-resident destination.
+    ///
+    /// Split out of `store_output_from_reg` so that function stays under the
+    /// audit-census ratchet and each shape is reviewable on its own.
+    fn store_condition_code_output(
+        &mut self,
+        op: &AsmOperand,
+        ptr: &Value,
+        cond: &str,
+        all_output_regs: &[&str],
+    ) {
+        if self.state.asm_cc_branch_output_ptrs.contains(&ptr.0) {
+            // Every read of this output is a branch proven to consume the
+            // live flags directly, so neither setcc nor a memory store is
+            // observable. The same proof applies in each output-edge
+            // trampoline.
+            return;
+        }
+        if matches!(op.operand_type, IrType::I8 | IrType::U8) {
+            if let Some(slot) = self.state.get_slot(ptr.0) {
+                if self.state.is_alloca(ptr.0) || self.state.is_direct_slot(ptr.0) {
+                    let sr = self.slot_ref(slot.0);
+                    let x86_cond = Self::gcc_cc_to_x86(cond);
+                    self.state
+                        .emit_fmt(format_args!("    set{} {}", x86_cond, sr));
+                    return;
+                }
+            }
+        }
+        // `ptr` may be an address value with no stack slot (e.g., a
+        // register-resident pointer from cpuid.h's `__cpuid(level, *a, ...)
+        // pattern); store through it instead of silently dropping the
+        // result. Emit SETcc + movzbl first, then the through-pointer store.
+        if self.state.get_slot(ptr.0).is_none() {
+            let reg = &op.reg;
+            let reg8 = Self::reg_to_8l(reg);
+            let x86_cond = Self::gcc_cc_to_x86(cond);
+            self.state
+                .emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
+            self.state
+                .out
+                .emit_instr_reg_reg("    movzbl", &reg8, &Self::reg_to_32(reg));
+            self.store_reg_through_ptr_value(reg, IrType::I32, ptr, all_output_regs);
+            return;
+        }
+        let reg = &op.reg;
+        let reg8 = Self::reg_to_8l(reg);
+        // Map GCC condition suffix to x86 SETcc instruction suffix
+        let x86_cond = Self::gcc_cc_to_x86(cond);
+        self.state
+            .emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
+        // A bool/U8 output is stored from its low byte directly. The
+        // zero-extension is needed only when the full register value is
+        // consumed; emitting it before `movb` is dead work.
+        if !matches!(op.operand_type, IrType::I8 | IrType::U8) {
+            self.state
+                .out
+                .emit_instr_reg_reg("    movzbl", &reg8, &Self::reg_to_32(reg));
+        }
+        // Store the result (0 or 1) to the output variable
+        if let Some(slot) = self.state.get_slot(ptr.0) {
+            let ty = op.operand_type;
+            if self.state.is_alloca(ptr.0) {
+                // True alloca: typed store
+                let store_instr = Self::mov_store_for_type(ty);
+                let src_reg = match ty {
+                    IrType::I8 | IrType::U8 => format!("%{}", Self::reg_to_8l(reg)),
+                    IrType::I16 | IrType::U16 => format!("%{}", Self::reg_to_16(reg)),
+                    IrType::I32 | IrType::U32 | IrType::F32 => {
+                        format!("%{}", Self::reg_to_32(reg))
+                    }
+                    _ => format!("%{}", reg),
+                };
+                {
+                    let sr = self.slot_ref(slot.0);
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, {}", store_instr, src_reg, sr));
+                }
+            } else if self.state.is_direct_slot(ptr.0) {
+                // Promoted asm output: movzbl already zero-extended, use
+                // full 8-byte store to match value_to_reg's movq load.
+                {
+                    let sr = self.slot_ref(slot.0);
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, {}", reg, sr));
+                }
+            } else {
+                let scratch = self.asm_output_scratch(all_output_regs, reg);
+                let preserve = all_output_regs.contains(&scratch.as_str());
+                if preserve {
+                    self.state.out.emit_instr_reg("    pushq", &scratch);
+                }
+                self.state
+                    .out
+                    .emit_instr_rbp_reg("    movq", slot.0, &scratch);
+                let store_instr = Self::mov_store_for_type(ty);
+                let src_reg = match ty {
+                    IrType::I8 | IrType::U8 => format!("%{}", Self::reg_to_8l(reg)),
+                    IrType::I16 | IrType::U16 => format!("%{}", Self::reg_to_16(reg)),
+                    IrType::I32 | IrType::U32 | IrType::F32 => {
+                        format!("%{}", Self::reg_to_32(reg))
+                    }
+                    _ => format!("%{}", reg),
+                };
+                self.state.emit_fmt(format_args!(
+                    "    {} {}, (%{})",
+                    store_instr, src_reg, scratch
+                ));
+                if preserve {
+                    self.state.out.emit_instr_reg("    popq", &scratch);
+                }
+            }
+        }
+    }
+
     /// Store an asm output register through a destination that has no stack
     /// slot: the destination is an address VALUE (a register-resident pointer,
     /// e.g., cpuid.h's `__cpuid(level, *a, *b, *c, *d)` outputs). The pointer

@@ -223,7 +223,10 @@ gate "lexer-extensions" fast \
 gate "ucn-identifier-table" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_ucn_identifier_table.sh
 gate "asm-operand-diagnostics" fast \
-    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_asm_operand_diagnostics.sh
+    env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm \
+    CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_asm_operand_diagnostics.sh
 gate "trapv-boundary-matrix-m64" fast \
     env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64
 gate "trapv-boundary-matrix-m32" fast \
@@ -661,6 +664,12 @@ gate "vector-static-init" fast \
 # -O2 -mavx2 (`add8` 2, GCC parity; it was 37).
 gate "vector-ext-codegen" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_vector_ext_codegen.sh
+
+# MMX entry points: the generated 90-intrinsic __m64 differential against
+# GCC's real-MMX implementation (m64 + m32) plus the packed-codegen
+# witnesses (one SSE2 op on the XMM low half, no per-lane scalar loop).
+gate "mmx-intrinsics" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_mmx_intrinsics.sh
 
 # Incoming x86-64 by-value objects, both frame modes and kill-switch control.
 gate "incoming-byval-homes" fast \
@@ -2186,6 +2195,8 @@ gate "i686-boot-asm" fast \
 
 gate "asm-goto-phi-edge" fast \
     bash tests/regression/check_asm_goto_phi_edge.sh
+gate "asm-goto-outputs" fast \
+    bash tests/regression/check_asm_goto_outputs.sh
 gate "i686-label-ref-safety" fast \
     bash tests/regression/check_i686_label_ref_safety.sh
 

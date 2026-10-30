@@ -41,11 +41,23 @@ expect() { # expect <case> <expected-substring|EMPTY> <source> [flags...]
     fi
 }
 
-# --- class 1: implemented -> silent -----------------------------------------
+# --- class 1: implemented AND correctly placed -> silent ---------------------
+# Every source below is the position GCC 16.2 accepts for that attribute; the
+# misapplied positions are class 1b, because GCC diagnoses them (measured
+# 2026-10-30: `int x __attribute__((noreturn));` is a warning, in either
+# position, so pinning silence here would pin a false negative).
 for a in packed aligned section used weak noinline noreturn const pure \
          always_inline noclone_but_unknown vector_size cleanup mode \
          visibility retained_section alias_ifunc; do
     case $a in
+        packed) src='struct S { char c; } __attribute__((packed));' ;;
+        aligned) src='int x __attribute__((aligned(16)));' ;;
+        section) src='int x __attribute__((section(".keep")));' ;;
+        noinline) src='void f(void) __attribute__((noinline)); void f(void){}' ;;
+        noreturn) src='void f(void) __attribute__((noreturn));' ;;
+        const) src='int f(void) __attribute__((const));' ;;
+        pure) src='int f(void) __attribute__((pure));' ;;
+        always_inline) src='inline void f(void) __attribute__((always_inline)); void f(void){}' ;;
         retained_section) src='int x __attribute__((retain, section(".keep")));' ;;
         alias_ifunc) src='void f(void); void g(void) __attribute__((alias("f")));' ;;
         noclone_but_unknown) src='__attribute__((noclone)) void f(void);' ;;
@@ -56,6 +68,15 @@ for a in packed aligned section used weak noinline noreturn const pure \
         *) src="int x __attribute__(($a));" ;;
     esac
     expect "silent:$a" EMPTY "$src"
+done
+
+# --- class 1b: implemented but misapplied -> GCC's own wording ----------------
+# Function-only attributes on an object. GCC's sentence is the generic one;
+# `naked` and `noplt` have dedicated wordings and are checked by the Python
+# twin (check_attribute_diagnostics.py), which diffs against a live gcc.
+for a in packed noinline noreturn const pure always_inline; do
+    expect "misapplied:$a" "'$a' attribute ignored" \
+        "int x __attribute__(($a));" -Wattributes
 done
 
 # --- class 2: benign (diagnostics/optimisation only) -> silent ---------------

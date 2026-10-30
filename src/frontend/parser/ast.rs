@@ -924,6 +924,9 @@ pub mod decl_attr_flag {
     /// `__attribute__((nocommon))` — a tentative definition goes to `.bss`
     /// instead of a common block, whatever `-fcommon` says.
     pub const NO_COMMON_ATTR: u32 = 1 << 19;
+    /// `__attribute__((noplt))` — calls to this function are dispatched
+    /// through the GOT rather than the PLT (`-fno-plt` for one symbol).
+    pub const NOPLT: u32 = 1 << 20;
 }
 
 impl DeclAttributes {
@@ -1008,6 +1011,14 @@ impl DeclAttributes {
     #[inline]
     pub fn set_noinit(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::NOINIT, v)
+    }
+    #[inline]
+    pub fn is_noplt(&self) -> bool {
+        self.flags & decl_attr_flag::NOPLT != 0
+    }
+    #[inline]
+    pub fn set_noplt(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::NOPLT, v)
     }
     #[inline]
     pub fn is_persistent(&self) -> bool {
@@ -1308,6 +1319,33 @@ impl DerivedDeclarator {
     /// (regression `fn_returning_fnptr_prototype.c`).
     pub fn declares_function(derived: &[DerivedDeclarator]) -> bool {
         matches!(derived.last(), Some(DerivedDeclarator::Function(..)))
+    }
+
+    /// Whether the declarator tree contains a function type whose parameter
+    /// list is not a prototype (`int f();`, `int (*p)();`), which is what
+    /// GCC's `-Wstrict-prototypes` reports.
+    ///
+    /// The rule is a property of the declared type, not of the parse order, so
+    /// it is derived from the finished declarator. Nested function types are
+    /// included because gcc-16 warns for them too: `void g(int (*h)());`
+    /// produces the warning at the declaration (measured), while
+    /// `int (*h)(void)` does not.
+    pub fn has_unprototyped_function_type(derived: &[DerivedDeclarator]) -> bool {
+        derived.iter().any(|d| match d {
+            DerivedDeclarator::Function(params, _, has_prototype)
+            | DerivedDeclarator::FunctionPointer(params, _, has_prototype) => {
+                !*has_prototype || Self::params_have_unprototyped_function_type(params)
+            }
+            DerivedDeclarator::Pointer(..) | DerivedDeclarator::Array(_) => false,
+        })
+    }
+
+    fn params_have_unprototyped_function_type(params: &[ParamDecl]) -> bool {
+        params.iter().any(|p| {
+            p.fptr_params.as_ref().is_some_and(|inner| {
+                !p.fptr_has_prototype || Self::params_have_unprototyped_function_type(inner)
+            })
+        })
     }
 
     /// Pointer indirection depth of the RETURN type a derived list encodes.
@@ -1728,6 +1766,9 @@ pub enum Stmt {
         clobbers: Vec<String>,
         /// Goto labels for asm goto (e.g., `asm goto("..." : : : : label1, label2)`)
         goto_labels: Vec<String>,
+        /// Source span of the `asm` keyword, so post-optimization diagnostics
+        /// and debug info can name the statement instead of a bare message.
+        span: Span,
     },
 }
 
@@ -1804,7 +1845,8 @@ impl Stmt {
             | Stmt::Label(_, _, span) => Some(*span),
             Stmt::Expr(Some(expr)) => Some(expr.span()),
             Stmt::Declaration(decl) => Some(decl.span),
-            Stmt::Expr(None) | Stmt::Compound(_) | Stmt::InlineAsm { .. } => None,
+            Stmt::InlineAsm { span, .. } => Some(*span),
+            Stmt::Expr(None) | Stmt::Compound(_) => None,
         }
     }
 }

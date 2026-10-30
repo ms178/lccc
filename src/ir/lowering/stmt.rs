@@ -107,6 +107,14 @@ impl Lowerer {
             if declarator.name.is_empty() {
                 continue;
             }
+            // A block-scope function declaration can carry `noplt` too; GCC
+            // honours it (`void b(void) __attribute__((noplt));` inside a
+            // function still calls `b` through the GOT, measured 2026-10-30).
+            if DerivedDeclarator::declares_function(&declarator.derived)
+                && declarator.attrs.is_noplt()
+            {
+                self.noplt_decl_names.insert(declarator.name.clone());
+            }
             if decl.is_extern() && self.lower_extern_decl(decl, declarator, inherited_volatile) {
                 continue;
             }
@@ -1675,6 +1683,7 @@ impl Lowerer {
                 inputs,
                 clobbers,
                 goto_labels,
+                ..
             } => {
                 self.lower_inline_asm_stmt(template, outputs, inputs, clobbers, goto_labels);
             }

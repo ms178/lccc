@@ -2309,10 +2309,10 @@ impl Driver {
         let mut parser = Parser::new(tokens);
         parser.set_diagnostics(diagnostics);
         parser.set_c23(self.c23_dialect());
-        // Code generation will run the post-optimization asm-constraint
-        // validator, which can prove local constant initializers and inlined
-        // arguments that the parser alone cannot classify. Syntax-only mode
-        // deliberately leaves this disabled above.
+        // Code generation runs the post-optimization asm-constraint validator,
+        // which can prove local constant initializers and inlined arguments
+        // that the parser alone cannot classify. Syntax-only mode deliberately
+        // leaves this disabled above.
         parser.set_deferred_asm_immediate_validation(true);
         let ast = parser.parse();
         if time_phases {
@@ -2411,12 +2411,24 @@ impl Driver {
         // width above and is reset per TU like every other target cell.
         {
             let isa = self.x86_isa();
-            let bytes = if self.target != Target::X86_64 || !isa.simd || self.opt_level == 0 {
+            // i686 participates at the SSE2 ceiling: the default -m32
+            // baseline (`-march=x86-64` minus the x86-64 bit) has SSE2, and
+            // `resolved_i686_sse2` denies it for pre-SSE -march rows and the
+            // -mno-sse* spellings, exactly like the rest of the i686 SIMD
+            // permissions.  The ceiling stops at 16 bytes: the i686 Vec*
+            // emitters cover the 128-bit image, while 256-bit packed
+            // lowering (and the optimizer's vectorizer permission below)
+            // stays x86-64-only, so 32-byte shapes keep their per-lane
+            // scalar fallback on -m32.  The -O0 contract is unchanged: the
+            // scalar form remains the differential oracle of the packed path.
+            let bytes = if self.opt_level == 0 {
                 0
-            } else if isa.ymm {
-                32
-            } else {
+            } else if self.target == Target::X86_64 && isa.simd {
+                if isa.ymm { 32 } else { 16 }
+            } else if self.target == Target::I686 && self.resolved_i686_sse2() {
                 16
+            } else {
+                0
             };
             crate::common::types::set_target_vector_lowering_bytes(bytes);
             crate::passes::vectorize::set_x86_simd_isa(
@@ -2562,33 +2574,45 @@ impl Driver {
         // an inline parameter that is not resolvable during parsing. Recheck
         // the optimized IR here. A Value is not an immediate; emitting the
         // backend's historical zero placeholder would silently miscompile a
-        // dynamic operand (e.g. `.long %c0`). The original always_inline
-        // helper body is exempt because it is retained only as the inline template;
-        // any reachable caller must have a constant or symbol after inlining.
-        if matches!(self.target, Target::X86_64 | Target::I686) {
-            for func in &module.functions {
-                if func.is_declaration || func.is_always_inline {
-                    continue;
-                }
-                for block in &func.blocks {
-                    for inst in &block.instructions {
-                        if let crate::ir::reexports::Instruction::InlineAsm {
-                            inputs,
-                            input_symbols,
-                            ..
-                        } = inst
-                        {
-                            for (index, (constraint, operand, _)) in inputs.iter().enumerate() {
-                                if crate::backend::inline_asm::constraint_is_immediate_only(
-                                    constraint,
-                                ) && matches!(operand, crate::ir::reexports::Operand::Value(_))
-                                    && input_symbols.get(index).and_then(Option::as_ref).is_none()
-                                {
-                                    return Err(format!(
-                                        "non-constant operand for immediate-only inline asm constraint `{constraint}` remains after optimization in function `{}`",
-                                        func.name
-                                    ));
-                                }
+        // dynamic operand (e.g. `.long %c0`). Dead-static elimination removes
+        // an unused static always_inline template after its callers have been
+        // inlined, but deliberately retains an address-taken definition as a
+        // callable function-pointer identity. Every surviving body must
+        // therefore be checked; an always_inline flag is not proof that the
+        // body is unemittable.
+        for func in &module.functions {
+            if func.is_declaration {
+                continue;
+            }
+            for block in &func.blocks {
+                for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                    if let crate::ir::reexports::Instruction::InlineAsm {
+                        inputs,
+                        input_symbols,
+                        ..
+                    } = inst
+                    {
+                        for (index, (constraint, operand, _)) in inputs.iter().enumerate() {
+                            if crate::backend::inline_asm::constraint_is_immediate_only(constraint)
+                                && matches!(operand, crate::ir::reexports::Operand::Value(_))
+                                && input_symbols.get(index).and_then(Option::as_ref).is_none()
+                            {
+                                let span = block
+                                    .source_spans
+                                    .get(inst_idx)
+                                    .copied()
+                                    .filter(|span| *span != crate::common::source::Span::dummy())
+                                    .unwrap_or(func.body_span);
+                                let location = source_manager
+                                    .map(|sm| sm.resolve_span(span))
+                                    .map(|loc| {
+                                        format!("{}:{}:{}: ", loc.file, loc.line, loc.column)
+                                    })
+                                    .unwrap_or_else(|| format!("{input_file}:1:1: "));
+                                return Err(format!(
+                                    "{location}non-constant operand for immediate-only inline asm constraint `{constraint}` remains after optimization in function `{}`",
+                                    func.name
+                                ));
                             }
                         }
                     }

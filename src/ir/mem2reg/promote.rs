@@ -370,14 +370,26 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                 // stack memory through the template (the backend substitutes the
                 // stack-relative address like -8(%rbp) for the operand).
                 Instruction::InlineAsm {
-                    outputs, inputs, ..
+                    outputs,
+                    inputs,
+                    goto_labels,
+                    ..
                 } => {
                     // Output pointers: treat as definitions of the alloca,
                     // unless the constraint is memory-only (=m) in which case
                     // the alloca must keep its stack slot.
                     for (constraint, ptr, _) in outputs {
                         if candidate_set.contains(&ptr.0) {
-                            if constraint_is_memory_only(constraint, false) {
+                            if !goto_labels.is_empty() {
+                                // An asm-goto output is defined on both the
+                                // fall-through edge and each label edge. The
+                                // current SSA renamer models implicit edges
+                                // from the instruction point, not per-edge
+                                // output defs, so keep this object in memory;
+                                // backend trampolines materialize it on label
+                                // edges before the C block reads it.
+                                disqualified.insert(ptr.0);
+                            } else if constraint_is_memory_only(constraint, false) {
                                 // Memory-only output: the inline asm template writes
                                 // directly to the alloca's memory address. Must keep
                                 // the alloca on the stack, not promote to SSA.

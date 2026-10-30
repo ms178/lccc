@@ -1382,6 +1382,73 @@ sessions have now spent time re-deriving that these numbers are not gaps.
 
 ---
 
+## 7a. asm-goto fusion: three measured codegen gaps it exposes (2026-10-30)
+
+The `=@cc` fusion in this branch is correct and it removes the
+setcc -> store -> reload -> test round trip, but the function around it
+still carries three instructions that serve nothing.  Measured on
+
+```c
+__attribute__((noinline)) static int cc_branch(unsigned x) {
+    _Bool err;
+    asm goto("testl %1, %1; jz %l[label]" : "=@ccz"(err) : "r"(x) : "cc" : label);
+    if (err) return 1;
+    return 0;
+label:
+    if (err) return 2;
+    return 3;
+}
+```
+
+at `-O2` on x86-64 (lccc fastbuild vs gcc 16.2, same source):
+
+| | per-call uops on the `x != 0` path | what it is |
+|---|---|---|
+| gcc 16.2 | 4 | `testl/jz`, `sete`, `movzbl`, `ret` |
+| lccc (this branch) | 8 | `subq $8,%rsp`, `movl %edi,%eax` (dead), `movl %edi,%ecx`, `testl/jz`, `jne` (always taken), `xorl`, `addq $8,%rsp`, `ret` |
+
+1. The frame is empty: the fused path stores nothing, yet the prologue still
+   runs `subq $8, %rsp` / `addq $8, %rsp`.  Frame sizing happens before the
+   fusion decision, so eliding it needs either a second sizing pass for
+   `asm goto` functions or a deferred-offset scheme.
+2. `movl %edi, %eax` is dead: it is the asm output's register home, allocated
+   before the fusion proved the home unused.  Freeing it is the same
+   "allocate after the fusion decision" change.
+3. `.LBB1: movl $1, %eax; ...; ret` is unreachable: on the label edge the
+   fusion emits `jne` whose target is statically never chosen (the edge is
+   only reachable through `jz`), but the block is still emitted.  A
+   reachability pass over the emitted CFG would delete it.
+
+Runtime consequence, measured: 40M calls of the function above take 51.07 ms
+with this branch, 50.95 ms with `origin/main` (0.2%, noise) and 38.73 ms with
+gcc 16.2.  The fusion is performance-neutral on this shape — it trades a
+setcc/movzbl pair for a taken branch — and the 32% gap to gcc is those three
+instructions plus the extra branch.  The correctness win is the real one: the
+same program prints 2 (correct, gcc-equal) here and 3 (stale taken-edge
+output) with `origin/main`.
+
+## 8a. Declaration-parser tail split (measured 2026-10-30)
+
+The attribute/cleanup verdict work feeds one declaration-level verdict pool, and
+the three declaration entry points each carry the tail that turns the collected
+flags into a `Declaration`.  They cross the 300-line ratchet:
+
+| function | file | lines | main |
+|---|---|---|---|
+| `parse_declaration_rest` | `src/frontend/parser/declarations.rs` | 355 | 315 |
+| `parse_local_declaration` | same | 342 | 291 |
+| `parse_external_decl` | same | 317 | 277 |
+| `lower` | `src/ir/lowering/lower.rs` | 514 | 500 |
+
+`scripts/audit_census_baseline.json` was raised by those three and one count in
+the commit that added them, which is the ratchet's own escape hatch.  The
+refactor that pays it back is mechanical and is the next item here: extract the
+`Declaration::new` + `set_*` tail into one `finish_declaration(...)` helper
+shared by the three entry points, and split `lower`'s call lowering from its
+statement walk.  Nothing in the current change depends on the split, and the
+semantics are already covered by `tests/regression/check_attribute_diagnostics.*`
+plus the attribute option ledger.
+
 ## 9a. SSE/AVX audit follow-through (2026-10-26)
 
 These are **open obligations**, not an ISA/manual sign-off. Start with
@@ -1526,6 +1593,118 @@ completion. `OPEN` means the acceptance criterion has not been met or tested;
 | GP-22 | PARTIAL | The priority-set ledger exists and is wired to hosted CI: 10 rows prove effect-or-refusal for all 7 priority options - `-Ofast` (= `-O3 -ffast-math`, byte-identical) and `-Og` (= `-O1`, byte-identical; GCC's own `-Og`==`-O1` re-measured on the scalar probe) are now *implemented* instead of tolerated, `-Wattributes` fires in both compilers, `-pedantic` accepts and acts, `-fprofile-arcs`/`-ftest-coverage` are refused by name with GCC's gcov-notes behaviour pinned as the divergence, and `-static-pie` joined the named-refusal class (`-flto`, `-fsanitize=address` refusals re-pinned). Remaining: the wider accepted-silent backlog (the historical 157), fail-closed `LCCC_STRICT_OPTIONS` coverage as a gate, and every other accepted spelling getting a row. |
 | GP-23 | PARTIAL | The ratchet gate landed: `check_macro_parity.py` pins the complete GNU23/x86-64 differential as three reviewed budgets (17 GCC-only, 33 LCCC-only, 34 value spellings), fails on any new divergence in either direction, and also fails on *stale* pins so the budgets can only move through a reviewed edit. Wired to CI next to the warning gates (gate-parity check green, 434 commands). Remaining: more targets/dialects (single target×dialect now) and converging the 34 value spellings. |
 | GP-24 | PARTIAL | Seven derived gzip/zlib-ng/Expat kernels passed bounded GCC/Clang/LCCC checks; compare256 covers four optimization levels, two ABIs and a detected mutation. Verified zlib-ng 2.3.3 configure/Make static builds passed upstream `alltests` under GCC and LCCC, followed by 48 cross-compiler roundtrips and 24 system-gzip decodes. Manually configured upstream Expat 2.9.0 passed 5,196 checks with GCC, Clang and LCCC libraries, including an LCCC-compiled runner. Its bounded paired benchmark on this VM measured LCCC/GCC median CPU-time ratio 1.3161 [1.3077, 1.3206], not a speedup. Expat configure/CMake/CTest, other configurations and kernel-style diagnostic matrices remain open. |
+
+**2026-10-30 progress (attribute applicability, `noplt`, two warning families).**
+
+* GP-01 — placement verdicts are now taken once per *declaration* instead of
+  per attribute position, matching GCC's rule that `int x __attribute__((noreturn));`
+  and `__attribute__((noreturn)) int x;` are the same mistake. Concretely:
+  specifier-position and post-declarator records survive to a single
+  declaration-level verdict; a trailing attribute on a later comma sibling
+  (`int a, b __attribute__((noreturn));`) is diagnosed too, which the previous
+  code dropped entirely. Verdicts report at the declaration's own location
+  (a leading `__attribute__` list included), which is what GCC prints
+  (`__attribute__((packed)) int x;` → column of the declaration, not of the
+  name). Two dedicated wordings measured and pinned: `'naked' attribute only
+  applies to functions`, `'noplt' attribute is only applicable on functions`.
+  Duplicate parser/sema verdicts are collapsed in `DiagnosticEngine::emit` on
+  (file, span, message); see the second-pass note below for the per-list salt
+  that keeps two real lists from collapsing into one. Remaining known
+  micro-divergence: when the attribute sits on a later *line* than the
+  declaration start, GCC's caret lands on that line's first token while LCCC
+  reports the declaration start; and `'x' attribute directive ignored`
+  (unknown names) still points at the name token. Both are recorded, not
+  silently accepted.
+* `noplt` is implemented rather than inventoried: `-Wattributes` was a false
+  positive on functions, and the semantic was missing. It is now a per-symbol
+  `-fno-plt`: calls dispatch through the GOT (`call *f@GOTPCREL(%rip)`),
+  verified byte-for-byte against gcc-16 on extern declarations, comma
+  siblings, post-declarator placement, block-scope declarations and
+  same-TU definitions (where GCC deliberately keeps the PLT call — so does
+  LCCC), plus leak controls proving the flag does not spread to neighbouring
+  declarations.
+* GP-09/GP-12 — `-Wdiv-by-zero` (default-on, `-Wall` label, `-Wno-`
+  effective) and `-Wstrict-prototypes` (opt-in, silent under `-std=c23`
+  because `()` is a prototype there) both match GCC's wording, gating and
+  diagnostic shape. `-Wdiv-by-zero` follows GCC's syntactic rule: it fires
+  inside `if (0)` and in both arms of a non-constant `?:`, but not for the
+  right operand of a deciding `&&`/`||`, the untaken arm of a constant `?:`,
+  or inside `sizeof`/`_Alignof`.
+* GP-22 — the option-effect ledger gained three rows (`-Wdiv-by-zero`,
+  `-Wstrict-prototypes`, `noplt`) and its priority set grew to 10; every row
+  was mutation-verified (removing the verdict fails the gate) and the
+  `-Wdiv-by-zero` row compares the warning *count* against GCC on seven
+  short-circuit/unevaluated shapes so the suppression rule cannot drift.
+* Stale claims corrected in this register: the GP-03 `retain` sentinel now
+  passes (measured: plain `__attribute__((retain))` → `.data.<name>`, flags
+  `WAR`, identical to gcc-16; `noinit`/`persistent` likewise), and
+  `-fstack-clash-protection` really does emit the probe loop for an 8 KiB
+  frame. `tests/regression/check_attribute_diagnostics.sh` had pinned the old
+  false negatives (`int x __attribute__((pure));` and friends expected silent,
+  while GCC warns); it now probes each attribute in a position GCC accepts and
+  keeps a separate misapplied class.
+
+**2026-10-30, second pass (declaration-level verdict anchors and `cleanup`).**
+Measured against gcc-16.2.0 with a differential harness (51 probes over
+`-Wattributes`, `-Wdiv-by-zero` and `-Wstrict-prototypes`); the exact-match
+score went from 32/51 to 41/51 with the remaining ten accounted for below.
+
+* One verdict per attribute *list*: the engine's warning dedupe keyed on
+  (file, span, message), which folded
+  `__attribute__((noreturn)) __attribute__((noreturn)) int x;` into a single
+  warning where GCC prints two. `Diagnostic` now carries a `dedup_salt` that
+  the attribute verdict sets from the list's own span, so repeats inside one
+  list still collapse while two lists report twice.
+* `noreturn` on a function *type* is silent, as in GCC:
+  `extern int (*fp)(void) __attribute__((noreturn));` and
+  `typedef void (*handler)(int) __attribute__((noreturn));` produced a false
+  `'noreturn' attribute ignored` because the object-target rule treated the
+  declarator as a plain object. The verdict is skipped whenever the
+  declarator's derived part names a function or a function pointer.
+* `cleanup` is checked, not merely parsed. GCC's matrix (measured, all
+  anchored at the declaration): zero or two arguments →
+  `error: wrong number of arguments specified for 'cleanup' attribute` plus
+  `note: expected 1, found N`; a non-identifier argument →
+  `error: cleanup argument not an identifier`; a well-formed attribute on an
+  automatic object → silent; on a function, or on an object with static
+  storage duration → only `'cleanup' attribute ignored`, with the shape
+  checks suppressed. The old parser took one identifier and left the rest of
+  the list in the token stream, so `cleanup()` produced cascading
+  `expected ';'` errors and `cleanup(1)` was silently accepted.
+* `-Wstrict-prototypes` is derived from the finished declarator tree instead
+  of transient parser state, which fixes the two shapes GCC reports and LCCC
+  did not: an unprototyped type nested in a prototype
+  (`void g(int (*h)());`) and a K&R definition. Locations now match GCC
+  column for column: a declaration reports at its first token (a leading
+  attribute list included), a definition at its name (`int k() {}` → the
+  `k`). Pinned by the option-effect ledger, which compares the verdict
+  locations against GCC on a three-shape fixture.
+* The C23 attribute specifier runs the same placement check as
+  `__attribute__`: `int b [[gnu::noreturn]];` and `int c [[gnu::packed]];`
+  report `'noreturn' attribute ignored` / `'packed' attribute ignored`, and
+  the standard spelling keeps its own measured sentence,
+  `standard 'noreturn' attribute can only be applied to functions`. The
+  legal placements stay silent, including `[[gnu::packed]] struct S { ... };`.
+* Coverage: `check_attribute_diagnostics.py` grew to 49 probes (two
+  `noreturn`-on-a-function-type silences, three `cleanup` verdicts, one
+  silent well-formed `cleanup`), and `DiagnosticEngine::note` makes the
+  `expected 1, found N` note a first-class emission.
+
+Remaining measured deltas, kept explicit: `cleanup` on a block-scope object
+with static storage duration, or on a block-scope function declaration, takes
+`'cleanup' attribute ignored` in GCC while LCCC is silent (the ignored-target
+rule covers file-scope objects only), and neither `cleanup argument not a
+function` nor the prototype-arity/pointer-compatibility checks are emitted —
+they need the symbol table; when an attribute sits on a later
+line than the declaration, GCC's caret lands on that line's first token while
+LCCC reports the declaration start (the same rule decides
+`'x' attribute directive ignored`, which still points at the name token);
+a macro
+expansion adds a `note: in expansion of macro` that GCC omits; and
+`int a[1 / 0];` prints its warning after the semantic error in LCCC
+(GCC: warning first), with the counted driver summary as a third line that
+GCC does not print at all (the summary is LCCC's own contract, pinned by
+`tools/corpus`).
 
 The `ms_abi`, `retain`, and `interrupt` findings are correctness/ABI hazards,
 not performance opportunities. Independent `typeof` red-teaming also found

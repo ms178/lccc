@@ -112,6 +112,13 @@ pub enum WarningKind {
     /// Integer operands of a comparison have different signedness.
     /// GCC flag: -Wsign-compare (enabled by -Wextra for C).
     SignCompare,
+    /// An integer division or remainder has a constant zero divisor.
+    /// GCC flag: -Wdiv-by-zero (on by default in C, as GCC does).
+    DivByZero,
+    /// A function declaration without a parameter-type list: `int f();`.
+    /// GCC flag: -Wstrict-prototypes (off by default; C23 makes `()`
+    /// a prototype, so GCC stays silent there and so must we).
+    StrictPrototypes,
     /// A printf-family format string does not match its variadic arguments.
     /// GCC flag: -Wformat (enabled by -Wall).
     Format,
@@ -292,6 +299,22 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [Extra],
         false,
         "mixed-sign integer comparison"
+    ),
+    warning!(
+        DivByZero,
+        "div-by-zero",
+        true,
+        [],
+        false,
+        "integer division or remainder by a constant zero"
+    ),
+    warning!(
+        StrictPrototypes,
+        "strict-prototypes",
+        false,
+        [],
+        false,
+        "function declaration without a parameter-type list"
     ),
     warning!(
         Format,
@@ -789,6 +812,13 @@ pub struct Diagnostic {
     /// missing `#include`) where the source manager is not yet available.
     /// Format: "file:line:" (rendered as the location prefix in output).
     pub explicit_location: Option<String>,
+    /// Disambiguates two diagnostics that are otherwise identical: same
+    /// severity, message and location. The engine drops a repeated warning
+    /// with the same key (the same issue reported twice by two phases), but
+    /// GCC reports one verdict per attribute list, so a caller that emits
+    /// several verdicts at one location sets this to a value that differs per
+    /// list (the list's own span). Zero means "no disambiguation".
+    pub dedup_salt: u64,
 }
 
 impl Diagnostic {
@@ -802,6 +832,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -815,6 +846,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -828,6 +860,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -841,6 +874,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -906,6 +940,15 @@ pub struct DiagnosticEngine {
     error_limit_noted: bool,
     /// Same latch for the warning cap (see `render_warning`).
     warning_limit_noted: bool,
+    /// Warnings already reported, keyed by (file, span, message hash).
+    ///
+    /// GCC reports one diagnostic per offending token, however many internal
+    /// paths notice the mistake. Two independent analyses of the same
+    /// declaration (the parser's placement check and the declaration-level
+    /// check) reach the same verdict on the same attribute; without this the
+    /// user sees the line twice. Warnings are therefore idempotent per
+    /// (span, message).
+    emitted_warnings: crate::common::fx_hash::FxHashSet<(u32, u32, u32, u64, u64)>,
 }
 
 impl DiagnosticEngine {
@@ -951,7 +994,38 @@ impl DiagnosticEngine {
             last_include_trace_file: None,
             error_limit_noted: false,
             warning_limit_noted: false,
+            emitted_warnings: crate::common::fx_hash::FxHashSet::default(),
         }
+    }
+
+    fn message_hash(message: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        message.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Remember a *salted* warning occurrence only when it is actually going
+    /// to be rendered (or promoted to an error).  A suppressed warning is not
+    /// an emission: if `-Wsystem-headers`, `-Wno-<name>`, or `-w` hid the first
+    /// attempt, a later visible attempt must not be deduplicated against it.
+    /// Unsalted warnings are never deduplicated: GCC reports one diagnostic
+    /// per offending token, and two independent problems at the same span are
+    /// two diagnostics.
+    fn record_warning_emission(&mut self, diag: &Diagnostic) -> bool {
+        if diag.severity != Severity::Warning || diag.dedup_salt == 0 {
+            return true;
+        }
+        let Some(span) = diag.span else {
+            return true;
+        };
+        self.emitted_warnings.insert((
+            span.file_id,
+            span.start,
+            span.end,
+            Self::message_hash(&diag.message),
+            diag.dedup_salt,
+        ))
     }
 
     /// Render an error-severity diagnostic subject to `MAX_RENDERED_ERRORS`.
@@ -1049,7 +1123,9 @@ impl DiagnosticEngine {
         // -Wsystem-headers asks for them; the suppression applies to warnings
         // only. Without this, a project that merely includes <pthread.h>
         // would see our honest `'returns_twice' attribute ignored` note on a
-        // declaration it does not own.
+        // declaration it does not own. It runs before the per-occurrence
+        // dedupe below: a suppressed warning must not consume the occurrence
+        // slot of the same diagnostic emitted later under `-Wsystem-headers`.
         if diag.severity == Severity::Warning
             && !self.warning_config.system_headers
             && diag
@@ -1058,6 +1134,7 @@ impl DiagnosticEngine {
         {
             return;
         }
+
         match diag.severity {
             Severity::Warning => {
                 if let Some(mut kind) = diag.warning_kind {
@@ -1070,6 +1147,9 @@ impl DiagnosticEngine {
                     // Check if this warning category is enabled
                     if !self.warning_config.is_enabled(kind) {
                         return; // suppressed by -Wno-<name>
+                    }
+                    if !self.record_warning_emission(diag) {
+                        return;
                     }
 
                     // Check if this warning should be promoted to an error
@@ -1097,6 +1177,7 @@ impl DiagnosticEngine {
                             notes: diag.notes.clone(),
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
+                            dedup_salt: diag.dedup_salt,
                         };
                         self.render_error(&promoted);
                         return;
@@ -1111,6 +1192,7 @@ impl DiagnosticEngine {
                         notes: diag.notes.clone(),
                         fix_hint: diag.fix_hint.clone(),
                         explicit_location: diag.explicit_location.clone(),
+                        dedup_salt: diag.dedup_salt,
                     };
                     self.render_warning(&annotated);
                 } else {
@@ -1118,6 +1200,9 @@ impl DiagnosticEngine {
                     // warnings (GCC 16.2: `-w` silences unclassified user-code
                     // warnings too), subject to global -Werror otherwise.
                     if self.warning_config.inhibit_all {
+                        return;
+                    }
+                    if !self.record_warning_emission(diag) {
                         return;
                     }
                     if self.warning_config.werror_all {
@@ -1129,6 +1214,7 @@ impl DiagnosticEngine {
                             notes: diag.notes.clone(),
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
+                            dedup_salt: diag.dedup_salt,
                         };
                         self.render_error(&promoted);
                     } else {
@@ -1168,6 +1254,14 @@ impl DiagnosticEngine {
         self.emit(&diag);
     }
 
+    /// Emit a `note:` line that belongs to the diagnostic just reported, at
+    /// the same location GCC uses for it. Notes never change the exit status
+    /// and are not counted in the diagnostic totals.
+    pub fn note(&mut self, message: impl Into<String>, span: Span) {
+        let diag = Diagnostic::note(message).with_span(span);
+        self.emit(&diag);
+    }
+
     /// Emit a warning with a message and span.
     pub fn warning(&mut self, message: impl Into<String>, span: Span) {
         let diag = Diagnostic::warning(message).with_span(span);
@@ -1177,6 +1271,21 @@ impl DiagnosticEngine {
     /// Emit a categorized warning with a message, span, and kind.
     pub fn warning_with_kind(&mut self, message: impl Into<String>, span: Span, kind: WarningKind) {
         let diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
+        self.emit(&diag);
+    }
+
+    /// Emit a categorized warning that must not be folded into an earlier
+    /// identical one. `salt` distinguishes the occurrences; see
+    /// [`Diagnostic::dedup_salt`].
+    pub fn warning_with_kind_salted(
+        &mut self,
+        message: impl Into<String>,
+        span: Span,
+        kind: WarningKind,
+        salt: u64,
+    ) {
+        let mut diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
+        diag.dedup_salt = salt;
         self.emit(&diag);
     }
 
@@ -1630,6 +1739,8 @@ mod dialect_severity_redteam_tests {
             WarningKind::Attributes,
             WarningKind::UnusedVariable,
             WarningKind::SignCompare,
+            WarningKind::DivByZero,
+            WarningKind::StrictPrototypes,
             WarningKind::Format,
             WarningKind::FormatSecurity,
             WarningKind::ImplicitInt,
@@ -1642,14 +1753,18 @@ mod dialect_severity_redteam_tests {
             WarningKind::CompareDistinctPointerTypes,
             WarningKind::Pedantic,
             WarningKind::Vla,
+            WarningKind::DivByZero,
+            WarningKind::StrictPrototypes,
         ];
+        let expected: HashSet<_> = kinds.into_iter().collect();
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
-        assert_eq!(WARNING_REGISTRY.len(), kinds.len());
-        assert_eq!(registered.len(), kinds.len());
-        assert_eq!(names.len(), kinds.len());
-        for kind in kinds {
-            assert!(registered.contains(&kind));
+        // The registry must be a bijection onto the measured warning kinds:
+        // no missing leaf, no duplicate row, and no duplicate flag spelling.
+        assert_eq!(WARNING_REGISTRY.len(), expected.len());
+        assert_eq!(registered, expected);
+        assert_eq!(names.len(), expected.len());
+        for kind in expected {
             assert_eq!(WarningKind::from_flag_name(kind.flag_name()), Some(kind));
         }
         for group in ["all", "extra", "implicit", "unused"] {
@@ -1739,6 +1854,7 @@ mod dialect_severity_redteam_tests {
             "compare-distinct-pointer-types",
             "discarded-qualifiers",
             "discarded-array-qualifiers",
+            "div-by-zero",
             "undeclared",
         ];
         expected_defaults.sort_unstable();
@@ -2004,5 +2120,66 @@ mod system_header_tests {
     fn command_line_and_builtin_locations_are_system() {
         assert!(is_system_header_path("<built-in>"));
         assert!(is_system_header_path("<command line>"));
+    }
+}
+
+#[cfg(test)]
+mod warning_dedup_tests {
+    use super::{DiagnosticEngine, WarningConfig, WarningKind};
+    use crate::common::source::{SourceManager, Span};
+
+    fn engine_with_user_file() -> (DiagnosticEngine, Span) {
+        let mut sm = SourceManager::new();
+        let file = sm.add_file("src/main.c".to_string(), "int v;\n".to_string());
+        let mut engine = DiagnosticEngine::new();
+        engine.set_source_manager(sm);
+        (engine, Span::new(0, 3, file))
+    }
+
+    #[test]
+    fn unsalted_identical_warnings_are_not_folded() {
+        let (mut engine, span) = engine_with_user_file();
+        engine.warning("same text", span);
+        engine.warning("same text", span);
+        assert_eq!(engine.warning_count(), 2);
+    }
+
+    #[test]
+    fn salted_identical_warnings_fold_per_salt() {
+        let (mut engine, span) = engine_with_user_file();
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 1);
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 1);
+        assert_eq!(engine.warning_count(), 1);
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 2);
+        assert_eq!(engine.warning_count(), 2);
+    }
+
+    #[test]
+    fn suppressed_salted_warning_does_not_consume_a_later_visible_emission() {
+        let (mut engine, span) = engine_with_user_file();
+        let mut config = WarningConfig::new();
+        config.disable(WarningKind::Attributes);
+        engine.set_warning_config(config.clone());
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 7);
+        assert_eq!(engine.warning_count(), 0);
+        config.enable(WarningKind::Attributes);
+        engine.set_warning_config(config);
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 7);
+        assert_eq!(engine.warning_count(), 1);
+    }
+
+    #[test]
+    fn system_header_suppression_does_not_consume_salted_dedup_slot() {
+        let mut sm = SourceManager::new();
+        let sys = sm.add_file("/usr/include/x.h".to_string(), "int v;\n".to_string());
+        let usr = sm.add_file("src/main.c".to_string(), "int v;\n".to_string());
+        let mut engine = DiagnosticEngine::new();
+        engine.set_source_manager(sm);
+        let sys_span = Span::new(0, 3, sys);
+        let usr_span = Span::new(0, 3, usr);
+        engine.warning_with_kind_salted("same text", sys_span, WarningKind::Attributes, 9);
+        assert_eq!(engine.warning_count(), 0);
+        engine.warning_with_kind_salted("same text", usr_span, WarningKind::Attributes, 9);
+        assert_eq!(engine.warning_count(), 1);
     }
 }

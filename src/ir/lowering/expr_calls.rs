@@ -1873,15 +1873,6 @@ impl Lowerer {
                     // area (GCC i386 psABI), mirroring the struct_align Some(16)
                     // the parameter side registers (func_lowering).
                     Some(CType::Float128) | Some(CType::Decimal128) => Some(16),
-                    // Vector varargs on x86-64: the SysV carrier alignment
-                    // (16 for padded SSE shapes, storage alignment otherwise).
-                    // 32-bit targets keep the legacy pointer convention.
-                    // Vector varargs on x86-64: the SysV carrier alignment
-                    // (16 for padded SSE shapes, storage alignment otherwise).
-                    // Other targets keep their existing convention.
-                    Some(ct) if ct.is_vector() && self.target == crate::backend::Target::X86_64 => {
-                        Some(ct.align_ctx(&*self.types.borrow_struct_layouts()))
-                    }
                     _ => None,
                 }
             })
@@ -1983,14 +1974,8 @@ impl Lowerer {
             if let Some((classes, _)) = self.sysv_arg_abi(&ctype) {
                 return classes;
             }
-            if self.target == crate::backend::Target::I686 && matches!(&ctype, CType::Vector(..)) {
-                // Distinguish naturally aligned GNU vectors from ordinary
-                // MEMORY records without adding a parallel CallInfo array.
-                // This marker is consumed only by the i386 backend.
-                return vec![
-                    crate::common::types::EightbyteClass::Memory,
-                    crate::common::types::EightbyteClass::NoClass,
-                ];
+            if let Some(classes) = self.i386_gnu_vector_memory_classes(&ctype) {
+                return classes;
             }
             if let Some(layout) = self.get_struct_layout_for_ctype(&ctype) {
                 return layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts());

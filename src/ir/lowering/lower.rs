@@ -73,6 +73,10 @@ pub struct Lowerer {
     /// frontend/IR DCE. They are intentionally independent.
     pub(super) retained_function_decls: FxHashSet<String>,
     pub(super) used_function_decls: FxHashSet<String>,
+    /// Function names declared `__attribute__((noplt))`. Filtered against the
+    /// definitions of this unit once lowering is complete, because GCC only
+    /// honours the attribute for callees the unit does not define.
+    pub(super) noplt_decl_names: FxHashSet<String>,
     /// Set of function names declared with __attribute__((error("..."))) or __attribute__((warning("..."))).
     /// Calls to these functions should be treated as unreachable (they are compile-time assertion traps).
     pub(super) error_functions: FxHashSet<String>,
@@ -373,6 +377,7 @@ impl Lowerer {
             static_functions: FxHashSet::default(),
             retained_function_decls: FxHashSet::default(),
             used_function_decls: FxHashSet::default(),
+            noplt_decl_names: FxHashSet::default(),
             error_functions: FxHashSet::default(),
             diagnose_as_builtins: FxHashMap::default(),
             noreturn_functions: FxHashSet::default(),
@@ -827,19 +832,12 @@ impl Lowerer {
             || referenced_statics.contains(&func.name))
     }
 
-    pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine) {
-        // Sema has already populated TypeContext with typedefs, enum constants,
-        // struct/union layouts, function typedefs, and function pointer typedefs.
-        // We only need to seed target-dependent builtin typedefs (va_list, size_t, etc.)
-        // and libc math function signatures that sema doesn't know about.
-        self.seed_builtin_typedefs();
-        self.seed_libc_math_functions();
-
-        // Pre-pass: update typedefs that have __attribute__((vector_size(N))) or
-        // __attribute__((ext_vector_type(N))).
-        // Sema doesn't handle vector_size, so the typedef map has the unwrapped base type.
-        // We need to apply vector_size wrapping before registering function metadata,
-        // so that function return types using vector typedefs are correctly resolved.
+    /// Apply vector-size typedef attributes before function metadata and ABI
+    /// classification are registered.  Sema leaves the typedef map at the
+    /// unwrapped base type; struct/union layouts that mention the typedef must
+    /// then be recomputed by key, because their `CType` references already use
+    /// the sema-assigned layout key.
+    fn apply_vector_typedefs(&mut self, tu: &TranslationUnit) {
         let mut has_vector_typedefs = false;
         for decl in &tu.decls {
             if let ExternalDecl::Declaration(decl) = decl {
@@ -863,16 +861,23 @@ impl Lowerer {
                 }
             }
         }
-
-        // After updating vector typedefs, re-compute struct/union layouts that may
-        // contain vector typedef fields. Sema computed these layouts before vector_size
-        // was applied, so their field sizes may be wrong (e.g., float4 was treated as
-        // float instead of vector(float, 16)). We must update the EXISTING layout
-        // entries (by key) rather than creating new ones, because CType::Union/Struct
-        // references use the key assigned by sema.
         if has_vector_typedefs {
             self.recompute_vector_struct_layouts(tu);
         }
+    }
+
+    pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine) {
+        // Sema has already populated TypeContext with typedefs, enum constants,
+        // struct/union layouts, function typedefs, and function pointer typedefs.
+        // We only need to seed target-dependent builtin typedefs (va_list, size_t, etc.)
+        // and libc math function signatures that sema doesn't know about.
+        self.seed_builtin_typedefs();
+        self.seed_libc_math_functions();
+
+        // Pre-pass: update typedefs that have __attribute__((vector_size(N))) or
+        // __attribute__((ext_vector_type(N))), then refresh any struct/union
+        // layouts whose fields depend on those typedefs.
+        self.apply_vector_typedefs(tu);
 
         // Pre-pass: register struct/union layouts from all declarations and function
         // definitions so that function signature registration (below) can compute
@@ -945,6 +950,9 @@ impl Lowerer {
                         }
                         if declarator.attrs.is_used() {
                             self.used_function_decls.insert(declarator.name.clone());
+                        }
+                        if declarator.attrs.is_noplt() {
+                            self.noplt_decl_names.insert(declarator.name.clone());
                         }
                     }
                     // Collect __asm__("label") linker symbol redirects on function declarations.
@@ -1323,6 +1331,17 @@ impl Lowerer {
         self.module
             .extern_function_symbols
             .extend(extern_function_symbols);
+        // `noplt` is a call-site property, so only symbols this unit does not
+        // define need it: GCC emits an ordinary PLT call to a function defined
+        // in the same translation unit even when it carries the attribute
+        // (measured against gcc-16.2.0).
+        let noplt_symbols: Vec<String> = self
+            .noplt_decl_names
+            .iter()
+            .filter(|name| !self.defined_functions.contains(*name))
+            .map(|name| self.resolve_ref_name(name))
+            .collect();
+        self.module.noplt_symbols.extend(noplt_symbols);
 
         self.finalize_module_visibility();
         (self.module, self.diagnostics.into_inner())
@@ -1724,27 +1743,19 @@ impl Lowerer {
             .enumerate()
             .map(|(i, p)| {
                 if param_struct_sizes.get(i).copied().flatten().is_some() {
-                    if matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128)
-                        || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128
-                    {
+                    let ct = self.type_spec_to_ctype(&p.type_spec);
+                    if matches!(ct, CType::Float128) || ct == CType::Decimal128 {
                         vec![
                             crate::common::types::EightbyteClass::Sse,
                             crate::common::types::EightbyteClass::Sse,
                         ]
-                    } else if let Some((classes, _)) =
-                        self.sysv_arg_abi(&self.type_spec_to_ctype(&p.type_spec))
-                    {
+                    } else if let Some((classes, _)) = self.sysv_arg_abi(&ct) {
                         // x86-64: the psABI classes of the struct, union or
-                        // vector (`[Memory]`, `[Sse, SseUp]`, ...).
+                        // vector (`[Memory]`, `[Sse, SseUp]`, ...). On i686
+                        // this also carries the 32/64-byte XMM vector pieces.
                         classes
-                    } else if self.target == crate::backend::Target::I686
-                        && matches!(self.type_spec_to_ctype(&p.type_spec), CType::Vector(..))
-                    {
-                        // Target-local GNU-vector marker; see func_lowering.
-                        vec![
-                            crate::common::types::EightbyteClass::Memory,
-                            crate::common::types::EightbyteClass::NoClass,
-                        ]
+                    } else if let Some(classes) = self.i386_gnu_vector_memory_classes(&ct) {
+                        classes
                     } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
                         layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                     } else {

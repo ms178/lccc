@@ -29,6 +29,15 @@ impl Parser {
         let mut local_labels = Vec::with_capacity(8);
 
         // Save typedef shadowing state for this scope
+        // Integer constants recorded for `asm "i"` operands follow block scope:
+        // a nested block INHERITS the enclosing records (the kernel writes
+        // `do { __auto_type __flags = …; do { asm…} while (0); } while (0)`, so
+        // the statement always sits one block deeper than its initializer), and
+        // exiting restores exactly what the enclosing scope had, so a name
+        // redeclared or reused in a sibling block cannot inherit a stale value.
+        // `clone` (not `take`) is what makes the inheritance work; an empty map
+        // — the overwhelmingly common case — clones for free.
+        let saved_local_constants = self.local_constants.clone();
         let saved_shadowed = self.shadowed_typedefs.clone();
         let enum_mark = self.enum_scope_log.len();
         self.block_depth += 1;
@@ -153,6 +162,7 @@ impl Parser {
 
         self.expect_closing(&TokenKind::RBrace, open_brace);
         self.shadowed_typedefs = saved_shadowed;
+        self.local_constants = saved_local_constants;
         self.block_depth -= 1;
         self.restore_enum_scope(enum_mark);
         self.attrs.restore_flags(saved_attr_flags);
@@ -169,7 +179,63 @@ impl Parser {
     /// dispatcher one frame per level. On exhaustion return an empty
     /// statement WITHOUT consuming tokens so every caller's progress
     /// guarantee unwinds safely.
+    /// Drop the parsed-constant record of every identifier assigned by `expr`.
+    ///
+    /// `int v = 5; v = 6; asm("" :: "i"(v));` must be rejected: the record is
+    /// only a licence for a *constant* operand, so any store to the name
+    /// withdraws it.  Compound assignment, `++`/`--`, and `&v` follow the same
+    /// rule.  Being conservative here costs at most a missed acceptance; the
+    /// alternative — keeping a stale value — would licence wrong code.
+    pub(super) fn invalidate_assigned_constants(&mut self, expr: &Expr) {
+        if self.local_constants.is_empty() {
+            return;
+        }
+        let mut stack: Vec<&Expr> = vec![expr];
+        while let Some(e) = stack.pop() {
+            match e {
+                Expr::Assign(lhs, rhs, _) | Expr::CompoundAssign(_, lhs, rhs, _) => {
+                    Self::forget_lvalue(lhs, &mut self.local_constants);
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                Expr::PostfixOp(_, target, _) | Expr::UnaryOp(_, target, _) => {
+                    Self::forget_lvalue(target, &mut self.local_constants);
+                    stack.push(target);
+                }
+                Expr::AddressOf(target, _) => {
+                    Self::forget_lvalue(target, &mut self.local_constants);
+                    stack.push(target);
+                }
+                _ => e.for_each_child(&mut |c| stack.push(c)),
+            }
+        }
+    }
+
+    /// Remove the name an lvalue expression designates, if any.
+    fn forget_lvalue(lhs: &Expr, constants: &mut crate::common::fx_hash::FxHashMap<String, i64>) {
+        match lhs {
+            Expr::Identifier(name, _) => {
+                constants.remove(name.as_str());
+            }
+            Expr::Cast(_, inner, _, _) | Expr::BitCast(_, inner, _) => {
+                Self::forget_lvalue(inner, constants)
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn parse_stmt(&mut self) -> Stmt {
+        let stmt = self.parse_stmt_guarded();
+        // Any store in this statement withdraws the parsed-constant record of
+        // the names it writes (see `invalidate_assigned_constants`).
+        if let Stmt::Expr(Some(expr)) = &stmt {
+            self.invalidate_assigned_constants(expr);
+        }
+        stmt
+    }
+
+    /// Frame-guarded entry point; the real dispatcher is `parse_stmt_inner`.
+    fn parse_stmt_guarded(&mut self) -> Stmt {
         if !self.enter_stmt_frame(self.peek_span()) {
             return Stmt::Expr(None);
         }
@@ -485,6 +551,7 @@ impl Parser {
     // === Inline assembly parsing ===
 
     fn parse_inline_asm(&mut self) -> Stmt {
+        let span = self.peek_span();
         self.advance(); // consume 'asm' / '__asm__'
         // Skip optional qualifiers: volatile, goto, inline
         while matches!(self.peek(), TokenKind::Volatile)
@@ -537,6 +604,7 @@ impl Parser {
             inputs,
             clobbers,
             goto_labels,
+            span,
         }
     }
 
@@ -561,19 +629,30 @@ impl Parser {
             return;
         }
         let is_x86 = matches!(crate::common::types::target_elf_machine(), 3 | 62);
-        // Fold the operand expressions first: the fold borrows the enum table
-        // immutably, and the diagnostics below need `&mut self`.
+        // Fold the operand expressions first: the fold borrows the parser's
+        // name tables immutably, and the diagnostics below need `&mut self`.
+        // Block-scope integer constants participate in the same fold as
+        // enumerators so `asm("" :: "i"(flags))` can be resolved later.
+        let mut fold_enums = self.enum_constants.clone();
+        for (name, value) in &self.local_constants {
+            fold_enums.entry(name.clone()).or_insert(*value);
+        }
+        let ctx = asm_validate::SymbolContext {
+            typedefs: &self.typedefs,
+            enums: &fold_enums,
+            functions: &self.function_names,
+        };
         let defer_immediate_constness = self.asm_immediate_validation_deferred;
         let constness: Vec<asm_validate::Constness> = outputs
             .iter()
             .chain(inputs.iter())
             .map(|op| {
-                let value = asm_validate::constness(&op.expr, &self.enum_constants);
+                let value =
+                    asm_validate::constness(&op.expr, &ctx, self.asm_deferred_instantiation);
                 if defer_immediate_constness && value == asm_validate::Constness::NonConstant {
-                    // Immediate-only constraints are resolved after mandatory
-                    // inlining. Unknown is deliberately not accepted as proof
-                    // that a non-inline/dynamic operand is valid; it merely
-                    // avoids a premature definition-site rejection.
+                    // Preserve the existing post-optimization deferral for
+                    // immediate-only constraints; dynamic operands are checked
+                    // once optimization has had a chance to fold them.
                     asm_validate::Constness::Unknown
                 } else {
                     value
@@ -586,6 +665,7 @@ impl Parser {
             .map(|(i, op)| asm_validate::Operand {
                 constraint: op.constraint.as_str(),
                 constant: constness[i],
+                name: op.name.as_deref(),
             })
             .collect();
         let in_view: Vec<asm_validate::Operand<'_>> = inputs
@@ -594,6 +674,7 @@ impl Parser {
             .map(|(i, op)| asm_validate::Operand {
                 constraint: op.constraint.as_str(),
                 constant: constness[outputs.len() + i],
+                name: op.name.as_deref(),
             })
             .collect();
         for problem in asm_validate::validate(template, &out_view, &in_view, label_count, is_x86) {

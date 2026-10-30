@@ -70,6 +70,20 @@ if cpu_has avx2 && cpu_has fma; then
              "-O2 -mavx2 -mfma -ffp-contract=off")
 fi
 cpu_has avx512f && levels+=("-O2 -mavx512f")
+
+# i686 (-m32) runtime differential: the whole-vector lowering publishes the
+# 16-byte SSE2 ceiling on i686 (pipeline.rs, `resolved_i686_sse2`), so every
+# 16-byte matrix shape must stay bit-identical to GCC in 32-bit code.  The
+# 32-byte shapes keep their per-lane scalar fallback at ceiling 16 (both
+# compilers agree: GCC's default -m32 baseline has no AVX).  Skipped loudly
+# when the environment has no 32-bit libc headers (host multilib or the
+# isolated sysroot via LCCC_SYSROOT) — CI and the sysroot-provisioned
+# sandbox both take the measuring path.
+if printf '#include <stdio.h>\n' | "$ccc" -m32 -fsyntax-only -x c - >/dev/null 2>&1; then
+    levels+=("-m32 -O0" "-m32 -O1" "-m32 -O2" "-m32 -O2 -mno-avx" "-m32 -Os")
+else
+    echo "SKIP: i686 runtime differential - no 32-bit libc headers in this environment"
+fi
 # Optional, explicit supplemental oracle configurations. Defaults retain the
 # complete host-supported matrix; code-quality/contraction checks always run.
 # Example: GCC=clang-23 "$0" --runtime-level "-O2 -mavx2 -ffp-contract=off"
@@ -157,7 +171,7 @@ for flags in "${levels[@]}"; do
         continue
     fi
     case $out in
-        *" checks passed") runs=$((runs + 1)) ;;
+        *" checks passed"*) runs=$((runs + 1)) ;;
         *) fail "runtime differential at $flags: unexpected output: $out" ;;
     esac
 done
@@ -263,6 +277,56 @@ ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
 ceiling shr_v32l 6     # signed 64-bit lanes: vpsrlvq + sign fix-up (xor/sub), GCC: 6
 ceiling shr_v16l 6
+
+# ---------------------------------------------- Part 2b: -m32 SSE2 ceilings
+# The i686 packed lowering (SSE2 ceiling, stack-slot homing) counts its own
+# measured shapes; GCC's default -m32 baseline (`-march=x86-64` minus the
+# 64-bit bit) reaches SSE2 too, so every witness below is a `p*` op that the
+# per-lane scalar form used to pay inline (173 adds -> 5 class, measured in
+# the backlog table).  Skipped with Part 1 when no 32-bit libc headers exist.
+if printf '#include <stdio.h>\n' | "$ccc" -m32 -fsyntax-only -x c - >/dev/null 2>&1; then
+    if ! "$ccc" -m32 -O2 -S "$src" -o "$tmp/m32.s" 2>"$tmp/m32.err"; then
+        fail "lccc -m32 -O2 -S: $(head -c 300 "$tmp/m32.err")"
+    else
+        # Positive packed witnesses: the 16-byte integer/FP binops, compares
+        # and the SSE2 integer multiply expansion must lower to packed ops.
+        for spec in             'add_v16i:paddd' 'sub_v16i:psubd' 'and_v16i:pand' 'or_v16i:por' \
+            'xor_v16i:pxor' 'add_v16c:paddb' 'add_v16s:paddw' 'mul_v16i:pmuludq' \
+            'add_v16f:addps' 'div_v16f:divps' 'add_v16d:addpd' \
+            'eq_v16i:pcmpeqd' 'lt_v16i:pcmpgtd' 'eq_v16f:cmpps' \
+            'splat_v16i:pshufd' 'ld_v16i:movups' 'st_v16i:movups'; do
+            fn=${spec%%:*}; want=${spec##*:}
+            if ! awk -v fn="$fn:" '$0 == fn {on=1; next} on && /^\s*\.cfi_endproc/{exit} on' "$tmp/m32.s" |
+                    grep -q "$want"; then
+                fail "-m32 $fn: expected $want in the packed lowering (per-lane scalarization regression)"
+            fi
+        done
+        # Instruction ceilings on the same shapes the x86-64 Part 2 pins
+        # (measured with this change; GCC's default -m32 baseline: same op
+        # counts plus its own prologue differences).
+        for fn in add_v16i sub_v16i and_v16i or_v16i xor_v16i add_v16c add_v16s \
+                  add_v16f sub_v16f mul_v16f div_v16f add_v16d div_v16d; do
+            n=$(awk -v fn="$fn:" '$0 == fn {on=1; next} on && /^\s*\.cfi_endproc/{exit} on {line=$0; sub(/^[ \t]+/,"",line); if (line=="" || line ~ /^[.#]/ || line ~ /:$/) next; n++} END {print n+0}' "$tmp/m32.s")
+            # The slot-homed staging costs a bounded number of movups over
+            # the bare two-op form; pin the measured envelope (never the
+            # 173-instruction scalar era).
+            if [ "$n" -gt 44 ]; then
+                fail "-m32 $fn: $n instructions at -O2 (packed ceiling 44)"
+            fi
+        done
+        n=$(awk -v fn="mul_v16i:" '$0 == fn {on=1; next} on && /^\s*\.cfi_endproc/{exit} on {line=$0; sub(/^[ \t]+/,"",line); if (line=="" || line ~ /^[.#]/ || line ~ /:$/) next; n++} END {print n+0}' "$tmp/m32.s")
+        if [ "$n" -gt 50 ]; then
+            fail "-m32 mul_v16i: $n instructions at -O2 (SSE2 pmuludq expansion ceiling 50)"
+        fi
+        # The compare matrix and shifts must not scalarize either.
+        for fn in eq_v16i lt_v16i eq_v16s lt_v16s shl_v16i shr_v16i; do
+            n=$(awk -v fn="$fn:" '$0 == fn {on=1; next} on && /^\s*\.cfi_endproc/{exit} on {line=$0; sub(/^[ \t]+/,"",line); if (line=="" || line ~ /^[.#]/ || line ~ /:$/) next; n++} END {print n+0}' "$tmp/m32.s")
+            if [ "$n" -gt 44 ]; then
+                fail "-m32 $fn: $n instructions at -O2 (compare/shift ceiling 44)"
+            fi
+        done
+    fi
+fi
 # Byte multiply through the word family: pmullw + mask + two shifts +
 # pmullw + shift + or (GCC: 10 / 12).
 ceiling mul_v32c 8

@@ -221,6 +221,28 @@ are Callgrind counts (modeled, not hardware).
 * **Ir gaps to GCC 16.2:** reduction_vecreg 3278 vs 1721, popcount 5801
   vs 4728, nbody 3385 vs 2965, switch_dispatch 978 vs 766, zstd
   `double_fast` 2823.5 vs 2686.2.
+* **i686 aggregate/32-byte stack ABI (fixed).** The vector-extension m32
+  differential now runs with no ABI exclusions. GCC 16.2 `-m32` honours the
+  natural alignment of a stack record whose type contains a GNU vector
+  (`struct { v16i; int; }` at `ebp+24`, `struct { v32f; }` at `ebp+40`),
+  while an explicitly `aligned(N)` or ordinary record stays 4-granular.
+  `Lowerer::i386_gnu_vector_memory_classes` emits the same
+  `[Memory, NoClass]` marker used by raw vectors for exactly
+  `contains_gnu_vector && !has_user_align`, after the SysV register-carrier
+  check so XMM-passed 32/64-byte vectors are untouched. The caller, the
+  callee prologue and `va_arg` share `i386_gnu_vector_stack_align`.
+* **SSE2-baseline vector value reuse (hot-instruction evidence,
+  2026-10-30).** `hotdiff --bench double_reduction` attributes the 1.104 Ir
+  ratio to the legacy (non-VEX) path re-reading images from slots per use:
+  `movdqu +167,772,160`, `pshufd +134,217,728` versus GCC 16.2 (which folds
+  the multi-use loads into `pmuludq`-mem and selects odd lanes with
+  `psrlq`+`punpckldq`).  `zlib_ng_adler32` (1.036) attributes to the byte
+  loop's structure: `lea +39,852,227`, `mov +12,776,255`, `sub +12,582,921`
+  — its 8x-unrolled body computes the a/b chains through `lea`+register
+  moves where GCC uses straight `addl` chains with one branch per 8 bytes.
+  Both are register/callocation quality (the §5.1 ownership note), measured
+  with `scripts/hotdiff.py`; fix candidates: legacy-path value caching for
+  the SSE2 emitter and lea→add/mov fusion in the unrolled byte loop.
 * **Unsigned-exit reductions** (`for (size_t i...) s += x[i]`) stay scalar
   under the Slt/Sgt restriction of the reduction recognizer. A census of 74
   benchmark programs at `-O2` and `-O3 -march=x86-64-v3` found no

@@ -20,7 +20,8 @@ use super::flag_peepholes::flags_dead_after;
 use super::helpers::{HIGH_BYTE_NAMES, get_dest_reg, has_implicit_reg_usage, writes_family};
 use super::liveness::{DeadWriteRefresh, FileLiveness};
 use super::relay_and_lea::{
-    is_relayable_family, plain_gp_operand, provably_dead_lv, split_two_operands,
+    RbpRoles, is_relayable_family, is_writable_family_gpr, plain_gp_operand, provably_dead_lv,
+    split_two_operands,
 };
 use crate::common::fx_hash::FxHashMap;
 
@@ -131,6 +132,7 @@ pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInf
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
     let mut upkeep = DeadWriteRefresh::new();
+    let mut rbp_roles = RbpRoles::default();
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -167,7 +169,12 @@ pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
-        if !is_relayable_family(fam) {
+        // rbp is admitted only when whole-function evidence proves it is an
+        // allocator-owned GPR, not the frame/CFA register.  Callee-save
+        // push/pop pairs alone do not veto it.  Every other guard, especially
+        // the independent flag-deadness proof below, is unchanged.
+        let rbp_gpr = fam == REG_RBP && rbp_roles.is_gpr(&lv, store, infos, i);
+        if !is_writable_family_gpr(fam, rbp_gpr) {
             i += 1;
             continue;
         }
@@ -183,6 +190,7 @@ pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInf
             continue;
         }
         upkeep.delete(&mut lv, store, infos, i);
+        rbp_roles.edited(&lv, store, infos, i);
         changed = true;
         i += 1;
     }
@@ -194,6 +202,7 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
     let mut upkeep = DeadWriteRefresh::new();
+    let mut rbp_roles = RbpRoles::default();
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -223,7 +232,12 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
-        if !is_relayable_family(fam) {
+        // Do not make an allocator decision part of the cleanup's power: rbp
+        // is a normal destination only under the same function-wide role proof
+        // used by the relay/flag passes.  The value and any source memory still
+        // have to pass their independent guards above and below.
+        let rbp_gpr = fam == REG_RBP && rbp_roles.is_gpr(&lv, store, infos, i);
+        if !is_writable_family_gpr(fam, rbp_gpr) {
             i += 1;
             continue;
         }
@@ -234,6 +248,7 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
         upkeep.before_query(&mut lv, store, infos, i, fam);
         if provably_dead_lv(&lv, store, infos, i, fam, &[i]) {
             upkeep.delete(&mut lv, store, infos, i);
+            rbp_roles.edited(&lv, store, infos, i);
             changed = true;
         }
         i += 1;
@@ -1730,6 +1745,28 @@ mod tests {
             .join("\n")
     }
 
+    /// Run only the two dead-write passes to their joint fixpoint.  Keeping
+    /// the rest of the pipeline out of this fixture makes the assertions name
+    /// the register-role and flag-liveness contracts under test.
+    fn run_dead_write_fixpoint(asm: &str) -> String {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        loop {
+            let pure = eliminate_dead_pure_writes(&store, &mut infos);
+            let flagged = eliminate_dead_flag_writes(&store, &mut infos);
+            if !pure && !flagged {
+                break;
+            }
+        }
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The hazard at the pass that actually consumes it.  `.byte 0xf5`
     /// is `cmc`: it reads and writes EFLAGS, so the flags are NOT dead after it
     /// and the producer must survive.  Before the fix, every walker in both
@@ -1771,6 +1808,62 @@ mod tests {
                 "{d:?}: bookkeeping blocked guard 4:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn dead_flag_write_to_gpr_rbp_is_retired_but_frame_rbp_is_not() {
+        let gpr = run_dead_flag_writes(concat!(
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    addl $1, %ebp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+        ));
+        assert!(!gpr.contains("addl $1, %ebp"), "{gpr}");
+        let frame = run_dead_flag_writes(concat!(
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    movq %rsp, %rbp\n",
+            ".cfi_def_cfa_register 6\n",
+            "    addl $1, %ebp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+        ));
+        assert!(frame.contains("addl $1, %ebp"), "{frame}");
+    }
+
+    #[test]
+    fn dead_pure_write_to_gpr_rbp_is_retired_but_frame_rbp_is_not() {
+        let gpr = run_dead_write_fixpoint(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    leaq (%rsi, %rdi), %rbp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!gpr.contains("leaq (%rsi, %rdi), %rbp"), "{gpr}");
+        let frame = run_dead_write_fixpoint(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    movq %rsp, %rbp\n",
+            ".cfi_def_cfa_register 6\n",
+            "    leaq (%rsi, %rdi), %rbp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(frame.contains("leaq (%rsi, %rdi), %rbp"), "{frame}");
     }
 
     fn slot_refs(out: &str, slot: &str) -> usize {
@@ -2644,6 +2737,72 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("movl %eax, (%rsi,%rbx,4)"), "{out}");
+    }
+
+    #[test]
+    fn dead_address_chain_through_plain_gpr_rbp_is_retired() {
+        // This is the orphaned SIB-address shape in zlib-ng's insertion loop:
+        // the store uses (%rdx,%rbx,2), not the separately staged rbp address.
+        // The add's flags die at the loop-varying sub before any consumer.
+        let out = run_dead_write_fixpoint(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbx, -16\n",
+            "    pushq %r14\n",
+            ".cfi_def_cfa_offset 24\n",
+            ".cfi_offset %r14, -24\n",
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 32\n",
+            ".cfi_offset %rbp, -32\n",
+            "    xorl %edi, %edi\n",
+            ".L1:\n",
+            "    movzwl %r10w, %ebx\n",
+            "    andl $16383, %ebx\n",
+            "    movl %ebx, %r14d\n",
+            "    addq %r14, %r14\n",
+            "    leaq (%rdx, %r14), %rbp\n",
+            "    movw %r11w, (%rdx, %rbx, 2)\n",
+            "    subl $1, %r8d\n",
+            "    addl $1, %edi\n",
+            "    cmpl $4, %edi\n",
+            "    jne .L1\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 24\n",
+            "    popq %r14\n",
+            ".cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("leaq (%rdx, %r14), %rbp"), "{out}");
+        assert!(!out.contains("addq %r14, %r14"), "{out}");
+        assert!(!out.contains("movl %ebx, %r14d"), "{out}");
+        assert!(out.contains("movw %r11w, (%rdx, %rbx, 2)"), "{out}");
+        assert!(out.contains("andl $16383, %ebx"), "{out}");
+    }
+
+    #[test]
+    fn frame_pointer_rbp_is_not_admitted_to_dead_write_cleanup() {
+        // The role gate is deliberately function-wide.  Even a locally dead
+        // rbp write stays untouched once rbp carries the frame/CFA contract.
+        let out = run_dead_write_fixpoint(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    movq %rsp, %rbp\n",
+            ".cfi_def_cfa_register 6\n",
+            "    leaq (%rsi, %rdi), %rbp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq (%rsi, %rdi), %rbp"), "{out}");
     }
 
     /// A register read only inside an address is a use: the dead-write pass

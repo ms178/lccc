@@ -1104,7 +1104,7 @@ jobs:
     - name: Inline-asm memory operands always carry an address
       run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_rmwcc_mem_operand.py
     - name: Inline-asm operand and template diagnostics match GCC 16.2
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
+      run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
     - name: One-lane ext_vector FP/int carrier correctness
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_lane1_abi.sh
     - name: Ill-typed builtin acceptance
@@ -1247,6 +1247,16 @@ jobs:
       run: |
         [ -s "$RUNNER_TEMP/vector-ext-codegen.log" ] || exit 0
         python3 scripts/ci_annotate_log.py --title "vector-ext codegen" "$RUNNER_TEMP/vector-ext-codegen.log"
+    - name: MMX intrinsics differential and packed-codegen witnesses
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_mmx_intrinsics.sh 2>&1 |
+          tee "$RUNNER_TEMP/mmx-intrinsics.log"
+    - name: Surface MMX intrinsic failures in annotations
+      if: failure()
+      run: |
+        [ -s "$RUNNER_TEMP/mmx-intrinsics.log" ] || exit 0
+        python3 scripts/ci_annotate_log.py --title "MMX intrinsics" "$RUNNER_TEMP/mmx-intrinsics.log"
     needs:
     - build
   codegen-a:
@@ -2663,6 +2673,11 @@ jobs:
         # only).  Mirrored in scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_char_signedness.sh
         bash tests/regression/check_asm_goto_phi_edge.sh
+        # asm-goto output operands: label-edge materialization, @cc suffix
+        # contract, multi-digit %l<N> numbering and the x86-64 flag-output
+        # fusion (mirrored in scripts/ci_local.sh as `asm-goto-outputs`,
+        # parity-checked).
+        bash tests/regression/check_asm_goto_outputs.sh
         # The differential oracle's own contract suites, compiler-free
         # like the encdiff one but anchored to the REAL pinned pair
         # (provisioned above): asmdiff's parser/oracle unit tests

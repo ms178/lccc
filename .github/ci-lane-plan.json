@@ -324,7 +324,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 426.208,
+      "predicted_gate_seconds": 428.208,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -703,6 +703,10 @@
         {
           "measured_s": 5.61,
           "name": "bash tests/regression/check_vec_dead_remainder.sh"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "bash tests/regression/check_asm_goto_outputs.sh"
         }
       ]
     },
@@ -1353,7 +1357,7 @@
     "frontend-c": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 273.42,
+      "predicted_gate_seconds": 279.52,
       "shards": 3,
       "steps": [
         {
@@ -1419,6 +1423,14 @@
         {
           "measured_s": 56.0,
           "name": "GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)"
+        },
+        {
+          "measured_s": 6.0,
+          "name": "MMX intrinsics differential and packed-codegen witnesses"
+        },
+        {
+          "measured_s": 0.1,
+          "name": "Surface MMX intrinsic failures in annotations"
         },
         {
           "measured_s": 5.0,

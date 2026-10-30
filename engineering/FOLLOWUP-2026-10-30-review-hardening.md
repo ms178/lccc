@@ -1,11 +1,11 @@
 # Review hardening: shared contracts and the honest scope of this change
 
 This change lands four contract simplifications and one new coalescing shape.
-It does **not** carry a reducer rewrite: the strided-32-bit reducer in this tree
-keeps its current `seed` / `emit_reduce_epilogue` / driver split and its
-`fn transform(...) -> usize` signature, complete with the decline-before-mutate
-discipline described below. Anything a review of the wider work suggested that
-is not visible in `git show` of this commit is out of scope here.
+It does **not** carry a reducer rewrite: the strided-32-bit reducer keeps its
+`VectorSchedule` / `build_preheader` / `emit_vector_body` / `emit_reduce` split
+and its `fn transform(...) -> Option<usize>` signature, complete with the
+decline-before-mutate discipline described below. Anything a review of the
+wider work suggested that is not visible in the tree is out of scope here.
 
 ## What this commit lands
 
@@ -36,10 +36,11 @@ is not visible in `git show` of this commit is out of scope here.
 ## Declining before mutating (existing property, kept)
 
 `transform` in the strided reducer performs no IR mutation until every plan
-buffer is built and every scalar-header phi target is validated. That property
-is what lets the reducer stay infallible at the call site and is deliberately
-preserved; this commit does not convert its return type and does not remove the
-`debug_assert!` that keeps the compact-load invariant loud in test builds.
+buffer is built and every scalar-header phi target is validated. It returns
+`None` (leaving the scalar function untouched) when the schedule, the resume
+constant, or any emit stage declines; the commit point is reached only after
+all of those proofs succeed. The `debug_assert!` that keeps the compact-load
+invariant loud in test builds is deliberately preserved.
 
 ## Classifications stay separate on purpose
 

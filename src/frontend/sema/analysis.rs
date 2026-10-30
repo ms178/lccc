@@ -279,6 +279,13 @@ pub struct SemanticAnalyzer {
     /// `void *` is silent) while the constraint errors still fire, so the
     /// warning sites consult this. Measured on gcc-16.2.
     unevaluated_depth: Cell<u32>,
+    /// Depth of operands whose evaluation is guaranteed not to happen:
+    /// the right side of a `&&`/`||` whose left side is a constant that
+    /// decides it, and the untaken arm of a `?:` with a constant
+    /// condition.  GCC's `-Wdiv-by-zero` is syntactic -- it fires in
+    /// `if (0)` and inside both arms of a non-constant `?:` -- but it does
+    /// honour these three operators (measured on gcc-16.2.0).
+    div_zero_quiet: Cell<u32>,
     /// One-shot marker for a dereference directly underneath `&`. `&*p` is
     /// the one use of a pointer to an incomplete type that does not compute a
     /// value (C23 6.5.3.2p4), so gcc-16.2 accepts it while `*p` -- even as a
@@ -316,6 +323,7 @@ impl SemanticAnalyzer {
             active_break_targets: Vec::new(),
             active_continue_targets: Vec::new(),
             unevaluated_depth: Cell::new(0),
+            div_zero_quiet: Cell::new(0),
             address_of_operand: Cell::new(false),
         };
         // Pre-populate with common implicit declarations
@@ -3392,7 +3400,18 @@ impl SemanticAnalyzer {
             Expr::FunctionCall(callee, args, _) => self.analyze_call(expr, callee, args),
             Expr::BinaryOp(op, lhs, rhs, span) => {
                 self.analyze_expr(lhs);
-                self.analyze_expr(rhs);
+                // `0 && x` and `1 || x` never evaluate `x`, and GCC's
+                // division verdict follows that (`u() && 1 / 0` still warns).
+                let short_circuited = match (op, Self::expr_int_value(lhs)) {
+                    (BinOp::LogicalAnd, Some(0)) => true,
+                    (BinOp::LogicalOr, Some(v)) if v != 0 => true,
+                    _ => false,
+                };
+                if short_circuited {
+                    self.analyze_unevaluated_by_constant(rhs);
+                } else {
+                    self.analyze_expr(rhs);
+                }
                 // Check pointer subtraction type compatibility (C11 6.5.6p3):
                 // both operands must point to compatible types.
                 if *op == BinOp::Sub {
@@ -3401,6 +3420,7 @@ impl SemanticAnalyzer {
                 self.check_incomplete_pointer_arithmetic(lhs, rhs, *op, *span);
                 self.check_pointer_comparison_spaces(op, lhs, rhs, *span);
                 self.warn_sign_compare(*op, lhs, rhs, *span);
+                self.warn_div_by_zero(*op, lhs, rhs, *span);
                 self.check_binary_operands(*op, lhs, rhs, *span);
             }
             Expr::UnaryOp(op, operand, span) => {
@@ -3518,8 +3538,20 @@ impl SemanticAnalyzer {
             }
             Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
-                self.analyze_expr(then_expr);
-                self.analyze_expr(else_expr);
+                match Self::expr_int_value(cond) {
+                    Some(0) => {
+                        self.analyze_unevaluated_by_constant(then_expr);
+                        self.analyze_expr(else_expr);
+                    }
+                    Some(_) => {
+                        self.analyze_expr(then_expr);
+                        self.analyze_unevaluated_by_constant(else_expr);
+                    }
+                    None => {
+                        self.analyze_expr(then_expr);
+                        self.analyze_expr(else_expr);
+                    }
+                }
                 self.check_conditional_pointer_spaces(then_expr, else_expr, *span);
                 self.check_scalar_condition(cond);
                 self.check_conditional_arms(then_expr, else_expr, *span);
@@ -5545,6 +5577,16 @@ impl SemanticAnalyzer {
         self.unevaluated_depth
             .set(self.unevaluated_depth.get().saturating_sub(1));
         self.address_of_operand.set(prev_addr_of);
+    }
+
+    /// Analyse an operand that is never evaluated because its parent's
+    /// constant operand decides the outcome. Type checking still happens;
+    /// only the "cannot be evaluated" family of warnings is quietened.
+    fn analyze_unevaluated_by_constant(&mut self, expr: &Expr) {
+        self.div_zero_quiet.set(self.div_zero_quiet.get() + 1);
+        self.analyze_expr(expr);
+        self.div_zero_quiet
+            .set(self.div_zero_quiet.get().saturating_sub(1));
     }
 
     /// Whether the operand being judged is unevaluated (`sizeof` and friends).
@@ -8278,6 +8320,31 @@ dereference it before applying '->' to it?"
     /// `4`, `1-3` -> `-2`). Identifiers never fold, even when declared
     /// `const` (`a[N]` keeps its source), and division keeps integer
     /// semantics with a zero divisor refusing the fold.
+    /// `-Wdiv-by-zero`: a constant zero divisor in an *integer* division or
+    /// remainder. GCC diagnoses exactly that case -- a floating-point divisor
+    /// of zero is IEEE arithmetic, and a runtime zero is not visible here --
+    /// with the same one-line wording, on by default in C.
+    fn warn_div_by_zero(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        if !matches!(op, BinOp::Div | BinOp::Mod) {
+            return;
+        }
+        if self.div_zero_quiet.get() > 0 || self.in_unevaluated_operand() {
+            return;
+        }
+        let is_floating = self
+            .expr_type_checker()
+            .infer_expr_ctype(lhs)
+            .is_some_and(|ty| ty.is_floating());
+        if is_floating || Self::expr_int_value(rhs) != Some(0) {
+            return;
+        }
+        self.diagnostics.borrow_mut().warning_with_kind(
+            "division by zero",
+            span,
+            crate::common::error::WarningKind::DivByZero,
+        );
+    }
+
     fn expr_int_value(expr: &Expr) -> Option<i64> {
         match expr {
             Expr::IntLiteral(v, _) => Some(*v),
