@@ -1612,6 +1612,12 @@ score went from 32/51 to 41/51 with the remaining ten accounted for below.
   attribute list included), a definition at its name (`int k() {}` → the
   `k`). Pinned by the option-effect ledger, which compares the verdict
   locations against GCC on a three-shape fixture.
+* The C23 attribute specifier runs the same placement check as
+  `__attribute__`: `int b [[gnu::noreturn]];` and `int c [[gnu::packed]];`
+  report `'noreturn' attribute ignored` / `'packed' attribute ignored`, and
+  the standard spelling keeps its own measured sentence,
+  `standard 'noreturn' attribute can only be applied to functions`. The
+  legal placements stay silent, including `[[gnu::packed]] struct S { ... };`.
 * Coverage: `check_attribute_diagnostics.py` grew to 49 probes (two
   `noreturn`-on-a-function-type silences, three `cleanup` verdicts, one
   silent well-formed `cleanup`), and `DiagnosticEngine::note` makes the
@@ -1621,8 +1627,7 @@ Remaining measured deltas, kept explicit: when an attribute sits on a later
 line than the declaration, GCC's caret lands on that line's first token while
 LCCC reports the declaration start (the same rule decides
 `'x' attribute directive ignored`, which still points at the name token);
-`int x [[gnu::noreturn]];` under `-std=c23` is silent here because the C23
-attribute-specifier path does not yet run the placement verdict; a macro
+a macro
 expansion adds a `note: in expansion of macro` that GCC omits; and
 `int a[1 / 0];` prints its warning after the semantic error in LCCC
 (GCC: warning first), with the counted driver summary as a third line that

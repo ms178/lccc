@@ -1845,6 +1845,18 @@ impl Parser {
                     }
                     "noreturn" | "_Noreturn" => {
                         self.attrs.set_noreturn(true);
+                        // C23 spells the verdict differently from the GNU
+                        // namespace: `int a [[noreturn]];` reports
+                        // `standard 'noreturn' attribute can only be applied to
+                        // functions`, while `[[gnu::noreturn]]` reports the
+                        // generic sentence (both measured on gcc-16.2.0). The
+                        // marker prefix keeps the two wordings apart in the
+                        // shared placement check.
+                        self.attrs.parsing_attr_targets.push((
+                            "standard:noreturn".to_string(),
+                            self.peek_span(),
+                            crate::frontend::parser::attribute_registry::AttributeTarget::Function,
+                        ));
                         self.advance();
                         if matches!(self.peek(), TokenKind::LParen) {
                             self.skip_balanced_parens();
@@ -1892,6 +1904,20 @@ impl Parser {
                     }
                 },
                 Some("gnu") => {
+                    // `[[gnu::noreturn]] int x;` is the same mistake as
+                    // `__attribute__((noreturn)) int x;` and carries the same
+                    // verdict, so the C23 spelling records the placement the
+                    // one funnel checks (measured: `'noreturn' attribute
+                    // ignored`, `'packed' attribute ignored`).
+                    use crate::frontend::parser::attribute_registry as registry;
+                    let target = registry::target(&attr_name);
+                    if target != registry::AttributeTarget::Any {
+                        self.attrs.parsing_attr_targets.push((
+                            registry::canonical(&attr_name).to_string(),
+                            self.peek_span(),
+                            target,
+                        ));
+                    }
                     self.dispatch_gcc_attribute(
                         &attr_name,
                         is_packed,
@@ -2329,6 +2355,9 @@ impl Parser {
                 let message = match name.as_str() {
                     "naked" => format!("\'{name}\' attribute only applies to functions"),
                     "noplt" => format!("\'{name}\' attribute is only applicable on functions"),
+                    "standard:noreturn" => {
+                        "standard 'noreturn' attribute can only be applied to functions".to_string()
+                    }
                     _ => format!("\'{name}\' attribute ignored"),
                 };
                 // One verdict per attribute list: gcc-16.2 reports
