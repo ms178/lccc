@@ -819,7 +819,7 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
         } if true_label == body && false_label == exit => c,
         _ => return false,
     };
-    if guard_cond == latch_cond || func.blocks[h].instructions.len() != 1 {
+    if guard_cond == latch_cond {
         return false;
     }
 
@@ -853,14 +853,10 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
             _ => None,
         }
     }
-    // The header gate above (`instructions.len() != 1`) has already proven the
-    // header holds exactly this compare, so the site is a constant and every
-    // later rewrite can address it by index.
-    const GUARD_CMP: usize = 0;
-    let guard_cmp = GUARD_CMP;
-    let Some((iv, limit_const, ty)) =
-        cmp_shape(&func.blocks[h].instructions[guard_cmp], guard_cond)
-    else {
+    let [guard_inst] = func.blocks[h].instructions.as_slice() else {
+        return false;
+    };
+    let Some((iv, limit_const, ty)) = cmp_shape(guard_inst, guard_cond) else {
         return false;
     };
     let Some(latch_cmp) = func.blocks[t]
@@ -888,21 +884,22 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
         return false;
     }
 
-    let mut iv_defs = Vec::new();
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if inst.dest() == Some(iv) {
-                iv_defs.push((bi, ii));
-            }
-        }
+    // Both recurrence definitions must be unique in their small home blocks.
+    // The global validation scan below rejects definitions anywhere else, so
+    // collecting either definition set with another full-function walk would
+    // duplicate work without strengthening the proof.
+    fn sole_def(insts: &[Instruction], value: Value) -> Option<usize> {
+        let mut defs = insts
+            .iter()
+            .enumerate()
+            .filter_map(|(ii, inst)| (inst.dest() == Some(value)).then_some(ii));
+        let def = defs.next()?;
+        defs.next().is_none().then_some(def)
     }
-    if iv_defs.len() != 2 {
-        return false;
-    }
-    let Some(&(_, init)) = iv_defs.iter().find(|(bi, _)| *bi == p) else {
-        return false;
-    };
-    let Some(&(_, copy)) = iv_defs.iter().find(|(bi, _)| *bi == t) else {
+    let (Some(init), Some(copy)) = (
+        sole_def(&func.blocks[p].instructions, iv),
+        sole_def(&func.blocks[t].instructions, iv),
+    ) else {
         return false;
     };
     if !matches!(
@@ -925,18 +922,10 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
         return false;
     }
 
-    let mut next_defs = Vec::new();
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if inst.dest() == Some(next) {
-                next_defs.push((bi, ii));
-            }
-        }
-    }
-    if next_defs.len() != 1 || next_defs[0].0 != t {
+    // `next` has the same single-home-block contract as `iv`.
+    let Some(update) = sole_def(&func.blocks[t].instructions, next) else {
         return false;
-    }
-    let update = next_defs[0].1;
+    };
     if !matches!(
         func.blocks[t].instructions[update],
         Instruction::BinOp {
@@ -952,27 +941,29 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
         return false;
     }
 
-    // No semantic use may survive outside the three recurrence sites.  This
-    // also rejects live-out values, asm outputs, hidden pointer uses and a
-    // second condition consuming either compare result.
+    // No unapproved definition or semantic use may survive outside the
+    // recurrence sites. This also rejects live-out values, asm outputs,
+    // hidden pointer uses and a second condition consuming either compare.
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             let site = (bi, ii);
             let mut valid = true;
+            // The header was matched as a one-instruction slice above, so
+            // `bi == h` is the guard site; no magic instruction index is
+            // needed here or during removal.
+            if (inst.dest() == Some(iv) && site != (p, init) && site != (t, copy))
+                || (inst.dest() == Some(next) && site != (t, update))
+            {
+                valid = false;
+            }
             inst.for_each_used_value(|v| {
-                if v == iv.0
-                    && site != (h, guard_cmp)
-                    && site != (t, update)
-                    && site != (t, latch_cmp)
-                {
+                if v == iv.0 && bi != h && site != (t, update) && site != (t, latch_cmp) {
                     valid = false;
                 }
                 if v == next.0 && site != (t, copy) {
                     valid = false;
                 }
-                if (v == guard_cond.0 && site != (h, guard_cmp))
-                    || (v == latch_cond.0 && site != (t, latch_cmp))
-                {
+                if (v == guard_cond.0 && bi != h) || (v == latch_cond.0 && site != (t, latch_cmp)) {
                     valid = false;
                 }
             });
@@ -1001,10 +992,10 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
         src: Operand::Const(limit_const),
     };
     let guard = &mut func.blocks[h];
-    if guard.source_spans.len() == guard.instructions.len() {
-        guard.source_spans.remove(guard_cmp);
-    }
-    guard.instructions.remove(guard_cmp);
+    guard.instructions.clear();
+    // The matched guard is now empty, so this is the only parallel span
+    // representation whether debug tracking was enabled or not.
+    guard.source_spans.clear();
     func.blocks[h].terminator = Terminator::Branch(body);
     if let Instruction::BinOp { op, .. } = &mut func.blocks[t].instructions[update] {
         *op = IrBinOp::Sub;
@@ -1194,8 +1185,12 @@ mod tests {
     #[test]
     fn dead_constant_trip_loop_downcounts_and_removes_guard() {
         let mut f = dead_counted_loop(8, IrType::U32);
+        f.blocks[1]
+            .source_spans
+            .push(crate::common::source::Span::dummy());
         assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
         assert_downcounted(&f, 8, IrType::U32);
+        assert!(f.blocks[1].source_spans.is_empty());
     }
 
     #[test]
@@ -1291,10 +1286,53 @@ mod tests {
             }
         }
 
+        let mut duplicate_next = dead_counted_loop(8, IrType::U32);
+        duplicate_next.blocks[0]
+            .instructions
+            .push(Instruction::Copy {
+                dest: Value(26),
+                src: Operand::Const(IrConst::from_i64(0, IrType::U32)),
+            });
+
+        let mut duplicate_next_in_latch = dead_counted_loop(8, IrType::U32);
+        duplicate_next_in_latch.blocks[2].instructions.insert(
+            1,
+            Instruction::Copy {
+                dest: Value(26),
+                src: Operand::Const(IrConst::from_i64(0, IrType::U32)),
+            },
+        );
+
+        let mut duplicate_iv_in_preheader = dead_counted_loop(8, IrType::U32);
+        duplicate_iv_in_preheader.blocks[0]
+            .instructions
+            .push(Instruction::Copy {
+                dest: Value(20),
+                src: Operand::Const(IrConst::from_i64(0, IrType::U32)),
+            });
+
+        let mut duplicate_iv_in_exit = dead_counted_loop(8, IrType::U32);
+        duplicate_iv_in_exit.blocks[3]
+            .instructions
+            .push(Instruction::Copy {
+                dest: Value(20),
+                src: Operand::Const(IrConst::from_i64(0, IrType::U32)),
+            });
+
         for (name, mut f) in [
             ("signed", signed),
             ("step two", step_two),
             ("variable limit", variable_limit),
+            ("duplicate next definition", duplicate_next),
+            (
+                "duplicate next definition in latch",
+                duplicate_next_in_latch,
+            ),
+            (
+                "duplicate iv definition in preheader",
+                duplicate_iv_in_preheader,
+            ),
+            ("duplicate iv definition in exit", duplicate_iv_in_exit),
         ] {
             assert_eq!(
                 invert_loops_with(&mut f, LoopInvertConfig::testing()),

@@ -919,6 +919,41 @@ fn call_preserved_homes(inst: &MachInst) -> FxHashSet<u8> {
     preserved
 }
 
+/// Architecture-implied writes shared by the core and allocating last-write
+/// classifiers. Callback order is part of the contract: a typed return move
+/// follows the call clobbers, so the allocating path's same-index overwrite
+/// and the core path's explicit Precolor tie-break both retain the return.
+fn for_each_implicit_write(inst: &MachInst, mut record: impl FnMut(u8, WindowWriteKind)) {
+    match inst {
+        MachInst::Cqto { .. } | MachInst::Div { .. } => {
+            record(0, WindowWriteKind::ScratchOrClobber);
+            record(16, WindowWriteKind::ScratchOrClobber);
+        }
+        MachInst::XorRdx => record(16, WindowWriteKind::ScratchOrClobber),
+        MachInst::Raw(text) => {
+            let mut written = Vec::new();
+            raw_written_regs(text, &mut written);
+            for r in written {
+                record(r, WindowWriteKind::ScratchOrClobber);
+            }
+        }
+        MachInst::Call { .. } | MachInst::CallTyped { .. } => {
+            let preserved = call_preserved_homes(inst);
+            for r in [14u8, 15, 16, 12, 13, 10, 11] {
+                if !preserved.contains(&r) {
+                    record(r, WindowWriteKind::ScratchOrClobber);
+                }
+            }
+            if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
+                if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
+                    record(p.0, WindowWriteKind::Precolor);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Per-register LAST-write classification for a window that contains no
 /// allocated vregs: every destination-position register write is a
 /// pre-colored definition, and only the architecture-implied writes
@@ -948,50 +983,11 @@ pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, Windo
                 record(p.0, idx, WindowWriteKind::Precolor, &mut last);
             }
         }
-        // Implicit writes beyond destination positions.
-        match inst {
-            MachInst::Cqto { .. } | MachInst::Div { .. } => {
-                record(0, idx, WindowWriteKind::ScratchOrClobber, &mut last);
-                record(16, idx, WindowWriteKind::ScratchOrClobber, &mut last);
-            }
-            MachInst::XorRdx => {
-                record(16, idx, WindowWriteKind::ScratchOrClobber, &mut last);
-            }
-            MachInst::Raw(text) => {
-                let mut written: Vec<u8> = Vec::new();
-                raw_written_regs(text, &mut written);
-                for r in written {
-                    record(r, idx, WindowWriteKind::ScratchOrClobber, &mut last);
-                }
-            }
-            MachInst::Call { .. } | MachInst::CallTyped { .. } => {
-                // SysV integer caller-clobber set (rax is not a home; the
-                // six argument registers and r10/r11 are). CallTyped's
-                // embedded save/restore pair PRESERVES every register in
-                // `caller_saves` and `ipa_keep` across the call — the
-                // pre-call state remains the register's truth for those, so
-                // no event is recorded for them (kernel calculate_imbalance: a saved
-                // r11 would otherwise be misclassified as clobbered and
-                // poison a sound alias read downstream).  CallTyped's
-                // embedded ret-move targets its own dst AFTER the call —
-                // the dst-position scan above only sees operand
-                // positions, so classify the ret home as a Precolor write
-                // at this index explicitly (recorded after the clobbers,
-                // and the equal-index rule prefers Precolor).
-                let preserved = call_preserved_homes(inst);
-                for r in [14u8, 15, 16, 12, 13, 10, 11] {
-                    if !preserved.contains(&r) {
-                        record(r, idx, WindowWriteKind::ScratchOrClobber, &mut last);
-                    }
-                }
-                if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
-                    if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
-                        record(p.0, idx, WindowWriteKind::Precolor, &mut last);
-                    }
-                }
-            }
-            _ => {}
-        }
+        // Implicit writes beyond destination positions use the SAME event
+        // stream as the allocating classifier below.
+        for_each_implicit_write(inst, |r, kind| {
+            record(r, idx, kind, &mut last);
+        });
     }
     last.into_iter().map(|(r, (_, k))| (r, k)).collect()
 }
@@ -1364,43 +1360,11 @@ pub(crate) fn allocate_window(
         if !is_core {
             continue;
         }
-        // Implicit writes (same law as the core classifier).
-        match inst {
-            MachInst::Cqto { .. } | MachInst::Div { .. } => {
-                for r in [0u8, 16] {
-                    last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
-                }
-            }
-            MachInst::XorRdx => {
-                last.insert(16, (fi, WindowWriteKind::ScratchOrClobber));
-            }
-            MachInst::Raw(text) => {
-                let mut written: Vec<u8> = Vec::new();
-                raw_written_regs(text, &mut written);
-                for r in written {
-                    last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
-                }
-            }
-            MachInst::Call { .. } | MachInst::CallTyped { .. } => {
-                // Same save/IPA-aware law as the core classifier: registers
-                // in caller_saves are preserved by the embedded restore and
-                // ipa_keep registers by the verified callee — their pre-call
-                // state stays true, so they keep whatever event preceded the
-                // call.
-                let preserved = call_preserved_homes(inst);
-                for r in [14u8, 15, 16, 12, 13, 10, 11] {
-                    if !preserved.contains(&r) {
-                        last.insert(r, (fi, WindowWriteKind::ScratchOrClobber));
-                    }
-                }
-                if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
-                    if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
-                        last.insert(p.0, (fi, WindowWriteKind::Precolor));
-                    }
-                }
-            }
-            _ => {}
-        }
+        // Shared with the core classifier; insertion order is significant
+        // for same-index call clobbers followed by a typed return move.
+        for_each_implicit_write(inst, |r, kind| {
+            last.insert(r, (fi, kind));
+        });
     }
     let writes = last.into_iter().map(|(r, (_, k))| (r, k)).collect();
     let vreg_writers: FxHashMap<u8, u32> = vreg_last
@@ -2515,10 +2479,15 @@ mod tests {
         assert!(preserved.contains(&13), "saved/restored r9 must survive");
         assert!(!preserved.contains(&14), "rdi remains caller-clobbered");
 
-        let writes = window_last_writes_core(&[
+        let insts = vec![
             MachInst::Mov {
                 src: MachOperand::Imm(7),
                 dst: MachOperand::Reg(phys(12)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Imm(8),
+                dst: MachOperand::Reg(phys(13)),
                 size: OpSize::S64,
             },
             MachInst::Mov {
@@ -2527,8 +2496,62 @@ mod tests {
                 size: OpSize::S64,
             },
             call,
-        ]);
+        ];
+        let writes = window_last_writes_core(&insts);
         assert_eq!(writes.get(&12), Some(&WindowWriteKind::Precolor));
+        assert_eq!(writes.get(&13), Some(&WindowWriteKind::Precolor));
         assert_eq!(writes.get(&14), Some(&WindowWriteKind::ScratchOrClobber));
+
+        // Exercise the allocating classifier too. This is the path that used
+        // to poison the still-live IPA home and trip the emitter's fail-closed
+        // stale-home check even though the core-only helper was correct.
+        let (slots, types, uses, busy) = base_maps();
+        let empty = FxHashSet::default();
+        let ctx = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let (_out, allocated_writes, _vreg_writers) =
+            allocate_window(insts, &ctx).expect("a fully pre-colored call window must allocate");
+        assert_eq!(allocated_writes.get(&12), Some(&WindowWriteKind::Precolor));
+        assert_eq!(allocated_writes.get(&13), Some(&WindowWriteKind::Precolor));
+        assert_eq!(
+            allocated_writes.get(&14),
+            Some(&WindowWriteKind::ScratchOrClobber)
+        );
+    }
+
+    #[test]
+    fn implicit_write_classifiers_agree_on_division_and_raw() {
+        let insts = vec![
+            MachInst::Cqto { size: OpSize::S64 },
+            MachInst::Div {
+                divisor: MachOperand::Reg(phys(1)),
+                signed: true,
+                size: OpSize::S64,
+            },
+            MachInst::XorRdx,
+            MachInst::Raw("movq %r8, %r9".to_string()),
+        ];
+        let expected = window_last_writes_core(&insts);
+        let (slots, types, uses, busy) = base_maps();
+        let empty = FxHashSet::default();
+        let ctx = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let (_out, actual, _vreg_writers) = allocate_window(insts, &ctx)
+            .expect("a fully pre-colored implicit-write window must allocate");
+        assert_eq!(actual, expected);
     }
 }
