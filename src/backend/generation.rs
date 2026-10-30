@@ -105,7 +105,8 @@ fn collect_asm_goto_cc_branch_values(
 
     // Pass 2: value use counts and asm-goto edge counts.
     let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut asm_edge_counts: FxHashMap<BlockId, u32> = FxHashMap::default();
+    let mut asm_edge_counts: FxHashMap<crate::ir::reexports::BlockId, u32> =
+        FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
             for_each_operand_in_instruction(inst, |op| {
@@ -131,7 +132,8 @@ fn collect_asm_goto_cc_branch_values(
     let mut fallthrough_fusions: FxHashMap<u32, String> = FxHashMap::default();
     let mut certified_dests: FxHashSet<u32> = FxHashSet::default();
     let mut label_fusions: Vec<(u32, &'static str, u32)> = Vec::new();
-    let mut target_edges: Vec<(usize, BlockId, u32, &'static str)> = Vec::new();
+    let mut target_edges: Vec<(usize, crate::ir::reexports::BlockId, u32, &'static str)> =
+        Vec::new();
 
     for (source_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
