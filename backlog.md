@@ -293,6 +293,67 @@ option union or exhaustive `Implemented | BenignNoop | Refused | WarnUnimplement
 inventory; the remaining benign-ignore entries and `--O1/--sort-common`
 behavior need evidence and justification.
 
+**Status (re-audited 2026-10-30, artifact-verified).** A 16-option sweep of the
+x86-64 builtin path (`readelf -lW/-dW/-nW/-SW` on every product, each compared
+against GCC 16.2.0's BFD link of the same objects) found exactly two options
+that still accepted and then did nothing:
+
+1. `-z execstack` was parsed (`args.rs`) and honoured by the i686 backend, but
+   the x86-64 writers derived `PT_GNU_STACK` from the input `.note.GNU-stack`
+   markers alone (`emit_exec.rs`) or hardcoded `PF_R|PF_W`
+   (`emit_shared.rs`). The command line was therefore dropped in the one
+   direction that changes a security property: a build that forced an
+   executable stack got `RW`. Both writers now take the override, and the scan
+   itself lives in `linker_common/stack_note.rs` so the two paths cannot
+   drift. BFD parity is now exact, including the *diagnostic*: an input whose
+   marker is executable widens the stack **and** is named
+   (`<input>: requires executable stack (because the .note.GNU-stack section is
+   executable)`), the line is suppressed once `-z execstack`/`-z noexecstack`
+   settled the answer, and `--fatal-warnings` promotes it
+   (`report_exec_stack_inputs` in `link.rs`). The shared-library path was the
+   worse half of this bug: `-shared` from a trampoline-bearing PIC object
+   produced `RW` where BFD produces `RWE`, i.e. a library that faults on the
+   nested call it was built to support.
+2. `--oformat=binary` through the **compiler driver** (`-Wl,--oformat=binary`)
+   exited 0 and left an ELF file behind. The flat-image conversion already
+   existed and `lccc-ld --oformat=binary` used it (and was tested); the driver's
+   dispatch (`backend/common.rs::link_builtin_native`) simply never called it.
+   It now does, producing bytes identical to `objcopy -O binary` of the same
+   link. `-shared --oformat=binary` is refused (a flat image has no headers, so
+   nothing can load it) and foreign encodings (`srec`, `pe-x86-64`, …) are
+   refused **by name**, with the encoding this backend actually writes named in
+   the message. BFD's deprecated alias `-b FORMAT` (which only ever arrives as
+   `-Wl,-b,binary`) was not parsed at all and is now recorded by
+   `parse_linker_args`, so it produces the same flat image instead of being
+   dropped as an unknown token.
+
+Both files were re-measured to confirm the *other* fourteen options are real:
+`-z now` (DT_FLAGS BIND_NOW + DT_FLAGS_1 NOW), `-z ibt`/`-z shstk`
+(GNU_PROPERTY), `-z nodlopen` (FLAGS_1 NOOPEN), `-z noexecstack`, `--hash-style=gnu`,
+`--build-id=sha1`, `--no-undefined` (hard error), `--fatal-warnings`, `--image-base`,
+`-z max-page-size`, `-z pack-relative-relocs`, and `--sort-common` (effective —
+the earlier "no delta" reading was a probe artifact: it only reorders *common*
+symbols, so the probe needs `-fcommon` input). `-z stack-size` and `-z muldefs`
+warn correctly. `-z text`, `-z separate-code` and the lld-spelling
+`--no-rosegment` produce no delta, which matches BFD itself (`-z separate-code`
+has a zero delta on BFD, and BFD reports `-z no-rosegment ignored`); pinning
+them as `BenignNoop` is the correct classification, not a fixed defect. DT_RELR
+on PIE and `-shared` was re-verified as working end to end (`RELR`/`RELRSZ`/
+`RELRENT` + `GLIBC_ABI_DT_RELR`, binaries exit identically to GCC's) — the
+earlier "missing" reading came from probing without the flag.
+
+Gates: the linker runner grew two assertions — `expect_gnu_stack` (emitted
+`PT_GNU_STACK` flags, cross-checked against the BFD oracle for the same command
+line) and `expect_diag` (a failing link must *name* the unsupported request).
+Rows: `gnu_stack_default_is_nonexec`, `z_execstack_requested`,
+`z_noexecstack_requested`, `gnu_stack_follows_input_marker`,
+`z_noexecstack_overrides_input_marker`, `shared_gnu_stack_follows_input_marker`,
+`oformat_binary_with_shared_is_refused`, `oformat_unknown_name_is_refused`,
+`oformat_native_is_accepted`, `exec_stack_warning_and_header`, and the driver
+flat-image byte comparison folded into `binary_output_matches_objcopy`. Every
+one of the five new code paths was mutation-verified (fix reverted → the row
+fails with the expected message).
+
 **Why.** Without that inventory, additional semantic, ABI, and diagnostic
 options can still be silently swallowed. Arch's default LDFLAGS include
 `-Wl,-z,pack-relative-relocs` and `-Wl,-O1 --sort-common`; RELR is now covered,
@@ -312,6 +373,8 @@ python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter b
 python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter warn_common
 python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter common_page_size_warns_and_honors_fatal_warnings --strict
 python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter emit_relocs_warns_when_unimplemented --strict
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter exec_stack --strict
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter oformat --strict
 ```
 
 **Plan.**

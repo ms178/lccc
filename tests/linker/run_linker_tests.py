@@ -70,7 +70,8 @@ class Case:
                  expect_distinct_addresses=None,
                  expect_dyn_has=None, expect_dyn_missing=None,
                  expect_comment=None, expect_symbol_order=None,
-                 expect_load_alignment=None, expect_version_needs=None):
+                 expect_load_alignment=None, expect_version_needs=None,
+                 expect_gnu_stack=None, expect_diag=None):
         self.name = name
         self.sources = sources              # dict fname -> contents (.c or .s)
         self.link_inputs = link_inputs      # ordered link inputs; default: all objects
@@ -155,6 +156,20 @@ class Case:
         # Version-need names that must be present in `readelf -V` output.
         # This covers ABI contracts such as GLIBC_ABI_DT_RELR.
         self.expect_version_needs = expect_version_needs
+        # PT_GNU_STACK p_flags, spelled the way readelf prints it ("RWE").
+        # Pins `-z execstack` / `-z noexecstack` onto the emitted program
+        # header: accepting the option and then discarding it is invisible
+        # to every other check in this file, and in the execstack direction
+        # it silently downgrades the security posture a build system asked
+        # for.  The `bfd` oracle must agree, so the expected string is
+        # validated against the reference implementation, not just asserted.
+        self.expect_gnu_stack = expect_gnu_stack
+        # Substrings that a failing link's diagnostic must contain.  Turns
+        # expect_fail from "something went wrong" into "the message names
+        # the unsupported request", which is the only shape a user can act
+        # on -- an option that is silently accepted is worse than one that
+        # is refused by name.
+        self.expect_diag = expect_diag
         # Ordered .comment subsequence: every listed string must occur
         # EXACTLY ONCE in the merged .comment section, in the listed
         # relative order.  Extra entries (the toolchain's own ident from
@@ -1340,6 +1355,90 @@ case("max_page_size_64k",
     ldflags=["-Wl,-z,max-page-size=0x10000"],
     expect_load_alignment=0x10000,
     tags=("layout", "options"))
+
+case("gnu_stack_default_is_nonexec",
+    # No flag, ordinary -fno-pic object (gcc marks .note.GNU-stack
+    # non-executable): the stack must come out RW.  bfd is the reference.
+    {"a.c": "int g = 1; int main(void) { return g - 1; }"},
+    compile_flags=["-O1", "-fno-pic"],
+    expect_gnu_stack="RW",
+    tags=("options", "security"))
+
+case("z_execstack_requested",
+    # `-z execstack` used to parse and then be dropped on x86-64, leaving the
+    # stack non-executable: the exact opposite of what was asked, and the one
+    # direction of this option a build system may depend on.
+    {"a.c": "int g = 1; int main(void) { return g - 1; }"},
+    compile_flags=["-O1", "-fno-pic"],
+    ldflags=["-Wl,-z,execstack"],
+    expect_gnu_stack="RWE",
+    tags=("options", "security"))
+
+case("z_noexecstack_requested",
+    {"a.c": "int g = 1; int main(void) { return g - 1; }"},
+    compile_flags=["-O1", "-fno-pic"],
+    ldflags=["-Wl,-z,noexecstack"],
+    expect_gnu_stack="RW",
+    tags=("options", "security"))
+
+case("gnu_stack_follows_input_marker",
+    # An input that marks its .note.GNU-stack executable (what a nested
+    # function's trampoline needs) must widen the output stack even with no
+    # flag on the command line, exactly as bfd does.
+    {"a.c": "int g = 1; int main(void) { return g - 1; }"},
+    compile_flags=["-O1", "-fno-pic", "-Wa,--execstack"],
+    expect_gnu_stack="RWE",
+    tags=("options", "security"))
+
+case("z_noexecstack_overrides_input_marker",
+    # ...and the command line wins over that marker.  Silently keeping RWX
+    # here would defeat the point of passing the hardening flag.
+    {"a.c": "int g = 1; int main(void) { return g - 1; }"},
+    compile_flags=["-O1", "-fno-pic", "-Wa,--execstack"],
+    ldflags=["-Wl,-z,noexecstack"],
+    expect_gnu_stack="RW",
+    tags=("options", "security"))
+
+case("shared_gnu_stack_follows_input_marker",
+    # The shared path hardcoded PF_R|PF_W before this was fixed, so a PIC
+    # object that needs an executable stack produced a library that would
+    # fault at run time while bfd's copy of it works.
+    {"a.c": "int g = 1; int *p = &g; int main(void) { return *p - 1; }"},
+    compile_flags=["-O1", "-fPIC", "-Wa,--execstack"],
+    ldflags=["-shared"],
+    expect_elf_type="DYN",
+    expect_gnu_stack="RWE",
+    tags=("options", "security", "shared"))
+
+case("oformat_binary_with_shared_is_refused",
+    # A flat image has no headers, so it can never be dlopen'd: combining the
+    # two requests is contradictory and must be rejected by name rather than
+    # silently producing one or the other.
+    {"a.c": "int g = 1; int main(void) { return g - 1; }"},
+    compile_flags=["-O1", "-fPIC"],
+    ldflags=["-shared", "-Wl,--oformat=binary"],
+    expect_fail=True,
+    expect_diag=["--oformat=binary", "-shared"],
+    tags=("options", "diagnostics", "shared"))
+
+case("oformat_unknown_name_is_refused",
+    # bfd knows srec/ihex/etc.; this linker writes ELF (and flat binaries).
+    # Naming the limitation beats writing an ELF file under a .srec name.
+    {"a.c": "int g = 1; int main(void) { return g - 1; }"},
+    compile_flags=["-O1", "-fno-pic"],
+    ldflags=["-Wl,--oformat=srec"],
+    expect_fail=True,
+    expect_diag=["--oformat=srec", "elf64-x86-64"],
+    tags=("options", "diagnostics"))
+
+case("oformat_native_is_accepted",
+    # The encoding this linker does produce must stay accepted: the refusals
+    # above are about flat images and foreign targets, not --oformat itself.
+    {"a.c": "int g = 1; int main(void) { return g - 1; }"},
+    compile_flags=["-O1", "-fno-pic"],
+    ldflags=["-Wl,--oformat=elf64-x86-64"],
+    expect_stdout="",
+    tags=("options",))
 
 case("rpath_default_is_runpath",
     # A plain -rpath must land in DT_RUNPATH, not DT_RPATH: bfd (as every
@@ -6716,11 +6815,17 @@ def _build_id_note_test(args, oracles):
 
 _PT_LOAD = 1
 _PT_NOTE = 4
+_PT_GNU_STACK = 0x6474E551
 _PT_GNU_RELRO = 0x6474E552
 _PT_GNU_PROPERTY = 0x6474E553
 _PF_W = 2  # ELF p_flags: X=1, W=2, R=4
 _SHF_ALLOC = 2
 _SHT_NOTE = 7
+
+
+def _gnu_stack_flags(flags):
+    """Spell p_flags the way readelf prints them ("RWE")."""
+    return "".join(c for c, bit in (("R", 4), ("W", 2), ("E", 1)) if flags & bit)
 
 
 def _elf_bytes_phdrs(d):
@@ -7985,6 +8090,95 @@ def _max_page_size_gnu_syntax_test(args, oracles):
         return Result(name, "PASS", "page-size parser and script alignment agree" + note)
 
 
+def _exec_stack_warning_test(args, oracles):
+    """`-z execstack` reaches the header, and an RWX-forcing input is named.
+
+    Three properties, all of them observable only in the emitted program
+    header or on stderr:
+
+    * the command-line override decides PT_GNU_STACK (it used to be parsed
+      and dropped on x86-64);
+    * an input whose `.note.GNU-stack` is executable widens the stack, and
+      bfd -- which does the same -- also *says so*, naming the input;
+    * `--fatal-warnings` promotes that line to an error, because an
+      unintended RWX stack is exactly what a hardened build wants to block.
+    """
+    name = "exec_stack_warning_and_header"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+
+    with tempfile.TemporaryDirectory(prefix="lccc-exec-stack-") as td:
+        plain = _linker_start_object(td)
+        if plain.returncode:
+            return Result(name, "SKIP", "fixture compile failed: " +
+                          plain.stderr.decode(errors="replace")[:200])
+        # `as --execstack` sets SHF_EXECINSTR on the marker section, which is
+        # how a nested-function trampoline asks for an RWX stack.
+        execstack = sh([CC, "-c", "-Wa,--execstack", "start.s", "-o",
+                        "start_exec.o"], cwd=td)
+        if execstack.returncode:
+            return Result(name, "SKIP", "cannot mark .note.GNU-stack executable: " +
+                          execstack.stderr.decode(errors="replace")[:200])
+
+        def stack_of(path):
+            try:
+                with open(os.path.join(td, path), "rb") as image:
+                    phdrs = _elf_bytes_phdrs(image.read())
+            except OSError:
+                return None
+            stacks = [p for p in (phdrs or []) if p[0] == _PT_GNU_STACK]
+            return _gnu_stack_flags(stacks[0][1]) if len(stacks) == 1 else None
+
+        cases = [
+            # label, input, extra flags, expected stack, warning required?
+            ("plain", "start.o", [], "RW", False),
+            ("requested", "start.o", ["-z", "execstack"], "RWE", False),
+            ("marker", "start_exec.o", [], "RWE", True),
+            ("marker_overridden", "start_exec.o", ["-z", "noexecstack"], "RW", False),
+            ("marker_confirmed", "start_exec.o", ["-z", "execstack"], "RWE", False),
+        ]
+        for label, obj, flags, want, want_warning in cases:
+            out = f"{label}.out"
+            r = sh([lccc_ld, "-e", "_start", *flags, obj, "-o", out], cwd=td)
+            stderr = r.stderr.decode(errors="replace")
+            if r.returncode:
+                return Result(name, "FAIL",
+                              f"{label}: link failed: {stderr[:300]}")
+            got = stack_of(out)
+            if got != want:
+                return Result(name, "FAIL",
+                              f"{label}: PT_GNU_STACK is {got}, expected {want}")
+            named = "requires executable stack" in stderr
+            if named and not want_warning:
+                return Result(name, "FAIL",
+                              f"{label}: warned about an executable stack that "
+                              f"the command line settled: {stderr.strip()[:300]}")
+            if want_warning:
+                if not named:
+                    return Result(name, "FAIL",
+                                  f"{label}: executable stack came from an input "
+                                  f"marker but was not reported: {stderr.strip()[:300]}")
+                if obj not in stderr:
+                    return Result(name, "FAIL",
+                                  f"{label}: diagnostic does not name {obj}: "
+                                  f"{stderr.strip()[:300]}")
+
+        fatal = sh([lccc_ld, "-e", "_start", "--fatal-warnings", "start_exec.o",
+                    "-o", "fatal.out"], cwd=td)
+        fatal_stderr = fatal.stderr.decode(errors="replace")
+        if fatal.returncode == 0:
+            return Result(name, "FAIL",
+                          "--fatal-warnings did not reject an input that forces "
+                          "an executable stack")
+        if "warning treated as error" not in fatal_stderr:
+            return Result(name, "FAIL",
+                          "promoted diagnostic lost its cause: " + fatal_stderr[:300])
+
+        return Result(name, "PASS",
+                      "override, marker propagation and fatal promotion agree")
+
+
 def _script_link_unsupported_option_warnings_test(args, oracles):
     """Script links diagnose unsupported options and promote them consistently."""
     name = "script_link_unsupported_option_warnings"
@@ -8245,6 +8439,8 @@ def _binary_output_matches_objcopy_test(args, oracles):
     if not shutil.which("objcopy"):
         return Result(name, "SKIP", "no objcopy")
     with tempfile.TemporaryDirectory(prefix="lccc-binary-output-") as td:
+        with open(os.path.join(td, "driver.c"), "w", encoding="utf-8") as stream:
+            stream.write("int g = 1;\nint main(void) { return g - 1; }\n")
         compiled = _linker_start_object(td)
         if compiled.returncode:
             return Result(name, "SKIP", "fixture compile failed: " + compiled.stderr.decode(errors="replace")[:200])
@@ -8268,6 +8464,64 @@ def _binary_output_matches_objcopy_test(args, oracles):
             return Result(name, "FAIL", "--oformat=binary produced an ELF header")
         if got != expected:
             return Result(name, "FAIL", f"binary differs from objcopy ({len(got)} vs {len(expected)} bytes)")
+
+        # The compiler driver takes the same request through `-Wl,`, and used
+        # to ignore it: the link exited 0 and left an ELF file behind.  The
+        # flat image it writes now must match objcopy of its own ELF link,
+        # byte for byte, exactly like the lccc-ld path above.
+        driver_elf = sh([args.lccc, "-O1", "-fno-pic", "driver.c", "-o",
+                         "driver.elf", "-Wl,--build-id=none"], cwd=td)
+        if driver_elf.returncode:
+            return Result(name, "SKIP", "driver ELF link failed: " +
+                          driver_elf.stderr.decode(errors="replace")[:200])
+        driver_flat = sh([args.lccc, "-O1", "-fno-pic", "driver.c", "-o",
+                          "driver.bin", "-Wl,--oformat=binary",
+                          "-Wl,--build-id=none"], cwd=td)
+        if driver_flat.returncode:
+            return Result(name, "FAIL", "driver --oformat=binary link failed: " +
+                          driver_flat.stderr.decode(errors="replace")[:300])
+        driver_ref = sh(["objcopy", "-O", "binary", "driver.elf",
+                         "driver.objcopy.bin"], cwd=td)
+        if driver_ref.returncode:
+            return Result(name, "SKIP", "objcopy reference failed: " +
+                          driver_ref.stderr.decode(errors="replace")[:200])
+        with open(os.path.join(td, "driver.bin"), "rb") as image:
+            driver_got = image.read()
+        with open(os.path.join(td, "driver.objcopy.bin"), "rb") as image:
+            driver_expected = image.read()
+        if driver_got.startswith(b"\x7fELF"):
+            return Result(name, "FAIL",
+                          "the compiler driver accepted -Wl,--oformat=binary and "
+                          "wrote an ELF file anyway (zero exit status, wrong artifact)")
+        if driver_got != driver_expected:
+            return Result(name, "FAIL",
+                          f"driver flat image differs from objcopy "
+                          f"({len(driver_got)} vs {len(driver_expected)} bytes)")
+
+        # `-b FORMAT` is BFD's deprecated alias for `--oformat`; it reaches a
+        # linker only through `-Wl,`, where an unparsed token is silently
+        # dropped rather than rejected.  Both joined spellings must produce the
+        # same flat image as the long option above.
+        for alias in (["-Wl,-b,binary"], ["-Wl,-bbinary"],
+                      # A driver forwards `-b binary` as two groups; the pair
+                      # has to be re-joined or `binary` becomes an input file.
+                      ["-Wl,-b", "-Wl,binary"]):
+            alias_out = "driver.alias.bin"
+            alias_link = sh([args.lccc, "-O1", "-fno-pic", "driver.c", "-o",
+                             alias_out, *alias, "-Wl,--build-id=none"], cwd=td)
+            if alias_link.returncode:
+                return Result(name, "FAIL", f"{' '.join(alias)} link failed: " +
+                              alias_link.stderr.decode(errors="replace")[:300])
+            with open(os.path.join(td, alias_out), "rb") as image:
+                alias_bytes = image.read()
+            if alias_bytes.startswith(b"\x7fELF"):
+                return Result(name, "FAIL",
+                              f"{' '.join(alias)} produced an ELF file: the -b alias was "
+                              f"parsed as an unknown token and dropped")
+            if alias_bytes != driver_expected:
+                return Result(name, "FAIL",
+                              f"{' '.join(alias)} flat image differs from objcopy "
+                              f"({len(alias_bytes)} vs {len(driver_expected)} bytes)")
         return Result(name, "PASS")
 
 
@@ -12654,6 +12908,8 @@ def _registry(args, oracles):
             _max_page_size_gnu_syntax_test, "options", "layout", "script"),
         one("script_link_unsupported_option_warnings",
             _script_link_unsupported_option_warnings_test, "options", "script", "diagnostics"),
+        one("exec_stack_warning_and_header", _exec_stack_warning_test,
+            "options", "security", "diagnostics"),
         one("image_base_sets_first_load", _image_base_layout_test, "options", "layout"),
         one("binary_output_matches_objcopy", _binary_output_matches_objcopy_test,
             "options", "layout"),
@@ -13272,6 +13528,12 @@ def run_case(c, args, oracles):
             if lccc_link_ok:
                 return Result(c.name, "FAIL", "link unexpectedly succeeded "
                               "(expected diagnostic)")
+            if c.expect_diag:
+                absent = [d for d in c.expect_diag if d not in lccc_link_err]
+                if absent:
+                    return Result(c.name, "FAIL",
+                        "diagnostic does not name %s: %s"
+                        % (", ".join(repr(a) for a in absent), lccc_link_err))
             return Result(c.name, "PASS")
 
         if not lccc_link_ok:
@@ -13394,6 +13656,34 @@ def run_case(c, args, oracles):
                     f"PT_LOAD p_align values are {[hex(p[6]) for p in loads]}, "
                     f"expected all {c.expect_load_alignment:#x}",
                 )
+        if c.expect_gnu_stack is not None:
+            with open(lccc_out, "rb") as image:
+                phdrs = _elf_bytes_phdrs(image.read())
+            if phdrs is None:
+                return Result(c.name, "FAIL", "cannot parse ELF program headers")
+            stacks = [p for p in phdrs if p[0] == _PT_GNU_STACK]
+            if len(stacks) != 1:
+                return Result(c.name, "FAIL",
+                    f"expected exactly one PT_GNU_STACK, found {len(stacks)}")
+            got = _gnu_stack_flags(stacks[0][1])
+            if got != c.expect_gnu_stack:
+                return Result(c.name, "FAIL",
+                    f"PT_GNU_STACK is {got}, expected {c.expect_gnu_stack}")
+            # The reference implementation must agree with the expectation.
+            # If bfd disagrees, the *expectation* is what is wrong, and the
+            # message says so instead of blaming the emitted header.
+            bfd_out = next((p for n, p in oracle_outs if n == "bfd"), None)
+            if bfd_out is not None:
+                with open(bfd_out, "rb") as image:
+                    bfd_phdrs = _elf_bytes_phdrs(image.read())
+                bfd_stacks = [p for p in (bfd_phdrs or [])
+                              if p[0] == _PT_GNU_STACK]
+                if len(bfd_stacks) == 1:
+                    bfd_got = _gnu_stack_flags(bfd_stacks[0][1])
+                    if bfd_got != c.expect_gnu_stack:
+                        return Result(c.name, "FAIL",
+                            f"bfd emits PT_GNU_STACK {bfd_got}, not the expected "
+                            f"{c.expect_gnu_stack}; the expectation is wrong")
         if c.expect_version_needs:
             version = sh(["readelf", "-VW", lccc_out], cwd=td)
             if version.returncode:

@@ -258,6 +258,37 @@ pub(crate) fn evaluate_pending_defsyms(
     Ok(())
 }
 
+/// bfd parity: an input whose `.note.GNU-stack` is executable silently turns
+/// the whole program's stack into RWX. bfd names every such input, and stays
+/// quiet once the command line has decided the stack either way -- the user
+/// who passed `-z execstack` asked for it, and the user who passed
+/// `-z noexecstack` already overrode it. `--fatal-warnings` promotes the line
+/// to an error, which is how a hardened build turns the marker into a gate.
+fn report_exec_stack_inputs(
+    objects: &[linker_common::Elf64Object],
+    requested_exec_stack: Option<bool>,
+    fatal_warnings: bool,
+) -> Result<(), String> {
+    if requested_exec_stack.is_some() {
+        return Ok(());
+    }
+    let forcing = linker_common::stack_note::requiring_inputs(objects);
+    if forcing.is_empty() {
+        return Ok(());
+    }
+    let warnings: Vec<String> = forcing
+        .iter()
+        .map(|name| linker_common::stack_note::warning_for(name))
+        .collect();
+    if fatal_warnings {
+        return Err(format!("warning treated as error: {}", warnings[0]));
+    }
+    for warning in &warnings {
+        eprintln!("lccc-ld: warning: {warning}");
+    }
+    Ok(())
+}
+
 pub fn link_builtin(
     object_files: &[&str],
     object_as_needed: &[bool],
@@ -955,6 +986,8 @@ pub fn link_builtin(
         INTERP.to_vec()
     };
 
+    report_exec_stack_inputs(&objects, parsed_args.z_execstack, fatal_warnings)?;
+
     // Emit executable
     let r = emit_executable(
         &objects,
@@ -981,6 +1014,7 @@ pub fn link_builtin(
         parsed_args.z_now,
         parsed_args.z_relro,
         parsed_args.z_pack_relative_relocs,
+        parsed_args.z_execstack,
         parsed_args.z_text,
         requested_dyn_flags,
         parsed_args.map_path.as_deref(),
@@ -1374,6 +1408,8 @@ pub fn link_shared(
     // Allocate COMMON symbols
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common);
 
+    report_exec_stack_inputs(&objects, parsed.z_execstack, parsed.fatal_warnings)?;
+
     // Emit shared library
     emit_shared_library(
         &objects,
@@ -1392,6 +1428,7 @@ pub fn link_shared(
         requested_dyn_flags,
         parsed.z_relro,
         parsed.z_pack_relative_relocs,
+        parsed.z_execstack,
         parsed.z_now,
         parsed.z_text,
         &exclude_libs,

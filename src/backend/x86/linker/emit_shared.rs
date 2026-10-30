@@ -211,6 +211,10 @@ pub(super) fn emit_shared_library(
     z_relro: bool,
     // `-z pack-relative-relocs` / `-z nopack-relative-relocs`.
     z_pack_relative_relocs: bool,
+    // `-z execstack` / `-z noexecstack`: force `PT_GNU_STACK` executable (or
+    // not), overriding the input `.note.GNU-stack` OR. `None` keeps the GNU
+    // default of ORing every input marker.
+    z_execstack: Option<bool>,
     // `-z now`: the lazy-binding `.got.plt` joins the RELRO window.
     z_now: bool,
     // `-z text` / `-z notext`: what a relocation into code does.
@@ -2208,7 +2212,12 @@ pub(super) fn emit_shared_library(
         );
         ph += 56;
     }
-    wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
+    // Same law as `emit_executable`: explicit `-z {execstack,noexecstack}`
+    // wins, otherwise every input `.note.GNU-stack` marker is ORed in.
+    let exec_stack =
+        z_execstack.unwrap_or_else(|| linker_common::stack_note::requires_exec_stack(objects));
+    let stack_flags = PF_R | PF_W | if exec_stack { PF_X } else { 0 };
+    wphdr(&mut out, ph, PT_GNU_STACK, stack_flags, 0, 0, 0, 0, 0x10);
     ph += 56;
     if has_relro {
         // filesz covers the RELRO file content; memsz reaches across the

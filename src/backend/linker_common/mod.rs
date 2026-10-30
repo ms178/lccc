@@ -79,6 +79,7 @@ mod resolve_lib;
 mod secdata;
 mod section_map;
 pub mod shdr;
+pub mod stack_note;
 pub mod strmerge;
 mod symbols;
 mod symstr;

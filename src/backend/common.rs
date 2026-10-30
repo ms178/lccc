@@ -1207,6 +1207,39 @@ fn link_builtin_native(
 ) -> Result<(), String> {
     use crate::backend::{arm, i686, riscv, x86};
 
+    // `--oformat`: `binary` is implemented (the same flat-image conversion
+    // `lccc-ld --oformat=binary` uses), and every other spelling must name the
+    // encoding this backend actually writes. The driver used to accept
+    // `-Wl,--oformat=binary` and then store an ELF image under the requested
+    // name -- a zero exit status with the wrong artifact, which is worse than
+    // a refusal because the build never notices.
+    let oformat = crate::backend::linker_common::parse_linker_args(user_args).oformat;
+    let native = match arch.elf_machine {
+        EM_X86_64 => "elf64-x86-64",
+        EM_386 => "elf32-i386",
+        EM_AARCH64 => "elf64-littleaarch64",
+        EM_RISCV => "elf64-littleriscv",
+        _ => "elf64",
+    };
+    if let Some(format) = oformat.as_deref()
+        && format != "binary"
+        && format != "default"
+        && format != native
+    {
+        return Err(format!(
+            "--oformat={format} is not implemented: the {arch_name} backend writes {native} \
+             (or `binary` for executables)",
+            arch_name = arch.arch_name
+        ));
+    }
+    if is_shared && oformat.as_deref() == Some("binary") {
+        return Err(
+            "--oformat=binary cannot be combined with -shared: a flat image has no headers, \
+             so nothing can load it as a shared object"
+                .to_string(),
+        );
+    }
+
     if is_shared {
         let setup = resolve_builtin_link_setup(arch, user_args, true, false);
         let refs = setup.as_refs();
@@ -1288,7 +1321,7 @@ fn link_builtin_native(
     }
     let refs = setup.as_refs();
 
-    match arch.elf_machine {
+    let linked = match arch.elf_machine {
         EM_X86_64 => x86::linker::link_builtin(
             object_files,
             &[], // the driver's own objects: `input_as_needed`
@@ -1333,7 +1366,12 @@ fn link_builtin_native(
             "No built-in linker for {} (elf_machine={})",
             arch.arch_name, arch.elf_machine
         )),
+    };
+    linked?;
+    if oformat.as_deref() == Some("binary") {
+        crate::backend::linker_common::convert_elf_file_to_flat_binary(output_path)?;
     }
+    Ok(())
 }
 
 /// Assembly output buffer with helpers for emitting text.

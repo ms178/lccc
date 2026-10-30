@@ -168,6 +168,11 @@ pub(super) fn emit_executable(
     z_now: bool,
     z_relro: bool,
     z_pack_relative_relocs: bool,
+    // `-z execstack` / `-z noexecstack`: force `PT_GNU_STACK` executable (or
+    // not), overriding the input `.note.GNU-stack` OR. `None` keeps the GNU
+    // default of ORing every input marker, which is what makes nested-function
+    // trampolines work.
+    z_execstack: Option<bool>,
     // `-z text` / `-z notext`: what a PIE relocation into code does.
     textrel_policy: linker_common::TextrelPolicy,
     // `(DT_FLAGS, DT_FLAGS_1)` bits the options request
@@ -2162,11 +2167,13 @@ pub(super) fn emit_executable(
     // Executable stack when ANY input object requests it (GNU semantics:
     // .note.GNU-stack with SHF_EXECINSTR — set by nested-function
     // trampolines). GNU ld ORs the flag across all inputs.
-    let exec_stack = objects.iter().any(|obj| {
-        obj.sections
-            .iter()
-            .any(|sec| sec.name == ".note.GNU-stack" && sec.flags & SHF_EXECINSTR != 0)
-    });
+    // `-z execstack` / `-z noexecstack` override the input markers, exactly as
+    // GNU ld does and as this tree's i686 backend already implemented. Without
+    // the override a build system that *forced* an executable stack got the
+    // silent opposite, which is the one direction of this option that changes
+    // a security property.
+    let exec_stack =
+        z_execstack.unwrap_or_else(|| linker_common::stack_note::requires_exec_stack(objects));
     let stack_flags = if exec_stack {
         PF_R | PF_W | PF_X
     } else {
