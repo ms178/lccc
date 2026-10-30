@@ -782,6 +782,74 @@ fn loop_value_escapes(
     false
 }
 
+/// The header's exit test and its two phis, as
+/// `(phis, cmp_op, cmp_lhs, cmp_ty, bound_raw)`.  Every refusal goes through
+/// `decline!`, so `LCCC_VEC_STRIDED_TRACE` names the exact precondition line
+/// even though the helper is a separate frame from [`analyze`]; the caller
+/// re-traces its own line when this returns `None`.
+fn header_exit_test(
+    func: &IrFunction,
+    header_idx: usize,
+    cmp_dest: Value,
+    preheader_label: BlockId,
+    body_label: BlockId,
+) -> Option<(
+    Vec<(Value, IrType, Operand, Operand)>,
+    IrCmpOp,
+    Value,
+    IrType,
+    i64,
+)> {
+    let mut phis = Vec::new();
+    let mut exit_cmp = None;
+    for inst in &func.blocks[header_idx].instructions {
+        match inst {
+            Instruction::Phi {
+                dest, ty, incoming, ..
+            } => {
+                if incoming.len() != 2 {
+                    decline!();
+                }
+                let Some((pre, _)) = incoming.iter().find(|(_, l)| *l == preheader_label) else {
+                    decline!();
+                };
+                let Some((back, _)) = incoming.iter().find(|(_, l)| *l == body_label) else {
+                    decline!();
+                };
+                phis.push((*dest, *ty, pre.clone(), back.clone()));
+            }
+            Instruction::Cmp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } if *dest == cmp_dest => {
+                exit_cmp = Some((*op, lhs.clone(), rhs.clone(), *ty));
+            }
+            _ => {
+                decline!();
+            }
+        }
+    }
+    if phis.len() != 2 {
+        decline!();
+    }
+    let Some(exit_cmp) = exit_cmp else {
+        decline!();
+    };
+    let (cmp_op, Operand::Value(cmp_lhs), Operand::Const(cmp_rhs_c), cmp_ty) = exit_cmp else {
+        decline!();
+    };
+    let Some(bound_raw) = cmp_rhs_c.to_i64() else {
+        decline!();
+    };
+    if bound_raw <= 0 {
+        decline!();
+    }
+    Some((phis, cmp_op, cmp_lhs, cmp_ty, bound_raw))
+}
+
 fn analyze(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
@@ -792,7 +860,9 @@ fn analyze(
         decline!();
     }
     let header_idx = loop_info.header;
-    let body_idx = *loop_info.body.iter().find(|&&b| b != header_idx)?;
+    let Some(&body_idx) = loop_info.body.iter().find(|&&b| b != header_idx) else {
+        decline!();
+    };
     let header_label = func.blocks[header_idx].label;
     let body_label = func.blocks[body_idx].label;
     if !matches!(func.blocks[body_idx].terminator, Terminator::Branch(lbl) if lbl == header_label) {
@@ -800,7 +870,9 @@ fn analyze(
     }
 
     // Unique external preheader jumping unconditionally to `header_idx`.
-    let preheader_idx = loop_info.find_preheader(&cfg.preds)?;
+    let Some(preheader_idx) = loop_info.find_preheader(&cfg.preds) else {
+        decline!();
+    };
     if !matches!(func.blocks[preheader_idx].terminator, Terminator::Branch(lbl) if lbl == header_label)
     {
         decline!();
@@ -819,55 +891,24 @@ fn analyze(
     if true_label != body_label {
         decline!();
     }
-    let exit_idx = func.blocks.iter().position(|b| b.label == false_label)?;
+    let Some(exit_idx) = func.blocks.iter().position(|b| b.label == false_label) else {
+        decline!();
+    };
     if loop_info.body.contains(&exit_idx) {
         decline!();
     }
 
     // Header must contain only two 2-way Phis (IV and accumulator) plus the exit Cmp.
-    let mut phis = Vec::new();
-    let mut exit_cmp = None;
-    for inst in &func.blocks[header_idx].instructions {
-        match inst {
-            Instruction::Phi {
-                dest, ty, incoming, ..
-            } => {
-                if incoming.len() != 2 {
-                    decline!();
-                }
-                let pre = incoming
-                    .iter()
-                    .find(|(_, l)| *l == preheader_label)?
-                    .0
-                    .clone();
-                let back = incoming.iter().find(|(_, l)| *l == body_label)?.0.clone();
-                phis.push((*dest, *ty, pre, back));
-            }
-            Instruction::Cmp {
-                dest,
-                op,
-                lhs,
-                rhs,
-                ty,
-            } if *dest == cmp_dest => {
-                exit_cmp = Some((*op, lhs.clone(), rhs.clone(), *ty));
-            }
-            _ => return None,
-        }
-    }
-    if phis.len() != 2 {
-        decline!();
-    }
-    let (cmp_op, Operand::Value(cmp_lhs), Operand::Const(cmp_rhs_c), cmp_ty) = exit_cmp? else {
+    let Some((phis, cmp_op, cmp_lhs, cmp_ty, bound_raw)) =
+        header_exit_test(func, header_idx, cmp_dest, preheader_label, body_label)
+    else {
         decline!();
     };
-    let bound_raw = cmp_rhs_c.to_i64()?;
-    if bound_raw <= 0 {
-        decline!();
-    }
 
     // Identify which phi is `iv_phi` (compared in `exit_cmp`, starts at 0, steps by +8).
-    let iv_pos = phis.iter().position(|(d, _, _, _)| *d == cmp_lhs)?;
+    let Some(iv_pos) = phis.iter().position(|(d, _, _, _)| *d == cmp_lhs) else {
+        decline!();
+    };
     let (iv_phi, iv_ty, iv_init, Operand::Value(iv_next)) = phis[iv_pos].clone() else {
         decline!();
     };
@@ -886,7 +927,9 @@ fn analyze(
     if iv_init_c.to_i64() != Some(0) {
         decline!();
     }
-    let scalar_trips = scalar_trip_count(cmp_op, iv_ty, bound_raw)?;
+    let Some(scalar_trips) = scalar_trip_count(cmp_op, iv_ty, bound_raw) else {
+        decline!();
+    };
     if scalar_trips < MIN_SCALAR_TRIPS {
         decline!();
     }
@@ -951,8 +994,14 @@ fn analyze(
                 seg_override: AddressSpace::Default,
                 volatile: false,
             } => {
-                let base = match_base_plus_iv(func, &loop_info.body, &loop_defs, *ptr, iv_phi)?;
-                let stream_idx = register_base(base, &mut load_bases)?;
+                let Some(base) =
+                    match_base_plus_iv(func, &loop_info.body, &loop_defs, *ptr, iv_phi)
+                else {
+                    decline!();
+                };
+                let Some(stream_idx) = register_base(base, &mut load_bases) else {
+                    decline!();
+                };
                 load_map.insert(*dest, stream_idx);
             }
             Instruction::Load {
@@ -1008,7 +1057,10 @@ fn analyze(
                                     p0,
                                     iv_phi,
                                 ) {
-                                    let stream_idx = register_base(base, &mut load_bases)?;
+                                    let Some(stream_idx) = register_base(base, &mut load_bases)
+                                    else {
+                                        decline!();
+                                    };
                                     load_map.insert(*dest, stream_idx);
                                     consumed_u8_loads.extend([l0, l1, l2, l3]);
                                 }
@@ -1020,14 +1072,18 @@ fn analyze(
             Instruction::Cast { from_ty, to_ty, .. }
                 if from_ty.is_integer() && to_ty.is_integer() => {}
             Instruction::Copy { .. } | Instruction::GetElementPtr { .. } => {}
-            _ => return None,
+            _ => {
+                decline!();
+            }
         }
     }
     if consumed_u8_loads.len() != u8_loads.len() || acc_uses_in_body != 1 || load_bases.is_empty() {
         decline!();
     }
-    let contrib_op = contrib_op?;
-    let expr = parse_expr(
+    let Some(contrib_op) = contrib_op else {
+        decline!();
+    };
+    let Some(expr) = parse_expr(
         func,
         &loop_info.body,
         iv_phi,
@@ -1035,7 +1091,9 @@ fn analyze(
         &load_map,
         &contrib_op,
         0,
-    )?;
+    ) else {
+        decline!();
+    };
     if !expr_has_load(&expr) {
         decline!();
     }
@@ -1044,7 +1102,9 @@ fn analyze(
     if safe_vecs < 4 {
         decline!();
     }
-    let vector_bytes = safe_vecs.checked_mul(VECTOR_BYTES)?;
+    let Some(vector_bytes) = safe_vecs.checked_mul(VECTOR_BYTES) else {
+        decline!();
+    };
     let wide_load_proven = load_bases
         .iter()
         .map(|&base| wide_load_proven(func, base, vector_bytes, symbol_facts))

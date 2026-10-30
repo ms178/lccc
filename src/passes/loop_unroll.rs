@@ -1764,11 +1764,6 @@ fn apply_env_term(term: &mut Terminator, env: &FxHashMap<u32, Operand>) {
     }
 }
 
-/// Header non-phi instructions that are NOT part of the exit-test chain (the
-/// Cmp and an optional Cast feeding the CondBranch).  These carry the loop
-/// condition's side effects and extra values (`for (...; cnt++, i < 4; ...)`),
-/// execute once per guard evaluation — `trip + 1` times — and must therefore
-/// be replicated per iteration AND once more after the last one.
 /// Is the loop a SERIAL carried accumulator — `acc = acc <op> x` with exactly
 /// one accumulation per iteration and no reassociation?
 ///
@@ -1881,6 +1876,14 @@ fn serial_carried_accumulator(
                     back_uses += 1;
                 }
             });
+            // Bare `Value` fields (Store/Load ptr, GEP base, Memcpy dest/src,
+            // Intrinsic dest_ptr, …) never appear in the operand walk; a use
+            // spelled that way is still a second consumer of the back value.
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                if *v == back {
+                    back_uses += 1;
+                }
+            });
         }
         crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |o| {
             if matches!(o, Operand::Value(v) if *v == back) {
@@ -1888,9 +1891,15 @@ fn serial_carried_accumulator(
             }
         });
     }
-    // `for_each_operand_in_instruction` does not report a BinOp's dest.
+    // Dest registers are definitions, not uses: neither walker reports them.
     back_uses == 1
 }
+
+/// Header non-phi instructions that are NOT part of the exit-test chain (the
+/// Cmp and an optional Cast feeding the CondBranch).  These carry the loop
+/// condition's side effects and extra values (`for (...; cnt++, i < 4; ...)`),
+/// execute once per guard evaluation — `trip + 1` times — and must therefore
+/// be replicated per iteration AND once more after the last one.
 
 fn header_extra_indices(func: &IrFunction, header: usize) -> Vec<usize> {
     let block = &func.blocks[header];
