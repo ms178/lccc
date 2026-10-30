@@ -764,11 +764,15 @@ fn loop_value_escapes(
                     bad = true;
                 }
             });
-            if let Instruction::GetElementPtr { base, .. } = inst {
-                if loop_defs.contains(base) && *base != acc {
+            // Bare `Value` fields — Store/Load ptr, GEP base, Memcpy dest/src,
+            // Intrinsic dest_ptr, … — are invisible to the operand walk.  The
+            // previous GEP-only special case covered one spelling of this; the
+            // walker covers all of them (and GEP's base goes through it).
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                if loop_defs.contains(v) && *v != acc {
                     bad = true;
                 }
-            }
+            });
         }
         crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
             if escapes(op) {
@@ -2099,6 +2103,174 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loop-defined pointer consumed outside the loop through a *bare*
+    /// `Value` field (a `Load`'s `ptr`) escapes the loop.  The operand walk
+    /// never reports those fields, and the pre-audit GEP-only special case
+    /// missed this spelling, so the pattern was admitted with a live escape.
+    #[test]
+    fn bare_value_memory_operands_escape_the_loop() {
+        fn fixture(outside_load: bool) -> (IrFunction, loop_analysis::NaturalLoop) {
+            let mut func =
+                IrFunction::new("escape_fixture".to_string(), IrType::Void, vec![], false);
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+            });
+            func.blocks.push(BasicBlock {
+                label: BlockId(1),
+                instructions: vec![],
+                terminator: Terminator::Branch(BlockId(0)),
+                source_spans: vec![],
+            });
+            if outside_load {
+                func.blocks.push(BasicBlock {
+                    label: BlockId(2),
+                    instructions: vec![Instruction::Load {
+                        dest: Value(50),
+                        ptr: Value(40),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    }],
+                    terminator: Terminator::Return(None),
+                    source_spans: vec![],
+                });
+            }
+            let loop_info = loop_analysis::NaturalLoop {
+                header: 0,
+                body: [0, 1].into_iter().collect(),
+            };
+            (func, loop_info)
+        }
+        let acc = Value(41);
+        let mut defs = FxHashSet::default();
+        defs.insert(Value(40)); // the loop-defined pointer
+        defs.insert(acc);
+        let (func, loop_info) = fixture(true);
+        assert!(
+            loop_value_escapes(&func, &loop_info, &defs, acc),
+            "outside Load with a bare loop-defined ptr must count as an escape"
+        );
+        let (func, loop_info) = fixture(false);
+        assert!(
+            !loop_value_escapes(&func, &loop_info, &defs, acc),
+            "with no outside consumer nothing escapes"
+        );
+    }
+
+    /// `LCCC_VEC_STRIDED_TRACE` must name a line for every refusal class,
+    /// including the ones that used to leave through a bare `?` operator:
+    /// run three dropping analyses in an isolated child (so the harness's
+    /// capture does not swallow the eprintln stream) and require three
+    /// distinct decline lines.
+    #[test]
+    fn decline_trace_names_every_refusal_class() {
+        const NAME: &str =
+            "passes::vectorize::strided_i32_reduce::tests::decline_trace_names_every_refusal_class";
+        match crate::test_support::run_isolated(NAME) {
+            Some(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let mut lines: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+                for l in stderr.lines() {
+                    if let Some(n) = l.strip_prefix("[STRIDED] decline at line ") {
+                        lines.insert(n.trim().parse().expect("numeric decline line"));
+                    }
+                }
+                assert!(
+                    out.status.success()
+                        && stdout.contains("test result: ok. 1 passed; 0 failed")
+                        && lines.len() >= 3,
+                    "expected a passing child with >= 3 distinct traced decline lines\n\
+                     (status {}): {lines:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                    out.status
+                );
+            }
+            None => {
+                set_trace_enabled(true);
+                let facts = ModuleSymbolFacts::default();
+                // (a) a body that is not two blocks: the very first precondition.
+                let mut fa = IrFunction::new("t".to_string(), IrType::Void, vec![], false);
+                fa.blocks.push(BasicBlock {
+                    label: BlockId(0),
+                    instructions: vec![],
+                    terminator: Terminator::Return(None),
+                    source_spans: vec![],
+                });
+                let la = loop_analysis::NaturalLoop {
+                    header: 0,
+                    body: [0].into_iter().collect(),
+                };
+                let ca = crate::ir::analysis::CfgAnalysis::build(&fa);
+                assert!(analyze(&fa, &la, &ca, &facts).is_none());
+                // (b) two blocks with no external preheader: the converted
+                // `find_preheader` decline, silent before the conversion.
+                let mut fb = IrFunction::new("t".to_string(), IrType::Void, vec![], false);
+                fb.blocks.push(BasicBlock {
+                    label: BlockId(0),
+                    instructions: vec![],
+                    terminator: Terminator::Branch(BlockId(1)),
+                    source_spans: vec![],
+                });
+                fb.blocks.push(BasicBlock {
+                    label: BlockId(1),
+                    instructions: vec![],
+                    terminator: Terminator::Branch(BlockId(0)),
+                    source_spans: vec![],
+                });
+                let lb = loop_analysis::NaturalLoop {
+                    header: 0,
+                    body: [0, 1].into_iter().collect(),
+                };
+                let cb = crate::ir::analysis::CfgAnalysis::build(&fb);
+                assert!(analyze(&fb, &lb, &cb, &facts).is_none());
+                // (c) a proper preheader/header/body/exit shape whose header
+                // carries a stray non-phi instruction: the converted
+                // `_ => decline` arm, a bare `return None` before the audit.
+                let mut fc = IrFunction::new("t".to_string(), IrType::Void, vec![], false);
+                fc.blocks.push(BasicBlock {
+                    label: BlockId(0),
+                    instructions: vec![],
+                    terminator: Terminator::Branch(BlockId(1)),
+                    source_spans: vec![],
+                });
+                fc.blocks.push(BasicBlock {
+                    label: BlockId(1),
+                    instructions: vec![Instruction::Copy {
+                        dest: Value(7),
+                        src: Operand::Const(IrConst::I32(0)),
+                    }],
+                    terminator: Terminator::CondBranch {
+                        cond: Operand::Value(Value(9)),
+                        true_label: BlockId(2),
+                        false_label: BlockId(3),
+                    },
+                    source_spans: vec![],
+                });
+                fc.blocks.push(BasicBlock {
+                    label: BlockId(2),
+                    instructions: vec![],
+                    terminator: Terminator::Branch(BlockId(1)),
+                    source_spans: vec![],
+                });
+                fc.blocks.push(BasicBlock {
+                    label: BlockId(3),
+                    instructions: vec![],
+                    terminator: Terminator::Return(None),
+                    source_spans: vec![],
+                });
+                let lc = loop_analysis::NaturalLoop {
+                    header: 1,
+                    body: [1, 2].into_iter().collect(),
+                };
+                let cc = crate::ir::analysis::CfgAnalysis::build(&fc);
+                assert!(analyze(&fc, &lc, &cc, &facts).is_none());
+            }
+        }
+    }
 
     /// Every exact load is one of the scalar program's own dword accesses,
     /// including the last group when the final gap is unmapped.

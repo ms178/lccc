@@ -5932,6 +5932,88 @@ mod tests {
     }
 
     #[test]
+    fn serial_predicate_counts_a_bare_value_consumer_of_the_back_edge() {
+        // `back_uses` decides whether a second observer can see the per-iteration
+        // accumulator value.  Operand walks miss the bare `Value` fields of an
+        // instruction (a `Load`'s `ptr` is one), so a loop whose back value is
+        // ALSO spelled as an outside load's address must be refused even though
+        // the operand walk still reports exactly one use (the phi incoming).
+        fn fixture(bare_outside_use: bool) -> (IrFunction, usize, usize, Value, usize) {
+            let mut func = IrFunction::new(
+                "serial_bare_use_test".to_string(),
+                IrType::Void,
+                vec![],
+                false,
+            );
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+            });
+            func.blocks.push(BasicBlock {
+                label: BlockId(1),
+                instructions: vec![Instruction::Phi {
+                    dest: Value(20),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                        (Operand::Value(Value(22)), BlockId(2)),
+                    ],
+                }],
+                terminator: Terminator::Branch(BlockId(2)),
+                source_spans: vec![],
+            });
+            func.blocks.push(BasicBlock {
+                label: BlockId(2),
+                instructions: vec![
+                    Instruction::Load {
+                        dest: Value(23),
+                        ptr: Value(30),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(22),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(20)),
+                        rhs: Operand::Value(Value(23)),
+                        ty: IrType::I32,
+                    },
+                ],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+            });
+            if bare_outside_use {
+                func.blocks.push(BasicBlock {
+                    label: BlockId(3),
+                    instructions: vec![Instruction::Load {
+                        dest: Value(24),
+                        ptr: Value(22),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    }],
+                    terminator: Terminator::Return(None),
+                    source_spans: vec![],
+                });
+            }
+            (func, 1, 2, Value(21), 2)
+        }
+        let (func, header, latch, iv, work_len) = fixture(false);
+        assert!(
+            serial_carried_accumulator(&func, header, latch, iv, work_len),
+            "one phi-incoming use must admit the single-chain shape"
+        );
+        let (func, header, latch, iv, work_len) = fixture(true);
+        assert!(
+            !serial_carried_accumulator(&func, header, latch, iv, work_len),
+            "an outside Load whose bare ptr is the back value is a second consumer"
+        );
+    }
+
+    #[test]
     fn two_block_unroll_declines_volatile_only_latch() {
         // Volatile accesses never join packs: a volatile-only latch has no
         // feedstock and must decline (the same bloat class, plus volatile
