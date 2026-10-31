@@ -356,6 +356,8 @@ thread_local! {
     /// a process-global read would make the kill-switch test race its siblings
     /// on cargo's thread pool.
     static SELF_RECURSION_CLONE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Compilation-scoped trace switch for parameter-reference remapping.
+    static PARAMREF_DEBUG_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Functions `self_recursion::inline_self_recursion` already expanded in
     /// the module being compiled. Each self-recursive function is expanded by
     /// ONE mechanism: the clone skips these, so its level never compounds on
@@ -369,6 +371,11 @@ thread_local! {
 pub(crate) fn set_self_recursion_clone_enabled(enabled: bool) {
     SELF_RECURSION_CLONE_ENABLED.with(|cell| cell.set(enabled));
     SELF_INLINED.with(|set| set.borrow_mut().clear());
+}
+
+/// Set the parameter-reference trace switch once for this compilation.
+pub(crate) fn set_paramref_debug_enabled(enabled: bool) {
+    PARAMREF_DEBUG_ENABLED.with(|cell| cell.set(enabled));
 }
 
 /// Suspend or resume the clone within one module without forgetting its
@@ -6137,7 +6144,7 @@ fn inline_call_site(
         }
     }
     let mut paramref_subst: FxInlineMap<u32, Operand> = FxInlineMap::default();
-    let paramref_debug = std::env::var("CCC_INLINE_PARAMREF_DEBUG").is_ok();
+    let paramref_debug = PARAMREF_DEBUG_ENABLED.with(std::cell::Cell::get);
     {
         let entry_block = &mut inlined_blocks[0];
         let mut insert_pos = 0;
