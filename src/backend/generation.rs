@@ -801,12 +801,25 @@ fn compute_omitted_tls_roots(cg: &dyn ArchCodegen, func: &IrFunction) -> FxHashM
     roots
 }
 
+/// The two callers ask two different questions, so the register-offset symbol
+/// arm (see below) is parameterised by `deadened_addrs`:
+///
+/// * `Some(dead)` — "will the emitter TAKE this fold?" Used only by the two
+///   skip decisions (`foldable_folds` and `idx_dead_producers`), which delete
+///   instructions. A fold the emitter refuses must never delete them, so this
+///   answer must be the dispatch's own answer, dead-`Add` gate included.
+/// * `None` — "is an indexed form ENCODABLE here?" Used at the accesses,
+///   where nothing is deleted: the emitter's dispatch picks the
+///   register-offset symbol form for a deadened `Add` and the plain
+///   register-base SIB otherwise. It must stay permissive for that class, or
+///   the second of those two forms would be lost.
 fn can_indexed_addr_fold(
     cg: &dyn ArchCodegen,
     info: &IndexedGepInfo,
     global_addr_map: &FxHashMap<u32, String>,
     reg_off_sym_map: &FxHashMap<u32, RegOffSym>,
     gep_dest: u32,
+    deadened_addrs: Option<&FxHashSet<u32>>,
 ) -> bool {
     // CCC_NO_FOLDED_INDEX_LIVENESS: same contract as the register-base arm
     // of can_const_addr_fold above — the SIB re-reads the index register
@@ -833,12 +846,21 @@ fn can_indexed_addr_fold(
     // Register-offset symbol base (`sym+disp(%off,%idx,scale)`): a GlobalAddr
     // `Add`ed with a register offset is consumed AT the access — the SIB's
     // base slot carries the offset register and the displacement the symbol.
-    // This arm answers "may this access fold"; the EMITTER dispatch only
-    // takes the symbol form once the deadening pass has removed the `Add`
-    // (dead_global_addrs), because that is the only case where the form pays
-    // for itself: a live `Add` reads fine through its own register home.
+    // The EMITTER dispatch only takes the symbol form once the deadening pass
+    // has removed the `Add` (dead_global_addrs), because that is the only case
+    // where the form pays for itself: a live `Add` reads fine through its own
+    // register home. This arm must therefore mirror the dispatch EXACTLY. A
+    // bare `reg_off_sym_fold_ok` answer is not enough: it says the SIB is
+    // ENCODABLE, not that the emitter will take this arm, and a "yes" here
+    // skips the GEP along with its whole offset chain (`idx_dead_producers`).
+    // When the `Add` stayed live the emitter's fallback walks
+    // `rematerialize_skipped_indexed`, which reads the offset's register home
+    // — a definition this file just skipped (gzip longest_match at
+    // `-O1 -fno-pie`: the skipped `Cast` of `best_len - 1` was read back as
+    // `%r11`, the register a sibling had redefined in the same block).
     if let Some(ro) = reg_off_sym_map.get(&info.base.0) {
-        if reg_off_sym_fold_ok(cg, ro, info) {
+        let deadened = deadened_addrs.is_none_or(|dead| dead.contains(&info.base.0));
+        if deadened && reg_off_sym_fold_ok(cg, ro, info) {
             return true;
         }
     }
@@ -6035,7 +6057,7 @@ fn generate_function_body(
             if load_cmp_ptrs_func.contains(dest) {
                 continue; // pointer needed materialised by a cmp-mem fold
             }
-            if can_indexed_addr_fold(cg, info, &global_addr_map, &reg_off_sym_map, *dest) {
+            if can_indexed_addr_fold(cg, info, &global_addr_map, &reg_off_sym_map, *dest, None) {
                 foldable_folds.insert(*dest);
             }
         }
@@ -6122,6 +6144,26 @@ fn generate_function_body(
                 }
             }
         }
+        // Re-decide the foldability set with the deadening in place. The
+        // register-offset arm is only available for an `Add` this pass just
+        // deadened (the emitter's dispatch), so a fold whose base stayed live
+        // drops out HERE, before the offset-producer walk below can skip a
+        // chain for it. Without this second pass the walk would deaden the
+        // offset chain of a fold the emitter then refuses, and the access's
+        // rematerialisation path (`rematerialize_skipped_indexed`) would read
+        // the never-written offset home.
+        foldable_folds.retain(|dest| {
+            indexed_gep_map.get(dest).is_some_and(|info| {
+                can_indexed_addr_fold(
+                    cg,
+                    info,
+                    &global_addr_map,
+                    &reg_off_sym_map,
+                    *dest,
+                    Some(&dead_global_addrs),
+                )
+            })
+        });
         let mut has_store_consumer: FxHashSet<u32> = FxHashSet::default();
         for block in &func.blocks {
             for inst in &block.instructions {
@@ -6630,6 +6672,7 @@ fn generate_function_body(
                             &global_addr_map,
                             &reg_off_sym_map,
                             dest.0,
+                            Some(&dead_global_addrs),
                         )
                     {
                         cg.state().folded_gep_values.insert(dest.0);
@@ -8091,7 +8134,7 @@ fn generate_load(
         // Same guard as the generic fold so the skip and emit decisions agree.
         if let Some(info) = indexed_gep_map.get(&ptr.0) {
             if seg_indexed_fold_ty(ty)
-                && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+                && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0, None)
             {
                 if cg.emit_seg_load_indexed(dest, info, ty, seg_override) {
                     return;
@@ -8166,7 +8209,7 @@ fn generate_load(
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
         if !is_wide_int_type(ty)
-            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0, None)
         {
             // Register-offset symbol form — ONLY when the base `Add` was
             // deadened, i.e. when every one of its uses is a fold taking
@@ -8264,7 +8307,7 @@ fn generate_store(
         }
         if let Some(info) = indexed_gep_map.get(&ptr.0) {
             if seg_indexed_fold_ty(ty)
-                && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+                && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0, None)
             {
                 if cg.emit_seg_store_indexed(val, info, ty, seg_override) {
                     return;
@@ -8310,7 +8353,7 @@ fn generate_store(
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
         if !is_wide_int_type(ty)
-            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0, None)
         {
             // Register-offset symbol form, deadened-`Add` only (see
             // generate_load).
