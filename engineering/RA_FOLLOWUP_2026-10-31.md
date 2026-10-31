@@ -110,10 +110,13 @@ is enabled.
   refused to continue without `target/fastbuild/lccc`, so neither RA CI gate
   could be reached through this runner. `tests/ra/test_harness.py --full` was
   run directly and passed. Do not report local `ci_local.sh --fast` as green.
-* Hosted GitHub CI passed on head `37390f13` (build, clippy, unit/regression,
-  benchmark, ICX integration and compiler-contract jobs). The subsequently added
-  LCCC-vs-GCC holdout gate still requires a fresh hosted run; do not infer its
-  result from that earlier green head.
+* Hosted GitHub CI passed on head `a11057f9` in run `41233865201`; all listed
+  jobs passed, including both fast-local-contract shards that execute the new
+  LCCC-vs-GCC holdout gate. Build/package, Clippy, unit/regression,
+  benchmark, ICX integration, GCC/Rust exact-version oracles, and compiler
+  contracts all passed. The Actions run summary is observable; fetching its
+  detailed downloadable log hit an EOF from GitHub's log host, so no unobserved
+  per-kernel scoreboard totals are quoted here.
 * The initial differential sweep found undefined behavior in the interpreter's
   stack updates (unsequenced `sp` read/write and signed overflow); those were
   changed to unsigned arithmetic with explicit sequencing. The subsequent
