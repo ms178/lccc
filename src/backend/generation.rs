@@ -1491,6 +1491,59 @@ fn retain_used(map: &mut FxHashMap<u32, impl Sized>, use_counts: &[u32]) {
     });
 }
 
+/// Offset producers whose every IR use disappears in guaranteed load folds.
+/// Machine-address index reads are not IR uses: protect ALL selected indices,
+/// not just the index of the chain currently being visited. One value can be
+/// peeled through in `a[2*(i+1)]` but remain the terminal index of
+/// `b[2*(i+1)+1]`. Deleting it through the former leaves the latter reading an
+/// unwritten register (SV-01). Store fallback paths still need orig_offset.
+fn dead_indexed_offset_producers(
+    func: &IrFunction,
+    indexed: &FxHashMap<u32, IndexedGepInfo>,
+    foldable: &FxHashSet<u32>,
+    stores: &FxHashSet<u32>,
+    uses: &[u32],
+    stab: &BaseStability,
+) -> FxHashSet<u32> {
+    let live_indices: FxHashSet<u32> = indexed.values().map(|info| info.index.0).collect();
+    let defs = index_single_defs(func, stab);
+    let mut attributed: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut work = Vec::new();
+    for dest in foldable {
+        if stores.contains(dest) {
+            continue;
+        }
+        if let Some(info) = indexed.get(dest) {
+            *attributed.entry(info.orig_offset.0).or_insert(0) += 1;
+            work.push(info.orig_offset.0);
+        }
+    }
+    let mut dead = FxHashSet::default();
+    while let Some(v) = work.pop() {
+        if live_indices.contains(&v) || dead.contains(&v) {
+            continue;
+        }
+        let total = uses.get(v as usize).copied().unwrap_or(0);
+        if attributed.get(&v).copied().unwrap_or(0) < total {
+            continue;
+        }
+        let Some(inst) = defs.get(&v) else {
+            continue;
+        };
+        dead.insert(v);
+        for_each_operand_in_instruction(inst, |op| {
+            if let Operand::Value(x) = op {
+                *attributed.entry(x.0).or_insert(0) += 1;
+                // Revisit shared operands when the final attributable use
+                // disappears; unlike a per-GEP DFS this reaches a fixed point
+                // independently of hash-map iteration order.
+                work.push(x.0);
+            }
+        });
+    }
+    dead
+}
+
 /// Variable-offset GEPs foldable into indexed addressing.
 
 /// Map of folded-GEP INDEX value ids to their consumer GEP-dest value ids
@@ -6174,58 +6227,14 @@ fn generate_function_body(
                 }
             }
         }
-        let single_defs = index_single_defs(func, &stab);
-        // Fixed-point dead-offset analysis. The old walk required
-        // `use_count == 1` per chain node, which stops at SHARED offsets:
-        // `a[i]; b[i]` both GEP the same `i*8` value (use_count 2), and the
-        // scaled-offset producer stayed live as dead code after both GEPs
-        // folded (linux_find_bit: `movq %r13,%rbx; shlq $3,%rbx` per scanned
-        // word). Instead, count uses ATTRIBUTABLE to the fold: (a) offset
-        // operands of foldable GEPs, (b) operand positions of other dead
-        // chain nodes. A node is dead iff every one of its uses is
-        // fold-attributable. The walk still stops at the fold's index value:
-        // the terminal index is live by construction (the RA keeps it
-        // register-resident to the access).
-        let mut fold_uses: FxHashMap<u32, u32> = FxHashMap::default();
-        for dest in &foldable_folds {
-            if let Some(info) = indexed_gep_map.get(dest) {
-                *fold_uses.entry(info.orig_offset.0).or_insert(0) += 1;
-            }
-        }
-        for (dest, info) in indexed_gep_map.iter() {
-            if !foldable_folds.contains(dest) || has_store_consumer.contains(dest) {
-                continue;
-            }
-            let index_val = info.index.0;
-            let mut stack = vec![info.orig_offset.0];
-            while let Some(v) = stack.pop() {
-                if v == index_val {
-                    continue;
-                }
-                if idx_dead_producers.contains(&v) {
-                    continue;
-                }
-                let total = value_use_counts.get(v as usize).copied().unwrap_or(0);
-                let attributed = fold_uses.get(&v).copied().unwrap_or(0);
-                if attributed < total {
-                    // Some use is outside the folded chains: keep the node
-                    // (and do not traverse through it — its operands may
-                    // still be live for those other uses).
-                    continue;
-                }
-                idx_dead_producers.insert(v);
-                if let Some(inst) = single_defs.get(&v) {
-                    for_each_operand_in_instruction(inst, |op| {
-                        if let Operand::Value(x) = op {
-                            stack.push(x.0);
-                            // This operand use is now attributable to the
-                            // fold (its consumer is dead).
-                            *fold_uses.entry(x.0).or_insert(0) += 1;
-                        }
-                    });
-                }
-            }
-        }
+        idx_dead_producers = dead_indexed_offset_producers(
+            func,
+            &indexed_gep_map,
+            &foldable_folds,
+            &has_store_consumer,
+            &value_use_counts,
+            &stab,
+        );
     }
 
     let emit_debug = cg.state_ref().debug_info && source_mgr.is_some() && !file_table.is_empty();
@@ -9744,5 +9753,170 @@ mod masked_layout_selection_tests {
             true,
             Some((0, 0))
         ));
+    }
+}
+
+#[cfg(test)]
+mod indexed_offset_dead_tests {
+    use super::*;
+    use crate::ir::reexports::BlockId;
+
+    fn fixture() -> IrFunction {
+        let mut f = IrFunction::new("shared_index".into(), IrType::Void, vec![], false);
+        let add = |dest, lhs, rhs| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(lhs)),
+            rhs,
+            ty: IrType::I64,
+        };
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "a".into(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I64(7)),
+                },
+                add(2, 1, Operand::Const(IrConst::I64(1))),
+                add(3, 2, Operand::Value(Value(2))),
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I64(2)),
+                    ty: IrType::I64,
+                },
+                add(5, 3, Operand::Const(IrConst::I64(1))),
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(5)),
+                    rhs: Operand::Const(IrConst::I64(2)),
+                    ty: IrType::I64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(7),
+                    base: Value(0),
+                    offset: Operand::Value(Value(4)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(8),
+                    base: Value(0),
+                    offset: Operand::Value(Value(6)),
+                    ty: IrType::Ptr,
+                },
+            ],
+            terminator: Terminator::Return(None),
+        });
+        f.next_value_id = 9;
+        f.next_label = 1;
+        f
+    }
+
+    fn folds() -> FxHashMap<u32, IndexedGepInfo> {
+        [(7, 1, 4, 8), (8, 2, 6, 4)]
+            .into_iter()
+            .map(|(dest, index, off, disp)| {
+                (
+                    dest,
+                    IndexedGepInfo {
+                        base: Value(0),
+                        index: Value(index),
+                        index_ty: IrType::I64,
+                        shift: 3,
+                        disp,
+                        orig_offset: Value(off),
+                        access_tys: vec![IrType::F32],
+                        feeds_store: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn dead(
+        f: &IrFunction,
+        map: &FxHashMap<u32, IndexedGepInfo>,
+        stores: &[u32],
+    ) -> FxHashSet<u32> {
+        dead_indexed_offset_producers(
+            f,
+            map,
+            &map.keys().copied().collect(),
+            &stores.iter().copied().collect(),
+            &count_value_uses(f),
+            &analyze_base_stability(f),
+        )
+    }
+
+    #[test]
+    fn preserves_indices_selected_by_other_folds() {
+        let f = fixture();
+        let d = dead(&f, &folds(), &[]);
+        assert!(!d.contains(&1));
+        assert!(!d.contains(&2), "odd-field SIB still reads i+1");
+        for id in [3, 4, 5, 6] {
+            assert!(d.contains(&id), "offset v{id} is still eliminated");
+        }
+    }
+
+    fn shared_offset() -> (IrFunction, FxHashMap<u32, IndexedGepInfo>) {
+        let mut f = fixture();
+        // Both accesses use one scaled offset. Remove the unused odd chain.
+        f.blocks[0]
+            .instructions
+            .retain(|i| !matches!(i.dest(), Some(Value(5 | 6))));
+        if let Instruction::GetElementPtr { offset, .. } = &mut f.blocks[0].instructions[6] {
+            *offset = Operand::Value(Value(4));
+        } else {
+            panic!("expected second GEP");
+        }
+        let mut m = folds();
+        let first = m[&7].clone();
+        m.insert(8, first);
+        (f, m)
+    }
+
+    #[test]
+    fn shared_offsets_reach_fixed_point_in_either_insertion_order() {
+        let (f, m) = shared_offset();
+        for order in [[7, 8], [8, 7]] {
+            let map = order.into_iter().map(|id| (id, m[&id].clone())).collect();
+            let d = dead(&f, &map, &[]);
+            assert_eq!(d, [2, 3, 4].into_iter().collect());
+        }
+    }
+
+    #[test]
+    fn store_fallback_keeps_shared_offset_materialized() {
+        let (f, m) = shared_offset();
+        assert!(dead(&f, &m, &[8]).is_empty());
+    }
+
+    #[test]
+    fn ordinary_use_keeps_offset_materialized() {
+        let (mut f, m) = shared_offset();
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(9),
+            src: Operand::Value(Value(4)),
+        });
+        f.next_value_id = 10;
+        assert!(dead(&f, &m, &[]).is_empty());
+    }
+
+    #[test]
+    fn ambiguous_definition_is_not_deleted() {
+        let (mut f, m) = shared_offset();
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(4),
+            src: Operand::Const(IrConst::I64(0)),
+        });
+        assert!(dead(&f, &m, &[]).is_empty());
     }
 }

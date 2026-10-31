@@ -1883,6 +1883,31 @@ Do after SV-06 S1 so the new framework defines the trait. **Effort** M.
   committed corpus with GCC 16.2, Clang 23.1 and ICX on identical flags, on real
   hardware, with the raw pairs published — not the VM screening above.
 
+### 9b.5 Implementation follow-up (2026-10-31)
+
+- **SV-01 root cause fixed; extended acceptance still open.** The AoS crash
+  is caused by backend dead-offset suppression, not a missing unroller IR
+  definition. A value peeled through by one address remains the selected SIB
+  index of another. Protect all selected indices across the function, retain
+  store-fallback offset chains, and make shared-offset deletion a worklist
+  fixed point. No unroll/vectorization kill switch is needed. Five Rust
+  regression cases pin these invariants.
+- **SV-01/SV-02 regression foundation:** the seven-shape runner now fails
+  closed on compilation/runtime/reference errors, compares every output
+  element, uses private scratch directories, emits optional JSON and supports
+  18 trip counts, start/end guard pages, four element types, pair strides 2–4
+  and bounded mixed-sign inputs. Local GCC 16.2 / Clang 23.1.4 differentials:
+  2,268 trip/layout checks plus 1,008 mixed-sign/type/stride checks passed.
+  GCC and authenticated ICX CI receive permanent smoke gates. See
+  `tests/simd/README.md` for commands, scope and oracle limitations.
+- **Still open:** SV-01's randomized one-day seed/page/misalignment/overlap
+  acceptance and scalar-loop extension; SV-02's hardened 44-kernel scoreboard,
+  controlled paired timing and full sweep. SV-03–SV-12 remain open; this fix
+  does not implement a general vectorizer, extend ISA coverage, or establish
+  target-hardware speedups. The offline Godbolt cross-add witness still shows
+  a substantial static-code gap against GCC/Clang; instruction counts are not
+  runtime wins. SM-1 is not yet complete.
+
 ## 10. Carried over from the superseded live queue (full text in the archives)
 
 Everything open in the 478-line queue that this file replaces is listed here with
