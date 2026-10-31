@@ -45,12 +45,13 @@ python3 tests/ra/test_harness.py             # GCC O0/O2
 python3 tests/ra/test_harness.py --full      # GCC O0/O1/O2/O3
 ```
 
-The fast CI lane runs the smoke test. The full sweep is an explicit research
-command because it compiles every generated kernel repeatedly. Both modes
-compare checksums against GCC `-O0` and run the fixed-seed kernels under GCC
-UBSan (including float-cast-overflow) at `-O2`; these screens are not a proof
-of C semantic correctness. Run fuzzing and targeted reference models for
-aggressive transformations.
+The fast CI lane runs the GCC harness smoke test and, after building LCCC,
+compares LCCC against GCC 16 on all 20 holdout kernels at O1/O2/O3, checking
+checksums against GCC `-O0` before reporting code shape. `--full` additionally
+checks GCC O0/O1/O2/O3. Both test modes run the fixed-seed kernels under GCC
+UBSan (including float-cast-overflow) at O2; these screens are not a proof of C
+semantic correctness. Run fuzzing and targeted reference models for aggressive
+transformations.
 
 ## Scoreboard semantics and limitations (RAP-02 / RAP-05 / RAP-10)
 

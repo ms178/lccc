@@ -38,8 +38,10 @@ No benchmark timing or allocator-quality result is claimed.
   holdout, so it remains easy to evaluate a frozen candidate separately from
   the tuning corpus. The existing benchmark C files are included via glob, not
   copied or rewritten.
-* Added checksum checking against GCC `-O0`; the deterministic corpus is
-  checked in the fast CI lane by `tests/ra/test_harness.py`.
+* Added checksum checking against GCC `-O0`; `tests/ra/test_harness.py` checks
+  corpus generation and GCC-only optimization-level invariance. A second fast
+  CI gate now runs LCCC vs GCC 16 for the full holdout at O1/O2/O3, with
+  checksum validation before its assembly scoreboard is printed.
 
 **Validation performed:** generator repeated twice and byte-compared; all 20
 kernels compiled and ran under GCC `-O0`, `-O1`, `-O2`, and `-O3`; every output
@@ -105,9 +107,13 @@ is enabled.
 * `PATH=/tmp/lccc-validation-venv/bin:$PATH ./scripts/ci_local.sh --fast` — the
   Python/YAML, shell, and initial repository gates passed; the run then stopped
   at `build` because neither `rustc` nor `cargo` is installed. As designed, it
-  refused to continue without `target/fastbuild/lccc`, so the newly added gate
-  could not be reached through this runner. `tests/ra/test_harness.py --full`
-  was run directly and passed. Do not report `ci_local.sh --fast` as green.
+  refused to continue without `target/fastbuild/lccc`, so neither RA CI gate
+  could be reached through this runner. `tests/ra/test_harness.py --full` was
+  run directly and passed. Do not report local `ci_local.sh --fast` as green.
+* Hosted GitHub CI passed on head `37390f13` (build, clippy, unit/regression,
+  benchmark, ICX integration and compiler-contract jobs). The subsequently added
+  LCCC-vs-GCC holdout gate still requires a fresh hosted run; do not infer its
+  result from that earlier green head.
 * The initial differential sweep found undefined behavior in the interpreter's
   stack updates (unsequenced `sp` read/write and signed overflow); those were
   changed to unsigned arithmetic with explicit sequencing. The subsequent
