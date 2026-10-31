@@ -106,9 +106,16 @@ carried facts with an explicit invariant.
   marker/column resync after the merge.
 * `text_processing.rs` tests — the phase-4 predicate as a table, and the
   exhaustive fast-path equivalence.
+* The sweep is a knob (`LCCC_PP_FUZZ_CASES`, `LCCC_PP_FUZZ_SEED`): CI runs the
+  default 24 cases in ~1 s, and a release audit widens it without editing code.
+  At 400 cases × 5 frontends (2 000 `-E` invocations, 9.4 s) every case agrees
+  with GCC 16.2, and a 60-case cross-check against Clang 23.1.4 agrees too — the
+  oracle is not the only thing that could be wrong.
 * Negative control: the upgraded gate run against the pre-fix binary fails 14
-  times (2 fixtures × 5 frontends, plus 4 sweep cases). A gate that cannot fail
-  is decoration.
+  times (2 fixtures × 5 frontends, plus 4 sweep cases); the same sweep over 150
+  randomized cases reports 7 divergences pre-fix and 0 after, and against Clang
+  23.1.4 as the oracle 3 pre-fix and 0 after. A gate that cannot fail is
+  decoration.
 
 The sibling change — `-fno-delete-null-pointer-checks` as a silent off-request
 with a ledger row, and the kernel harness compiling the package's own config —

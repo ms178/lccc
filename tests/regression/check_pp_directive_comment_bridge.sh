@@ -54,6 +54,15 @@
 #     found by exactly this sweep once their templates were encoded.
 #   * a value pin — the kernel macro's numeric value, computed here.
 #
+# The sweep is a knob so one gate serves both duties: CI runs the default
+# width in about a second, and a release audit widens it without editing code —
+#
+#     LCCC_PP_FUZZ_CASES=400 bash tests/regression/check_pp_directive_comment_bridge.sh
+#
+# reproduces the 400-case x 5-frontend audit recorded in
+# engineering/journal/2026-10-31-comment-bridged-directives.md (2000 compiler
+# invocations, ~10 s on two cores). LCCC_PP_FUZZ_SEED changes the corpus.
+#
 # Usage:  env CCC=... [GCC=gcc-16] bash tests/regression/check_pp_directive_comment_bridge.sh
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -229,14 +238,18 @@ int after;
 # around them, generated from a fixed seed so a failure reproduces exactly.
 # The sweep runs against $CCC only: every frontend above shares this frontend
 # code, and the fixture leg proves that on all of them.
-python3 - "$tmp/sweep" <<'PYEOF'
+sweep_cases_wanted=${LCCC_PP_FUZZ_CASES:-24}
+sweep_seed=${LCCC_PP_FUZZ_SEED:-0x5EED1234}
+python3 - "$tmp/sweep" "$sweep_cases_wanted" "$sweep_seed" <<'PYEOF'
 import os
 import random
 import sys
 
 out = sys.argv[1]
+wanted = int(sys.argv[2], 0)
+seed = int(sys.argv[3], 0)
 os.makedirs(out, exist_ok=True)
-rng = random.Random(0x5EED1234)
+rng = random.Random(seed)
 
 WORDS = ("change", "size", "atime", "mtime", "deleg", "not // code", "it's", '"quoted"', "%", "%:")
 
@@ -311,11 +324,13 @@ def case_f(a, b, c, d):
 
 templates = (case_a, case_b, case_c, case_d, case_e, case_f)
 index = 0
-for template in templates:
-    for _ in range(4):
+while index < wanted:
+    for template in templates:
+        if index >= wanted:
+            break
         a, b, c, d = ints()
         a = a * 100 + index  # unique macro/binding names per case
-        with open(os.path.join(out, f"case{index:02d}.c"), "w") as handle:
+        with open(os.path.join(out, f"case{index:03d}.c"), "w") as handle:
             handle.write(template(a, b, c, d))
         index += 1
 print(index)
@@ -344,7 +359,7 @@ for case in "$tmp/sweep"/*.c; do
   fi
 done
 if (( fail == 0 )); then
-  echo "ok[sweep] ($sweep_cases generated cases, seed 0x5EED1234)"
+  echo "ok[sweep] ($sweep_cases generated cases, seed $sweep_seed)"
 fi
 
 if [ "$fail" -ne 0 ]; then
