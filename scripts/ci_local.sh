@@ -1288,6 +1288,19 @@ gate "i386-call-staging-asm" fast \
 gate "ptr-iv-collapse-codegen" fast \
     env CCC="$LCCC" bash tests/regression/check_ptr_iv_collapse_codegen.sh
 
+# GCC expands a directly self-recursive callee one level; the clone removes a
+# call/return, a prologue and an epilogue per level and halves the frame depth
+# of a full tree walk.  The gate is two-sided (the kill-switch build must show
+# the old call counts, and tail calls / oversized bodies must be untouched).
+gate "self-recursion-clone" fast \
+    env CCC="$LCCC" bash tests/regression/check_self_recursion_clone.sh
+
+# The compile-time constant evaluator is depth-bounded: a constant recursion
+# deeper than the bound must stay a call instead of recursing until the
+# compiler's own 64 MiB stack is gone (which aborted the whole compile).
+gate "ipcp-eval-depth" fast \
+    env CCC="$LCCC" bash tests/regression/check_ipcp_eval_depth.sh
+
 gate "loop-invert-census" fast \
     python3 scripts/loop_invert_census.py --lccc "$LCCC" --quiet
 
@@ -2597,6 +2610,20 @@ gate "ch-maj-codegen" fast \
 # loss, now opt-in via CCC_IVSR_SCALAR_DERIVED=1).
 gate "nbody-perf-shapes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_nbody_perf_shapes.sh
+
+# Stack-slot dead stores: a 32-bit `leal` on a data-register %rbp used to bail
+# never-read store elimination for the whole function, leaving `spill_deref`'s
+# deleted reloads behind as dead stores in the hottest block (glibc_strstr:
+# two of them, measured -1.0 % runtime).  The gate pins the structural contract
+# on a fixture that reproduces the shape, and self-tests its checker.
+gate "dead-stack-store" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_dead_stack_store.sh
+# An empty inline-asm template assembles to nothing, so it must stage nothing:
+# the old staging path reserved a scratch for every memory operand and spilled
+# the address to the frame when the busy set was full, costing a store/load
+# pair per iteration around every `asm volatile("" : "+m"(x))` barrier.
+gate "asm-barrier-staging" fast \
+    env CCC=target/fastbuild/lccc GCC_BIN=gcc-16 bash tests/regression/check_asm_barrier_no_spill.sh
 gate "ivsr-scalar-derived-default" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_scalar_derived_default.sh
 

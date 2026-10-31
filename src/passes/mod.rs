@@ -1144,6 +1144,73 @@ pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
     })
 }
 
+/// True when an inline-asm constraint can only name memory, an immediate or a
+/// literal — never a register.
+///
+/// Conservative by construction: every character that could select a register
+/// class (`r`, `g`, `a`, `b`, `c`, `d`, `S`, `D`, `A`, `f`, `t`, `u`, `x`, `y`,
+/// `v`, `q`, `Q`, `R`, `l`, `Y`, `k`, `X`) is absent from the allow list, so an
+/// unrecognised constraint keeps the instruction rather than dropping it.
+fn asm_constraint_names_no_register(constraint: &str) -> bool {
+    constraint.chars().all(|c| {
+        c.is_ascii_digit()
+            // `%` is deliberately absent: `%0` matches another operand, which
+            // may well be a register. Neither is `,`: an alternative list is
+            // only inert when every alternative is.
+            || matches!(c, '=' | '+' | '&' | '#' | '*')
+            || matches!(
+                c,
+                'm' | 'o'
+                    | 'V'
+                    | '<'
+                    | '>'
+                    | 'i'
+                    | 'n'
+                    | 'I'
+                    | 'J'
+                    | 'K'
+                    | 'L'
+                    | 'M'
+                    | 'N'
+                    | 'O'
+                    | 'P'
+                    | 'e'
+                    | 'Z'
+                    | 's'
+            )
+    })
+}
+
+/// Drop inline asm that assembles to nothing and names no register.
+///
+/// See the call site for why this is the last IR transform: the barrier's only
+/// job is to order memory operations for the optimisers, and none are left.
+/// Returns the number of instructions removed.
+fn remove_inert_inline_asm(f: &mut crate::ir::reexports::IrFunction) -> usize {
+    use crate::ir::reexports::Instruction;
+    let mut removed = 0;
+    for block in &mut f.blocks {
+        let before = block.instructions.len();
+        block.instructions.retain(|inst| {
+            !matches!(
+                inst,
+                Instruction::InlineAsm {
+                    template,
+                    outputs,
+                    inputs,
+                    goto_labels,
+                    ..
+                } if goto_labels.is_empty()
+                    && crate::backend::inline_asm::inline_asm_template_has_no_instructions(template.as_str())
+                    && outputs.iter().all(|(c, _, _)| asm_constraint_names_no_register(c))
+                    && inputs.iter().all(|(c, _, _)| asm_constraint_names_no_register(c))
+            )
+        });
+        removed += before - block.instructions.len();
+    }
+    removed
+}
+
 /// Apply the driver-level `-fno-tree-vectorize` policy to every automatic
 /// vectorizer entry in the pass pipeline. Explicit vector types and intrinsics
 /// are unaffected; the disable list gates only automatic transformations.
@@ -1527,6 +1594,7 @@ pub(crate) fn run_passes(
     // keeps the kill-switch unit test from racing its siblings (see
     // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
     loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
+    inline::set_self_recursion_clone_enabled(std::env::var("CCC_NO_SELF_RECURSION_CLONE").is_err());
     loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
     loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
     // Every remaining pass switch, resolved here for the same reason.  No pass
@@ -4212,6 +4280,25 @@ pub(crate) fn run_passes(
         verify::verify_after_pass(module, "fmanegpeel");
     }
 
+    // An inline asm that assembles to nothing and names no register is a
+    // compiler barrier with no code behind it: `asm volatile("" : "+m"(x))`.
+    // Its operands exist to tell the optimiser that `x` is read and written,
+    // and every memory pass that could have used that fact (LICM, the
+    // dead-store eliminators, store/load forwarding, the scheduler) has already
+    // run by now. Dropping the instruction here removes the last two things it
+    // still costs: the operands count as uses, so a memory operand's address is
+    // materialised into a register instead of folding into the addressing modes
+    // of the accesses that dominate it (zlib_ng_slide_hash's `ref_slide_chain`
+    // paid two `leaq`s per iteration for an address both its load and its store
+    // can encode), and the value keeps a home alive across the block. The
+    // register refusal below is what keeps `asm("" : "=r"(x) : "0"(x))` — the
+    // kernel's OPTIMIZER_HIDE_VAR — intact: that one names a register, and the
+    // tied value must still be delivered to the output home.
+    // Kill switch: CCC_DISABLE_PASSES=inertasm.
+    if !pass_disabled(&disabled, "inertasm") {
+        module.for_each_function(remove_inert_inline_asm);
+    }
+
     if time_passes {
         round_cap::report();
     }
@@ -4229,6 +4316,99 @@ pub(crate) fn run_passes(
 /// regressions), so an unset environment must NEVER enable it.
 fn ivsr_scalar_derived_enabled(run_ivsr: bool) -> bool {
     run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok()
+}
+
+#[cfg(test)]
+mod inert_inline_asm_tests {
+    use super::{asm_constraint_names_no_register, remove_inert_inline_asm};
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
+    };
+
+    fn asm_func(
+        template: &str,
+        outputs: Vec<(&str, Value)>,
+        inputs: Vec<(&str, Value)>,
+    ) -> IrFunction {
+        let mut func = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::InlineAsm {
+                template: template.to_string(),
+                outputs: outputs
+                    .into_iter()
+                    .map(|(c, v)| (c.to_string(), v, None))
+                    .collect(),
+                inputs: inputs
+                    .into_iter()
+                    .map(|(c, v)| (c.to_string(), Operand::Value(v), None))
+                    .collect(),
+                clobbers: vec!["memory".to_string()],
+                operand_types: vec![IrType::I64],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 8;
+        func
+    }
+
+    #[test]
+    fn memory_only_barrier_is_dropped() {
+        // `asm volatile("" : "+m"(x))`: read-write memory, no register.
+        let mut func = asm_func("", vec![("+m", Value(0))], vec![]);
+        assert_eq!(remove_inert_inline_asm(&mut func), 1);
+        assert!(func.blocks[0].instructions.is_empty());
+    }
+
+    #[test]
+    fn register_operand_keeps_the_instruction() {
+        // The kernel's OPTIMIZER_HIDE_VAR: `asm("" : "=r"(x) : "0"(x))` must
+        // survive, because the tied value still has to reach the output home.
+        let mut func = asm_func("", vec![("=r", Value(1))], vec![("0", Value(1))]);
+        assert_eq!(remove_inert_inline_asm(&mut func), 0);
+        assert_eq!(func.blocks[0].instructions.len(), 1);
+    }
+
+    #[test]
+    fn non_empty_template_keeps_the_instruction() {
+        // A real instruction is a real memory barrier for the assembler.
+        let mut func = asm_func(
+            "\n\tlock addq $1, (%rdi)\n\t",
+            vec![],
+            vec![("m", Value(0))],
+        );
+        assert_eq!(remove_inert_inline_asm(&mut func), 0);
+        assert_eq!(func.blocks[0].instructions.len(), 1);
+    }
+
+    #[test]
+    fn asm_goto_is_never_dropped() {
+        let mut func = asm_func("", vec![], vec![("m", Value(0))]);
+        if let Instruction::InlineAsm { goto_labels, .. } = &mut func.blocks[0].instructions[0] {
+            goto_labels.push(("fail".to_string(), BlockId(1)));
+        }
+        assert_eq!(remove_inert_inline_asm(&mut func), 0);
+    }
+
+    #[test]
+    fn constraint_classifier_is_conservative() {
+        for c in [
+            "m", "+m", "=m", "o", "V", "i", "n", "I", "K", "e", "Z", "s", "0", "1",
+        ] {
+            assert!(asm_constraint_names_no_register(c), "{c}");
+        }
+        for c in [
+            "r", "=r", "+r", "g", "a", "b", "c", "d", "S", "D", "A", "f", "x", "v", "q", "Q", "R",
+            "l", "{r12}", "X", "%0",
+        ] {
+            assert!(!asm_constraint_names_no_register(c), "{c}");
+        }
+    }
 }
 
 #[cfg(test)]

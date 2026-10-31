@@ -982,6 +982,7 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
         // (`common::tls::set_call_sequence_symbols`).
         Instruction::GlobalAddr { name, .. } => crate::common::tls::address_is_call_sequence(name),
         Instruction::InlineAsm {
+            template,
             outputs,
             inputs,
             clobbers,
@@ -990,9 +991,24 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
             // `asm volatile("" ::: "memory")` is a compiler barrier, not a
             // register clobber. A GP/XMM clobber list without operands
             // (`syscall ::: rcx,r11`) *is* a call point.
-            !outputs.is_empty()
-                || !inputs.is_empty()
-                || clobbers.iter().any(|c| clobber_is_allocatable_reg(c))
+            //
+            // The template, not the operand list, decides whether anything
+            // can be clobbered: an empty template assembles to zero
+            // instructions, so no register is destroyed no matter what the
+            // operands say. `asm volatile("" : "+m"(x))` — the barrier form
+            // that carries a read-write memory operand — used to look like
+            // an operand-carrying asm and was therefore treated as a call
+            // point, which forced every value live across it into a
+            // callee-saved home or a stack slot and paid a store/reload pair
+            // per iteration (zlib_ng_slide_hash `ref_slide_chain`: 2 extra
+            // memory operations in a 25M-iteration loop). The memory effect
+            // is unchanged: a `"memory"` clobber still orders the accesses at
+            // the IR level (`may_write_memory`, LICM's barrier model); only
+            // the register accounting is corrected.
+            !crate::backend::inline_asm::inline_asm_template_has_no_instructions(template)
+                && (!outputs.is_empty()
+                    || !inputs.is_empty()
+                    || clobbers.iter().any(|c| clobber_is_allocatable_reg(c)))
         }
         Instruction::Memcpy { .. }
         | Instruction::VaArg { .. }
@@ -3437,6 +3453,66 @@ mod tests {
         assert!(
             result.call_points.is_empty(),
             "Empty inline asm barriers should NOT be call points"
+        );
+    }
+
+    #[test]
+    fn test_empty_template_asm_with_memory_operand_is_not_call_point() {
+        // `asm volatile("" : "+m"(x))` carries a read-write memory operand, so
+        // the old "any operand makes it a call point" rule spilled every live
+        // value across the barrier. The template is what reaches the
+        // assembler, and an empty one emits nothing: no register dies.
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I32(1)),
+                    rhs: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::I32,
+                },
+                Instruction::InlineAsm {
+                    template: "\n\t".to_string(),
+                    outputs: vec![("+m".to_string(), Value(1), None)],
+                    inputs: vec![("m".to_string(), Operand::Value(Value(2)), None)],
+                    clobbers: vec!["memory".to_string()],
+                    operand_types: vec![IrType::I64, IrType::I64],
+                    goto_labels: vec![],
+                    input_symbols: vec![],
+                    seg_overrides: vec![],
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 4;
+
+        let result = compute_live_intervals(&func);
+        assert!(
+            result.call_points.is_empty(),
+            "an empty template cannot clobber a register: {:?}",
+            result.call_points
+        );
+        // The same operands with a real instruction ARE a call point.
+        let mut with_body = func.clone();
+        for inst in &mut with_body.blocks[0].instructions {
+            if let Instruction::InlineAsm { template, .. } = inst {
+                *template = "nop".to_string();
+            }
+        }
+        let result = compute_live_intervals(&with_body);
+        assert!(
+            !result.call_points.is_empty(),
+            "a non-empty template with operands stays a call point"
         );
     }
 

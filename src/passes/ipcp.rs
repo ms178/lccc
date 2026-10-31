@@ -29,6 +29,21 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrConst, IrModule, Operand, Terminator};
 
+/// Maximum nesting of compile-time evaluated calls; see
+/// [`eval_const_function_at`] for why the step budget alone is not enough.
+///
+/// Sized from the folds this interpreter exists for, not from the budget:
+/// `ackermann(3, 11)` — the canonical "constant recursion" kernel, and the
+/// shape `tests/benchmark/programs/ackermann.c` and `constant_recursion.c`
+/// both use — reaches an intermediate `ackermann(2, 16379)` and therefore
+/// nests ~16.4k calls, so anything near that number would turn a
+/// fully-folded benchmark back into a runtime loop. 65,536 leaves 4x
+/// headroom at ~100 bytes of interpreter frame per level (measured against
+/// the 64 MiB pipeline stack: an unbounded 10M-deep fold aborted at roughly
+/// 700k levels), so the cap converts a stack overflow into a refusal
+/// without rejecting any fold that fits.
+const MAX_EVAL_CALL_DEPTH: u32 = 65_536;
+
 /// Run interprocedural constant propagation on the module.
 ///
 /// Returns the number of changes made (call sites replaced, calls eliminated,
@@ -230,7 +245,39 @@ fn eval_const_function(
     active: &mut FxHashSet<(usize, Vec<crate::ir::constants::ConstHashKey>)>,
     budget: &mut u64,
 ) -> Option<IrConst> {
-    if *budget == 0 {
+    eval_const_function_at(
+        module,
+        function_indices,
+        function_idx,
+        args,
+        memo,
+        active,
+        budget,
+        0,
+    )
+}
+
+/// Depth-bounded body of [`eval_const_function`].
+///
+/// The step budget bounds *work*, not *stack*: one recursion level costs a
+/// single step, so a body that recurses per step (`sum(n - 1, acc + n)` with a
+/// constant `n`) could reach hundreds of thousands of Rust frames before the
+/// 2,000,000-step budget ran out and overflow the compiler's own stack
+/// (observed: `-O2` on a 10-millisecond tail-recursive sum aborted with
+/// "thread has overflowed its stack"). A depth cap turns that into the honest
+/// answer both callers already handle: this call is not a compile-time
+/// constant, so it stays a call.
+fn eval_const_function_at(
+    module: &IrModule,
+    function_indices: &FxHashMap<String, usize>,
+    function_idx: usize,
+    args: &[IrConst],
+    memo: &mut FxHashMap<(usize, Vec<crate::ir::constants::ConstHashKey>), Option<IrConst>>,
+    active: &mut FxHashSet<(usize, Vec<crate::ir::constants::ConstHashKey>)>,
+    budget: &mut u64,
+    depth: u32,
+) -> Option<IrConst> {
+    if *budget == 0 || depth > MAX_EVAL_CALL_DEPTH {
         return None;
     }
     let key = (function_idx, args.iter().map(|c| c.to_hash_key()).collect());
@@ -381,7 +428,7 @@ fn eval_const_function(
                         for arg in &info.args {
                             call_args.push(eval_const_operand(arg, &values)?);
                         }
-                        let result = eval_const_function(
+                        let result = eval_const_function_at(
                             module,
                             function_indices,
                             callee_idx,
@@ -389,6 +436,7 @@ fn eval_const_function(
                             memo,
                             active,
                             budget,
+                            depth + 1,
                         )?;
                         if let Some(dest) = info.dest {
                             values.insert(dest.0, result);

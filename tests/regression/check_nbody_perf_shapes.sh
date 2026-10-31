@@ -8,6 +8,8 @@
 #      Missing workloads, unknown addresses and ambiguous CFG facts fail;
 #      zero displacement-form matches cannot manufacture a pass.
 #      This is a workload-specific codegen contract, not a runtime metric.
+#   C. scalar broadcasts: no `mov %A,%T; unpcklp{d,s} %T,%T` pair survives
+#      (one `pshufd` of %A replaces both), and the loop's splats are present.
 #   B. same-value FP squares: no `movsd SLOT, %rX` immediately followed by
 #      `vmulsd SLOT, %rX, %rX` reading the SAME slot twice (the register
 #      already holds it — nbody's d² chain shape).
@@ -57,6 +59,31 @@ EOF
 [ "$D" -eq 0 ] || bad "nbody: $D same-value squares re-read the slot (register already holds it)"
 
 if [ "$fails" -eq 0 ]; then
+# ── C: scalar broadcasts cost one instruction, not two ─────────────────
+# The SLP lowerings splat a scalar by copying it into a scratch register and
+# unpacking that register with itself, because `unpcklpd`/`unpcklps` need a
+# distinct destination.  `pshufd` does not, so the pair must be folded into a
+# single shuffle ($0x44 = the packed-double splat, $0x50 = packed-single).
+# nbody's energy/advance loops hold five of them.
+C=$(python3 - "$TMP/nb.s" <<'EOF'
+import re, sys
+lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+pairs = 0
+for i in range(len(lines) - 1):
+    m = re.match(r'^mov(apd|aps|upd|ups|dqa|dqu|sd|q) +(%xmm\d+), +(%xmm\d+)$', lines[i])
+    if not m:
+        continue
+    src, dst = m.group(2), m.group(3)
+    u = re.match(r'^unpcklp[d,s] +' + re.escape(dst) + r', +' + re.escape(dst) + r'$', lines[i+1])
+    if u and src != dst:
+        pairs += 1
+print(pairs)
+EOF
+)
+[ "$C" -eq 0 ] || bad "nbody: $C copy+splat pairs remain (fold them into one pshufd)"
+SPLATS=$(grep -c 'pshufd \$0x44' "$TMP/nb.s" || true)
+[ "${SPLATS:-0}" -ge 4 ] || bad "nbody: only ${SPLATS:-0} packed-double splats; expected the loop's broadcasts"
+
   note "nbody perf shapes: PASS"
 else
   note "nbody perf shapes: $fails failure(s)"

@@ -348,6 +348,49 @@ const MAX_SMALL_INLINE_INSTRUCTIONS: usize = 20;
 /// Maximum blocks for a callee to be considered "small" (see above).
 const MAX_SMALL_INLINE_BLOCKS: usize = 3;
 
+thread_local! {
+    /// Whether the one-level self-recursion clone runs. Resolved ONCE by the
+    /// driver (`passes::mod`, `CCC_NO_SELF_RECURSION_CLONE`) into per-thread
+    /// state: the pass pipeline must not read the process environment per call
+    /// (`tests/regression/check_env_test_hygiene.sh` ratchets that count), and
+    /// a process-global read would make the kill-switch test race its siblings
+    /// on cargo's thread pool.
+    static SELF_RECURSION_CLONE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Resolve the self-recursion clone kill switch for this thread.
+pub(crate) fn set_self_recursion_clone_enabled(enabled: bool) {
+    SELF_RECURSION_CLONE_ENABLED.with(|cell| cell.set(enabled));
+}
+
+fn self_recursion_clone_enabled() -> bool {
+    SELF_RECURSION_CLONE_ENABLED.with(|cell| cell.get())
+}
+
+/// Largest body this pass duplicates when it clones one level of a *directly
+/// self-recursive* callee into itself (see `clone_self_recursion_sites`).
+/// GCC's recursive inliner is bounded by
+/// `--param max-inline-recursive-depth-auto` and by the caller growth caps
+/// rather than by a body size; the size gate here is what keeps a single
+/// clone from turning a large recursive body into an I-cache resident twice
+/// over. `binary_trees`' `make`/`check`/`destroy` (7-14 IR instructions,
+/// 2-3 blocks) are the motivating shapes; the cap leaves room for a body
+/// three times that size without admitting anything loop-shaped.
+const MAX_SELF_CLONE_INSTRUCTIONS: usize = 64;
+
+/// Maximum blocks in a body admitted to the one-level self clone.
+const MAX_SELF_CLONE_BLOCKS: usize = 6;
+
+/// Self-call sites expanded per function. A full binary recursion has two;
+/// more than this is a wide recursion whose body would be duplicated once
+/// per site in one frame, which stops paying for itself.
+const MAX_SELF_CLONE_SITES: usize = 3;
+
+/// Upper bound on the caller's size after the clones. Each clone adds one
+/// body, so a 2-site clone of a 40-instruction body lands at 120; the cap
+/// keeps a pathological shape from multiplying code size.
+const MAX_SELF_CLONE_FINAL_INSTRUCTIONS: usize = 192;
+
 /// Maximum instructions for a `static` (non-`inline`) function to be eligible
 /// for inlining. GCC at -O2 inlines small static functions even without the
 /// `inline` keyword. This is critical for correctness: if a static function
@@ -1512,6 +1555,28 @@ fn inline_run_with(
             if block.label.0 > global_max_block_id {
                 global_max_block_id = block.label.0;
             }
+        }
+    }
+
+    // ── One-level direct self-recursion clone ───────────────────────────
+    // Runs before the ordinary rounds so every downstream decision (callee
+    // sizes, `has_inlined_calls`, the recursive-caller caps) sees the cloned
+    // bodies. It is a one-shot transform, so it cannot interact with the
+    // fixpoint below. `-Os` keeps the small body it has; the always-inline-only
+    // invocation is a restricted mode and must not add ordinary inlining.
+    if !size_optimized && !always_inline_only && self_recursion_clone_enabled() {
+        let cloned = clone_self_recursion_sites(
+            module,
+            &callee_map,
+            &skip_list,
+            &mut global_max_block_id,
+            debug_inline,
+        );
+        if cloned > 0 {
+            // The cloned bodies are the callees of later rounds: replace the
+            // pre-clone snapshots so sizes and flags describe what is there.
+            callee_map = build_callee_map_with(module, &callee_ctx);
+            total_inlined += cloned;
         }
     }
 
@@ -5419,6 +5484,159 @@ fn const_ir_type(c: &IrConst) -> Option<IrType> {
         IrConst::LongDouble(..) => IrType::F128,
         IrConst::Zero => crate::common::types::target_int_ir_type(),
     })
+}
+
+/// Inline one level of a *directly self-recursive* callee into itself.
+///
+/// GCC expands a self call once (`--param max-inline-recursive-depth-auto`),
+/// so a full tree walk in a body that makes two self calls per node pays half
+/// the call/return pairs, prologues and epilogues per level and needs half the
+/// frame depth. LCCC refused every recursive callee instead
+/// (`select_inline_site`, both passes, plus `find_inline_call_sites`), which is
+/// the correct default for a *fixed-point* inliner — a clone still contains the
+/// recursive call, so repeating the expansion only inflates the caller — but it
+/// leaves the single, bounded level on the table. `binary_trees`
+/// (`make`/`check`/`destroy` over 2^d nodes) is the shape that measures the
+/// difference: LCCC/GCC 1.14 on the CI runner, 1.29 locally.
+///
+/// The expansion is bounded, not fixed-point:
+///
+/// * within one invocation the site list is collected once, from the entry
+///   body, and processed in reverse program order (`inline_call_site` inserts
+///   the clone *after* the split block, so lower-index and lower-instruction
+///   sites stay valid) — the clones' own calls are never revisited;
+/// * across invocations the body has to fit `MAX_SELF_CLONE_INSTRUCTIONS`,
+///   `MAX_SELF_CLONE_BLOCKS`, `MAX_SELF_CLONE_SITES` *and*
+///   `MAX_SELF_CLONE_FINAL_INSTRUCTIONS`, and every expansion strictly grows
+///   the body, so the sequence terminates;
+/// * a body with `N` self call sites comes back with `N^2`, so the tree shape
+///   (`N = 2`) is exactly one level (`4 > MAX_SELF_CLONE_SITES`) while a
+///   single-site body may expand again while it still fits — GCC's
+///   `max-inline-recursive-depth-auto` behaves the same way;
+/// * only a *direct* self call qualifies, never mutual recursion, so the frame
+///   growth stays inside one function;
+/// * `DynAlloca` and aggregate frame bytes are refused: the clone must not
+///   multiply dynamic stack use, only one static level;
+/// * the body must be small, branch-light and end under
+///   `MAX_SELF_CLONE_FINAL_INSTRUCTIONS`.
+///
+/// Static locals are *not* a hazard here (unlike ordinary inlining): both
+/// copies are the same function, so they name the same object.
+fn clone_self_recursion_sites(
+    module: &mut IrModule,
+    callee_map: &FxHashMap<String, CalleeData>,
+    skip_list: &[String],
+    global_max_block_id: &mut u32,
+    debug_inline: bool,
+) -> usize {
+    let mut cloned = 0usize;
+    for func_idx in 0..module.functions.len() {
+        let func = &module.functions[func_idx];
+        if func.is_declaration
+            || func.is_always_inline
+            || func.is_noinline
+            || func.section.is_some()
+            || skip_list.iter().any(|s| s == &func.name)
+        {
+            continue;
+        }
+        let Some(data) = callee_map.get(&func.name) else {
+            continue;
+        };
+        let entry_size: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
+
+        if entry_size == 0
+            || entry_size > MAX_SELF_CLONE_INSTRUCTIONS
+            || data.blocks.len() > MAX_SELF_CLONE_BLOCKS
+            || data.agg_frame_bytes != 0
+        {
+            continue;
+        }
+        // A *dynamic* stack object would be multiplied by the clone: the frame
+        // growth must stay one static level. A small `Alloca` is a promotable
+        // parameter slot (mem2reg/SROA runs after this pass); a large one is
+        // already refused above through `agg_frame_bytes`.
+        if data.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
+        }) {
+            continue;
+        }
+        // Collect the entry body's self call sites, in program order.
+        let mut sites: Vec<InlineCallSite> = Vec::new();
+        let name = func.name.clone();
+        for (block_idx, block) in func.blocks.iter().enumerate() {
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                if let Instruction::Call { func: callee, info } = inst {
+                    if callee == &name {
+                        sites.push(InlineCallSite {
+                            block_idx,
+                            inst_idx,
+                            callee_name: name.clone(),
+                            dest: info.dest,
+                            args: info.args.clone(),
+                            pgo_force: false,
+                            arg_meta: CallArgMeta::from_call_info(info),
+                        });
+                    }
+                }
+            }
+        }
+        if sites.is_empty()
+            || sites.len() > MAX_SELF_CLONE_SITES
+            || entry_size + sites.len() * entry_size > MAX_SELF_CLONE_FINAL_INSTRUCTIONS
+        {
+            continue;
+        }
+        // A *tail* self call belongs to `tail_call_elim`: it becomes a back
+        // edge, and the loop it creates is what `closed_form_tail_sum` and
+        // LICM/IVSR then work on. Cloning it first would duplicate the body
+        // into a shape neither of those recognises (measured: `tce_sum`'s
+        // `sum(n, acc)` stopped folding to its closed form), so leave every
+        // function with a tail-position self call entirely to TCE.
+        if sites.iter().any(|site| {
+            let block = &func.blocks[site.block_idx];
+            match (&block.terminator, site.dest) {
+                (Terminator::Return(None), None) => true,
+                (Terminator::Return(Some(Operand::Value(rv))), Some(dest)) => rv == &dest,
+                _ => false,
+            }
+        }) {
+            continue;
+        }
+        // Reverse program order: each inline inserts its clone blocks directly
+        // after the split block, so every not-yet-processed site keeps its
+        // (block_idx, inst_idx).
+        sites.sort_by_key(|s| (s.block_idx, s.inst_idx));
+        sites.reverse();
+        let mut inlined_here = 0usize;
+        for site in &sites {
+            let ok = inline_call_site(
+                &mut module.functions[func_idx],
+                site,
+                data,
+                global_max_block_id,
+            );
+            if ok {
+                inlined_here += 1;
+            }
+        }
+        if inlined_here == 0 {
+            continue;
+        }
+        cloned += inlined_here;
+        // The body now contains expanded code from here on; the wrapper
+        // heuristics that read this flag must see that.
+        module.functions[func_idx].has_inlined_calls = true;
+        if debug_inline {
+            eprintln!(
+                "[INLINE] Cloned one level of self-recursion in '{}' ({} site(s), {} instructions)",
+                module.functions[func_idx].name, inlined_here, entry_size
+            );
+        }
+    }
+    cloned
 }
 
 fn inline_call_site(
@@ -10084,7 +10302,10 @@ mod phase0_tests {
 
     /// zstd's `ZSTD_litLengthPrice` shape: a self-recursive caller of a
     /// 12-instruction leaf (above the 5-instruction tiny limit). The leaf is
-    /// inlined; recursion itself stays a call.
+    /// inlined, and the self call is expanded by `clone_self_recursion_sites`:
+    /// the single site is *replaced* by a copy of the body, so the caller
+    /// still has exactly one self call — nested one level deeper — while its
+    /// size roughly doubles.
     #[test]
     fn recursive_caller_inlines_frame_neutral_leaf() {
         let mut module = IrModule::new();
@@ -10092,7 +10313,107 @@ mod phase0_tests {
         module.functions.push(static_leaf("leaf", &[], 12));
         run(&mut module);
         assert_eq!(sites(&module, "rec", "leaf"), 0, "leaf left outlined");
-        assert_eq!(sites(&module, "rec", "rec"), 1, "recursion must stay");
+        assert_eq!(
+            sites(&module, "rec", "rec"),
+            1,
+            "one self call stays one self call after a one-site expansion"
+        );
+        let size: usize = module
+            .functions
+            .iter()
+            .find(|f| f.name == "rec")
+            .map(|f| f.blocks.iter().map(|b| b.instructions.len()).sum())
+            .unwrap_or(0);
+        assert!(
+            size > 5,
+            "the self call was not expanded: rec is still {size} instructions"
+        );
+    }
+
+    /// The self clone: a two-site (tree-shaped) body is expanded exactly one
+    /// level — `N` sites come back as `N^2`, and `4` exceeds
+    /// `MAX_SELF_CLONE_SITES`, so a second invocation cannot expand it again.
+    /// A single-site body keeps expanding while it still fits the size caps,
+    /// which is why the transform is bounded rather than one-shot, and why the
+    /// growth must terminate.
+    #[test]
+    fn self_recursion_clone_is_bounded_and_skips_tail_calls() {
+        let mut module = IrModule::new();
+        module
+            .functions
+            .push(static_leaf("walk", &["walk", "walk"], 6));
+        run(&mut module);
+        assert_eq!(
+            sites(&module, "walk", "walk"),
+            4,
+            "two self call sites must be expanded into four"
+        );
+        let size_after_first = module.functions[0]
+            .blocks
+            .iter()
+            .map(|b| b.instructions.len())
+            .sum::<usize>();
+        run(&mut module);
+        assert_eq!(
+            sites(&module, "walk", "walk"),
+            4,
+            "a second invocation must not expand the tree shape again"
+        );
+        assert_eq!(
+            module.functions[0]
+                .blocks
+                .iter()
+                .map(|b| b.instructions.len())
+                .sum::<usize>(),
+            size_after_first,
+            "the cloned tree shape is not a fixed point in either direction"
+        );
+
+        // A single-site body converges under the size caps instead.
+        let mut module = IrModule::new();
+        module.functions.push(static_leaf("chain", &["chain"], 6));
+        for _ in 0..8 {
+            run(&mut module);
+        }
+        let final_size: usize = module.functions[0]
+            .blocks
+            .iter()
+            .map(|b| b.instructions.len())
+            .sum();
+        assert!(
+            final_size <= MAX_SELF_CLONE_FINAL_INSTRUCTIONS,
+            "repeated expansion must stop under MAX_SELF_CLONE_FINAL_INSTRUCTIONS (got {final_size})"
+        );
+        assert_eq!(
+            sites(&module, "chain", "chain"),
+            1,
+            "a single self call stays a single (nested) self call"
+        );
+
+        // Tail position: `Return(Some(call result))` is TCE's shape.
+        let mut tail = IrFunction::new("sum".into(), IrType::I32, vec![], false);
+        tail.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![Instruction::Call {
+                func: "sum".to_string(),
+                info: CallInfo {
+                    dest: Some(Value(7)),
+                    ..CallInfo::default()
+                },
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
+            source_spans: Vec::new(),
+        });
+        tail.next_value_id = 8;
+        tail.next_label = 2;
+        let mut module = IrModule::new();
+        module.functions.push(tail);
+        run(&mut module);
+        assert_eq!(
+            sites(&module, "sum", "sum"),
+            1,
+            "a tail self call belongs to tail_call_elim, not to the cloner"
+        );
     }
 }
 

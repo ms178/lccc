@@ -418,6 +418,147 @@ fn parse_reg_to_reg_ext(trimmed: &str) -> Option<(usize, RegId, RegId)> {
     Some((sw, sfam, dfam))
 }
 
+/// The canonical counted-loop latch proof for a sign extension.
+///
+/// [`sign_extend_is_identity`] accepts a producer only when it *statically*
+/// leaves the value in `[0, i32::MAX]` (`andl $mask`, `movl $imm`). A loop
+/// induction variable has no such single producer: its latch is
+/// `addl $1, %eI; movslq %eI, %rI`, and the value is bounded by the loop
+/// itself. This proves the bound textually:
+///
+/// ```text
+/// preheader: xorl %eId,%eId            (or movl $C,%eId, 0 <= C <= i32::MAX-1)
+/// .Lloop:    <body>                    (%eI is written nowhere else)
+///            addl $1, %eI
+///            movslq %eI, %rI           <- identity
+///            cmpl %Kd, %eId
+///            jl .Lloop                 (signed, strict)
+/// ```
+///
+/// * The initializer is in `[0, i32::MAX - 1]`, so the first iteration's
+///   increment cannot overflow.
+/// * Every later iteration arrived through the latch test, which holds
+///   `iel` < `sext(K)` and therefore `i <= K-1 <= i32::MAX-1` before the
+///   increment.
+/// * Hence `i + 1 ∈ [1, i32::MAX]` at the extension, and sign-extending a
+///   value that already fits in a non-negative `i32` is the identity.
+///
+/// Nothing weaker is accepted: another branch into `.Lloop` could skip the
+/// test, a non-`$1` increment could step over the bound, a second write to
+/// the family inside the loop could leave the increment path at all, and a
+/// non-constant initializer would defeat the first-iteration argument. Every
+/// one of those answers `false`, and the extension then stays.
+fn loop_latch_increment_bounds_identity(
+    store: &LineStore,
+    infos: &[LineInfo],
+    ext_at: usize,
+    fam: RegId,
+) -> bool {
+    if fam == REG_RSP || fam > REG_GP_MAX {
+        return false;
+    }
+    let i32_name = REG_NAMES[W32][fam as usize];
+    let at = ext_at;
+    // 1. The latch increment must be the extension's producer.
+    let mut prev = at;
+    loop {
+        if prev == 0 {
+            return false;
+        }
+        prev -= 1;
+        if infos[prev].is_nop() {
+            continue;
+        }
+        break;
+    }
+    let inc = infos[prev].trimmed(store.get(prev));
+    if inc != format!("addl $1, {i32_name}") {
+        return false;
+    }
+    // 2. The strict signed latch test must follow it.
+    let mut next = at + 1;
+    while next < infos.len() && infos[next].is_nop() {
+        next += 1;
+    }
+    if next + 1 >= infos.len() {
+        return false;
+    }
+    let cmp_line = infos[next].trimmed(store.get(next));
+    let branch = infos[next + 1].trimmed(store.get(next + 1));
+    if !cmp_line.starts_with("cmpl ") || !cmp_line.ends_with(&format!(", {i32_name}")) {
+        return false;
+    }
+    let Some(target) = branch.strip_prefix("jl ") else {
+        return false;
+    };
+    if !infos[next + 1].kind.eq(&LineKind::CondJmp) {
+        return false;
+    }
+    // 3. The target must be a backward edge to the loop head, and no other
+    //    edge may enter the loop.
+    let label = format!("{target}:");
+    let Some(head) = (0..at).find(|&k| infos[k].trimmed(store.get(k)) == label) else {
+        return false;
+    };
+    for k in 0..infos.len() {
+        if infos[k].is_nop() || k == next + 1 {
+            continue;
+        }
+        let text = infos[k].trimmed(store.get(k));
+        if text.ends_with(&format!(", {target}"))
+            || text == format!("jmp {target}")
+            || text == format!("jmp {target} ")
+        {
+            return false;
+        }
+    }
+    // 4. Inside the loop the family is written only by that increment.
+    for k in head..=next + 1 {
+        if k == prev || k == at {
+            continue;
+        }
+        if infos[k].is_nop() {
+            continue;
+        }
+        let text = infos[k].trimmed(store.get(k));
+        if writes_family(&infos[k], text, fam) {
+            return false;
+        }
+    }
+    // 5. The value entering the loop is a non-negative constant that cannot
+    //    overflow on the first increment.
+    for k in (0..head).rev() {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let text = infos[k].trimmed(store.get(k));
+        if text.starts_with(".cfi_startproc") {
+            return false;
+        }
+        if !writes_family(&infos[k], text, fam) {
+            continue;
+        }
+        if text == format!("xorl {i32_name}, {i32_name}") {
+            return true;
+        }
+        let Some(rest) = text.strip_prefix("movl $") else {
+            return false;
+        };
+        let Some((imm, dst)) = rest.rsplit_once(',') else {
+            return false;
+        };
+        if dst.trim() != i32_name {
+            return false;
+        }
+        return imm
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .is_some_and(|value| (0..i32::MAX as i64).contains(&value));
+    }
+    false
+}
+
 /// A sign extension is a full-register identity only when ALL bits above
 /// bit 30 are already zero. Merely knowing zero upper 32 bits is insufficient:
 /// 0x80000000 must sign-extend to 0xffffffff80000000, not stay zero-extended.
@@ -427,6 +568,11 @@ fn sign_extend_is_identity(store: &LineStore, infos: &[LineInfo], at: usize, fam
     for n in (at.saturating_sub(32)..at).rev() {
         if infos[n].is_nop() {
             continue;
+        }
+        if infos[n].kind == LineKind::Label {
+            // A loop latch's counter has no single static producer; ask the
+            // counted-loop proof before giving up at the barrier.
+            return loop_latch_increment_bounds_identity(store, infos, at, fam);
         }
         if infos[n].is_barrier() || infos[n].pinned || infos[n].kind == LineKind::InlineAsm {
             return false;
@@ -442,6 +588,11 @@ fn sign_extend_is_identity(store: &LineStore, infos: &[LineInfo], at: usize, fam
             return false;
         };
         let dst = dst.trim();
+        // A loop latch's `addl $1` has no static bound of its own; the counted
+        // loop around it does (see the proof).
+        if op == "addl" && src.trim() == "$1" && dst == REG_NAMES[W32][fam as usize] {
+            return loop_latch_increment_bounds_identity(store, infos, at, fam);
+        }
         if !((op == "andl" || op == "movl") && dst == REG_NAMES[W32][fam as usize]
             || (op == "andq" || op == "movq") && dst == REG_NAMES[W64][fam as usize])
         {
@@ -517,8 +668,22 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
         } else {
             false
         };
-        if sfam == dfam
-            || sfam == REG_RSP
+        if sfam == dfam {
+            // An in-place sign extension (`movslq %eId, %rI`) is a no-op once
+            // the value is known to fit in a non-negative i32 — the widened
+            // bits already hold exactly what the extension would write.  It is
+            // a real instruction otherwise, so this needs the proof; the
+            // counted-loop latch proof is what covers an induction variable.
+            if is_ext
+                && trimmed.starts_with("movslq ")
+                && sign_extend_is_identity(store, infos, i, sfam)
+            {
+                mark_nop(&mut infos[i]);
+                changed = true;
+            }
+            continue;
+        }
+        if sfam == REG_RSP
             || dfam == REG_RSP
             || (sfam == REG_RBP && !rbp_gpr && !is_ext)
             || (dfam == REG_RBP && !rbp_gpr)

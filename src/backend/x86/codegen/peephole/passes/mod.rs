@@ -57,6 +57,7 @@ mod self_zext;
 mod spill_deref;
 mod store_forwarding;
 mod tail_call;
+mod vector_broadcast;
 mod vector_copy;
 mod vex_promote;
 
@@ -1307,6 +1308,15 @@ fn peephole_optimize_inner(
         // A narrow copy into a private temporary cannot serve the packed reads
         // that follow it, which is what keeps copysign's copies alive; widening
         // it first lets the two passes below do their work.
+        // A copied scalar splatted in place (`movapd %A,%T; unpcklpd %T,%T`)
+        // is one `pshufd` of `%A`: the copy exists only because the unpack
+        // form needs a destination, and `pshufd` does not.  Runs before the
+        // copy bracket and propagation passes so they never see the pair.
+        {
+            let c = vector_broadcast::fold_broadcast_copies(&mut store, &mut infos);
+            trace("fold_broadcast_copies", pass_count, c, &store, &infos);
+            changed |= c;
+        }
         if !sk("vector_copy_widen") {
             {
                 let c = vector_copy::widen_private_vector_copies(&mut store, &mut infos);
