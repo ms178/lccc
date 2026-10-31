@@ -38,23 +38,50 @@ SIZE_RE = re.compile(rf"^\s*\.size\s+({NAME_RE})\s*,")
 LABEL_RE = re.compile(rf"^({NAME_RE}|\.{NAME_RE}):")
 STACK_RE = re.compile(r"\(%(?:rsp|rbp|esp|ebp)(?:\s*,|\))")
 INSN_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_.]*)\s*(.*?)\s*$")
+INSTRUCTION_PREFIXES = {"lock", "rep", "repe", "repz", "repne", "repnz", "bnd", "notrack", "xacquire", "xrelease", "addr16", "addr32", "data16", "data32"}
 
 
 def assembly_functions(asm: str) -> dict[str, list[str]]:
     functions: dict[str, list[str]] = {}
     pending: str | None = None
     current: str | None = None
+    section = ".text"
+    previous_section: tuple[str, str | None] | None = None
+    section_stack: list[tuple[str, str | None]] = []
     in_text = True
     for raw in asm.splitlines():
         line = raw.split("#", 1)[0].rstrip()
         text = line.strip()
-        if text.startswith(".section"):
-            in_text = ".text" in text
-            if not in_text:
+        if text.startswith((".section", ".pushsection")):
+            parts = text.split(None, 1)
+            target = parts[1].split(",", 1)[0].strip('"') if len(parts) > 1 else ""
+            if text.startswith(".pushsection"):
+                section_stack.append((section, current))
+            else:
+                previous_section = (section, current)
+            section = target
+            in_text = section.startswith(".text")
+            if not in_text or not current or not section.startswith(".text"):
                 current = None
             continue
-        if text == ".text":
-            in_text = True
+        if text == ".popsection":
+            if section_stack:
+                section, current = section_stack.pop()
+                in_text = section.startswith(".text")
+            continue
+        if text == ".previous":
+            if previous_section is not None:
+                old_section, old_current = section, current
+                section, current = previous_section
+                previous_section = (old_section, old_current)
+                in_text = section.startswith(".text")
+            continue
+        if text in {".data", ".bss", ".rodata", ".rdata", ".tdata", ".tbss", ".text"}:
+            previous_section = (section, current)
+            section = text
+            in_text = section == ".text"
+            if not in_text:
+                current = None
             continue
         if match := TYPE_RE.match(line):
             pending = match.group(1)
@@ -80,6 +107,30 @@ def assembly_functions(asm: str) -> dict[str, list[str]]:
     return functions
 
 
+def split_operands(text: str) -> list[str]:
+    """Split AT&T operands at top-level commas (not commas inside SIB tuples)."""
+    result: list[str] = []
+    depth = 0
+    start = 0
+    for idx, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            result.append(text[start:idx].strip())
+            start = idx + 1
+    tail = text[start:].strip()
+    if tail or result:
+        result.append(tail)
+    return result
+
+
+def is_memory_operand(operand: str) -> bool:
+    # x87 register operands are spelled `%st(0)` and are not memory accesses.
+    return "(" in operand and not re.fullmatch(r"%st\(\d+\)", operand)
+
+
 def instruction_counts(lines: list[str]) -> dict[str, int]:
     counts = {k: 0 for k in ("instructions", "stack_operands", "loads", "stores", "push", "pop", "calls", "loop_push_pop")}
     labels: dict[str, int] = {}
@@ -95,28 +146,41 @@ def instruction_counts(lines: list[str]) -> dict[str, int]:
             parsed.append(None)
             continue
         mnemonic, operands = match.group(1).lower(), match.group(2)
+        while mnemonic in INSTRUCTION_PREFIXES and operands:
+            prefixed_instruction = INSN_RE.match(operands)
+            if prefixed_instruction is None:
+                break
+            mnemonic, operands = prefixed_instruction.group(1).lower(), prefixed_instruction.group(2)
         parsed.append((mnemonic, operands))
         if mnemonic.startswith((".", "#")):
             continue
         counts["instructions"] += 1
-        if mnemonic not in {"push", "pushq", "pushl", "pop", "popq", "popl", "call", "callq", "lea", "leaq", "leal"} and STACK_RE.search(operands):
+        if not mnemonic.startswith(("push", "pop", "call", "lea")) and STACK_RE.search(operands):
             counts["stack_operands"] += 1
-        if mnemonic.startswith(("mov", "vmov", "fld", "fild", "ld", "vld")) and "(" in operands:
-            # AT&T: memory source is before the final comma; a memory
-            # destination occurs in the final operand. Distinguish by position.
-            args = [p.strip() for p in operands.split(",")]
-            if args and "(" in args[-1]:
+        args = split_operands(operands)
+        explicit_memory = [arg for arg in args if is_memory_operand(arg)]
+        if explicit_memory and not mnemonic.startswith(("lea", "call", "jmp")):
+            destination_is_memory = bool(args and is_memory_operand(args[-1]))
+            if mnemonic.startswith("pop") and destination_is_memory:
+                counts["stores"] += 1
+            elif mnemonic.startswith(("mov", "vmov")):
+                # AT&T source,destination order; the SIB-aware splitter keeps
+                # `(%base,%index,scale)` in a single operand.
+                counts["stores" if destination_is_memory else "loads"] += 1
+            elif mnemonic.startswith("set") and destination_is_memory:
+                counts["stores"] += 1
+            elif mnemonic.startswith(("fst", "fist", "st")) and destination_is_memory:
                 counts["stores"] += 1
             else:
+                # Most x86 arithmetic memory operands are reads. Instructions
+                # with a memory destination in this set are read-modify-write.
                 counts["loads"] += 1
-        elif mnemonic.startswith(("st", "fst", "vst")) and "(" in operands:
-            counts["stores"] += 1
-        elif "(" in operands and not mnemonic.startswith(("lea", "call", "jmp")):
-            # ALU memory operands are both a memory read and potentially a
-            # read-modify-write; keep them visible in both aggregate classes.
-            counts["loads"] += 1
-            if mnemonic.startswith(("add", "sub", "and", "or", "xor", "inc", "dec", "sh", "sal", "sar", "rol", "ror")):
-                counts["stores"] += 1
+                if destination_is_memory and mnemonic.startswith((
+                    "add", "sub", "adc", "sbb", "and", "or", "xor", "inc", "dec",
+                    "neg", "not", "shl", "sal", "shr", "sar", "rol", "ror",
+                    "rcl", "rcr", "bts", "btr", "btc", "xchg", "xadd", "cmpxchg",
+                )):
+                    counts["stores"] += 1
         if mnemonic.startswith("push"):
             counts["push"] += 1
         if mnemonic.startswith("pop"):
@@ -152,7 +216,10 @@ def compile_assembly(cc: str, src: Path, opt: str, extra: list[str]) -> tuple[di
         elapsed = time.perf_counter() - start
         if proc.returncode:
             raise RuntimeError(f"compile failed ({' '.join(cmd)}):\n{proc.stderr[-4000:]}")
-        return assembly_functions(out.read_text(errors="replace")), elapsed
+        functions = assembly_functions(out.read_text(errors="replace"))
+        if not functions:
+            raise RuntimeError(f"no function bodies recognized in {src} from {cc} -O{opt}")
+        return functions, elapsed
 
 
 def check_correctness(cc: str, src: Path, opt: str, extra: list[str], reference: str | None = None) -> str:
@@ -161,7 +228,10 @@ def check_correctness(cc: str, src: Path, opt: str, extra: list[str], reference:
         cmd = [*shlex.split(cc), f"-O{opt}", *extra, str(src), "-o", str(exe)]
         proc = subprocess.run(cmd, text=True, capture_output=True, timeout=180)
         if proc.returncode:
-            raise RuntimeError(f"link failed ({' '.join(cmd)}):\n{proc.stderr[-4000:]}")
+            raise RuntimeError(
+                f"link failed ({' '.join(cmd)}); --check requires a standalone executable translation unit or a source-specific runner:\n"
+                f"{proc.stderr[-4000:]}"
+            )
         run = subprocess.run([str(exe)], text=True, capture_output=True, timeout=20)
         if run.returncode:
             raise RuntimeError(f"program failed ({cc} -O{opt}): {run.stderr[-1000:]}")
@@ -233,10 +303,12 @@ def main() -> int:
                         got = "not-checked"
                     for fn, body in sorted(funcs.items()):
                         counts = instruction_counts(body)
-                        rows.append({"suite": suite, "kernel": src.stem, "function": fn, "compiler": name, "compiler_command": cc,
+                        rows.append({"suite": suite, "kernel": src.stem, "source": src.name,
+                                     "source_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
+                                     "function": fn, "compiler": name, "compiler_command": cc,
                                      "opt": f"O{opt}", "compile_wall_seconds": round(elapsed, 6),
                                      "checksum": got, **counts})
-        fields = ["suite", "kernel", "function", "compiler", "compiler_command", "opt", "compile_wall_seconds", "checksum",
+        fields = ["suite", "kernel", "source", "source_sha256", "function", "compiler", "compiler_command", "opt", "compile_wall_seconds", "checksum",
                   "instructions", "stack_operands", "loads", "stores", "push", "pop", "calls", "loop_push_pop"]
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
@@ -254,11 +326,14 @@ def main() -> int:
                 writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader(); writer.writerows(rows)
         if args.text or not args.json and not args.csv:
-            print("suite\tkernel\tcompiler\topt\tfunction\tinsns\tstack\tloads\tstores\tpush/pop\tloop-push/pop\tcompile_s\tchecksum")
+            print("suite\tsource\tcompiler\topt\tfunction\tinsns\tstack\tloads\tstores\tpush/pop\tloop-push/pop\tcompile_s\tchecksum")
             for row in rows:
-                print("\t".join(str(row[k]) for k in ("suite", "kernel", "compiler", "opt", "function", "instructions", "stack_operands", "loads", "stores"))
+                print("\t".join(str(row[k]) for k in ("suite", "source", "compiler", "opt", "function", "instructions", "stack_operands", "loads", "stores"))
                       + f"\t{row['push']}/{row['pop']}\t{row['loop_push_pop']}\t{row['compile_wall_seconds']}\t{row['checksum']}")
         return 0
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     finally:
         tmp.cleanup()
 

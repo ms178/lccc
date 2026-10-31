@@ -12,9 +12,8 @@ Usage: python3 tests/ra/gen_rastress.py [--output-dir DIR] [--list]
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[2]
 
 KERNELS: dict[str, str] = {
     "bitdecode": r'''static uint64_t kernel(uint64_t seed) {
@@ -43,7 +42,7 @@ KERNELS: dict[str, str] = {
     double t0=ar+cr,t1=ai+ci,t2=br+dr,t3=bi+di;
     re[a]=t0+t2; im[a]=t1+t3; re[b]=t0-t2; im[b]=t1-t3;
     re[c]=ar-cr+bi-di; im[c]=ai-ci+dr-br; re[d]=ar-cr-bi+di; im[d]=ai-ci-dr+br;
-  } uint64_t x=0; for(unsigned i=0;i<256;i++) x=x*33+(uint64_t)(re[i]*1000+im[i]*2000); return x;
+  } uint64_t x=0; for(unsigned i=0;i<256;i++){int64_t q=(int64_t)(re[i]*1000+im[i]*2000);x=x*33+(uint64_t)q;} return x;
 }''',
     "fe_mul": r'''static uint64_t kernel(uint64_t seed) {
   int64_t a[10],b[10],h[10]; for(int i=0;i<10;i++){a[i]=(int64_t)(seed+i*7919)%1000000;b[i]=(int64_t)(seed/3+i*104729)%1000000;h[i]=0;}
@@ -101,14 +100,14 @@ static uint64_t kernel(uint64_t seed) {struct Node n[511];for(int i=0;i<511;i++)
     "montgomery": r'''static uint64_t kernel(uint64_t seed) {const uint64_t mod=0xffffffffffffffc5ull;uint64_t a=seed|1,b=(seed>>1)|3,x=1;for(unsigned i=0;i<3000;i++){__uint128_t t=(__uint128_t)a*b+x;uint64_t lo=(uint64_t)t,hi=(uint64_t)(t>>64);uint64_t q=lo*0xcccccccccccccccdull;__uint128_t u=(__uint128_t)q*mod;uint64_t v=hi+(uint64_t)(u>>64);x=v>=mod?v-mod:v;a=a*3+1;b=b*5+7;}return x;}
 ''',
     "matrix_inverse": r'''static uint64_t kernel(uint64_t seed) {double m[4][8];for(int i=0;i<4;i++)for(int j=0;j<8;j++)m[i][j]=j<4?(i==j?4.0+(seed%7):((i+j+seed)%5)*0.1):(j-4==i);
- for(int k=0;k<4;k++){double p=m[k][k];for(int j=0;j<8;j++)m[k][j]/=p;for(int i=0;i<4;i++)if(i!=k){double f=m[i][k];for(int j=0;j<8;j++)m[i][j]-=f*m[k][j];}}uint64_t x=0;for(int i=0;i<4;i++)for(int j=4;j<8;j++)x=x*131+(uint64_t)(m[i][j]*1000000);return x;}
+ for(int k=0;k<4;k++){double p=m[k][k];for(int j=0;j<8;j++)m[k][j]/=p;for(int i=0;i<4;i++)if(i!=k){double f=m[i][k];for(int j=0;j<8;j++)m[i][j]-=f*m[k][j];}}uint64_t x=0;for(int i=0;i<4;i++)for(int j=4;j<8;j++){int64_t q=(int64_t)(m[i][j]*1000000);x=x*131+(uint64_t)q;}return x;}
 ''',
     "radix_histogram": r'''static uint64_t kernel(uint64_t seed) {uint32_t a[2048],hist[256]={0};for(unsigned i=0;i<2048;i++)a[i]=(uint32_t)(seed+i*0x9e3779b9u)^(i>>3);for(unsigned i=0;i<2048;i++)hist[(a[i]>>(i%4*8))&255]++;uint32_t sum=0;for(unsigned i=0;i<256;i++){uint32_t v=hist[i];hist[i]=sum;sum+=v;}uint64_t x=sum;for(unsigned i=0;i<2048;i++)x=x*33+(hist[(a[i]>>(i%4*8))&255]++);return x;}
 ''',
     "siphash_stream": r'''static uint64_t kernel(uint64_t seed) {uint64_t v0=0x736f6d6570736575ull^seed,v1=0x646f72616e646f6dull,v2=0x6c7967656e657261ull,v3=0x7465646279746573ull;for(unsigned i=0;i<1027;i++){uint64_t m=((uint64_t)i<<32)^seed^i*0x9e3779b97f4a7c15ull;v3^=m;for(int r=0;r<2;r++){v0+=v1;v1=(v1<<13)|(v1>>51);v1^=v0;v0=(v0<<32)|(v0>>32);v2+=v3;v3=(v3<<16)|(v3>>48);v3^=v2;v0+=v3;v3=(v3<<21)|(v3>>43);v3^=v0;v2+=v1;v1=(v1<<17)|(v1>>47);v1^=v2;v2=(v2<<32)|(v2>>32);}v0^=m;}return v0^v1^v2^v3;}
 ''',
     "geometry_return": r'''struct Vec3 {double x,y,z;};static struct Vec3 transform(struct Vec3 a,struct Vec3 b){struct Vec3 o={a.y*b.z-a.z*b.y+a.x,a.z*b.x-a.x*b.z+a.y,a.x*b.y-a.y*b.x+a.z};return o;}
-static uint64_t kernel(uint64_t seed) {struct Vec3 a={seed%17+1,3.25,7.5},b={2.5,seed%29+2,5.75};uint64_t x=0;for(int i=0;i<4000;i++){struct Vec3 c=transform(a,b);x=x*33+(uint64_t)(c.x*1000+c.y*100+c.z*10);a.x+=0.001;a.y-=0.002;b.z+=0.003;}return x;}
+static uint64_t kernel(uint64_t seed) {struct Vec3 a={seed%17+1,3.25,7.5},b={2.5,seed%29+2,5.75};uint64_t x=0;for(int i=0;i<4000;i++){struct Vec3 c=transform(a,b);int64_t q=(int64_t)(c.x*1000+c.y*100+c.z*10);x=x*33+(uint64_t)q;a.x+=0.001;a.y-=0.002;b.z+=0.003;}return x;}
 ''',
     "parser_fragment": r'''static uint64_t parse(const char *s,unsigned *p,unsigned depth){if(depth>24)return 0;uint64_t x=0;while(s[*p]&&s[*p]!=')'){char c=s[(*p)++];if(c>='0'&&c<='9')x=x*10+(c-'0');else if(c=='(')x+=parse(s,p,depth+1);else if(c=='+')x^=0x9e37;else if(c=='*')x=x*3+1;}if(s[*p]==')')(*p)++;return x;}
 static uint64_t kernel(uint64_t seed) {char s[4096];unsigned n=0;for(unsigned i=0;i<1000;i++){if(i%17==0)s[n++]='(';s[n++]=(char)('0'+((i+seed)%10));if(i%17==16)s[n++]=')';s[n++]=i%3?'+' : '*';}s[n]=0;unsigned p=0;return parse(s,&p,0);}
@@ -122,6 +121,11 @@ def render(name: str, body: str) -> str:
         + body.strip() + "\nint main(void) { printf(\"%llu\\n\", (unsigned long long)kernel(0x123456789abcdef0ull)); return 0; }\n"
 
 
+def _first_line(path: Path) -> str:
+    with path.open(encoding="utf-8") as stream:
+        return stream.readline().rstrip("\r\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path("/tmp/lccc-rastress"))
@@ -131,8 +135,33 @@ def main() -> int:
         print("\n".join(KERNELS))
         return 0
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    generated_header = "/* Generated by tests/ra/gen_rastress.py; do not edit. */"
+    expected = {f"{name}.c" for name in KERNELS}
+    # Validate every destination before cleanup or writes, so a collision
+    # cannot leave a half-cleaned corpus behind.
+    for name in KERNELS:
+        target = args.output_dir / f"{name}.c"
+        if target.exists():
+            try:
+                first_line = _first_line(target)
+            except (OSError, UnicodeError) as exc:
+                raise SystemExit(f"refusing to overwrite unreadable file: {target}: {exc}")
+            if first_line != generated_header:
+                raise SystemExit(f"refusing to overwrite non-generated file: {target}")
+    for path in args.output_dir.glob("*.c"):
+        if path.name in expected:
+            continue
+        try:
+            is_generated = _first_line(path) == generated_header
+        except (OSError, UnicodeError):
+            is_generated = False
+        if is_generated:
+            path.unlink()  # remove only our own stale files, never user sources
     for name, body in KERNELS.items():
-        (args.output_dir / f"{name}.c").write_text(render(name, body), encoding="utf-8")
+        target = args.output_dir / f"{name}.c"
+        temporary = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+        temporary.write_text(render(name, body), encoding="utf-8")
+        temporary.replace(target)
     print(f"generated {len(KERNELS)} deterministic RA kernels in {args.output_dir}")
     return 0
 

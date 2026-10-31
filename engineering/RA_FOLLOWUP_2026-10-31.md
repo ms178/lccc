@@ -13,8 +13,8 @@ Working-tree base: `935f243273329e168aa80a29f57e54bbbd0b64cf` (the checked-out
 repository's `scripts/ensure_swap.sh` successfully activated an 8 GiB `/swapfile`
 for this container; current swap usage was zero. `scripts/build_lccc_fast.sh`
 was attempted as required and failed before compilation because `rustc` and
-`cargo` are absent. No lccc binary was available, so no lccc code-generation
-comparison or `ci_local.sh --fast` run could be completed. There is no Intel
+`cargo` are absent. No lccc binary was available, so no lccc code-generation comparison was
+possible and `ci_local.sh --fast` could not pass its build gate. There is no Intel
 14700KF or usable PMU evidence in this VM.
 
 The latest-main fetch returned the same commit as the session base; no rebase
@@ -41,14 +41,18 @@ was necessary. No benchmark timing or allocator-quality result is claimed.
 
 **Validation performed:** generator repeated twice and byte-compared; all 20
 kernels compiled and ran under GCC `-O0`, `-O1`, `-O2`, and `-O3`; every output
-checksum matched the `-O0` reference. The scoreboard completed a GCC-only
-`-O1/-O2/-O3` run for all 20 sources and wrote 174 function/compiler/level rows.
-This is a harness self-test, not a cross-compiler result.
+checksum matched the `-O0` reference. The final scoreboard self-test completed a
+GCC-only `-O1/-O2/-O3` run for all 20 holdout sources and wrote 174
+function/compiler/level rows; its `tuning` O2 census parsed 110 translation
+units into 616 rows after the data-section parser fix. These runs use GCC 12.2.0
+on both labels only to test the harness, not as a cross-compiler result. Reports
+carry source SHA-256, compiler version, target flags, and host platform.
 
 ### RAP-02 — partial reporting only
 
-The scoreboard supplies a deterministic *assembly-derived* per-function report
-and records exact command/compile elapsed time. It cannot see allocator values,
+The scoreboard supplies deterministic *assembly-derived metrics* in a
+per-function report and records the exact command plus a variable compile
+elapsed-time sample. It cannot see allocator values,
 register classes, live-range segments, MAXLIVE, demotion causes, rematerialized
 values, or weighted spill cost. Consequently it cannot certify an avoidable
 spill, and the RAP-02 internal report and `fft4_stage` certificate remain open.
@@ -82,8 +86,19 @@ is enabled.
 * `python3 tests/ra/spill_compare.py --gcc gcc --lccc gcc --opt-levels 1,2,3
   --check --json /tmp/ra-report.json` — PASS; this deliberately uses GCC on both
   sides solely to test harness mechanics.
-* `bash -n scripts/ci_local.sh` and Python byte-compilation/unit tests remain to
-  be run in the final validation after changes settle.
+* `bash -n scripts/ci_local.sh`, Python byte-compilation, `scripts/check_ci_gate_parity.py`
+  (with PyYAML in a temporary validation venv), and the full RA harness tests
+  pass after the red-team fixes.
+* `-fsanitize=undefined,float-cast-overflow` passed on all 20 fixed-seed kernels
+  at GCC `-O2`; a separate AddressSanitizer + UBSan pass also passed all 20 at
+  GCC `-O1`.
+* Red-team parser fixtures now cover `.data` globals, `.pushsection/.popsection`,
+  SIB operands, `lock` prefixes, x87 `%st(n)` register operands, the exact
+  stack-reference exclusions, and loop-local push/pop. Reports hash each input
+  source and record compiler version/flags; empty function parses fail closed.
+* The generator removes only stale files bearing its own marker, atomically
+  replaces its own generated outputs, and refuses to overwrite unmarked user
+  sources; regression tests verify both preservation and refusal behavior.
 * `scripts/build_lccc_fast.sh` — BLOCKED: no `rustc` / `cargo` binaries.
 * `PATH=/tmp/lccc-validation-venv/bin:$PATH ./scripts/ci_local.sh --fast` — the
   Python/YAML, shell, and initial repository gates passed; the run then stopped
@@ -91,10 +106,14 @@ is enabled.
   refused to continue without `target/fastbuild/lccc`, so the newly added gate
   could not be reached through this runner. `tests/ra/test_harness.py --full`
   was run directly and passed. Do not report `ci_local.sh --fast` as green.
-* The generator initially contained undefined behavior in interpreter stack
-  updates; optimization-level checks found a GCC O0/O1 checksum mismatch. The
-  source was repaired by making arithmetic unsigned and sequencing stack-pointer
-  updates explicitly; the full differential matrix now passes.
+* The initial differential sweep found undefined behavior in the interpreter's
+  stack updates (unsequenced `sp` read/write and signed overflow); those were
+  changed to unsigned arithmetic with explicit sequencing. The subsequent
+  red-team UBSan pass found negative floating-point results converted directly
+  to `uint64_t` in the FFT, matrix, and geometry checksums. These now convert
+  first to bounded `int64_t` values; the complete fixed-seed corpus passes GCC
+  `-fsanitize=undefined,float-cast-overflow -fno-sanitize-recover=all` at `-O2`.
+  Both the fast and full harness modes now execute that sanitizer check.
 * The operation counts are deliberately labeled proxies. The loop finder only
   recognizes direct lexical backedges and the load/store classifier is an
   assembly heuristic. Neither is a compiler correctness checker nor a runtime
