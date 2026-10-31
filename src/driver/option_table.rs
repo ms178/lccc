@@ -132,6 +132,18 @@ pub(super) const CONTRACTS: &[Contract] = &[
         rationale: "Accepted but does nothing until GP-10 implements ISO pedwarns.",
         probe_id: Some("probe-pedantic-inert"),
     },
+    // The kernel passes this to every translation unit. Nothing here derives
+    // null-check facts from dereference UB in either direction, so the state
+    // the flag asks for is already the state — the *inverse* request
+    // (`-fdelete-null-pointer-checks`, delete the guards) is the one that must
+    // stay unimplemented, and it stays on cli.rs's tolerated path because it
+    // deliberately has no row here.
+    Contract {
+        spelling: "-fno-delete-null-pointer-checks",
+        class: Class::Inert,
+        rationale: "No dereference-implies-nonnull fold exists, so no null guard is ever deleted; the requested state is the emitted state.",
+        probe_id: Some("probe-nullptr-checks-inert"),
+    },
 ];
 
 /// Look up an option's contract.  Returns `None` for spellings not in the
@@ -213,6 +225,14 @@ mod tests {
         ] {
             assert_eq!(lookup(flag).unwrap().class, Class::Inert, "{flag}");
         }
+        // The kernel's off-request is a ledger row, not just a bare match
+        // arm: the row is what makes GP-22 account for a flag every
+        // translation unit of a kernel build passes. Its probe is the guard
+        // ratchet in tests/regression/check_nullptr_check_policy.sh.
+        assert_eq!(
+            lookup("-fno-delete-null-pointer-checks").unwrap().class,
+            Class::Inert
+        );
         assert!(lookup("-fdefinitely-not-a-flag").is_none());
         // Every Inert entry must carry a probe_id.
         for c in CONTRACTS {

@@ -434,3 +434,94 @@ fn comment_bridged_directive_resyncs_positions_afterwards() {
     );
     assert_positions(src, 2);
 }
+
+// ---- comment bridges that start on an ORDINARY line ------------------------
+// The comment's *opening* line says nothing about the phase-4 context of the
+// line it bridges into; only the closing line's remaining tokens do. Reading
+// the opening line instead is what truncated `#define … 1 + \` here.
+
+#[test]
+fn comment_bridge_from_an_ordinary_line_into_a_directive_stays_whole() {
+    // GCC: the comment's newline is deleted, the `#define` it precedes is a
+    // directive, and its splice joins `2`, so `A` is `1 + 2`.
+    let src = concat!(
+        "/* header\n",
+        "   comment */ #define A 1 + \\\n",
+        "  2\n",
+        "int arr[A];\n",
+    );
+    let (pp, out) = preprocess(src);
+    assert!(pp.errors().is_empty(), "errors: {:?}", pp.errors());
+    assert!(pp.macros.is_defined("A"), "{out}");
+    assert!(
+        squeeze(&out).contains("int arr[1 + 2];"),
+        "directive bridged from an ordinary line was truncated:\n{out}"
+    );
+}
+
+#[test]
+fn comment_bridge_into_a_directive_without_space_after_the_close() {
+    // `*/#define` — the introducer is the first byte after the terminator.
+    let src = concat!(
+        "/* header\n",
+        "   comment */#define B 2 * \\\n",
+        "  3\n",
+        "int arr[B];\n",
+    );
+    let (pp, out) = preprocess(src);
+    assert!(pp.errors().is_empty(), "errors: {:?}", pp.errors());
+    assert!(pp.macros.is_defined("B"), "{out}");
+    assert!(
+        squeeze(&out).contains("int arr[2 * 3];"),
+        "`*/#define` was not treated as a directive:\n{out}"
+    );
+}
+
+#[test]
+fn a_bridged_comment_swallows_following_code_into_the_macro_body() {
+    // The carry must reproduce phase 3 exactly, including its destructive
+    // half: GCC deletes the comment's newline, so `int swallowed …;` is part
+    // of the directive and never reaches the output. It is not code the fix
+    // may "rescue", and the macro body keeps its spliced continuation.
+    let src = concat!(
+        "#define D 1 /* c\n",
+        "*/ int swallowed = 1 \\\n",
+        "  + 2;\n",
+        "int after;\n",
+    );
+    let (pp, out) = preprocess(src);
+    assert!(pp.errors().is_empty(), "errors: {:?}", pp.errors());
+    assert!(pp.macros.is_defined("D"), "{out}");
+    assert!(!out.contains("swallowed"), "code must stay macro body:\n{out}");
+    assert!(squeeze(&out).contains("int after;"), "{out}");
+}
+
+#[test]
+fn a_bridged_ordinary_line_keeps_its_break() {
+    // The carry must not turn every comment-bridged line into a join: a line
+    // that starts inside a comment but is not directive context is still
+    // splittable, so the keep-break elision — which preserves __LINE__
+    // granularity for consumers that can take it — survives unchanged.
+    let src = concat!("int a = 1 + /* c\n", "*/ 2 + \\\n", " 3;\n");
+    let (pp, out) = preprocess(src);
+    assert!(pp.errors().is_empty(), "errors: {:?}", pp.errors());
+    assert!(
+        out.contains("2 + \n 3;"),
+        "an ordinary bridged line lost its kept break:\n{out:?}"
+    );
+    assert!(squeeze(&out).contains("int a = 1 + 2 + 3;"), "{out}");
+}
+
+#[test]
+fn comment_bridge_from_an_ordinary_line_resyncs_positions() {
+    // The merged directive collapses two physical lines into one output line;
+    // the marker after it still resolves to its own line and column.
+    let src = concat!(
+        "/* header\n",
+        "   comment */ #define A 1 \\\n",
+        "  + 2\n",
+        "l4c1 + A;\n",
+        "l5c1;\n",
+    );
+    assert_positions(src, 2);
+}

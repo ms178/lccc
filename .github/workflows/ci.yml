@@ -2283,10 +2283,10 @@ jobs:
     # steps are a partition: tests/regression/check_ci_shard_partition.py
     # fails if a gate appears in both, disappears from both, or reappears in a
     # third step.
-    # lane-split: 80 of 178 independent gate invocations from the
+    # lane-split: 81 of 179 independent gate invocations from the
     # lane-split: single step that used to run them all in sequence, assigned by
-    # lane-split: longest-processing-time over measured per-gate cost (423 s of
-    # lane-split: 846 s). The shards are a partition:
+    # lane-split: longest-processing-time over measured per-gate cost (424 s of
+    # lane-split: 847 s). The shards are a partition:
     # lane-split: tests/regression/check_ci_shard_partition.py fails if a gate appears in
     # lane-split: both, disappears from both, or reappears in a third step, and
     # lane-split: tests/regression/check_ci_lane_plan.py fails if a shard drifts from
@@ -2384,6 +2384,12 @@ jobs:
         # value pin. The local gate of the same name; parity is checked by
         # check_ci_gate_parity.py.
         env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_pp_directive_comment_bridge.sh
+        # The kernel harness now refuses to build a kernel the package does not
+        # ship: it compares the package's enabled features with what olddefconfig
+        # produced. This gate pins the two readers that decide that (value
+        # spellings, prefix anchoring, drift direction, empty configs) against
+        # synthetic config pairs, so the harness's verdict cannot rot silently.
+        bash tests/regression/check_kconfig_query.sh
         # The statement expression's value comes from the last item that can
         # produce one: the kernel's `sizeof(struct { _Static_assert(...); })`
         # idiom depends on it, and a used void one must be diagnosed.

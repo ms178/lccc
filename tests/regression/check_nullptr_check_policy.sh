@@ -31,6 +31,9 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 CCC=${CCC:-$root/target/fastbuild/lccc}
 GCC=${GCC:-gcc-16}
 command -v "$CCC" >/dev/null || { echo "missing lccc: $CCC" >&2; exit 1; }
+# A development box with only the distro GCC still gets a usable gate; CI pins
+# GCC 16.2 through $GCC, and the differential is only as good as the oracle.
+if ! command -v "$GCC" >/dev/null; then GCC=gcc; fi
 command -v "$GCC" >/dev/null || { echo "missing oracle: $GCC" >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT

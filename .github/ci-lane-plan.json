@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 422.77,
+      "predicted_gate_seconds": 423.85,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -108,12 +108,16 @@
           "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_divzero_constant_arms.sh"
         },
         {
-          "measured_s": 0.26,
+          "measured_s": 0.28,
           "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_nullptr_check_policy.sh"
         },
         {
-          "measured_s": 0.25,
+          "measured_s": 1.21,
           "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_pp_directive_comment_bridge.sh"
+        },
+        {
+          "measured_s": 0.1,
+          "name": "bash tests/regression/check_kconfig_query.sh"
         },
         {
           "measured_s": 2.37,
@@ -1601,9 +1605,9 @@
   },
   "provenance": {
     "backend-contracts": {
-      "costs": "/tmp/costs-full.tsv",
-      "measured_seconds_total": 845.78,
-      "source": "measured by scripts/ci_gate_costs.py"
+      "costs": "re-measured locally on this tree (2-core sandbox, rust 1.99.1 fastbuild)",
+      "measured_seconds_total": 846.86,
+      "source": "measured by scripts/ci_gate_costs.py for the lane; the three gates this change touches were re-measured directly (median of 5 runs: nullptr 0.28 s, pp-directive-comment-bridge 1.21 s over five frontends, kconfig-query 0.10 s)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",

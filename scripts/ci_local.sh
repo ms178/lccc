@@ -879,6 +879,11 @@ gate "nullptr-check-policy" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_nullptr_check_policy.sh
 gate "pp-directive-comment-bridge" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_pp_directive_comment_bridge.sh
+# The kernel harness refuses to build a kernel the package does not ship; these
+# are the readers that decide it (value spellings, prefix anchoring, drift
+# direction, empty configs), pinned without a kernel tree.
+gate "kconfig-query" fast \
+    bash tests/regression/check_kconfig_query.sh
 # A statement expression's value comes from the last item that can produce
 # one; the kernel's `sizeof(struct { _Static_assert(...); })` idiom depends on
 # it, and a used void statement expression must be diagnosed rather than
