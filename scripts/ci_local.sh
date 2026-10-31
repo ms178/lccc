@@ -404,6 +404,20 @@ gate "shift-signext-fold" fast \
 gate "generator-map" fast \
     env CCC="$LCCC" bash tests/regression/check_generator_map.sh
 
+# RA harness self-tests: deterministic generation, GCC-only cross-opt checksum
+# agreement, UBSan, and assembly-parser edge cases. The real LCCC-vs-GCC
+# differential gate immediately follows after the compiler build.
+gate "ra-holdout-harness" fast \
+    python3 tests/ra/test_harness.py
+
+# Differential RA/code-shape run against the compiler built by this same CI
+# invocation. Checks checksums at every optimization level before recording
+# per-function assembly counts; the holdout is evaluated, never tuned.
+gate "ra-holdout-differential" fast \
+    python3 tests/ra/spill_compare.py --suite holdout \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --opt-levels 1,2,3 \
+        --check --text --json target/ra-holdout.json
+
 # Register-offset symbol folds (`Add(symbol, register)` -> `sym(%off,%idx)`):
 # the sliding-window shape `const u8 *m = window + cur; m[i]` must fold the
 # symbol into the memory operand where the derived pointer has no other use,
