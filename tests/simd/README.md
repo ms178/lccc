@@ -1,9 +1,30 @@
 # SIMD correctness probes
 
 These are regression probes, not a claim of compiler performance superiority.
-The 44-row `scoreboard_kernels.c` remains exploratory: its timing methodology,
-reduction checksums and signed arithmetic need hardening before it can be an
-acceptance gate. This change does not promote it to one.
+The 44-row `scoreboard_kernels.c` now has a strict checksum-only gate:
+
+```sh
+python3 tests/simd/check_scoreboard.py --reference gcc-16
+python3 tests/simd/check_scoreboard.py --reference clang-23 --reps 17 --json /tmp/scoreboard.json
+```
+
+The independent 44-name inventory rejects missing, unknown and duplicate rows,
+malformed checksums and invalid timings; timings are never compared as an
+acceptance criterion. Reference compilation/execution failure stops the gate.
+Each candidate at O1/O2/O3 is compared against the scalar O0 reference with
+contraction off and all C warnings treated as errors. `REPS=1` is the fast
+correctness case; 1..4000 is selectable, and matmul always executes at least
+once. The reduction sink uses defined unsigned wrapping; shift inputs convert
+to unsigned before left shift. FP reduction receipts retain every result bit,
+and matrix hashing stays within each row's C array bounds. GCC 16.2 UBSan
+reproduced the old signed-sink overflow; the repaired full default corpus
+completed without a UBSan diagnostic.
+
+**Timing is still exploratory:** saxpy initializes inside its timed call,
+sqrt includes negative inputs, and repeated kernels are not an order-balanced,
+affinity-controlled hardware benchmark. These known limitations are not
+concealed by the new checksum gate. The initial performance table cannot be
+reproduced with changed checksums as if it were an unchanged baseline.
 
 ## Interleaved-access regression
 

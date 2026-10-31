@@ -42,7 +42,7 @@ NOINL void k_add_u8(void){ for(int i=0;i<N;i++) bc[i]=(u8)(ba[i]+bb[i]); }
 NOINL void k_satadd_u8(void){ for(int i=0;i<N;i++){ int t=ba[i]+bb[i]; bc[i]=(u8)(t>255?255:t);} }
 NOINL void k_widen_u8_u16(void){ for(int i=0;i<N;i++) sa[i]=(short)(ba[i]*3); }
 NOINL void k_narrow_i16_u8(void){ for(int i=0;i<N;i++) bc[i]=(u8)(sb[i]>>8); }
-NOINL void k_shift_i32(void){ for(int i=0;i<N;i++) ia[i]=(ib[i]<<3)^(ic[i]>>2); }
+NOINL void k_shift_i32(void){ for(int i=0;i<N;i++) ia[i]=(int)(((unsigned)ib[i]<<3)^(unsigned)(ic[i]>>2)); }
 /* ---- control flow ---- */
 NOINL void k_abs_f32(void){ for(int i=0;i<N;i++) fa[i]=fb[i]>0?fb[i]:-fb[i]; }
 NOINL void k_select_f32(void){ for(int i=0;i<N;i++) fa[i]=fc[i]<0?fb[i]:fd[i]; }
@@ -84,17 +84,26 @@ static void init(void){
   for(int i=0;i<2*N+16;i++){ s=s*1664525u+1013904223u; cplx[i]=((int)(s>>8)%201-100)/13.0f; s=s*1664525u+1013904223u; cplx2[i]=((int)(s>>8)%201-100)/17.0f; }
   for(int i=0;i<64;i++) for(int j=0;j<64;j++){ M1[i][j]=(i*7+j)%11*0.25; M2[i][j]=(i+j*5)%13*0.125; M3[i][j]=0; }
 }
+#ifndef REPS
 #define REPS 4000
+#endif
+#if REPS <= 0
+#error REPS must be positive
+#endif
+#define MAT_REPS (REPS / 16 > 0 ? REPS / 16 : 1)
 #define RUNV(NAME,CALL,CS) do{ init(); double t0=now(); for(int r=0;r<REPS;r++){ CALL; } double t1=now(); \
    printf("%s %016llx %.4f\n",NAME,(unsigned long long)(CS),(t1-t0)/REPS/N);}while(0)
-#define RUNR(NAME,CALL) do{ init(); volatile int sink=0; double t0=now(); for(int r=0;r<REPS;r++){ sink+=(int)(CALL); } double t1=now(); \
+#define RUNR(NAME,CALL) do{ init(); volatile uint32_t sink=0; double t0=now(); for(int r=0;r<REPS;r++){ sink+=(uint32_t)(CALL); } double t1=now(); \
    printf("%s %016llx %.4f\n",NAME,(unsigned long long)(uint32_t)sink,(t1-t0)/REPS/N);}while(0)
+/* Preserve the complete FP reduction result; truncating to int hid errors. */
+#define RUNFP(NAME,CALL,TYPE,CS) do{ init(); volatile TYPE sink=0; double t0=now(); for(int r=0;r<REPS;r++){ sink=(CALL); } double t1=now(); TYPE result=sink; \
+   printf("%s %016llx %.4f\n",NAME,(unsigned long long)CS(&result,1),(t1-t0)/REPS/N);}while(0)
 int main(void){
   RUNV("add_f32",k_add_f32(),cs_f(fa,N)); RUNV("saxpy",(init(),k_saxpy()),cs_f(fa,N)); RUNV("daxpy",k_daxpy(),cs_d(da,N));
   RUNV("fma3",k_fma3(),cs_f(fa,N)); RUNV("sqrt_f32",k_sqrt_f32(),cs_f(fa,N)); RUNV("f2i",k_f2i(),cs_i(ia,N)); RUNV("i2f",k_i2f(),cs_f(fa,N));
   RUNV("f2d",k_f2d(),cs_d(da,N)); RUNV("stencil3",k_stencil3(),cs_f(fa,N));
   RUNR("sum_i32",k_sum_i32()); RUNR("max_i32",k_max_i32()); RUNR("dot_i32",k_dot_i32());
-  RUNR("dot_f32_fast",(int)(k_dot_f32_fast()*8)); RUNR("sum_f64_fast",(int)(k_sum_f64_fast()*8));
+  RUNFP("dot_f32_fast",k_dot_f32_fast(),float,cs_f); RUNFP("sum_f64_fast",k_sum_f64_fast(),double,cs_d);
   RUNR("sad_u8",k_sad_u8()); RUNR("popcnt",k_popcnt()); RUNR("count_eq_u8",k_count_eq_u8());
   RUNV("add_i32",k_add_i32(),cs_i(ia,N)); RUNV("mul_i32",k_mul_i32(),cs_i(ia,N)); RUNV("add_i16",k_add_i16(),cs_s(sa,N)); RUNV("add_u8",k_add_u8(),cs_b(bc,N));
   RUNV("satadd_u8",k_satadd_u8(),cs_b(bc,N)); RUNV("widen_u8_u16",k_widen_u8_u16(),cs_s(sa,N)); RUNV("narrow_i16_u8",k_narrow_i16_u8(),cs_b(bc,N));
@@ -106,5 +115,5 @@ int main(void){
   RUNV("alias_ptr",k_alias_ptr(fa,fb,fc,N),cs_f(fa,N)); RUNV("restrict",k_restrict(fa,fb,fc,N),cs_f(fa,N)); RUNV("unknown_n",k_unknown_n(N-3),cs_f(fa,N));
   RUNV("alias_overlap",k_alias_ptr(fa+1,fa,fb,N-1),cs_f(fa,N));
   RUNV("recur",k_recur(),cs_f(fa,N)); RUNV("prefix_i32",k_prefix_i32(),cs_i(ia,N)); RUNV("overlap_dist1",k_overlap_dist1(),cs_f(fa,N));
-  { init(); double t0=now(); for(int r=0;r<REPS/16;r++) k_matmul(); double t1=now(); uint64_t h=cs_d(&M3[0][0],64*64); printf("matmul %016llx %.4f\n",(unsigned long long)h,(t1-t0)/(REPS/16)/(64.0*64*64)); }
+  { init(); double t0=now(); for(int r=0;r<MAT_REPS;r++) k_matmul(); double t1=now(); uint64_t h=1469598103934665603ULL; for(int row=0;row<64;row++) h=(h^cs_d(M3[row],64))*1099511628211ULL; printf("matmul %016llx %.4f\n",(unsigned long long)h,(t1-t0)/MAT_REPS/(64.0*64*64)); }
   return 0; }
