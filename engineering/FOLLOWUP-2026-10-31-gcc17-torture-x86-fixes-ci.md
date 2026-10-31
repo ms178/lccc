@@ -224,6 +224,18 @@ beside `check_cfi_unwind.sh` and asserts, in the emitted text and in the
    outputs confirmed against `gcc` and `clang` first, so the expectations are an
    oracle rather than a snapshot.
 
+The probe fixture also carries a `.flags` sidecar (`-O2 -fno-omit-frame-pointer`),
+so the ordinary corpus run — not only the shape gate — executes a probed
+prologue and compares it against the same oracle.
+
+Shape assertions cannot tell a correct `movsbl` from a wrong one, because
+`movzbl %dil, %eax; cltd; idivl %esi` is well-formed and returns 127 for
+`-1 / 2`. `machinst_tests::narrow_divide_the_selector_builds_computes_the_narrow_quotient_when_executed`
+therefore runs the selector's own instruction sequence for I8/I16/U8/U16 and
+compares the truncated quotient against the C semantics of the same type, on
+inputs whose divisors are nonzero in every narrow interpretation and that never
+reach the one narrow input that traps.
+
 ## Known gaps
 
 1. The 49 x86-64 / 48 i686 compile-leg failures are candidate failures —

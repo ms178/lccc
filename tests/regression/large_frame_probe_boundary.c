@@ -12,6 +12,12 @@
 // Everything here is volatile and every page of the frame is touched BEFORE
 // and AFTER the call, so a clobbered guard page or a one-page-short frame is a
 // wrong sum rather than an undetected success.
+//
+// The companion `.flags` file pins `-O2 -fno-omit-frame-pointer`, so the
+// DEFAULT corpus run (not only the shape gate) executes the probed prologue and
+// compares it against the oracle: with a frame pointer the allocation ends in
+// the register-form `subq %r11, %rsp`, which is the adjustment the unwind model
+// has to describe.
 #include <stdio.h>
 
 #define FRAME_PAGES 3

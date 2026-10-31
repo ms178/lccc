@@ -2052,6 +2052,82 @@ fn div_uses_rax_rdx_and_computes_quotient_when_executed() {
     }
 }
 
+/// The narrow divide the SELECTOR builds, executed.
+///
+/// `narrow_divides_are_widened_to_a_32_bit_divide_with_an_extending_staging`
+/// asserts the text, which cannot tell a correct `movsbl` from a wrong one:
+/// `movzbl %dil, %eax; cltd; idivl %esi` is well-formed, assembles, and returns
+/// 127 for `-1 / 2`. This test runs the selector's own instruction sequence and
+/// compares the narrow quotient against the C semantics of the same type, so
+/// the extension WIDTH and SIGN are both observed rather than described.
+///
+/// The comparison is on the truncated result, which is the whole contract: a
+/// narrow value is canonical only in its low bits, and every consumer re-extends
+/// from them.
+#[test]
+fn narrow_divide_the_selector_builds_computes_the_narrow_quotient_when_executed() {
+    use super::isel::lower_binop;
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{IrBinOp, Operand, Value};
+
+    // Divisors are nonzero in EVERY narrow interpretation of the input, and no
+    // pair reaches the one narrow input that traps (`min / -1`).
+    let inputs: &[(i64, i64)] = &[(5, 2), (-5, 2), (-128, 3), (127, -3), (0, 7), (-7, -2)];
+    for (ty, signed) in [
+        (IrType::I8, true),
+        (IrType::I16, true),
+        (IrType::U8, false),
+        (IrType::U16, false),
+    ] {
+        let mut homes: FxHashMap<u32, PhysReg> = FxHashMap::default();
+        homes.insert(0, RDI); // dividend arrives in %rdi
+        homes.insert(1, RSI); // divisor arrives in %rsi
+        homes.insert(2, RAX); // dest: %rax is the return register
+        let op = if signed { IrBinOp::SDiv } else { IrBinOp::UDiv };
+        let mut insts = Vec::new();
+        assert!(
+            lower_binop(
+                &Value(2),
+                op,
+                &Operand::Value(Value(0)),
+                &Operand::Value(Value(1)),
+                ty,
+                &homes,
+                &mut insts,
+            ),
+            "{ty:?}: the selector refused a narrow divide"
+        );
+        let mut out = AsmOutput::new();
+        for inst in &insts {
+            emit_machinst(inst, &mut out);
+        }
+        let Some(got) = run_emitted(&out.buf, inputs) else {
+            eprintln!("SKIP: no assembler/linker; narrow-divide execution cannot run");
+            return;
+        };
+        for ((a, b), g) in inputs.iter().zip(got.iter()) {
+            let want = match ty {
+                IrType::I8 => (*a as i8).wrapping_div(*b as i8) as i64,
+                IrType::I16 => (*a as i16).wrapping_div(*b as i16) as i64,
+                IrType::U8 => ((*a as u8) / (*b as u8)) as i64,
+                _ => ((*a as u16) / (*b as u16)) as i64,
+            };
+            let narrow_got = match ty {
+                IrType::I8 => (g as i8) as i64,
+                IrType::I16 => (g as i16) as i64,
+                IrType::U8 => (g as u8) as i64,
+                _ => (g as u16) as i64,
+            };
+            assert_eq!(
+                narrow_got, want,
+                "{ty:?} signed={signed}: {a} / {b} returned {g} (narrow {narrow_got}), expected {want}, emitted:\n{}",
+                out.buf
+            );
+        }
+    }
+}
+
 #[test]
 fn div64_width_bypass_is_emitted_only_where_the_tuning_row_asks_and_runs_correctly() {
     // Three claims in one place, because they fail independently:

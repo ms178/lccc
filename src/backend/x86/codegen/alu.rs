@@ -869,6 +869,21 @@ impl X86Codegen {
         }
     }
 
+    /// Emit the 32-bit divide that is exact for a NARROW (I8/U8/I16/U16)
+    /// dividend and divisor, both already staged in `%rax`/`%rcx` in 64-bit
+    /// canonical form -- whose low 32 bits ARE the canonical 32-bit operands.
+    ///
+    /// `cqto; idivq` would compute with the upper half of a quantity that has
+    /// none, and it costs 42/21 latency/throughput against 26/6 for the 32-bit
+    /// form (SKL, signed; 36/21 against 22/6 unsigned). It cannot trap: the
+    /// dividend is bounded by the narrow width, so the one `idiv` input that
+    /// raises `#DE` independently of a zero divisor -- `INT32_MIN / -1` -- is
+    /// unreachable. `cltd` / `xorl %edx, %edx` set up `%edx`, and a 32-bit
+    /// write leaves `%rax`/`%rdx` in the narrow canonical form every consumer
+    /// re-extends from, so no canonicalization instruction is added.
+    ///
+    /// The MachInst backend mirrors this: `isel::emit_narrow_dividend` stages
+    /// the dividend and `isel::lower_divrem` widens the whole sequence.
     fn emit_div_narrow(&mut self, signed: bool) {
         if signed {
             self.state.emit("    cltd");
