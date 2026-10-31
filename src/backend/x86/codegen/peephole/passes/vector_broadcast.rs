@@ -178,9 +178,11 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         assert!(!fold_broadcast_copies(&mut store, &mut infos));
-        assert!(store
-            .build_result(|i| infos[i].is_nop())
-            .contains("unpcklps"));
+        assert!(
+            store
+                .build_result(|i| infos[i].is_nop())
+                .contains("unpcklps")
+        );
     }
 
     #[test]

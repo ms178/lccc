@@ -674,7 +674,9 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             // bits already hold exactly what the extension would write.  It is
             // a real instruction otherwise, so this needs the proof; the
             // counted-loop latch proof is what covers an induction variable.
-            if is_ext && trimmed.starts_with("movslq ") && sign_extend_is_identity(store, infos, i, sfam)
+            if is_ext
+                && trimmed.starts_with("movslq ")
+                && sign_extend_is_identity(store, infos, i, sfam)
             {
                 mark_nop(&mut infos[i]);
                 changed = true;
