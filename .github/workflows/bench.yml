@@ -203,7 +203,7 @@ jobs:
         env:
           REPORT: ${{ inputs.report }}
           LCCC_BENCH_RATIOS: ${{ vars.LCCC_BENCH_RATIOS }}
-        run: python3 .github/scripts/ci_bench_ratios.py --report "$REPORT" --annotate
+        run: python3 .github/scripts/ci_bench_ratios.py --report "$REPORT"
 
       - name: Post shard summary
         if: always()
