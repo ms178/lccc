@@ -12810,6 +12810,18 @@ def _i686_debug_gotoff_test(args, oracles):
     return [Result(name, "PASS" if r.returncode == 0 else "FAIL", detail)]
 
 
+def _kernel_no_warn_rwx_test(args, _oracles):
+    """Exercise Kbuild's fatal-warnings/real-mode linker-script combination."""
+    name = "kernel_no_warn_rwx_under_fatal_warnings"
+    cc = os.path.abspath(args.lccc)
+    ld = os.path.join(os.path.dirname(cc), "lccc-ld")
+    env = {**os.environ, "LCCC": cc, "LCCC_LD": ld}
+    script = os.path.join(REPO, "tests/regression/ld_no_warn_rwx_fixture.sh")
+    result = subprocess.run(["bash", script], env=env, capture_output=True, text=True)
+    detail = (result.stdout + result.stderr)[-1000:]
+    return Result(name, "PASS" if result.returncode == 0 else "FAIL", detail)
+
+
 class _Entry:
     """One registered test (or group of tests sharing a fixture).
 
@@ -12899,6 +12911,7 @@ def _registry(args, oracles):
         one("crossarch_gnu_hash_relro", _crossarch_gnu_hash_relro_test, "dynamic"),
         one("static_pie_refused", _static_pie_refusal_test, "driver"),
         one("emit_relocs_warns_when_unimplemented", _emit_relocs_warns_test, "kernel"),
+        one("kernel_no_warn_rwx_under_fatal_warnings", _kernel_no_warn_rwx_test, "kernel"),
         one("warn_common_fatal_order", _warn_common_fatal_order_test, "diagnostics"),
         one("common_binds_shared_data", _common_binds_shared_data_test, "dynamic"),
         one("positional_shared_operands", _positional_shared_operands_test, "dynamic"),

@@ -284,6 +284,11 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "--no-copy-dt-needed-entries"
         | "--no-warn-mismatch"
         | "--no-warn-search-mismatch"
+        // No backend currently emits RWX LOAD-segment warnings. Explicitly
+        // disabling that diagnostic is therefore already honored; do not
+        // promote a spurious "not implemented" warning under --fatal-warnings.
+        // This does NOT implement --warn-rwx-segments, which remains diagnosed.
+        | "--no-warn-rwx-segments"
         | "--no-warn-execstack"
         | "--warn-execstack"
         // GNU's `--warn-textrel` turns the text-relocation check to "warn",
@@ -866,7 +871,6 @@ fn run(args: &[String]) -> Result<(), String> {
                         handle_z_keyword(kw, &mut passthrough);
                     }
                 } else if a.starts_with("--orphan-handling")
-                    || a == "--no-warn-rwx-segments"
                     || a.starts_with("--sort-section")
                     || a.starts_with("--print-")
                     // `--no-undefined-version` is a real GNU flag ("Disallow

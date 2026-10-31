@@ -60,19 +60,16 @@ CC_ORACLE=${CC_ORACLE:-gcc}
 [[ -d $K ]] || { echo "boot_size_oracle: kernel tree missing: $K" >&2; exit 1; }
 [[ -x $LCCC ]] || { echo "boot_size_oracle: lccc missing: $LCCC" >&2; exit 1; }
 cd "$K"
-# `LCCC_BOOT_OBJS` includes `header`, and header.S includes zoffset.h/voffset.h
-# for ZO_efi*_stub_entry / VO__text.  A setup-only link never regenerates them,
-# so this harness was sourcing boot_offsets.sh without ever calling it and then
-# dying on the missing header instead of reporting a size delta.  Restore the
-# same deterministic immediates build_kernel_boot.sh uses; both toolchains
-# compile the identical stubbed header, so the lccc-vs-oracle delta stays
-# codegen-only.
-ensure_boot_offset_stubs
+# Stage the same deterministic header for all compilers, without overwriting
+# Kbuild's real generated offsets (which a later bzImage must still use).
+mkdir -p "$OUT"
+header_stage=$(mktemp -d "$OUT/.boot-header.XXXXXX")
+trap 'rm -rf -- "$header_stage"' EXIT
+lccc_boot_stage_header "$header_stage"
 
 # The KEEP-annotated copy of setup.ld used by build_kernel_boot.sh; regenerate
 # identically so both links see the same script.
 SETUP_LD="$OUT/setup-gc.ld"
-mkdir -p "$OUT"
 python3 - "arch/x86/boot/setup.ld" "$SETUP_LD" <<'PY'
 from pathlib import Path
 import sys
@@ -100,10 +97,12 @@ compile_set() { # compile_set <cc> <outdir> <extra-args...>
   # code-generation delta.
   local cflags
   cflags=$(lccc_boot_cflags_for "$cc")
-  local f
+  local f source
   for f in "${LCCC_BOOT_ASM_FILES[@]}"; do
+    source="arch/x86/boot/$f.S"
+    [[ $f != header ]] || source="$header_stage/header.S"
     "$cc" $LCCC_BOOT_CPPFLAGS $cflags "$@" -D__ASSEMBLY__ \
-      -c "arch/x86/boot/$f.S" -o "$dir/$f.o"
+      -c "$source" -o "$dir/$f.o"
   done
   for f in "${LCCC_BOOT_C_FILES[@]}"; do
     "$cc" $LCCC_BOOT_CPPFLAGS $cflags "$@" \

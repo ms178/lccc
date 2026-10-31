@@ -36,21 +36,18 @@
 //! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured) |
 //! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`, `-fverbose-asm`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
 //!
-//! The last row is the one that needs defending, and the defence is the
-//! measurement, not taste.  LCCC implements sixteen warning names out of the
-//! 549 GNU exposes (`gcc -Q --help=warnings`, measured; the table is
-//! `WARNING_REGISTRY` in `src/common/error.rs` — spelling, groups and default
-//! severity all derive from it) and has no parameter,
-//! debug-selector, optimisation or long-option table at all, so for those
-//! namespaces it cannot tell a typo from a spelling a newer GNU added.  The
-//! consequence of ignoring a request in this row is an optimisation, warning,
-//! reporting or debug-info preference *not being applied* — visible in the
-//! diagnostic — rather than a program that means something different, which is
-//! why the meaning-changing requests above are refused instead.  Strict mode
-//! exists precisely because a capability probe cannot live with that judgement
-//! call: under `LCCC_STRICT_OPTIONS=1` every tolerated request fails, so the
-//! exit status means "implemented", and that is the mode
-//! `scripts/lccc_capability_probe.py` runs in.
+//! The open option namespace cannot distinguish typos from newer GCC flags.
+//! Ignoring an option can change program semantics: in particular, signed
+//! overflow transforms already exist even without poison in the IR. Normal
+//! mode's diagnostic is therefore not a safety guarantee. The signed part of
+//! `-fno-strict-overflow` is implemented, while its pointer semantics remain
+//! unaudited and explicitly diagnosed; strict mode rejects that partial
+//! implementation as well as unknown flags. Its positive counterpart
+//! `-fstrict-overflow` grants an assumption this compiler never exploits, so
+//! normal mode accepts it silently (there is nothing unmet to report) and only
+//! strict mode refuses it -- "no such optimisation exists" is not
+//! "the optimisation is implemented".
+//! `scripts/lccc_capability_probe.py` uses strict mode for capability checks.
 //!
 //! Escalation is spelled with the `LCCC_STRICT_` prefix already established by
 //! `LCCC_STRICT_MFLAGS` below.
@@ -3134,6 +3131,50 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 "-fno-rounding-math" => self.fp_rounding_math = false,
                 "-ftrapping-math" => self.fp_trapping_math = true,
                 "-fno-trapping-math" => self.fp_trapping_math = false,
+                // GCC's umbrella also changes pointer-overflow assumptions.
+                //
+                // `-fno-strict-overflow` asks for signed wraparound, which is
+                // honoured (`wrap_signed_overflow`), and for pointer-overflow
+                // semantics this compiler does not establish. Half of the
+                // request is therefore unmet, so normal builds get one warning
+                // and strict mode refuses it: a capability probe must not read
+                // a partial implementation as a full one.
+                //
+                // `-fstrict-overflow` asks for the *opposite* -- permission to
+                // assume signed overflow never happens. Nothing here exploits
+                // that assumption, so the request is already satisfied in the
+                // only direction that can change an answer (this compiler is
+                // strictly more conservative than the flag allows). Warning
+                // about it on every translation unit would be noise without a
+                // consequence to warn about, so normal mode accepts it
+                // silently; strict mode still refuses it, because "no such
+                // optimisation exists" is not "the optimisation is implemented".
+                "-fno-strict-overflow" => {
+                    if strict_options {
+                        return Err("'-fno-strict-overflow' is only partially implemented: \
+                             pointer-overflow semantics are not established; \
+                             LCCC_STRICT_OPTIONS is set"
+                            .to_string());
+                    }
+                    self.wrap_signed_overflow = true;
+                    self.trapv = false;
+                    if unknown_options.insert("-fno-strict-overflow".to_string()) {
+                        eprintln!(
+                            "warning: '-fno-strict-overflow' implements signed-overflow policy only; pointer-overflow semantics are not established; set LCCC_STRICT_OPTIONS=1 to make this an error"
+                        );
+                    }
+                }
+                "-fstrict-overflow" => {
+                    self.wrap_signed_overflow = false;
+                    if strict_options {
+                        return Err(
+                            "'-fstrict-overflow' asks for signed-overflow assumptions this \
+                             compiler never makes, so there is no implementation to enable; \
+                             LCCC_STRICT_OPTIONS is set"
+                                .to_string(),
+                        );
+                    }
+                }
                 "-fwrapv" => {
                     self.wrap_signed_overflow = true;
                     self.trapv = false;
@@ -3570,16 +3611,10 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                         // Tolerated with a diagnostic, not fatal: measured, 16
                         // of 93 flag spellings that the kernel, glibc, zlib-ng,
                         // gzip and expat build systems pass unconditionally
-                        // have no arm here (`-fno-strict-aliasing`, `-fwrapv`,
-                        // `-fno-strict-overflow`, `-fno-plt`, `-flto`,
-                        // `-funroll-loops`, `-Og`, `-ansi`, `-fno-ident`, ...).
-                        // Failing the build on those would break real builds
-                        // while the request itself is an optimisation,
-                        // reporting or debug-info preference -- the classes
-                        // whose being ignored cannot change the generated
-                        // program's *meaning*.  The requests that would change
-                        // it are refused above (stack protector, data model,
-                        // ABI) and the dialect request is implemented.
+                        // had no arm at the time of that audit. Some now have
+                        // implementations, and ignored options can change
+                        // program meaning. A warning is not a correctness or
+                        // security guarantee; strict mode fails capability probes.
                         unknown_option_tolerated(arg, strict_options)?;
                     }
                 }
@@ -4995,6 +5030,11 @@ mod cli_tests {
             (vec!["-fwrapv", "-fno-wrapv"], false),
             (vec!["-fno-wrapv", "-fwrapv"], true),
             (vec!["-fwrapv", "-ffast-math"], true),
+            (vec!["-fno-strict-overflow"], true),
+            (vec!["-fno-strict-overflow", "-fno-wrapv"], false),
+            (vec!["-fno-wrapv", "-fno-strict-overflow"], true),
+            (vec!["-fwrapv", "-fstrict-overflow"], false),
+            (vec!["-fstrict-overflow", "-fwrapv"], true),
         ] {
             let mut driver = Driver::new();
             let args = std::iter::once("lccc")
@@ -5004,6 +5044,28 @@ mod cli_tests {
                 .collect::<Vec<_>>();
             driver.parse_cli_args(&args).unwrap();
             assert_eq!(driver.wrap_signed_overflow, expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn partial_strict_overflow_preserves_gcc_signed_trap_precedence() {
+        for (flags, wrap, trap) in [
+            (vec!["-ftrapv", "-fno-strict-overflow"], true, false),
+            (vec!["-fno-strict-overflow", "-ftrapv"], false, true),
+            (vec!["-ftrapv", "-fstrict-overflow"], false, true),
+        ] {
+            let args = std::iter::once("lccc")
+                .chain(flags)
+                .chain(["x.c"])
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let mut driver = Driver::new();
+            driver.parse_cli_args(&args).unwrap();
+            assert_eq!(
+                (driver.wrap_signed_overflow, driver.trapv),
+                (wrap, trap),
+                "{args:?}"
+            );
         }
     }
 

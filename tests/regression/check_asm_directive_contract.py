@@ -59,6 +59,23 @@ ROWS = {
     "mac_surplus": (".macro O a\n.byte \\a\n.endm\n\t.data\nO 1, 2\n", "all"),
     "mac_req_missing": (".macro O a:req\n.byte 1\n.endm\n\t.data\nO\n", "all"),
     "mac_missing_empty": (".macro E a b\n.byte \\a\\b\n.endm\n\t.data\nE 7\n", "all"),
+    # `.org` targets: GAS resolves a label only when it is already defined; a
+    # forward target is a fatal "Infinite loop encountered whilst attempting to
+    # compute the addresses of symbols" (2.47), so both assemblers refuse it. A
+    # backward target is legal, including a local numeric label, and it must
+    # survive jump relaxation: the pad shrinks when a jump before it grows.
+    "org_backward_local": ("\t.text\n1:\n\tnop\n\t.org 1b + 4, 0x11\n\tret\n",
+                           "x86s"),
+    "org_backward_named": ("\t.text\nstart:\n\tnop\n\t.org start + 4, 0x33\n\tret\n",
+                           "x86s"),
+    "org_relax_local": ("\t.text\n1:\n\tnop\n\tjmp 2f\n\t.org 1b + 12, 0x77\n"
+                        "\t.space 200\n2:\n\tret\n", "x86s"),
+    "org_dot_relative": ("\t.text\n\tnop\n\t.org . + 4, 0x90\n\tret\n",
+                         "x86s"),
+    "org_forward_local": ("\t.text\n\t.org 1f, 0xcc\n\tnop\n1:\n\tret\n",
+                          "x86s"),
+    "org_forward_named": ("\t.text\n\t.org tail, 0x55\n\tnop\ntail:\n\tret\n",
+                          "x86s"),
     # `\@` counts invocations in pre-order (M=0, its I=1, the next M=2).
     "mac_counter": (".macro I\nL\\@i: .byte 0\n.endm\n.macro M\nL\\@m: .byte 1\nI\nL\\@z: .byte 2\n.endm\n\t.data\nM\nM\n", "all"),
     # Any number of labels may precede an invocation.
@@ -781,6 +798,23 @@ PINS = {
     ('riscv64', 'num_zero_back'): '.data:8:1:0000000004000800',
     ('x86_64', 'abs_self_text'): '.text:15:1:90b800000000680000000000000000 @2:r10:.text+1 @7:r11:.text+2 @11:r10:.text+1 foo:LOCAL:NOTYPE:.text:1:0',
     ('i686', 'abs_self_text'): '.text:15:1:90b800000000680000000000000000 @2:r1:.text+1 @7:r1:.text+2 @11:r1:.text+1 foo:LOCAL:NOTYPE:.text:1:0',
+    # `.org` rows above. A forward target is a GAS fatal error (address
+    # computation cannot converge), so both assemblers refuse it; the backward
+    # forms pin the bytes, and org_relax_local pins the padding SHRINKING from
+    # nine bytes to six when the `jmp` before it relaxes to a near jump.
+    ('x86_64', 'org_backward_local'): '.text:5:1:90111111c3',
+    ('x86_64', 'org_backward_named'): '.text:5:1:90333333c3 start:LOCAL:NOTYPE:.text:0:0',
+    ('x86_64', 'org_relax_local'): '.text:213:1:90e9ce0000007777777777770000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c3',
+    ('x86_64', 'org_dot_relative'): '.text:6:1:9090909090c3',
+    ('x86_64', 'org_forward_local'): 'error',
+    ('x86_64', 'org_forward_named'): 'error',
+    ('i686', 'org_backward_local'): '.text:5:1:90111111c3',
+    ('i686', 'org_backward_named'): '.text:5:1:90333333c3 start:LOCAL:NOTYPE:.text:0:0',
+    ('i686', 'org_relax_local'): '.text:213:1:90e9ce0000007777777777770000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c3',
+    ('i686', 'org_dot_relative'): '.text:6:1:9090909090c3',
+    ('i686', 'org_forward_local'): 'error',
+    ('i686', 'org_forward_named'): 'error',
+
 }
 
 

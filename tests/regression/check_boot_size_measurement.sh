@@ -22,7 +22,10 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 # shellcheck source=../../scripts/elf_sections.sh
 source "$repo_root/scripts/elf_sections.sh"
 
-CC=${CC:-gcc}
+# Prefer the pinned oracle where it exists (see check_static_assert_sema.sh).
+if [ -z "${CC:-}" ]; then
+    if command -v gcc-16 >/dev/null 2>&1; then CC=gcc-16; else CC=gcc; fi
+fi
 fail=0
 say_fail() { printf 'FAIL %s\n' "$*" >&2; fail=1; }
 expect_eq() { # expect_eq <label> <actual> <expected>
@@ -177,4 +180,7 @@ if (( fail != 0 )); then
     echo "check_boot_size_measurement: FAILED" >&2
     exit 1
 fi
-echo "check_boot_size_measurement: PASS (code bytes by flag, ranking by delta)"
+# The same setup-size probes must not overwrite a real Kbuild's offsets.
+# Run the isolated staging regression in the existing local + hosted gate.
+bash "$repo_root/tests/regression/boot_offset_isolation_fixture.sh"
+echo "check_boot_size_measurement: PASS (code bytes, ranking, offset isolation)"

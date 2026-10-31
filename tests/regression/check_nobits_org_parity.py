@@ -223,6 +223,17 @@ def main():
                 if got != want:
                     failures += 1
                     print(f"FAIL {tgt} .org {name}: lccc {got}, want {want}")
+    # The x86 setup/real-mode fixed-slot case also needs byte parity after
+    # jump relaxation and a fail-closed backwards-location verdict. Keep it
+    # in this existing hosted + local gate, rather than an orphan script.
+    x86_test = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "x86_location_assignment_fixture.sh")
+    env = {**os.environ, "CCC": os.path.abspath(args.lccc)}
+    result = subprocess.run(["bash", x86_test], env=env, check=False)
+    rows += 1
+    if result.returncode:
+        print("FAIL x86 location-counter assignment parity")
+        failures += 1
     print(f"nobits/org parity: {rows - failures}/{rows} rows hold "
           f"({len(DIVERGENCES)} pinned divergences)")
     return 1 if failures else 0

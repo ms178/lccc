@@ -108,13 +108,37 @@ turns that diagnostic into an error, so a capability probe can tell
 ## Option contract
 
 Tolerating an optimisation flag is safe only while the optimisation it controls
-does not exist here: `-fno-strict-aliasing` has nothing to switch off because
-this compiler performs no type-based alias analysis, and `-fwrapv` /
-`-fno-strict-overflow` have nothing to constrain because it carries no
-signed-overflow or `inbounds` poison. That precondition is machine-checked —
-`scripts/check_no_ub_exploitation.py` fails if such a concept appears in `src/`,
-because landing one would silently turn those tolerated spellings into
-miscompiles.
+does not exist here. `-fno-strict-aliasing` has nothing to switch off: this
+compiler performs no type-based alias analysis. `-fwrapv` *is* implemented —
+`wrap_signed_overflow` is a real pass policy, not a tolerated spelling.
+
+The two `strict-overflow` spellings are not symmetric, and treating them as one
+pair is how a capability probe gets a wrong answer:
+
+* `-fno-strict-overflow` is **partially** implemented. Its signed-arithmetic
+  half is honoured (the same policy as `-fwrapv`, which the kernel relies on
+  when it passes the umbrella instead of `-fwrapv`); its pointer-overflow half
+  is not established anywhere in this compiler. A build therefore gets one
+  warning per translation unit and `LCCC_STRICT_OPTIONS=1` refuses it — a probe
+  must not read half an implementation as a whole one.
+* `-fstrict-overflow` asks for the *opposite*: permission to assume signed
+  overflow never happens. Nothing here exploits that assumption, so the request
+  is already satisfied in the only direction that can change an answer — this
+  compiler is strictly more conservative than the flag allows. Normal mode
+  accepts it silently, because there is no unmet part to report; strict mode
+  still refuses it, because "no such optimisation exists" is not "the
+  optimisation is implemented".
+
+The precondition behind both is checked, but the check is a **tripwire, not a
+proof**. `scripts/check_no_ub_exploitation.py` fails when one of an enumerated
+set of TBAA/`inbounds`/poison spellings appears in `src/`; it cannot see an
+optimisation that exploits undefined behaviour through a range or comparison
+fold with no poison flag in the IR. Adding such a fold therefore requires
+extending the tripwire in the same change, and the executable evidence is the
+differential behaviour itself: `check_iabs_cmp_fold.sh` runs the wraparound legs
+under `-fwrapv` and under the umbrella at every optimisation level, and
+`check_divzero_constant_arms.sh` pins which constant arms may be folded against
+GCC 16.2 in both target modes.
 
 The wider fail-closed unknown-option contract (exit 1 for data-model flags
 like `-funsigned-char` and for hardening requests, `LCCC_STRICT_OPTIONS=1` to

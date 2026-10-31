@@ -544,40 +544,46 @@ impl<'a> ExprTypeChecker<'a> {
                 }
             }
 
-            // Statement expression: type of the last expression statement
+            // Statement expression: the type of its value expression.
+            //
+            // A tail that cannot produce a value is `void` (GCC 16.2:
+            // `({ int y; })`, `({ ; })`, `({ if (c) ; })`), never a
+            // convenient default `int`: substituting one would let a use of a
+            // void statement expression compile into an undefined value.
             Expr::StmtExpr(compound, _) => {
-                if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.items.last() {
-                    // Nested statement expression: resolve it scope-threaded
-                    // FIRST.  Plain inference of a not-yet-executed nested
-                    // stmt-expr can "succeed" with a wrong fallback type
-                    // (typeof failures degrade to Int, so `typeof(*p)` on an
-                    // unresolved nested stmt-expr yields int *), which then
-                    // poisons the outer typeof.  The scope-threaded path
-                    // re-derives declaration types from the AST and resolves
-                    // cross-compound references (kernel xchg/cmpxchg macros:
-                    // outer declares __ai_ptr, inner uses typeof(*__ai_ptr)).
-                    if let Expr::StmtExpr(inner_compound, _) = expr {
-                        let scope = self.build_compound_scope(compound, None);
-                        if !scope.is_empty() {
-                            if let Some(ctype) =
-                                self.infer_stmt_expr_ctype_with_scope(inner_compound, Some(&scope))
-                            {
-                                return Some(ctype);
-                            }
-                        }
-                    }
-                    if let Some(ctype) = self.infer_expr_ctype(expr) {
+                let Some(expr) = compound.value_expr() else {
+                    return Some(CType::Void);
+                };
+                // Nested statement expression: resolve it scope-threaded
+                // FIRST.  Plain inference of a not-yet-executed nested
+                // stmt-expr can "succeed" with a wrong fallback type
+                // (typeof failures degrade to Int, so `typeof(*p)` on an
+                // unresolved nested stmt-expr yields int *), which then
+                // poisons the outer typeof.  The scope-threaded path
+                // re-derives declaration types from the AST and resolves
+                // cross-compound references (kernel xchg/cmpxchg macros:
+                // outer declares __ai_ptr, inner uses typeof(*__ai_ptr)).
+                if let Expr::StmtExpr(inner_compound, _) = expr {
+                    let scope = self.build_compound_scope(compound, None);
+                    if !scope.is_empty()
+                        && let Some(ctype) =
+                            self.infer_stmt_expr_ctype_with_scope(inner_compound, Some(&scope))
+                    {
                         return Some(ctype);
                     }
-                    // If the last expr is an identifier not in the symbol table
-                    // (e.g., inside typeof where the stmt expr was never executed),
-                    // resolve it from declarations within this compound statement.
-                    // We build a local scope as we iterate so that typeof expressions
-                    // referencing earlier declarations can be resolved (e.g., the
-                    // kernel's xchg macro: typeof(&field) ptr = ...; __typeof__(*ptr) ret = ...; ret;)
-                    if let Expr::Identifier(name, _) = expr {
-                        return self.resolve_var_from_compound(compound, name, None);
-                    }
+                }
+                if let Some(ctype) = self.infer_expr_ctype(expr) {
+                    return Some(ctype);
+                }
+                // If the value expression is an identifier not in the symbol
+                // table (e.g., inside typeof where the stmt expr was never
+                // executed), resolve it from declarations within this compound
+                // statement.  We build a local scope as we iterate so that
+                // typeof expressions referencing earlier declarations can be
+                // resolved (e.g., the kernel's xchg macro: typeof(&field) ptr
+                // = ...; __typeof__(*ptr) ret = ...; ret;)
+                if let Expr::Identifier(name, _) = expr {
+                    return self.resolve_var_from_compound(compound, name, None);
                 }
                 None
             }
@@ -764,11 +770,11 @@ impl<'a> ExprTypeChecker<'a> {
             // preferring the scope cannot change its answer; where the scope holds
             // something else, that something else is what the name means.
             if let Some(sym) = self.symbols.lookup(name) {
-                if matches!(sym.ty, CType::Function(_)) {
-                    if let Some(ct) = Self::extract_return_ctype_from_type(&sym.ty) {
-                        return Some(ct);
-                    }
-                }
+                // A function-pointer object is also an ordinary-name binding:
+                // it must shadow a same-named file-scope function even when
+                // the latter has an incompatible return type. If the binding
+                // is not callable, do not fall back to the hidden function.
+                return Self::extract_return_ctype_from_type(&sym.ty);
             }
             // Check function signatures (external entities and implicit decls)
             if let Some(func_info) = self.functions.get(name.as_str()) {
@@ -777,10 +783,6 @@ impl<'a> ExprTypeChecker<'a> {
             // Check builtin return types
             if let Some(ct) = Self::builtin_return_ctype(name) {
                 return Some(ct);
-            }
-            // Check symbol table for function pointer variables
-            if let Some(sym) = self.symbols.lookup(name) {
-                return Self::extract_return_ctype_from_type(&sym.ty);
             }
         }
 
@@ -1793,31 +1795,32 @@ impl<'a> ExprTypeChecker<'a> {
         compound: &CompoundStmt,
         parent_scope: Option<&FxHashMap<String, CType>>,
     ) -> Option<CType> {
-        if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.items.last() {
-            // Nested statement expression: build this compound's scope and
-            // recurse with it as the parent so inner typeof()s can see
-            // variables declared here.  Do this before plain inference for
-            // the same reason as infer_expr_ctype's StmtExpr arm: plain
-            // inference of an un-executed nested stmt-expr can return a
-            // wrong fallback type instead of None.
-            if let Expr::StmtExpr(inner_compound, _) = expr {
-                let scope = self.build_compound_scope(compound, parent_scope);
-                if !scope.is_empty() {
-                    if let Some(ctype) =
-                        self.infer_stmt_expr_ctype_with_scope(inner_compound, Some(&scope))
-                    {
-                        return Some(ctype);
-                    }
-                }
-            }
-            if let Some(ctype) = self.infer_expr_ctype(expr) {
+        let Some(expr) = compound.value_expr() else {
+            // Mirrors `infer_expr_ctype`: a tail that cannot produce a value
+            // makes the whole statement expression `void`.
+            return Some(CType::Void);
+        };
+        // Nested statement expression: build this compound's scope and
+        // recurse with it as the parent so inner typeof()s can see variables
+        // declared here.  Do this before plain inference for the same reason
+        // as infer_expr_ctype's StmtExpr arm: plain inference of an unexecuted
+        // nested stmt-expr can return a wrong fallback type instead of None.
+        if let Expr::StmtExpr(inner_compound, _) = expr {
+            let scope = self.build_compound_scope(compound, parent_scope);
+            if !scope.is_empty()
+                && let Some(ctype) =
+                    self.infer_stmt_expr_ctype_with_scope(inner_compound, Some(&scope))
+            {
                 return Some(ctype);
             }
-            // Plain identifier: resolve from declarations in this compound
-            // (including those inherited from enclosing compounds).
-            if let Expr::Identifier(name, _) = expr {
-                return self.resolve_var_from_compound(compound, name, parent_scope);
-            }
+        }
+        if let Some(ctype) = self.infer_expr_ctype(expr) {
+            return Some(ctype);
+        }
+        // Plain identifier: resolve from declarations in this compound
+        // (including those inherited from enclosing compounds).
+        if let Expr::Identifier(name, _) = expr {
+            return self.resolve_var_from_compound(compound, name, parent_scope);
         }
         None
     }

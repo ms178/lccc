@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Shared setup-only offset fallback for the x86 boot-size harnesses.
 #
-# A full kernel build normally regenerates zoffset.h/voffset.h from the
-# compressed image and vmlinux.  The setup-size harness intentionally links
-# only arch/x86/boot, so it uses immediates instead.  Keep the fallback
-# deterministic and restore it when a preceding full build left a generated
-# zoffset.h without the EFI mixed-mode symbols that header.S requires.
+# A full kernel build generates zoffset.h/voffset.h from real binaries. Setup
+# size probes must not overwrite those files: newer stub timestamps could make
+# Kbuild reuse bogus boot offsets in a subsequent real bzImage. Stage a copy of
+# header.S and private deterministic offsets instead. Other quoted includes
+# still resolve through the normal -Iarch/x86/boot search path.
 
 ensure_boot_offset_stubs() {
-  local zoffset=${1:-arch/x86/boot/zoffset.h}
-  local voffset=${2:-arch/x86/boot/voffset.h}
+  local zoffset=${1:?private zoffset path required}
+  local voffset=${2:?private voffset path required}
   local tmp
 
   if [[ ! -r "$zoffset" ]] || \
@@ -57,4 +57,13 @@ EOF
 EOF
     mv -f "$tmp" "$voffset"
   fi
+}
+
+# Called from the kernel root with a freshly created private directory.
+# Keep header.S beside its offsets so quoted include lookup finds the stubs
+# before the real kernel tree, regardless of -I search order.
+lccc_boot_stage_header() {
+  local dir=${1:?private staging directory required}
+  cp -- arch/x86/boot/header.S "$dir/header.S"
+  ensure_boot_offset_stubs "$dir/zoffset.h" "$dir/voffset.h"
 }

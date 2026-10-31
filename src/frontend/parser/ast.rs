@@ -594,6 +594,25 @@ impl Declaration {
     pub fn is_typedef(&self) -> bool {
         self.flags & decl_flag::TYPEDEF != 0
     }
+
+    /// Whether this declaration reserves storage for a block-scope object.
+    ///
+    /// This is the exact question GCC's parser answers when it decides
+    /// whether a declaration ends the search for a statement expression's
+    /// value (see [`BlockItem::is_value_transparent`]). A declaration does so
+    /// when it declares at least one *object*: a typedef declares a type, an
+    /// `extern` declaration names storage owned elsewhere, and a function
+    /// declaration (including a prototype such as `int f(void);`, which
+    /// [`DerivedDeclarator::declares_function`] classifies) declares no
+    /// storage here. `static int q;`, `int y;` and `int y = 2;` all do.
+    pub fn defines_block_storage(&self) -> bool {
+        !self.is_typedef()
+            && !self.is_extern()
+            && self
+                .declarators
+                .iter()
+                .any(|d| !DerivedDeclarator::declares_function(&d.derived))
+    }
     #[inline]
     pub fn is_const(&self) -> bool {
         self.flags & decl_flag::CONST != 0
@@ -1713,6 +1732,79 @@ pub struct CompoundStmt {
     pub local_labels: Vec<String>,
     /// True when synthesized by `if (init; cond)` or `switch (init; expr)` (C2y 6.8.5).
     pub is_synthetic_init_scope: bool,
+}
+
+impl CompoundStmt {
+    /// The item that carries a GNU statement expression's value.
+    ///
+    /// GCC's rule, measured on 16.2 over the 20-shape matrix in
+    /// `tests/regression/stmt_expr_tail_parity.c`: the value comes from the
+    /// last item that can produce one, and the items below leave the earlier
+    /// value in place:
+    ///
+    /// * `_Static_assert` — the kernel's `sizeof(struct { _Static_assert(…); })`
+    ///   shape queues one after the item that contained its member list, and a
+    ///   source-level assertion at the tail is transparent too (`({ 1;
+    ///   _Static_assert(1, ""); })` is `int`).
+    /// * the null statement `;` (`({ 1; ; })` is `int`).
+    /// * declarations that reserve no block storage — typedefs, `extern`
+    ///   objects, function prototypes, and bare tag/enum definitions
+    ///   (`({ 1; typedef int T; })` and `({ 1; int f(void); })` are `int`,
+    ///   while `({ 1; int y; })` is `void`).
+    ///
+    /// Clang answers `void` for every one of those; this compiler follows GCC
+    /// because GCC 16.2 is the reference every differential gate measures
+    /// against. The matrix is a gate, so a future "simplification" back to
+    /// `items.last()` fails immediately.
+    pub fn value_tail_item(&self) -> Option<&BlockItem> {
+        self.items
+            .iter()
+            .rev()
+            .find(|item| !item.is_value_transparent())
+    }
+
+    /// The expression a statement expression evaluates to.
+    ///
+    /// `None` means the tail cannot produce a value, which is `void` in GCC:
+    /// `({ int y; })`, `({ ; })` and `({ if (c) ; })` are void, while
+    /// `({ 1; out: 2; })` is `int` because GCC sees through a top-level label
+    /// (measured on 16.2). Callers must not substitute a default integer type
+    /// for `None`; that turns a use of a void value into silent garbage.
+    pub fn value_expr(&self) -> Option<&Expr> {
+        match self.value_tail_item()? {
+            BlockItem::Statement(stmt) => stmt.value_expr(),
+            _ => None,
+        }
+    }
+}
+
+impl Stmt {
+    /// The expression this statement contributes as a statement expression's
+    /// value, seeing through GCC's top-level label wrappers (`out: expr;`).
+    pub fn value_expr(&self) -> Option<&Expr> {
+        match self {
+            Stmt::Expr(Some(expr)) => Some(expr),
+            Stmt::Label(_, inner, _)
+            | Stmt::Case(_, inner, _)
+            | Stmt::CaseRange(_, _, inner, _)
+            | Stmt::Default(inner, _) => inner.value_expr(),
+            _ => None,
+        }
+    }
+}
+
+impl BlockItem {
+    /// Whether a statement expression's value passes through this item to the
+    /// one before it. See [`CompoundStmt::value_tail_item`] for the rule and
+    /// the measurement behind it.
+    pub fn is_value_transparent(&self) -> bool {
+        match self {
+            BlockItem::StaticAssert(_) => true,
+            BlockItem::Statement(Stmt::Expr(None)) => true,
+            BlockItem::Declaration(decl) => !decl.defines_block_storage(),
+            _ => false,
+        }
+    }
 }
 
 /// Items within a block.

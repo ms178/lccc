@@ -9,7 +9,13 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 CCC=${CCC:-"$root/target/fastbuild/lccc"}
-CC=${CC:-gcc}
+# Pin the reference: the fixture relies on C23 enumerator typing
+# (`WB = 0x80000000u` is `unsigned int`), which GCC 13 and later implement, so a
+# developer box whose `gcc` is older would report a false LCCC failure. Hosted CI
+# symlinks gcc-16 to `gcc`, so the fallback is what old local images get.
+if [ -z "${CC:-}" ]; then
+    if command -v gcc-16 >/dev/null 2>&1; then CC=gcc-16; else CC=gcc; fi
+fi
 [[ -x "$CCC" ]] || { echo "missing LCCC compiler: $CCC" >&2; exit 1; }
 command -v "$CC" >/dev/null 2>&1 || { echo "missing C oracle: $CC" >&2; exit 1; }
 work=$(mktemp -d)
@@ -33,6 +39,7 @@ negatives=(
     'void f(void) { { enum Small { SV = -5 }; } _Static_assert(TY(SA) == 1 && sizeof(enum Small) == 8, "scope"); }'
     'struct M { int x; _Static_assert(sizeof(struct S) == 3, "member"); };'
     'void f(void) { struct N { _Static_assert(_Alignof(struct S) == 1, "nested member"); int y; } n; (void)n; }'
+    'void f(void) { (void)({ sizeof(struct { _Static_assert(sizeof(int) == 99, "member in expression"); }); }); }'
 )
 for i in "${!negatives[@]}"; do
     src="$work/neg$i.c"
