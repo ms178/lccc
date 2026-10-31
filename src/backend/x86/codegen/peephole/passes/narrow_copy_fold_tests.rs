@@ -1190,3 +1190,129 @@ fn upper32_selfmove_architectural_execution() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// The counted-loop latch proof: `addl $1, %eId; movslq %eId, %rId` inside a
+/// loop whose only entry passed a strict signed latch test is the identity,
+/// because the counter is bounded by that test. fannkuch's flip loop kept the
+/// extension and ran 10 instructions per swap instead of GCC's 8.
+#[test]
+fn loop_latch_sign_extension_is_eliminated() {
+    let out = run(concat!(
+        "f:\n",
+        ".cfi_startproc\n",
+        "    subq $8, %rsp\n",
+        "    xorl %r10d, %r10d\n",
+        "    movl $5, %r15d\n",
+        ".LBB11:\n",
+        "    cmpl %r15d, %r10d\n",
+        "jge .LBB13\n",
+        ".LBB12:\n",
+        "    movl (%r8, %r10, 4), %ebp\n",
+        "    addl $1, %r10d\n",
+        "    movslq %r10d, %r10\n",
+        "    cmpl %r15d, %r10d\n",
+        "jl .LBB12\n",
+        ".LBB13:\n",
+        "    movl (%r8, %r10, 4), %eax\n",
+        "    addq $8, %rsp\n",
+        "    ret\n",
+        ".cfi_endproc\n",
+    ));
+    assert!(!out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// A step of two can cross the bound in one iteration, so it stays.
+#[test]
+fn loop_latch_two_step_increment_keeps_the_extension() {
+    let out = run(concat!(
+        "f:\n",
+        ".cfi_startproc\n",
+        "    xorl %r10d, %r10d\n",
+        "    movl $5, %r15d\n",
+        ".LBB11:\n",
+        "    cmpl %r15d, %r10d\n",
+        "jge .LBB13\n",
+        ".LBB12:\n",
+        "    addl $2, %r10d\n",
+        "    movslq %r10d, %r10\n",
+        "    cmpl %r15d, %r10d\n",
+        "jl .LBB12\n",
+        ".LBB13:\n",
+        "    ret\n",
+        ".cfi_endproc\n",
+    ));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// `jle` admits `i == K`, and `i == i32::MAX` then overflows on the next
+/// increment: only the strict test is a bound.
+#[test]
+fn loop_latch_nonstrict_test_keeps_the_extension() {
+    let out = run(concat!(
+        "f:\n",
+        ".cfi_startproc\n",
+        "    xorl %r10d, %r10d\n",
+        "    movl $5, %r15d\n",
+        ".LBB11:\n",
+        "    cmpl %r15d, %r10d\n",
+        "jg .LBB13\n",
+        ".LBB12:\n",
+        "    addl $1, %r10d\n",
+        "    movslq %r10d, %r10\n",
+        "    cmpl %r15d, %r10d\n",
+        "jle .LBB12\n",
+        ".LBB13:\n",
+        "    ret\n",
+        ".cfi_endproc\n",
+    ));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// A second edge into the loop head can enter without the latch test, so the
+/// bound does not hold: the extension stays.
+#[test]
+fn loop_latch_second_entry_keeps_the_extension() {
+    let out = run(concat!(
+        "f:\n",
+        ".cfi_startproc\n",
+        "    xorl %r10d, %r10d\n",
+        "    movl $5, %r15d\n",
+        "    jmp .LBB12\n",
+        ".LBB11:\n",
+        "    cmpl %r15d, %r10d\n",
+        "jge .LBB13\n",
+        ".LBB12:\n",
+        "    addl $1, %r10d\n",
+        "    movslq %r10d, %r10\n",
+        "    cmpl %r15d, %r10d\n",
+        "jl .LBB12\n",
+        ".LBB13:\n",
+        "    ret\n",
+        ".cfi_endproc\n",
+    ));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// An initializer at `i32::MAX` overflows on the first increment, so the
+/// first-iteration argument fails and the extension stays.
+#[test]
+fn loop_latch_saturating_initializer_keeps_the_extension() {
+    let out = run(concat!(
+        "f:\n",
+        ".cfi_startproc\n",
+        "    movl $2147483647, %r10d\n",
+        "    movl $5, %r15d\n",
+        ".LBB11:\n",
+        "    cmpl %r15d, %r10d\n",
+        "jge .LBB13\n",
+        ".LBB12:\n",
+        "    addl $1, %r10d\n",
+        "    movslq %r10d, %r10\n",
+        "    cmpl %r15d, %r10d\n",
+        "jl .LBB12\n",
+        ".LBB13:\n",
+        "    ret\n",
+        ".cfi_endproc\n",
+    ));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
