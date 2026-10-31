@@ -1886,6 +1886,11 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_nbody_perf_shapes.sh
+    - name: Verify stack-slot dead-store contracts
+      env:
+        CCC: target/fastbuild/lccc
+        GCC_BIN: gcc-16
+      run: bash tests/regression/check_dead_stack_store.sh
     - name: Verify IVSR scalar-derived default pin
       env:
         CCC: target/fastbuild/lccc

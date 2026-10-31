@@ -1260,7 +1260,27 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 LineKind::Other { .. } => {
                     let rbp_off = infos[k].rbp_offset;
                     let line = infos[k].trimmed(store.get(k));
-                    if line.starts_with("leaq ") {
+                    // An `(%rbp)` operand is only a frame reference when %rbp IS
+                    // the frame pointer. Under -fomit-frame-pointer %rbp is an
+                    // ordinary data register, so `leal -1(%rbp), %eax` is an
+                    // address computation on a data value: it touches no frame
+                    // slot at all. The old prefix test only recognised the
+                    // 64-bit spelling, so the 32-bit `leal` fell through to the
+                    // generic rbp-offset arm, where `frame_read_extent` has no
+                    // LEA entry and bailed the whole function — a single
+                    // `leal -1(%rbp)` disabled never-read store elimination
+                    // everywhere (glibc_strstr kept two dead spill stores in
+                    // its hottest loop).
+                    let lea = is_lea_instruction(line);
+                    // `(%rbp)` names a frame slot only when %rbp IS the frame
+                    // pointer. Under -fomit-frame-pointer it is a data register,
+                    // so a LEA on it computes an address from a data value and
+                    // touches no frame slot; any *other* instruction on a data
+                    // %rbp stays on the generic path below, unchanged.
+                    if lea && !rbp_is_frame && line.contains("%rbp") && !line.contains("%rsp") {
+                        continue;
+                    }
+                    if lea {
                         // Address taken at a frame slot: the derived pointer
                         // may reach an unbounded upward span (passed to a
                         // callee, indexed later) — record a floor, not a
@@ -1703,6 +1723,17 @@ fn step_rsp_depth(
     true
 }
 
+/// True for an address-computing LEA in any width (`leaq`/`leal`/`leaw`/`lea`).
+/// A LEA never accesses memory, so a frame-base operand inside one names an
+/// address, never a slot read; every spelling must be recognised, because a
+/// missed spelling falls through to the generic frame-read arms.
+fn is_lea_instruction(line: &str) -> bool {
+    match line.split_once(char::is_whitespace) {
+        Some((mnemonic, _)) => matches!(mnemonic, "lea" | "leaq" | "leal" | "leaw"),
+        None => false,
+    }
+}
+
 /// Pre-scan for a raw frame-base escape: a line with no frame memory operand
 /// that copies the frame base into another register (`movq %rsp,%reg`, or
 /// `%rbp` when it is the frame pointer). A leaked base may reach any frame
@@ -1820,6 +1851,72 @@ mod tests {
         mark_nop(&mut infos[second]);
         eliminate_dead_stores(&store, &mut infos);
         assert!(!infos[first].is_nop(), "the first store feeds {read}");
+    }
+
+    /// A 32-bit `leal` on a DATA-register `%rbp` (no frame pointer) computes an
+    /// address and touches no frame slot: it must not be mistaken for a frame
+    /// read. Before this test the generic `rbp_offset` arm asked
+    /// `frame_read_extent("leal …")`, which has no LEA entry, and bailed the
+    /// whole function — one `leal -1(%rbp), %eax` in glibc_strstr's search loop
+    /// disabled never-read store elimination and left two dead spill stores in
+    /// the hottest block.
+    #[test]
+    fn leal_on_a_data_register_rbp_does_not_bail_dead_store_elimination() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $40, %rsp\n",
+            ".cfi_def_cfa_offset 48\n",
+            "    leal -1(%rbp), %eax\n",
+            "    movq %rax, 8(%rsp)\n",
+            "    imull $3, %edi, %edi\n",
+            "    addq $40, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, mut infos) = build(asm);
+        eliminate_never_read_stores(&store, &mut infos);
+        let kept: Vec<&str> = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim())
+            .filter(|t| t.contains("(%rsp)"))
+            .collect();
+        assert!(
+            !kept.iter().any(|t| t.starts_with("movq %rax")),
+            "a data-register `leal` must not keep the never-read store alive: {kept:?}"
+        );
+    }
+
+    /// The control for the test above: a genuine memory operand on a
+    /// data-register `%rbp` may alias any frame slot, so the never-read store
+    /// must stay.
+    #[test]
+    fn memory_operand_on_a_data_register_rbp_still_bails() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $40, %rsp\n",
+            ".cfi_def_cfa_offset 48\n",
+            "    movl -1(%rbp), %eax\n",
+            "    movq %rax, 8(%rsp)\n",
+            "    imull $3, %edi, %edi\n",
+            "    addq $40, %rsp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, mut infos) = build(asm);
+        eliminate_never_read_stores(&store, &mut infos);
+        let kept: Vec<&str> = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim())
+            .filter(|t| t.contains("(%rsp)"))
+            .collect();
+        assert!(
+            kept.iter().any(|t| t.starts_with("movq %rax")),
+            "a pointer access through a data-register %rbp can reach any slot: {kept:?}"
+        );
     }
 
     #[test]

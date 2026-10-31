@@ -2610,6 +2610,14 @@ gate "ch-maj-codegen" fast \
 # loss, now opt-in via CCC_IVSR_SCALAR_DERIVED=1).
 gate "nbody-perf-shapes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_nbody_perf_shapes.sh
+
+# Stack-slot dead stores: a 32-bit `leal` on a data-register %rbp used to bail
+# never-read store elimination for the whole function, leaving `spill_deref`'s
+# deleted reloads behind as dead stores in the hottest block (glibc_strstr:
+# two of them, measured -1.0 % runtime).  The gate pins the structural contract
+# on a fixture that reproduces the shape, and self-tests its checker.
+gate "dead-stack-store" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_dead_stack_store.sh
 gate "ivsr-scalar-derived-default" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_scalar_derived_default.sh
 
