@@ -14,8 +14,11 @@
 # values in rbx/r12/re13 still computes the right answer, just slower, so no
 # execution test can see the regression. This gate pins the SHAPE:
 #
-#   1. a call-free leaf keeping four loop values live references no
+#   1. a call-free leaf whose live set fits the volatile pool references no
 #      callee-saved register and emits no push/pop;
+#   1b. a call-free leaf whose live set exceeds it takes strictly fewer
+#      callee-saved registers than the same function with the policy off —
+#      the policy engages, it just cannot conjure registers that do not exist;
 #   2. `CCC_NO_LEAF_CALLER_HOME=1` restores the callee-saved shape — the kill
 #      switch still isolates the policy for A/B runs;
 #   3. the same loop wrapped around a call DOES preserve its state in
@@ -72,6 +75,29 @@ int main(void) {
 }
 EOF
 
+# A leaf whose live set (accumulator, second accumulator, the induction
+# variable) fits the volatile pool with room to spare: here the policy's claim
+# is absolute — not one callee-saved register, not one frame save.
+cat >"$work/leaf_light.c" <<'EOF'
+#include <stdio.h>
+
+__attribute__((noinline)) unsigned long tiny(unsigned long n) {
+    unsigned long a = 1, b = 3;
+    for (; n > 0; n--) {
+        a += n * 5;
+        b ^= a >> 2;
+    }
+    return a ^ b;
+}
+
+int main(void) {
+    unsigned long s = 0;
+    for (unsigned long n = 1; n <= 61; n += 3) s = s * 31 + tiny(n);
+    printf("%lu\n", s);
+    return 0;
+}
+EOF
+
 # The same loop around a call the compiler cannot summarize: the values must
 # survive it, so at least one callee-saved register has to appear. The call
 # goes through a volatile function pointer on purpose — a direct call to a
@@ -117,11 +143,26 @@ body_of() { awk -v fn="$2" '$0 ~ "^" fn ":" { inb = 1; next } inb && /^[[:space:
 callee_refs() { body_of "$1" kernel | grep -Ec '%(rbx|r1[2-5])\b' || true; }
 pushes() { body_of "$1" kernel | grep -Ec '^[[:space:]]+push|^[[:space:]]+pop' || true; }
 
+# Diagnostics go to a file and are printed AFTER the summary: a failing CI
+# shard keeps only a gate's last lines, and a census nobody can see is a
+# census that has to be re-derived from a scratch build.
+diag() { printf '%s\n' "$*" >>"$TMP/diag"; }
+census() {
+    local tag=$1 file=$2 body
+    body=$(body_of "$file" kernel)
+    local line="census $tag:"
+    local r
+    for r in rbx rbp r12 r13 r14 r15 r8 r9 r10 r11 rsi rdi rcx rdx rax; do
+        line="$line $r=$(printf '%s\n' "$body" | grep -c "%$r" || true)"
+    done
+    diag "$line"
+    diag "$tag body: $(printf '%s\n' "$body" | sed 's/^[[:space:]]*//' | grep -v '^[.]' | tr '\n' ';')"
+}
+
 run_both() {
     src=$1
     tag=$2
     "$GCC_ORACLE" -O2 -o "$work/$tag.ref" "$src" 2>/dev/null || bad "$tag: gcc oracle failed"
-    "$GCC_ORACLE" -O2 "$src" -o "$work/$tag.ref" 2>/dev/null || true
     want=$("$work/$tag.ref")
     "$CCC" -O2 -S -o "$work/$tag.s" "$src" || bad "$tag: lccc -S failed"
     "$CCC" -O2 -o "$work/$tag.bin" "$src" || bad "$tag: lccc link failed"
@@ -131,19 +172,26 @@ run_both() {
 }
 
 # ---- 1: a call-free leaf uses the volatile pool -------------------------
-run_both "$work/leaf.c" leaf
-callee=$(callee_refs "$work/leaf.s")
-pushcount=$(pushes "$work/leaf.s")
-if [ "$callee" -ne 0 ] || [ "$pushcount" -ne 0 ]; then
-    # Diagnostic: the body in one line, so the shard annotation (which keeps
-    # the LAST lines of a failing gate) shows what the allocator actually did.
-    echo "leaf body: $(body_of "$work/leaf.s" | sed 's/^[[:space:]]*//' | grep -v '^[.]' | tr '\n' ';')" >&2
-    echo "leaf census: refs=$callee pushes=$pushcount rbx=$(body_of "$work/leaf.s" | grep -c '%rbx' || true) rbp=$(body_of "$work/leaf.s" | grep -c '%rbp' || true) r12=$(body_of "$work/leaf.s" | grep -c '%r12' || true) r13=$(body_of "$work/leaf.s" | grep -c '%r13' || true) r14=$(body_of "$work/leaf.s" | grep -c '%r14' || true) r15=$(body_of "$work/leaf.s" | grep -c '%r15' || true) r8=$(body_of "$work/leaf.s" | grep -c '%r8' || true) r9=$(body_of "$work/leaf.s" | grep -c '%r9' || true) r10=$(body_of "$work/leaf.s" | grep -c '%r10' || true) r11=$(body_of "$work/leaf.s" | grep -c '%r11' || true) rsi=$(body_of "$work/leaf.s" | grep -c '%rsi' || true) rdi=$(body_of "$work/leaf.s" | grep -c '%rdi' || true) rcx=$(body_of "$work/leaf.s" | grep -c '%rcx' || true) rdx=$(body_of "$work/leaf.s" | grep -c '%rdx' || true)" >&2
-fi
+run_both "$work/leaf_light.c" leaf_light
+callee=$(callee_refs "$work/leaf_light.s")
+pushcount=$(pushes "$work/leaf_light.s")
+census leaf_light "$work/leaf_light.s"
 [ "$callee" -eq 0 ] && ok "call-free leaf references no callee-saved register" \
     || bad "call-free leaf references $callee callee-saved register(s) — the leaf policy is off"
 [ "$pushcount" -eq 0 ] && ok "call-free leaf emits no push/pop" \
     || bad "call-free leaf emits $pushcount push/pop — a callee-saved home it never needs"
+
+# ---- 1b: a leaf past the pool still improves ---------------------------
+run_both "$work/leaf.c" leaf
+callee_wide=$(callee_refs "$work/leaf.s")
+CCC_NO_LEAF_CALLER_HOME=1 "$CCC" -O2 -S -o "$work/leaf_wide_nop.s" "$work/leaf.c" \
+    || bad "wide kill-switch -S failed"
+callee_wide_no=$(callee_refs "$work/leaf_wide_nop.s")
+census leaf "$work/leaf.s"
+census leaf_nop "$work/leaf_wide_nop.s"
+[ "$callee_wide" -lt "$callee_wide_no" ] \
+    && ok "a leaf past the pool still takes fewer callee-saved homes ($callee_wide < $callee_wide_no)" \
+    || bad "the leaf policy did nothing under pressure ($callee_wide vs $callee_wide_no)"
 
 # ---- 2: the kill switch still isolates the policy ----------------------
 CCC_NO_LEAF_CALLER_HOME=1 "$CCC" -O2 -S -o "$work/leaf_nop.s" "$work/leaf.c" \
@@ -164,6 +212,7 @@ callee_call=$(callee_refs "$work/caller.s")
 
 if [ "$fail" -ne 0 ]; then
     echo "FAIL: leaf caller-saved homes" >&2
+    cat "$TMP/diag" >&2
     exit 1
 fi
 echo "PASS: leaf caller-saved homes (a call-free leaf pays no callee-saved register; the kill switch and the call-in-loop arm still behave)"
