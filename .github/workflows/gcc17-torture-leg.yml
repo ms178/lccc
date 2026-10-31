@@ -1,0 +1,105 @@
+name: GCC 17 C torture leg
+
+# One x86 target of the full gcc.c-torture/{execute,compile} campaign against a
+# revision-pinned GCC 17-git trunk checkout. Called twice by
+# `gcc17-torture.yml` (x86_64, i686) so the leg exists exactly once and the two
+# lanes cannot drift apart; the caller is also where `needs: [build]` and the
+# artifact identity live, because a reusable workflow cannot see the caller's
+# other jobs.
+#
+# `type: string` inputs are passed through as the wrapper's documented
+# environment variables; the wrapper treats an EMPTY value as "use my default"
+# (`${VAR:-default}` and `[[ -n ]]`), so an unset dispatch input is harmless.
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        # A default (rather than `required: true`) keeps this file
+        # self-describing: scripts/check_ci_gate_parity.py models every
+        # workflow standalone as well as through its caller, and a required
+        # input with no value there is uninterpretable. Both callers pass the
+        # architecture explicitly, and ci_gcc17_torture.sh rejects anything
+        # that is not x86_64/i686 on its own.
+        description: 'Target architecture: x86_64 or i686'
+        required: false
+        default: 'x86_64'
+        type: string
+      flags:
+        description: 'Comma-separated optimization configurations'
+        required: false
+        default: '-O2'
+        type: string
+      filter:
+        description: 'Regular expression over test basenames (empty: whole corpus)'
+        required: false
+        default: ''
+        type: string
+      ref:
+        description: 'GCC trunk commit to pin (empty: resolve current master)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  torture:
+    name: GCC 17 torture — ${{ inputs.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CARGO_BUILD_JOBS: '2'
+      GCC_TORTURE_JOBS: '2'
+      GCC_BIN: gcc-16
+      GCC_TORTURE_FLAGS: ${{ inputs.flags }}
+      GCC_TORTURE_FILTER: ${{ inputs.filter }}
+      GCC17_TORTURE_REF: ${{ inputs.ref }}
+      LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Compute weekly apt cache epoch
+        id: apt-epoch
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - name: Cache GCC package downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-apt
+          key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+          restore-keys: |
+            lccc-apt-debs-v1-${{ runner.os }}-
+      - name: Cache provisioned oracle toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-toolchain
+          key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+      - name: Provision GCC 16 multilib and cached oracle toolchain
+        run: bash scripts/ci_provision_toolchain.sh --multilib
+      - name: Verify GCC 16 and i686 multilib
+        run: bash scripts/ci_verify_oracles.sh
+      - name: Download compiler artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: lccc-fast-${{ github.sha }}
+          path: target/fastbuild
+      - name: Verify compiler artifact identity
+        run: |
+          set -euo pipefail
+          test "$(cat target/fastbuild/ci-build.commit)" = "$(git rev-parse HEAD)"
+          sha256sum -c target/fastbuild/ci-build.sha256
+      - name: Run full GCC 17 compile + execute corpus
+        env:
+          GCC_TORTURE_RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
+        run: bash scripts/ci_gcc17_torture.sh "${{ inputs.arch }}"
+      - name: Publish machine-readable reports and failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gcc17-torture-${{ inputs.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}
+          if-no-files-found: warn
+          retention-days: 14

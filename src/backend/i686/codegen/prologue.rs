@@ -1968,6 +1968,18 @@ fn emit_stack_alloc_i686(
     if size <= 0 {
         return;
     }
+    // i686 needs no register-form fallback: `subl imm32, %esp` takes the full
+    // 32-bit immediate (the x86-64 sign-extension trap that forces
+    // `emit_stack_adjust_x86` does not exist here -- a 32-bit operand size
+    // means the immediate is the whole value), and a frame larger than the
+    // address space cannot be built in the first place. A size above `u32::MAX`
+    // is a front-end defect, not something to encode: the assertion catches it
+    // in a debug build, and the assembler rejects the literal otherwise rather
+    // than letting a wrapped constant move `%esp` the wrong way.
+    debug_assert!(
+        size <= i64::from(u32::MAX),
+        "i686 frame {size} does not fit the 32-bit immediate"
+    );
     const PAGE_SIZE: i64 = 4096;
     if !state.stack_clash_protection || size <= PAGE_SIZE {
         state.emit_fmt(format_args!("    subl ${}, %esp", size));

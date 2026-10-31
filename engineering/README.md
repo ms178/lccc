@@ -20,6 +20,13 @@ intermediate-cast bit-idiom miscompiles and salvage two SQLite regressions.
 to take from two formal-verification projects, what was rejected, and why.
 [Continuity and prioritized follow-up](FOLLOWUP-2026-10-18-vellvm-vir-transplant.md).
 
+## GCC 17-git torture and x86-64 codegen fixes (2026-10-31)
+
+[Campaign record, measured defects and CI handoff](FOLLOWUP-2026-10-31-gcc17-torture-x86-fixes-ci.md):
+narrow-integer canonicalization at the accumulator boundary, stack adjustments
+past signed imm32 (with the unwind model extended to the materialization), and
+the revision-pinned GCC 17-git torture lane for both x86 targets.
+
 ## Read order for an implementation agent
 
 1. [`STATE.md`](STATE.md) — the compiler as it is on `main` right now.

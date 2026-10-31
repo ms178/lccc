@@ -915,6 +915,18 @@ pub fn emit_machinst_with_tune(
             signed,
             size,
         } => {
+            // A narrow divide is lowered as a 32-bit divide by `isel`
+            // (`emit_narrow_dividend` + `div_size`): the narrow forms take
+            // their dividend in AX and need `cbw`, and a `divb` with a
+            // zero-extended %al mis-signed-values. Reaching this arm with a
+            // narrow size means the selector stopped widening the sequence,
+            // which no unit test could distinguish from correct code --
+            // `idivb %cl` assembles and computes a plausible-looking wrong
+            // quotient -- so state the invariant where it is relied on.
+            debug_assert!(
+                !matches!(size, OpSize::S8 | OpSize::S16),
+                "narrow Div must be widened to S32 by isel, got {size:?}"
+            );
             let mnem = if *signed { "idiv" } else { "div" };
             let suffix = size.suffix();
             let div_str = fmt_operand(divisor, *size, out);

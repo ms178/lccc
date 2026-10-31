@@ -329,6 +329,48 @@ ret
         assert_eq!(eh, gnu_as);
     }
 
+    /// A CFA offset above signed imm32 must be encoded as
+    /// `DW_CFA_def_cfa_offset` (0x0e) with the exact ULEB128 value.
+    ///
+    /// The parser used to hand this directive through `i32`, which turned
+    /// 2147483664 into -2147483632 *and* switched the opcode to
+    /// `DW_CFA_def_cfa_offset_sf` (0x13, a FACTORED operand). Read back by an
+    /// unwinder that is `rsp - 17179869056`, not `rsp + 2147483664`: the
+    /// unwind table for every frame above 2 GiB described the wrong stack.
+    /// GNU as encodes the directive as 0x0e + ULEB128, so that is the byte
+    /// sequence asserted here.
+    #[test]
+    fn a_cfa_offset_past_imm32_stays_a_def_cfa_offset_with_the_exact_value() {
+        let asm = "\
+.text
+.globl f
+.type f, @function
+f:
+.cfi_startproc
+subq $2147483640, %rsp
+.cfi_def_cfa_offset 2147483664
+addq $2147483640, %rsp
+.cfi_def_cfa_offset 8
+ret
+.cfi_endproc
+.size f, .-f
+";
+        let eh = eh_frame_of(asm, CfiArch::X86_64).expect(".eh_frame emitted");
+        // `DW_CFA_def_cfa_offset` (0x0e) then ULEB128 2147483664 =
+        // 0x90 0x80 0x80 0x80 0x08, never the 0x13 factored form.
+        let wanted: &[u8] = &[0x0e, 0x90, 0x80, 0x80, 0x80, 0x08];
+        assert!(
+            eh.windows(wanted.len()).any(|w| w == wanted),
+            "expected {wanted:02x?} in .eh_frame, got {:02x?}",
+            eh
+        );
+        assert!(
+            !eh.contains(&0x13),
+            "no factored CFA operand may appear: {:02x?}",
+            eh
+        );
+    }
+
     #[test]
     fn i386_uses_its_own_register_numbers_and_alignment() {
         let asm = "\
