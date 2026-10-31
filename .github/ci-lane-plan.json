@@ -336,7 +336,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 426.63,
+      "predicted_gate_seconds": 438.13,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -639,6 +639,14 @@
         {
           "measured_s": 0.84,
           "name": "bash tests/regression/check_reg_off_sym_fold.sh"
+        },
+        {
+          "measured_s": 1.9,
+          "name": "bash tests/regression/check_pie_link_execution.sh"
+        },
+        {
+          "measured_s": 9.6,
+          "name": "bash tests/regression/check_inline_param_home.sh"
         },
         {
           "measured_s": 0.56,
