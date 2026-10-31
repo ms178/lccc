@@ -5215,6 +5215,55 @@ mod rmw_increment_form_tests {
         assert_eq!(out[0], "addl $1, (%rdi, %rsi, 4)", "{out:?}");
     }
 
+    /// A `uint16_t` counter at `-O2`: the load stays 32-bit while the
+    /// increment runs at 64-bit address width, because staging a narrow value
+    /// into the accumulator canonicalizes it there.  Refusing the mixed
+    /// spelling left the whole relay in place and made
+    /// `check_rmw_sib_folds.sh` contract 2b fail, so this is a real regression
+    /// witness, not a hypothetical shape.
+    #[test]
+    fn folds_a_wider_increment_over_a_narrower_load() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %rax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addw $1, (%rdx)", "{out:?}");
+    }
+
+    /// The same shape with a self-extending truncate between the increment and
+    /// the store: what `x++` on a `uint16_t` global actually emits once the
+    /// accumulator staging is canonicalizing.
+    #[test]
+    fn folds_a_wider_increment_relayed_through_a_narrow_self_extend() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %rax\n    movzwl %ax, %eax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addw $1, (%rdx)", "{out:?}");
+    }
+
+    /// A NARROWER increment must still refuse: once the addition wraps below
+    /// the load's width, its low bits are no longer the sum the narrow store
+    /// has to see.
+    #[test]
+    fn refuses_an_increment_narrower_than_the_load() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addb $1, %al\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// A wider increment that names a DIFFERENT register of the family is not
+    /// the loaded value: `%rax` may hold an address-width copy, `%r10` cannot
+    /// belong to an `%eax` load at all.
+    #[test]
+    fn refuses_a_wider_increment_naming_another_register() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %r10\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
     /// The loaded register's own spelling stays accepted.
     #[test]
     fn folds_lea_with_exact_base() {

@@ -743,8 +743,25 @@ pub fn lower_binop(
     // ── Division and remainder ───────────────────────────────────────
     match op {
         IrBinOp::SDiv | IrBinOp::SRem => {
-            emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
-            out.push(MachInst::Cqto { size });
+            // NARROW DIVIDES RUN AT 32-BIT WIDTH, for the same reason the
+            // mature path does (`emit_div_narrow`): both operands are exact in
+            // %eax/%edx, the 32-bit write leaves %rax/%rdx in the narrow
+            // canonical form, and the divide cannot trap -- the dividend is
+            // bounded by the narrow width, so INT32_MIN / -1 is unreachable.
+            // `div_size` widens staging, sign-extension, Cqto and the divide
+            // together; the result copy stays at `size` so the narrow home
+            // keeps the zero-extended narrow-copy convention.
+            let div_size = if matches!(size, OpSize::S8 | OpSize::S16) {
+                OpSize::S32
+            } else {
+                size
+            };
+            if div_size == size {
+                emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
+            } else {
+                emit_narrow_dividend(lhs, true, size, ra, out);
+            }
+            out.push(MachInst::Cqto { size: div_size });
             let mut divisor_op = lower_operand_with_regs(rhs, ra);
             // x86 div/idiv has no immediate form. Materialize constants in the
             // dedicated rcx scratch register rather than emitting invalid
@@ -753,7 +770,7 @@ pub fn lower_binop(
                 out.push(MachInst::Mov {
                     src: MachOperand::Imm(value),
                     dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                    size,
+                    size: div_size,
                 });
                 divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
             }
@@ -768,14 +785,14 @@ pub fn lower_binop(
                 out.push(MachInst::Mov {
                     src: divisor_op,
                     dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                    size,
+                    size: div_size,
                 });
                 divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
             }
             out.push(MachInst::Div {
                 divisor: divisor_op,
                 signed: true,
-                size,
+                size: div_size,
             });
             let result_phys = if op == IrBinOp::SDiv { RAX } else { RDX };
             out.push(MachInst::Mov {
@@ -786,14 +803,23 @@ pub fn lower_binop(
             true
         }
         IrBinOp::UDiv | IrBinOp::URem => {
-            emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
+            let div_size = if matches!(size, OpSize::S8 | OpSize::S16) {
+                OpSize::S32
+            } else {
+                size
+            };
+            if div_size == size {
+                emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
+            } else {
+                emit_narrow_dividend(lhs, false, size, ra, out);
+            }
             out.push(MachInst::XorRdx);
             let mut divisor_op = lower_operand_with_regs(rhs, ra);
             if let MachOperand::Imm(value) = divisor_op {
                 out.push(MachInst::Mov {
                     src: MachOperand::Imm(value),
                     dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                    size,
+                    size: div_size,
                 });
                 divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
             }
@@ -803,14 +829,14 @@ pub fn lower_binop(
                 out.push(MachInst::Mov {
                     src: divisor_op,
                     dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                    size,
+                    size: div_size,
                 });
                 divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
             }
             out.push(MachInst::Div {
                 divisor: divisor_op,
                 signed: false,
-                size,
+                size: div_size,
             });
             let result_phys = if op == IrBinOp::UDiv { RAX } else { RDX };
             out.push(MachInst::Mov {
@@ -825,6 +851,83 @@ pub fn lower_binop(
 }
 
 // ── Load / Store / Copy ──────────────────────────────────────────────────
+
+/// Stage a NARROW dividend into `%eax` in 32-bit-signed/unsigned canonical
+/// form.
+///
+/// The narrow canonical form is 32 bits -- `emit_mov_operand_r`'s own rule for
+/// narrow register copies -- but that copy is a `movzbl`/`movzwl`: it
+/// ZERO-extends. A signed narrow dividend therefore cannot use it, because
+/// `idivl` would divide `0x000000FF` where the program means `-1` (and
+/// `-1 / 2` would come out `127`). The 8/16-bit `idiv` forms are not an
+/// alternative either: they take their dividend in AX (so an `I8` divide
+/// would need `cbw`, not `cltd`) and would leave the quotient in a half
+/// register every later consumer has to re-extend. The 64-bit form divides
+/// the stale upper half of a value that has none.
+///
+/// One instruction in the register/immediate case (`movsbl %bl, %eax` reads
+/// the narrow register directly); the memory case loads the narrow operand
+/// and then extends from the just-loaded register, because a memory operand
+/// of `movsx` would need its address registers pinned for the whole window.
+fn emit_narrow_dividend(
+    op: &Operand,
+    signed: bool,
+    size: OpSize,
+    ra: &dyn HomeMap,
+    out: &mut Vec<MachInst>,
+) {
+    let rax = MachReg::Phys(RAX);
+    let src = lower_operand_with_regs(op, ra);
+    match src {
+        // A narrow constant IS its 32-bit canonical form already: `movl`
+        // zero-extends, and the scalar value is sign-correct because
+        // const_to_i64 produced the sign-extended spelling.
+        MachOperand::Imm(value) => out.push(MachInst::Mov {
+            src: MachOperand::Imm(value),
+            dst: MachOperand::Reg(rax),
+            size: OpSize::S32,
+        }),
+        MachOperand::Reg(_) => out.push(if signed {
+            MachInst::Movsx {
+                src,
+                dst: rax,
+                from_size: size,
+                to_size: OpSize::S32,
+            }
+        } else {
+            MachInst::Movzx {
+                src,
+                dst: rax,
+                from_size: size,
+                to_size: OpSize::S32,
+            }
+        }),
+        _ => {
+            // `movb/movw mem, %al/%ax` writes only the narrow half; the
+            // extension below reads exactly those bits back.
+            out.push(MachInst::Mov {
+                src: src.clone(),
+                dst: MachOperand::Reg(rax),
+                size,
+            });
+            out.push(if signed {
+                MachInst::Movsx {
+                    src: MachOperand::Reg(rax),
+                    dst: rax,
+                    from_size: size,
+                    to_size: OpSize::S32,
+                }
+            } else {
+                MachInst::Movzx {
+                    src: MachOperand::Reg(rax),
+                    dst: rax,
+                    from_size: size,
+                    to_size: OpSize::S32,
+                }
+            });
+        }
+    }
+}
 
 /// Lower an IR Load: dest = *ptr.
 pub fn lower_load(
@@ -2895,6 +2998,8 @@ fn lower_instruction_typed_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::common::AsmOutput;
+    use crate::backend::x86::codegen::machinst_emit::emit_machinst;
 
     #[test]
     fn widening_cast_uses_source_signedness() {
@@ -3058,6 +3163,78 @@ mod tests {
                 size: OpSize::S64,
             }
         )));
+    }
+
+    /// A NARROW divide must be a 32-bit divide with a sign-extended dividend.
+    ///
+    /// The failure this pins is invisible in the instruction stream's shape:
+    /// `movzbl %bl, %eax; cqto; idivb %cl` assembles and returns a quotient
+    /// for every input -- it is just the quotient of the zero-extended byte,
+    /// so `-1 / 2` gives 127 instead of 0. The assertions are therefore on
+    /// the widths (S32 divide, S32 Cqto, extending staging) and on the
+    /// rendered text, which is where the miscompile lived.
+    #[test]
+    fn narrow_divides_are_widened_to_a_32_bit_divide_with_an_extending_staging() {
+        for (ty, signed_ok) in [
+            (IrType::I8, true),
+            (IrType::U8, false),
+            (IrType::I16, true),
+            (IrType::U16, false),
+        ] {
+            for signed in [true, false] {
+                if signed && !signed_ok {
+                    continue; // an unsigned type has no signed divide
+                }
+                let mut assignments = FxHashMap::default();
+                assignments.insert(1, PhysReg(1));
+                assignments.insert(2, PhysReg(2));
+                let mut out = Vec::new();
+                lower_binop(
+                    &Value(2),
+                    if signed { IrBinOp::SDiv } else { IrBinOp::URem },
+                    &Operand::Value(Value(1)),
+                    &Operand::Value(Value(0)),
+                    ty,
+                    &assignments,
+                    &mut out,
+                );
+                let want_stage = match (ty, signed) {
+                    (IrType::I8, true) => "movsbl",
+                    (IrType::I16, true) => "movswl",
+                    (IrType::I8 | IrType::U8, false) => "movzbl",
+                    _ => "movzwl",
+                };
+                let mut text = AsmOutput::new();
+                for inst in &out {
+                    emit_machinst(inst, &mut text);
+                }
+                assert!(
+                    text.buf.contains(want_stage),
+                    "{ty:?} signed={signed}: dividend not extended with {want_stage}:\n{}",
+                    text.buf
+                );
+                assert!(
+                    text.buf
+                        .contains(if signed { "cltd" } else { "xorl %edx, %edx" }),
+                    "{ty:?} signed={signed}: no 32-bit sign/zero extension of the dividend:\n{}",
+                    text.buf
+                );
+                assert!(
+                    text.buf.contains(if signed { "idivl" } else { "divl" }),
+                    "{ty:?} signed={signed}: narrow divide not widened to 32 bits:\n{}",
+                    text.buf
+                );
+                assert!(
+                    !text.buf.contains("idivb")
+                        && !text.buf.contains("idivw")
+                        && !text.buf.contains("cqto")
+                        && !text.buf.contains("divb")
+                        && !text.buf.contains("divw"),
+                    "{ty:?} signed={signed}: narrow/64-bit divide form survived:\n{}",
+                    text.buf
+                );
+            }
+        }
     }
 
     #[test]
