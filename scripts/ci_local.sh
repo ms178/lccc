@@ -2618,6 +2618,12 @@ gate "nbody-perf-shapes" fast \
 # on a fixture that reproduces the shape, and self-tests its checker.
 gate "dead-stack-store" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_dead_stack_store.sh
+# An empty inline-asm template assembles to nothing, so it must stage nothing:
+# the old staging path reserved a scratch for every memory operand and spilled
+# the address to the frame when the busy set was full, costing a store/load
+# pair per iteration around every `asm volatile("" : "+m"(x))` barrier.
+gate "asm-barrier-staging" fast \
+    env CCC=target/fastbuild/lccc GCC_BIN=gcc-16 bash tests/regression/check_asm_barrier_no_spill.sh
 gate "ivsr-scalar-derived-default" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_scalar_derived_default.sh
 

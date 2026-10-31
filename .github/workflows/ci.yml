@@ -1891,6 +1891,11 @@ jobs:
         CCC: target/fastbuild/lccc
         GCC_BIN: gcc-16
       run: bash tests/regression/check_dead_stack_store.sh
+    - name: Verify empty-template inline asm stages no operands
+      env:
+        CCC: target/fastbuild/lccc
+        GCC_BIN: gcc-16
+      run: bash tests/regression/check_asm_barrier_no_spill.sh
     - name: Verify IVSR scalar-derived default pin
       env:
         CCC: target/fastbuild/lccc

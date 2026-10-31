@@ -545,6 +545,15 @@ fn constraint_writes_operand(constraint: &str) -> bool {
     constraint.contains('=') || constraint.contains('+')
 }
 
+/// True when an inline asm template assembles to no instructions at all.
+///
+/// Only whitespace and statement separators count as empty. A comment, a label
+/// or a directive keeps the template non-empty, so every conservative answer
+/// elsewhere stays in force for anything that is not provably inert.
+pub fn inline_asm_template_has_no_instructions(template: &str) -> bool {
+    template.chars().all(|c| c.is_whitespace() || c == ';')
+}
+
 pub fn emit_inline_asm_common_impl(
     emitter: &mut dyn InlineAsmEmitter,
     template: &str,
@@ -557,6 +566,10 @@ pub fn emit_inline_asm_common_impl(
     markers: Option<(&'static str, &'static str)>,
     seg_overrides: &[AddressSpace],
 ) {
+    // The dialect expansion decides whether any instruction exists at all.
+    let dialect_expanded = expand_dialect_alternatives(template);
+    let template_is_empty = inline_asm_template_has_no_instructions(&dialect_expanded);
+
     emitter.reset_scratch_state();
 
     // An asm-goto branch bypasses the normal post-template output stores.
@@ -602,6 +615,25 @@ pub fn emit_inline_asm_common_impl(
         outputs,
         inputs,
     );
+    // An empty template assembles to nothing, so it stages nothing either: no
+    // operand address to resolve into a scratch register, no input to load, no
+    // output to write back. That only holds when no operand names a REGISTER —
+    // `asm("" : "=r"(x) : "0"(x))` (the kernel's OPTIMIZER_HIDE_VAR) still has
+    // to deliver the tied value into the output register, because the source
+    // relies on the output being a fresh location holding that value. Memory
+    // and immediate operands name no register at all, so for those the whole
+    // staging path is dead work: it reserved a scratch per memory operand and,
+    // when the busy set left none free, spilled the address to a frame slot and
+    // reloaded it after the block — a store/load pair in the loop body (see
+    // `tests/regression/check_asm_barrier_no_spill.sh`).
+    if template_is_empty
+        && goto_labels.is_empty()
+        && operands
+            .iter()
+            .all(|op| matches!(op.kind, AsmOperandKind::Memory | AsmOperandKind::Immediate))
+    {
+        return;
+    }
     resolve_tied_and_types(&mut operands, &input_tied_to, outputs, operand_types);
     let (_, gcc_to_internal) = finalize_operands_and_build_gcc_map(
         emitter,
@@ -1649,6 +1681,20 @@ fn to_8bit_setcc_dest(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_asm_templates_are_recognised() {
+        // The barrier forms: no template, no instruction.
+        assert!(inline_asm_template_has_no_instructions(""));
+        assert!(inline_asm_template_has_no_instructions("\n\t"));
+        assert!(inline_asm_template_has_no_instructions(" \t ; \n "));
+        // Anything the assembler would see keeps the conservative path.
+        assert!(!inline_asm_template_has_no_instructions("nop"));
+        assert!(!inline_asm_template_has_no_instructions("\n\tnop\n\t"));
+        assert!(!inline_asm_template_has_no_instructions("# comment"));
+        assert!(!inline_asm_template_has_no_instructions("1:"));
+        assert!(!inline_asm_template_has_no_instructions(".p2align 4"));
+    }
 
     #[test]
     fn normalize_inline_asm_reg_name_strips_gcc_adornments() {
