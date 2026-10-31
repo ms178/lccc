@@ -210,6 +210,21 @@ remain deferred**: the ledger is now 170 reviewed (52 limited, 118 deferred),
 algebra; matching private shuffles factor around safe integer/bitwise binops.
 Existing machine-level adjacent shuffle composition is not claimed as new.
 
+## Batch 5: re-inventory, 151-report audit, two scalar identities
+
+[BATCH-5.md](BATCH-5.md) refreshes the label to **3,169 posts** on 2026-10-31
+(+58 arrivals, 11 upstream closures, 0 removals), reads **151 reports** with a
+per-report verdict in [`batch5-sources.json`](batch5-sources.json), and ships the
+two identities the probe corpus found missing: `(x << k) >>u k` to
+`x & (2^(W-k) - 1)`, and `(x == 0) | (x == 1)` to `x <=u 1` with its `!=`/`&`
+dual. Both are 1-to-1 `bit_idioms` rewrites, exhaustively tested on the 8- and
+16-bit rings, gated natively with a `{0,2}` negative control and a disabled-pass
+attribution leg, and measured at GCC 16.2 parity (4 to 3 and 9 to 4
+instructions). The cohort's `covered` count is **0**: no report in the snapshot
+isolates either fold, so no ledger row is claimed for them. The audit also
+measured eight reproducible scalar gaps and records them as the batch-6 queue
+rather than as fixed work.
+
 ## Packed shifts and canonical masks
 
 [Packed mask shifts](PACKED-MASK-SHIFTS.md) adds **250 new excerpt-based report

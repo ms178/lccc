@@ -2748,6 +2748,9 @@ jobs:
         # contract, the ungated __*_chk rows and three runtime programs.
         bash tests/regression/check_libcall_synthesis_no_selfcall.sh
         python3 tests/regression/check_llvm_missed_zero_choice.py
+        # Batch 5 scalar sets: shift-pair masks and {0,1} membership, with a
+        # {0,2} negative control and a disabled-pass attribution leg.
+        python3 tests/regression/check_llvm_batch5_scalar_sets.py
         # The architectural implicit-operand table is the single source of
         # truth for every pass that reasons about registers an instruction
         # does not name; its fixture is reviewed independently of the code.

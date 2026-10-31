@@ -1,7 +1,7 @@
 {
   "repository": "llvm/llvm-project",
   "label": "missed-optimization",
-  "started_at": "2026-10-20T16:00:58.529329+00:00",
+  "started_at": "2026-10-31T17:43:29.008174+00:00",
   "status": "complete",
   "method": "REST Issues state=all (includes PRs); two stable membership enumerations; no Search API cap",
   "limitations": [
@@ -10,12 +10,12 @@
     "PR review threads, diffs, linked external pages and removed comments are not conversation comments.",
     "Automatic scope classification is routing only; every row starts unreviewed."
   ],
-  "posts": 3111,
-  "issues": 3101,
+  "posts": 3169,
+  "issues": 3159,
   "prs": 10,
   "requests": 64,
-  "posts_sha256": "79bceb5d6526c07e84c1775d8bb3eeb36ef1df73f5e4b342745f9982e190ee25",
-  "csv_sha256": "b6fb081ba74e6377a6d51ac31368cddb1b11458ec257e1446cf951deb32a852f",
+  "posts_sha256": "e481cb326b8449ab05531b1d903d7394dc924b38db8325be2e36c4966139403f",
+  "conversations": "Not re-collected in this refresh: the 2026-10-20 run archived the conversations of the then-current 3,111 posts (comments_sha256 262905b041716939cd5840620904b62ad8ef5af44e277fcf767297be01530f73). The 58 posts that joined the label afterwards have bodies only.",
   "comment_counter_gaps": [
     {
       "number": 60854,
@@ -30,8 +30,16 @@
       "missing_from_api_counter": 1
     }
   ],
-  "comments_sha256": "262905b041716939cd5840620904b62ad8ef5af44e277fcf767297be01530f73",
-  "completed_at": "2026-10-20T17:11:49.615086+00:00",
-  "requests_this_invocation": 0,
-  "ledger_sha256": "640398e8484b56ad61b41bc7e646709c13e494e3c6e3212c88156a552f719be0"
+  "previous": {
+    "snapshot": "2026-10-20",
+    "posts": 3111,
+    "posts_sha256": "79bceb5d6526c07e84c1775d8bb3eeb36ef1df73f5e4b342745f9982e190ee25",
+    "csv_sha256": "b6fb081ba74e6377a6d51ac31368cddb1b11458ec257e1446cf951deb32a852f",
+    "comments_sha256": "262905b041716939cd5840620904b62ad8ef5af44e277fcf767297be01530f73"
+  },
+  "refresh_note": "Membership refresh only (no --comments): two identical state=all enumerations of the label, 64 requests, 3,169 posts. Batch 5's 151 review verdicts live in batch5-sources.json.",
+  "completed_at": "2026-10-31T17:44:30.361255+00:00",
+  "requests_this_invocation": 64,
+  "csv_sha256": "c554633573e8c3cb50d51198f353dc7311bc928a21e930ba511fc6a99e5ad912",
+  "ledger_sha256": "5591619fc1946358202fbea7f121614dc9f92578accc22344735a8b39b0f780c"
 }

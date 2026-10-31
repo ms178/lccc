@@ -1651,6 +1651,10 @@ gate "count-observations" fast python3 tests/regression/check_count_observations
 gate "llvm-scalar-logic" fast python3 tests/regression/check_llvm_scalar_logic.py
 gate "llvm-ring-identities" fast python3 tests/regression/check_llvm_ring_identities.py
 gate "llvm-predicate-relations" fast python3 tests/regression/check_llvm_predicate_relations.py
+# Batch 5: `(x << k) >>u k` is a mask, and {0,1} membership is one unsigned
+# threshold.  Values at -O0..-O3, mechanism, a {0,2} negative control, a
+# disabled-pass attribution leg and the GCC 16.2 length oracle.
+gate "llvm-batch5-scalar-sets" fast python3 tests/regression/check_llvm_batch5_scalar_sets.py
 gate "packed-vector-relations" fast python3 tests/regression/check_packed_vector_relations.py
 gate "shuffle-composition" fast python3 tests/regression/check_shuffle_composition.py
 gate "packed-mask-shifts" fast python3 tests/regression/check_packed_mask_shifts.py

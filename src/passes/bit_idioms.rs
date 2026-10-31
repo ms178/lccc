@@ -1459,6 +1459,159 @@ fn fold_sign_choice_zero(inst: &Instruction, defs: &[Option<Instruction>]) -> Op
     None
 }
 
+/// `(x << k) >>u k` is `x & (2^(W-k) - 1)` for every constant `k` in `1..W`.
+///
+/// The left shift drops the top `k` bits and moves the low `W-k` bits up; the
+/// LOGICAL right shift returns zeros above them, so the pair keeps exactly the
+/// low `W-k` bits of `x`.  (`k`, not `W-k`, is the amount that leaves the
+/// value: the first draft of this fold masked with `2^k - 1` and was wrong for
+/// every `x` with a bit at or above `k`; the oracle differential caught it.)  Two shifts and a temporary become one AND, and
+/// on every supported target the AND is one instruction while the pair is
+/// two plus a move (the same register cannot serve both shifts without a
+/// copy on x86, and the mask is an immediate).
+///
+/// `AShr` is deliberately not admitted: `(x << k) >>s k` sign-extends a low
+/// bit field, which differs from the mask on every negative input.  A
+/// mismatched amount, a mismatched width, `k == 0` (already the identity) and
+/// `k >= W` (undefined in C, and the frontend never creates it) are refused,
+/// so the fold is total and its rewrite is exact for all admitted shapes.
+/// Only the consumer is rewritten; the shifts become dead and the ordinary
+/// dead-code pass removes them, so a live user of the left shift keeps its
+/// value.
+fn fold_shl_lshr_mask(inst: &Instruction, defs: &[Option<Instruction>]) -> Option<Instruction> {
+    let Instruction::BinOp {
+        dest,
+        op: IrBinOp::LShr,
+        lhs,
+        rhs,
+        ty,
+    } = inst
+    else {
+        return None;
+    };
+    if !ty.is_integer() {
+        return None;
+    }
+    let bits = ty.size() * 8;
+    let amount = const_in_ring(*rhs, bits)?;
+    if amount == 0 || amount as usize >= bits {
+        return None;
+    }
+    let Operand::Value(v) = peel_copies(*lhs, defs) else {
+        return None;
+    };
+    let Some(Instruction::BinOp {
+        op: IrBinOp::Shl,
+        lhs: source,
+        rhs: shl_amount,
+        ty: shl_ty,
+        ..
+    }) = defs.get(v.0 as usize).and_then(Option::as_ref)
+    else {
+        return None;
+    };
+    if *shl_ty != *ty || const_in_ring(*shl_amount, bits)? != amount {
+        return None;
+    }
+    // `1 <= amount < bits`, so `bits - amount` is in `1..=63`.
+    let mask = (1u64 << (bits - amount as usize)) - 1;
+    Some(Instruction::BinOp {
+        dest: *dest,
+        op: IrBinOp::And,
+        lhs: *source,
+        rhs: Operand::Const(IrConst::from_i64(mask as i64, *ty)),
+        ty: *ty,
+    })
+}
+
+/// A comparison of one SSA value against a constant, viewed through `Copy`
+/// chains: the comparison op, the value, the constant (in the ring of the
+/// compared type) and that type.  Ordering comparisons are admitted only
+/// because the caller checks which op it received; the constant may sit on
+/// either side here only for the symmetric Eq/Ne ops.
+fn cmp_against_constant(
+    opnd: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<(IrCmpOp, Operand, u64, IrType)> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    let Some(Instruction::Cmp {
+        op, lhs, rhs, ty, ..
+    }) = defs.get(v.0 as usize).and_then(Option::as_ref)
+    else {
+        return None;
+    };
+    if !ty.is_integer() || !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+        return None;
+    }
+    let bits = ty.size() * 8;
+    if let Some(c) = const_in_ring(*rhs, bits) {
+        return Some((*op, *lhs, c, *ty));
+    }
+    if let Some(c) = const_in_ring(*lhs, bits) {
+        return Some((*op, *rhs, c, *ty));
+    }
+    None
+}
+
+/// `(x == 0) | (x == 1)` is `x <=u 1`, and `(x != 0) & (x != 1)` is
+/// `x >u 1`.
+///
+/// Both sides test the same value against two constants that form the
+/// half-open membership set `{0, 1}`, which a single unsigned comparison
+/// expresses exactly: every other value of the ring, including every
+/// negative one, is unsigned-above `1`.  The rule is the comparator form of
+/// LLVM #234703's implied-false disjunct and #237533's guarded-OR fold, kept
+/// to the one set whose single-comparison rewrite needs no subtract (a
+/// shifted set such as `{A, A+1}` would need `x - A`, which is a second
+/// instruction and not this fold's business).
+///
+/// The two comparisons must have the same op, the same compared value (after
+/// `Copy` peeling) and the same integer type; the constants may appear in
+/// either order on either comparison.  A mixed pair (`== 0` with `!= 1`)
+/// is a different function and is refused, as is any constant other than
+/// `{0, 1}`.  Only the consumer is rewritten, so shared comparisons keep
+/// their values.
+fn fold_zero_one_membership(
+    inst: &Instruction,
+    defs: &[Option<Instruction>],
+) -> Option<Instruction> {
+    let Instruction::BinOp {
+        dest,
+        op: logic @ (IrBinOp::Or | IrBinOp::And),
+        lhs,
+        rhs,
+        ty: _,
+    } = inst
+    else {
+        return None;
+    };
+    let (op_a, value_a, const_a, ty_a) = cmp_against_constant(*lhs, defs)?;
+    let (op_b, value_b, const_b, ty_b) = cmp_against_constant(*rhs, defs)?;
+    if ty_a != ty_b || op_a != op_b {
+        return None;
+    }
+    if !same_value(value_a, value_b, defs) {
+        return None;
+    }
+    if !matches!((const_a, const_b), (0, 1) | (1, 0)) {
+        return None;
+    }
+    let op = match (logic, op_a) {
+        (IrBinOp::Or, IrCmpOp::Eq) => IrCmpOp::Ule,
+        (IrBinOp::And, IrCmpOp::Ne) => IrCmpOp::Ugt,
+        _ => return None,
+    };
+    Some(Instruction::Cmp {
+        dest: *dest,
+        op,
+        lhs: value_a,
+        rhs: Operand::Const(IrConst::from_i64(1, ty_a)),
+        ty: ty_a,
+    })
+}
+
 fn add_const(
     opnd: Operand,
     amount: u64,
@@ -2968,6 +3121,8 @@ pub(crate) fn recognize_function(
 
             if let Some(new) = fold_same_condition_select(&block.instructions[index], &defs)
                 .or_else(|| fold_sign_choice_zero(&block.instructions[index], &defs))
+                .or_else(|| fold_shl_lshr_mask(&block.instructions[index], &defs))
+                .or_else(|| fold_zero_one_membership(&block.instructions[index], &defs))
             {
                 // New direct arm uses must be counted BEFORE a later boolean
                 // matcher can repurpose a supposedly single-use producer.
@@ -6155,6 +6310,10 @@ mod range_tests;
 #[cfg(test)]
 #[path = "bit_idioms_zero_choice_tests.rs"]
 mod zero_choice_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_batch5_tests.rs"]
+mod batch5_tests;
 
 #[path = "bit_idioms_observe.rs"]
 mod observe;
