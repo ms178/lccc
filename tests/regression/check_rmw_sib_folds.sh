@@ -146,12 +146,12 @@ grep -qE "addq[[:space:]]+\\\$1,[[:space:]]*bins\(,[[:space:]]*%[a-z0-9]+,[[:spa
     || bad "-fno-pie: no \`addq \$1, bins(, %idx, 8)\` in main"
 grep -qE "^[[:space:]]+shl[a-z]*[[:space:]]" <<< "$np" \
     && bad "-fno-pie: a \`shl\` survived in main"
-# The newer scaled-index-temp pass can independently fold a bare shift into
-# an LEA which is then spliced into the memory operand. Disable that competing
-# route as well here so this mutation arm isolates `shl_sib`'s ownership rather
-# than rejecting an equivalent optimization performed by another pass.
-CCC_PEEPHOLE_SKIP=shl_sib,scaled_index_temp "$CCC" -O2 -fno-pie -S "$bench" -o "$work/bench_np_nos.s" \
-    || bad "-S build failed (-fno-pie, no-sib or scaled-index-temp)"
+# The scaled-index-temp and copy-shift-to-LEA passes can independently fold
+# this address calculation before it reaches the memory operand. Disable those
+# competing routes too, so this mutation arm isolates `shl_sib` ownership
+# rather than rejecting equivalent optimization by another pass.
+CCC_PEEPHOLE_SKIP=shl_sib,scaled_index_temp,copy_shift_lea "$CCC" -O2 -fno-pie -S "$bench" -o "$work/bench_np_nos.s" \
+    || bad "-S build failed (-fno-pie, competing shift folds disabled)"
 grep -qE "^[[:space:]]+shl[a-z]*[[:space:]]" "$work/bench_np_nos.s" \
     || bad "-fno-pie: skipping shl_sib left no shl: the arm is not what removed it"
 note "non-PIC: parity, absolute scaled SIB RMW, no shl; skip arm keeps the shl"
