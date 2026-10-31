@@ -113,11 +113,11 @@ check() {
     ""|"-march=x86-64")
       local body
       body=$(awk "/^$func:/,/^\\.size $func/" "$tmp/$form.s")
-      if ! printf '%s\n' "$body" | grep -q 'pshuflw \$0xb1'; then
+      if ! grep -q 'pshuflw \$0xb1' <<<"$body"; then
         echo "FAIL [$tag]: rotate-by-16 is not the pshuflw/pshufhw half swap" >&2
         fail=1
       fi
-      if printf '%s\n' "$body" | grep -qE 'ps(l|r)ld \$16'; then
+      if grep -qE 'ps(l|r)ld \$16' <<<"$body"; then
         echo "FAIL [$tag]: rotate-by-16 still stages through the shift triple" >&2
         fail=1
       fi

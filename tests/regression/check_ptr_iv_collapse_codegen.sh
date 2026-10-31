@@ -90,7 +90,11 @@ gatesrc="$repo/tests/regression/clz_zero_guard.c"
 # The defined-zero lowering introduces `clz_nz`/`clz_done`/`ctz_nz` labels.
 # None may appear in a guarded count.
 for fn in clz_guarded ctz_guarded byte_bit_length cap_leading; do
-  if body "$tmp/counts.s" "$fn" | grep -qE '^\.L(clz|ctz)_(nz|done)'; then
+  # `<<<` rather than a pipe: `grep -q` stops reading at the first match, and
+  # under `set -o pipefail` the producer then dies of SIGPIPE and fails the
+  # gate on a *successful* match (scripts/check_pipefail_sigpipe.py).
+  fn_body=$(body "$tmp/counts.s" "$fn")
+  if grep -qE '^\.L(clz|ctz)_(nz|done)' <<<"$fn_body"; then
     bad "$fn still emits the defined-zero diamond"
   fi
 done
@@ -99,14 +103,16 @@ done
 # either the diamond or the branch-free zero seed (`movl $63`, `movl $32`).
 # Without one of them the positive case above proves nothing about the guard.
 for fn in clz_plain ctz_plain; do
-  if ! body "$tmp/counts.s" "$fn" |
-      grep -qE '^(\.L(clz|ctz)_(nz|done)|\s+mov[lq] \$(32|63), %e?[a-z0-9]+$)'; then
+  fn_body=$(body "$tmp/counts.s" "$fn")
+  if ! grep -qE '^(\.L(clz|ctz)_(nz|done)|\s+mov[lq] \$(32|63), %e?[a-z0-9]+$)' \
+      <<<"$fn_body"; then
     bad "$fn lost its defined-zero lowering: the negative control is vacuous"
   fi
 done
 # ...and the guarded forms must not contain one.
 for fn in clz_guarded ctz_guarded byte_bit_length; do
-  if body "$tmp/counts.s" "$fn" | grep -qE '\s+mov[lq] \$(32|63), %e?[a-z0-9]+$'; then
+  fn_body=$(body "$tmp/counts.s" "$fn")
+  if grep -qE '\s+mov[lq] \$(32|63), %e?[a-z0-9]+$' <<<"$fn_body"; then
     bad "$fn still seeds a zero result: the guard proof did not reach the lowering"
   fi
 done
