@@ -326,3 +326,111 @@ fn c_splices_still_keep_their_break() {
         "C-mode splice elision changed shape:\n{out}"
     );
 }
+
+// ---- comment-bridged directives (fs/nfs/callback_xdr.c regression) ----------
+//
+// C11 5.1.1.2 orders the phases: splicing (phase 2) before comment
+// replacement (phase 3) before directives (phase 4). A comment that opens on
+// a directive line and spans that line's *unspliced* newline — a newline the
+// comment itself contains, so phase 2 never touched it — merges the next
+// physical line into the same directive at phase 3. A backslash after the
+// comment closes must still splice, and no keep-break elision may insert a
+// directive-terminating newline anywhere inside that extent. The shape is
+// the kernel's fs/nfs/callback_xdr.c CB_OP_GETATTR_RES_MAXSZ macro; the
+// miscompile leaked `(2 + 2 + 3 + 3 + 3 + 3 + 3) * 4)` as stray tokens
+// ("expected declaration before '('") and truncated the #define.
+
+#[test]
+fn comment_bridged_directive_with_post_comment_splice_stays_whole() {
+    let src = concat!(
+        "#define HDR (2 * 4)\n",
+        "#define RES (HDR + \\\n",
+        "  /* change, size, atime,\n",
+        "   * mtime, deleg_atime */\\\n",
+        "  (2 + 2 + 3 + 3) * 4)\n",
+        "int arr[RES];\n",
+        "int after;\n",
+    );
+    let (pp, out) = preprocess(src);
+    assert!(pp.errors().is_empty(), "errors: {:?}", pp.errors());
+    assert!(pp.macros.is_defined("RES"), "{out}");
+    assert!(
+        squeeze(&out).contains("int arr[((2 * 4) + (2 + 2 + 3 + 3) * 4)];"),
+        "macro body truncated or arithmetic leaked:\n{out}"
+    );
+}
+
+#[test]
+fn comment_bridged_directive_apostrophe_and_slash_text_stays_whole() {
+    // Comment text is not code on the bridged line: the apostrophe in
+    // `it's` and the `//` sequence must not flip the lexical state the
+    // joiner scans with (they would if the state were rescanned from
+    // `Code` instead of inherited as `BlockComment`).
+    let src = concat!(
+        "#define RES (1 + \\\n",
+        "  /* it's not // code\n",
+        "   * still comment */ 2 + \\\n",
+        "  3)\n",
+        "int arr[RES];\n",
+    );
+    let (pp, out) = preprocess(src);
+    assert!(pp.errors().is_empty(), "errors: {:?}", pp.errors());
+    assert!(pp.macros.is_defined("RES"), "{out}");
+    assert!(
+        squeeze(&out).contains("int arr[(1 + 2 + 3)];"),
+        "quoted comment text corrupted the bridged directive:\n{out}"
+    );
+}
+
+#[test]
+fn comment_bridge_poisons_directives_only_not_ordinary_lines() {
+    // Ordinary-line bridge (no directive): tokens still merge and the
+    // markers keep their physical lines — the fix must not poison
+    // ordinary code with the directive-context carry.
+    let src = concat!("int l1 = 1 + /* c\n", "  c */ 2;\n", "l3c1;\n", "l4c1;\n",);
+    let _ = assert_positions(src, 3);
+    let (_, out) = preprocess(src);
+    assert!(
+        squeeze(&out).contains("int l1 = 1 + 2;"),
+        "ordinary comment bridge broke tokens:\n{out}"
+    );
+}
+
+#[test]
+fn comment_bridge_directive_state_ends_at_comment_close() {
+    // The bridge closes on the second line; a LATER ordinary splice must
+    // still keep its break — directive context must not leak past the
+    // comment that carried it, and the carry must not stick either.
+    let src = concat!(
+        "#define D (1 + /*\n",
+        "  c */ 2)\n",
+        "int a = 1 + \\\n",
+        " 2;\n",
+    );
+    let (pp, out) = preprocess(src);
+    assert!(pp.errors().is_empty(), "errors: {:?}", pp.errors());
+    assert!(pp.macros.is_defined("D"), "{out}");
+    assert!(
+        out.contains("1 + \n 2;"),
+        "ordinary splice after a closed bridge lost its break:\n{out}"
+    );
+    assert!(
+        squeeze(&out).contains("int a = 1 + 2;"),
+        "ordinary splice after a closed bridge broke tokens:\n{out}"
+    );
+}
+
+#[test]
+fn comment_bridged_directive_resyncs_positions_afterwards() {
+    // The merged directive collapses to one output line; the markers on
+    // the following physical lines must still resolve to their own lines
+    // and column 1 (no drift from the merge).
+    let src = concat!(
+        "#define RES (1 + \\\n",
+        "/* a\n",
+        "b */ 2)\n",
+        "l4c1 + RES;\n",
+        "l5c1;\n",
+    );
+    assert_positions(src, 2);
+}

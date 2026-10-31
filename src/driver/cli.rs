@@ -33,7 +33,7 @@
 //! | *contract* flags — `-fstack-protector*`, `-ftrapv`, `-fsanitize=` | **hard error** + remediation hint (upstream's original rule) |
 //! | data-model / ABI requests — `-fshort-enums`, `-fpack-struct[=n]` | **hard error**, because ignoring one silently returns objects whose layout disagrees with the libraries they link against. `-funsigned-char` and `-fshort-wchar` are *not* here: both are implemented (`char_is_unsigned()` / `set_short_wchar`), and `-fsigned-char` names the x86-64 SysV default LCCC already emits |
 //! | `-g<selector>` that GNU rejects (`-g4`, `-ggdb9`, `-gdwarf-9`, `-gz=bogus`, `-gno-bogus`, `-gbogus`) | **hard error** — the selector grammar is closed and was measured exhaustively, so a name outside it is a typo, not a newer GNU (GCC 14.2/16.2, Clang 23.1 and ICX all reject these) |
-//! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured) |
+//! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>`, `-fno-delete-null-pointer-checks` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured; for the `-f` spelling, nine measured null-guard shapes keep their checks with and without the flag, pinned by `tests/regression/check_nullptr_check_policy.sh`) |
 //! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`, `-fverbose-asm`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
 //!
 //! The open option namespace cannot distinguish typos from newer GCC flags.
@@ -3185,6 +3185,42 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     self.wrap_signed_overflow = false;
                 }
                 "-fno-trapv" => self.trapv = false,
+                // `-fno-delete-null-pointer-checks` asks that a pointer never
+                // be treated as non-null merely because it was dereferenced
+                // (GCC's `-fdelete-null-pointer-checks` fold would turn a
+                // later `p == 0` into `false` along a path that loaded
+                // through `p`). This compiler has no such transform in any
+                // direction: the optimizer never derives null-check facts
+                // from dereference UB, so the request is already satisfied
+                // in the only direction that can change an answer — the same
+                // "strictly more conservative than the flag allows" argument
+                // that lets normal mode accept `-fstrict-overflow` silently.
+                //
+                // The claim is measured, not assumed (kernel builds pass
+                // this flag unconditionally; a silent "tolerated" warning
+                // would tell every translation unit something false): nine
+                // canonical shapes — same-block, both-paths/phi-merged,
+                // loop-carried, store-through, field/base, then-arm-join,
+                // call-clobbered, GVN-merged and low-address range — keep
+                // their guards byte-identically with and without the flag at
+                // -O2 and -O3. tests/regression/check_nullptr_check_policy.sh
+                // pins that evidence in both compilers.
+                //
+                // Strict mode accepts it too: a probe passing this spelling
+                // asks "will null checks survive?", and "yes" is the true
+                // answer. (Contrast `-fstrict-overflow`, which strict mode
+                // refuses because its silent acceptance would affirm an
+                // optimisation that does not exist.)
+                //
+                // The positive `-fdelete-null-pointer-checks` spelling is
+                // deliberately NOT listed here: it asks to DELETE checks,
+                // which nothing here will do, so the generic tolerated
+                // path's "nothing will act on it" is the accurate answer
+                // for it. If a dereference-implies-nonnull fold is ever
+                // added, it must default OFF, be gated on this flag, extend
+                // scripts/check_no_ub_exploitation.py in the same change,
+                // and start setting a real policy bit from this arm.
+                "-fno-delete-null-pointer-checks" => {}
                 "-fno-plt" => self.no_plt = true,
                 "-fplt" => self.no_plt = false,
                 arg if self.apply_hardening_or_ipa_fflag(arg)? => {}
@@ -6097,6 +6133,7 @@ mod cli_tests {
             "-fno-builtin-memcpy",
             "-fwrapv",
             "-fno-strict-overflow",
+            "-fno-delete-null-pointer-checks",
             "-fno-common",
             "-fsigned-char",
             "-fno-asynchronous-unwind-tables",

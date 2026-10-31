@@ -191,6 +191,32 @@ fn starts_directive(line: &[u8]) -> bool {
     offset.is_some_and(|i| hash_token_len(&line[i..]) != 0)
 }
 
+/// Whether the first *token* of `line` is a directive introducer, skipping
+/// horizontal white space AND same-line block comments. Unlike
+/// [`starts_directive`], which answers for raw text before comment removal,
+/// this is the phase-4 question ("does this line begin a directive?") for a
+/// line whose leading comment has already been closed on the same line —
+/// `/* x */ #define A 1 /*` both opens a comment that bridges the next line
+/// AND is a directive. An unclosed `/*` or a `//` before the candidate
+/// introducer answers `false`: what follows is comment text, not a token.
+fn first_token_is_directive(line: &[u8]) -> bool {
+    let mut i = 0;
+    loop {
+        match line.get(i) {
+            None => return false,
+            Some(b' ' | b'\t') => i += 1,
+            Some(b'/') if line.get(i + 1) == Some(&b'*') => {
+                let Some(close) = line[i + 2..].windows(2).position(|w| w == b"*/") else {
+                    return false; // comment still open at end of line
+                };
+                i += close + 4;
+            }
+            Some(b'/') if line.get(i + 1) == Some(&b'/') => return false,
+            Some(_) => return hash_token_len(&line[i..]) != 0,
+        }
+    }
+}
+
 /// Find a directive introducer at or after `from`, skipping horizontal space
 /// and same-line block comments. A newline terminates the search.
 fn next_token_is_directive(bytes: &[u8], mut from: usize) -> bool {
@@ -537,6 +563,28 @@ impl Preprocessor {
         let mut splice_state = SpliceState::Code;
         // Whether the open joined line may be split at all (not a directive).
         let mut splittable = false;
+        // Carried across joined-line boundaries: a block comment open over the
+        // real newline that ended the previous joined line, and whether that
+        // joined line was in directive context. C11 5.1.1.2 runs phase 3
+        // (comment replacement, embedded newlines included) before phase 4
+        // reads the directive, so a comment opened on a directive line and
+        // still open at its end bridges the NEXT physical line into the same
+        // directive. Two things then follow, and forgetting either one
+        // miscompiles real code (fs/nfs/callback_xdr.c:
+        // `CB_OP_GETATTR_RES_MAXSZ` ends its last continuation after `*/`):
+        //   * the bridged line is directive context: keeping a physical break
+        //     instead of splicing would insert the newline that terminates the
+        //     `#define`, truncating the macro body; the keep-break elision
+        //     must not fire there (a newline on an ordinary line is white
+        //     space, inside a directive it is a terminator);
+        //   * its lexical state starts INSIDE the comment: rescanning comment
+        //     text from `Code` would read the quotes of `deleg_mtime`'s
+        //     neighbours and any `//` as literal or line-comment delimiters.
+        let mut carry_block = false;
+        let mut carry_dir = false;
+        // Whether the open joined line is in directive context (its own
+        // introducer, or inherited across a bridged comment).
+        let mut join_dir = false;
         let mut lines = source.lines().peekable();
         // Keeping the physical break (the elision above) is sound only when the
         // consumer is a C tokenizer, for which a newline is just white space.
@@ -560,9 +608,18 @@ impl Preprocessor {
             let bs_pos = Self::find_continuation_backslash(line);
             if let Some(pos) = bs_pos {
                 if !continuation {
-                    splice_state = SpliceState::Code;
-                    splittable = first_non_blank(line.as_bytes()) != Some(b'/')
+                    // New joined line: inherit an open block comment (and the
+                    // directive context it bridges) from the previous close.
+                    let inherited = carry_block && carry_dir;
+                    splice_state = if carry_block {
+                        SpliceState::BlockComment
+                    } else {
+                        SpliceState::Code
+                    };
+                    splittable = !inherited
+                        && first_non_blank(line.as_bytes()) != Some(b'/')
                         && !starts_directive(line.as_bytes());
+                    join_dir = inherited || first_token_is_directive(line.as_bytes());
                 }
                 splice_state = splice_state.scan(&line.as_bytes()[..pos]);
                 let next = lines.peek().map_or(&b""[..], |l| l.as_bytes());
@@ -576,11 +633,15 @@ impl Preprocessor {
                     && !starts_directive(next)
                 {
                     // Keep the line break: this part ends its joined line.
-                    // A block comment stays open across it (`splice_state`
-                    // is reset at the next joined line's start, which is
-                    // safe: see `SpliceState`). An earlier join on this
+                    // A block comment may stay open across it; the next
+                    // joined line inherits both the comment state and — only
+                    // when this joined line was a directive — its directive
+                    // context (the carry recorded below), so a break inside a
+                    // directive can never be kept. An earlier join on this
                     // joined line already set `any_spliced`; a split alone
                     // keeps the identity map.
+                    carry_block = matches!(splice_state, SpliceState::BlockComment);
+                    carry_dir = join_dir;
                     if continuation {
                         segs.push((result.len(), phys));
                         map.push(LineSegments::Mapped(segs.clone().into()));
@@ -603,6 +664,10 @@ impl Preprocessor {
                     result.push_str(&line[..pos]);
                     // Still continuing.
                 } else {
+                    // Closes the joined line at a real newline: the closing
+                    // line's content decides what carries (an open comment
+                    // continues through the newline).
+                    splice_state = splice_state.scan(line.as_bytes());
                     any_spliced = true;
                     segs.push((result.len(), phys));
                     map.push(LineSegments::Mapped(segs.clone().into()));
@@ -610,6 +675,8 @@ impl Preprocessor {
                     result.push_str(line);
                     result.push('\n');
                     continuation = false;
+                    carry_block = matches!(splice_state, SpliceState::BlockComment);
+                    carry_dir = join_dir;
                 }
             } else if let Some(pos) = bs_pos {
                 // Opens a new spliced joined line. The first physical part
@@ -623,10 +690,25 @@ impl Preprocessor {
                 result.push_str(&line[..pos]);
                 continuation = true;
             } else {
-                // Standalone joined line: closes immediately.
+                // Standalone joined line: opens and closes its own joined
+                // line in one step. The bridge carry still applies: an
+                // inherited open comment (with its directive context) runs
+                // through this line, and the line's own end state carries to
+                // the next one, so `#define A 1 /*\n */ 2;`-shaped sources
+                // and any later splice see the true lexical state.
+                let inherited = carry_block && carry_dir;
+                splice_state = if carry_block {
+                    SpliceState::BlockComment
+                } else {
+                    SpliceState::Code
+                };
+                join_dir = inherited || first_token_is_directive(line.as_bytes());
+                splice_state = splice_state.scan(line.as_bytes());
                 result.push_str(line);
                 result.push('\n');
                 map.push(LineSegments::Flat(phys));
+                carry_block = matches!(splice_state, SpliceState::BlockComment);
+                carry_dir = join_dir;
             }
             phys += 1;
         }
