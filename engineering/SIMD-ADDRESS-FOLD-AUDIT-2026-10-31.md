@@ -12,6 +12,7 @@
 | Scoreboard signed arithmetic was undefined | GCC 16.2 UBSan stopped on signed sink accumulation | Use defined unsigned wrapping and unsigned left-shift operands. Preserve signed right-shift behavior on the supported targets. |
 | FP reduction receipts truncated results to int | Source audit | Hash the complete float/double result. Narrow integer receipts could miss low-bit errors. |
 | Matrix hashing walked across a C row subobject | Source audit | Hash each row within its bounds, then combine unsigned hashes. |
+| Clock failure left an uninitialized timestamp | Source audit and injected `clock_gettime` failure | Check the return value, print a diagnostic and exit 70. Both the reference and candidate must fail in exactly this way; compilation failure or a signal cannot masquerade as a successful fault test. |
 | Small repetition counts skipped matmul / divided by zero | New configurable correctness mode | Reject nonpositive counts; execute matmul at least once. Test REPS=1 and 17, not only the default 4000. |
 | AoS source emitted an indentation warning | Enabling GCC 16.2 `-Wall -Wextra -Werror` failed | Brace the output loop; require warning-clean compilation on both sides. |
 | Killing only a compiler parent does not bound pipe-inheriting descendants | Process-lifetime audit and real parent/child timeout test | Start a POSIX process session, kill the process group on timeout/interruption, drain/reap the parent, then report failure. A real sleeping descendant is terminated within the timeout budget. |
@@ -62,11 +63,12 @@ are x86-64 only; no native ARM/RISC-V execution is claimed.
   active swap, `RUSTFLAGS='-D warnings'`.
 - Full library suite: **7,098 passed, 10 ignored, zero failed**. Clippy with
   warnings denied passed. Rustfmt and whitespace checks passed.
-- Python suite: **17 passed**, including parser mutations, failed references,
+- Python suite: **18 passed**, including parser mutations, failed references,
   stale artifacts, signal/timeout handling and a real descendant timeout.
 - **3,276** AoS differential comparisons passed with C warnings denied:
   2,268 trip/page-layout checks and 1,008 type/stride/mixed-sign checks, against
   GCC 16.2 and Clang 23.1.4.
+- Clock-failure injection passed with lccc and both local reference compilers; hosted GCC/ICX gates run it as well.
 - **528** scoreboard checksum comparisons passed: 44 kernels × three candidate
   optimization levels × two reference compilers × REPS={1,17}.
 - Default 4000-repeat corpus: GCC 16.2 and Clang 23.1.4 UBSan instrumentation

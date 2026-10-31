@@ -1,6 +1,7 @@
 /* SIMD auto-vectorization probe corpus (TSVC-style). One noinline function per
  * kernel; main() runs each REPS times and prints "<name> <checksum> <ns/elem>". */
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
@@ -68,7 +69,7 @@ NOINL void k_overlap_dist1(void){ for(int i=0;i<N-1;i++) fa[i]=fa[i+1]+fb[i]; }
 static double M1[64][64], M2[64][64], M3[64][64];
 NOINL void k_matmul(void){ for(int i=0;i<64;i++) for(int k=0;k<64;k++) for(int j=0;j<64;j++) M3[i][j]+=M1[i][k]*M2[k][j]; }
 
-static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e9+t.tv_nsec; }
+static double now(void){ struct timespec t; if(clock_gettime(CLOCK_MONOTONIC,&t)!=0){perror("clock_gettime");exit(70);} return t.tv_sec*1e9+t.tv_nsec; }
 static uint64_t cs_f(const float*p,int n){ uint64_t h=1469598103934665603ULL; for(int i=0;i<n;i++){ uint32_t u; memcpy(&u,&p[i],4); h=(h^u)*1099511628211ULL;} return h; }
 static uint64_t cs_i(const int*p,int n){ uint64_t h=1469598103934665603ULL; for(int i=0;i<n;i++) h=(h^(uint32_t)p[i])*1099511628211ULL; return h; }
 static uint64_t cs_s(const short*p,int n){ uint64_t h=1469598103934665603ULL; for(int i=0;i<n;i++) h=(h^(uint16_t)p[i])*1099511628211ULL; return h; }

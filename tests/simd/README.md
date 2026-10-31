@@ -4,7 +4,7 @@ These are regression probes, not a claim of compiler performance superiority.
 The 44-row `scoreboard_kernels.c` now has a strict checksum-only gate:
 
 ```sh
-python3 tests/simd/check_scoreboard.py --reference gcc-16
+python3 tests/simd/check_scoreboard.py --check-clock-failure --reference gcc-16
 python3 tests/simd/check_scoreboard.py --reference clang-23 --reps 17 --json /tmp/scoreboard.json
 ```
 
@@ -14,7 +14,8 @@ acceptance criterion. Reference compilation/execution failure stops the gate.
 Each candidate at O1/O2/O3 is compared against the scalar O0 reference with
 contraction off and all C warnings treated as errors. `REPS=1` is the fast
 correctness case; 1..4000 is selectable, and matmul always executes at least
-once. The reduction sink uses defined unsigned wrapping; shift inputs convert
+once. The optional clock-failure test links an injected failing clock into separate reference/candidate binaries and requires exit 70 plus its diagnostic (not a compiler error, signal or silent success).
+The reduction sink uses defined unsigned wrapping; shift inputs convert
 to unsigned before left shift. FP reduction receipts retain every result bit,
 and matrix hashing stays within each row's C array bounds. GCC 16.2 UBSan
 reproduced the old signed-sink overflow; the repaired full default corpus

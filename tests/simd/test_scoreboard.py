@@ -61,6 +61,17 @@ class ScoreboardTests(unittest.TestCase):
                 self.assertIn('-ffp-contract=off', command)
                 self.assertIn('-Werror', command)
 
+    def test_injected_clock_failure_requires_exact_runtime_failure(self):
+        good = ProbeError('probe: rc=70\nclock_gettime: injected failure')
+        for bad in ('compile failed', 'probe: rc=-11', ''):
+            effects = ['', output()]*4 + ['', ProbeError(bad) if bad else '', '', good]
+            with self.subTest(failure=bad), patch.object(gate, 'run', side_effect=effects):
+                with patch('builtins.print'):
+                    self.assertEqual(gate.main(['--check-clock-failure']), 1)
+        with patch.object(gate, 'run', side_effect=['', output()]*4 + ['', good, '', good]):
+            with patch('builtins.print'):
+                self.assertEqual(gate.main(['--check-clock-failure']), 0)
+
 
 if __name__ == '__main__':
     unittest.main()

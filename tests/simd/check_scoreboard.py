@@ -48,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--reference', default='gcc-16')
     parser.add_argument('--reps', type=int, default=1)
     parser.add_argument('--json', type=Path)
+    parser.add_argument('--check-clock-failure', action='store_true')
     args = parser.parse_args(argv)
     if args.reps < 1 or args.reps > 4000:
         parser.error('--reps must be in 1..4000')
@@ -78,6 +79,26 @@ def main(argv: list[str] | None = None) -> int:
                     rows.append(dict(opt=opt, ok=False, error=str(exc)))
         except ProbeError as exc:
             rows.append(dict(stage='reference', ok=False, error=str(exc)))
+        if args.check_clock_failure:
+            # Compilation failure is NOT the expected runtime clock failure.
+            for role, cc, opt in [('reference', reference, '-O0'), ('candidate', candidate, '-O2')]:
+                try:
+                    exe = root / 'clock-failure'
+                    exe.unlink(missing_ok=True)
+                    fixture = SOURCE.with_name('clock_failure.c')
+                    run([*cc, opt, '-DREPS=1', '-ffp-contract=off',
+                         '-Wall', '-Wextra', '-Werror', str(SOURCE), str(fixture),
+                         '-lm', '-o', str(exe)], root, 60)
+                    try:
+                        run([str(exe)], root, 60)
+                    except ProbeError as exc:
+                        if 'rc=70\n' not in str(exc) or 'clock_gettime:' not in str(exc):
+                            raise
+                    else:
+                        raise ProbeError('injected clock failure did not terminate the probe')
+                    rows.append(dict(stage='clock_failure', compiler=role, ok=True))
+                except ProbeError as exc:
+                    rows.append(dict(stage='clock_failure', compiler=role, ok=False, error=str(exc)))
     failed = [row for row in rows if not row['ok']]
     for row in failed:
         print(row)
