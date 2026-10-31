@@ -222,18 +222,42 @@ project rather than a commit:
    instructions against ICX 74, Clang 176, GCC 232 on the same kernel: a 3-8x
    code-size gap driven by scalar quarter-rounds under spill pressure. This is
    vectorisation work in the loop/SLP passes, not a codegen tweak.
-2. **Leaf functions and the callee-saved bank.** After the mode change the
-   corpus still emits 741 `push`/`pop` against GCC's 271. The MachInst
-   allocator already prefers caller-saved registers; the mature linear-scan
-   path allocates from the callee-saved bank, so a leaf function that keeps
-   seven values live pays `push`/`pop` for registers it need not preserve at
-   all. Changing the pool changes every function the allocator touches, so it
-   needs its own differential run against the corpus, not a ride-along.
+2. **The remaining `push`/`pop`.** After the mode change the corpus still
+   emits 741 against GCC's 271, and the first explanation to reach for — "the
+   allocator hands leaves a callee-saved home they never needed" — is **not**
+   what is happening. `RegAllocConfig::leaf_caller_saved_homes` (x86-64, on by
+   default, `CCC_NO_LEAF_CALLER_HOME` to A/B it) already lets a call-free
+   leaf's hot loop values compete for the volatile pool first, with only the
+   Phase-2c overflow reaching the callee-saved bank; `tests/regression/
+   check_leaf_caller_homes.sh` pins that shape. What produces the count is:
+
+   * leaves whose live set exceeds the six-register volatile pool (the
+     overflow is a real register, so the save is real);
+   * non-leaf functions, where callee-saved homes are the point;
+   * functions containing an inline-expanded `memcpy`/`memset`. Those are
+     call points in the allocator *by design* (`instruction_is_call_point`
+     answers true for the IR `Call`, and the completeness argument in
+     `collect_x64_rdx_clobber_points` says why: the expansion writes the
+     volatile pool without staging the values that live across it, so a
+     volatile home spanning it would be corrupted). They are *not* call
+     points for the frame (`has_calls` in the prologue excludes them) or for
+     parameter homes, and those three predicates agreeing is itself
+     deliberate. Recovering the volatile homes those functions lose means
+     modelling the expansion's clobber set per register instead of declaring
+     a whole call point — the same machinery that already admits `%rdx`
+     per-value at clobber-free live ranges — and it has to be done for every
+     expansion shape (GPR, SSE, `rep movs`, per-CPU tuning row). That is the
+     next real win, and it is a register-class project, not a pool tweak.
 3. **Loop rotation default-enable (PF-17).** The pass exists and removes the
    extra entry jump in hot loops; it stays off until the remaining 15 edge-case
    loop shapes are hardened.
 
 **Narrow integer ALU width — analysed, and why it is not in this change.**
+`tests/regression/check_narrow_alu_arithmetic.sh` states the value contract the
+change would have to preserve (wrapped results, sign extension, comparisons,
+over the whole u8 grid and a sampled i16 grid), so the next attempt has its
+safety net already in place; what it does not have is a proof about FLAGS,
+which is where the difficulty actually lives.
 After the divide work, narrow integer arithmetic still runs at 64-bit width.
 It looks like a mechanical `addq` -> `addl` sweep and it is not: `addl` and
 `addq` are only equivalent on canonical operands when the *result* also stays

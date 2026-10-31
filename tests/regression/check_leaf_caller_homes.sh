@@ -134,6 +134,12 @@ run_both() {
 run_both "$work/leaf.c" leaf
 callee=$(callee_refs "$work/leaf.s")
 pushcount=$(pushes "$work/leaf.s")
+if [ "$callee" -ne 0 ] || [ "$pushcount" -ne 0 ]; then
+    # Diagnostic: the body in one line, so the shard annotation (which keeps
+    # the LAST lines of a failing gate) shows what the allocator actually did.
+    echo "leaf body: $(body_of "$work/leaf.s" | sed 's/^[[:space:]]*//' | grep -v '^[.]' | tr '\n' ';')" >&2
+    echo "leaf census: refs=$callee pushes=$pushcount rbx=$(body_of "$work/leaf.s" | grep -c '%rbx' || true) rbp=$(body_of "$work/leaf.s" | grep -c '%rbp' || true) r12=$(body_of "$work/leaf.s" | grep -c '%r12' || true) r13=$(body_of "$work/leaf.s" | grep -c '%r13' || true) r14=$(body_of "$work/leaf.s" | grep -c '%r14' || true) r15=$(body_of "$work/leaf.s" | grep -c '%r15' || true) r8=$(body_of "$work/leaf.s" | grep -c '%r8' || true) r9=$(body_of "$work/leaf.s" | grep -c '%r9' || true) r10=$(body_of "$work/leaf.s" | grep -c '%r10' || true) r11=$(body_of "$work/leaf.s" | grep -c '%r11' || true) rsi=$(body_of "$work/leaf.s" | grep -c '%rsi' || true) rdi=$(body_of "$work/leaf.s" | grep -c '%rdi' || true) rcx=$(body_of "$work/leaf.s" | grep -c '%rcx' || true) rdx=$(body_of "$work/leaf.s" | grep -c '%rdx' || true)" >&2
+fi
 [ "$callee" -eq 0 ] && ok "call-free leaf references no callee-saved register" \
     || bad "call-free leaf references $callee callee-saved register(s) — the leaf policy is off"
 [ "$pushcount" -eq 0 ] && ok "call-free leaf emits no push/pop" \
