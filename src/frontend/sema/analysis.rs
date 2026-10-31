@@ -3963,7 +3963,30 @@ impl SemanticAnalyzer {
         // K&R body declarations intentionally contribute no prototype;
         // only a separately visible declaration can supply one.
         let checker = self.expr_type_checker();
-        let signature = match checker.infer_expr_ctype(callee) {
+        let callee_ty = checker.infer_expr_ctype(callee);
+        // C11 6.5.2.2: the callee must be a function designator or a pointer
+        // to function. A visible non-callable object shadows any file-scope
+        // function of the same name; falling through to the hidden function
+        // both accepts invalid C and emits a call to the wrong entity.
+        let callable = match &callee_ty {
+            Some(CType::Function(_)) => true,
+            Some(CType::Pointer(inner, _)) => matches!(inner.as_ref(), CType::Function(_)),
+            _ => false,
+        };
+        if !callable && let Some(ty) = &callee_ty {
+            let builtin_callee =
+                matches!(callee, Expr::Identifier(name, _) if builtins::is_builtin(name));
+            if !builtin_callee {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "called object type '{}' is not a function or function pointer",
+                        operand_constraints::type_name(&ty.integer_promoted())
+                    ),
+                    callee.span(),
+                );
+            }
+        }
+        let signature = match callee_ty {
             Some(CType::Function(ft)) => Some(*ft),
             Some(CType::Pointer(inner, _)) => match *inner {
                 CType::Function(ft) => Some(*ft),

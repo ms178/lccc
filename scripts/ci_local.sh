@@ -363,6 +363,28 @@ gate "builtin-float-aliases" fast \
 gate "ci-link-oracle-provisioning" fast \
     python3 tests/regression/check_ci_link_oracle_provisioning.py
 
+# GNU ld's default RWX LOAD diagnostic must be real on ELF32/ELF64, obey
+# --fatal-warnings and last-toggle-wins, and run before flat-binary conversion.
+gate "linker-rwx-segments" fast \
+    python3 tests/linker/check_rwx_segments.py
+
+# GAS `. =` / `.org` parity: macro vector layout, relaxation fixup, fill bytes,
+# numeric locals and fail-closed malformed expressions on ELF32/ELF64.
+gate "assembler-dot-assignment" fast \
+    python3 tests/regression/check_dot_assignment.py
+
+# Kernel preparation/build provenance: recipe identity, compiler-content
+# invalidation, config preservation, real objtool and post-build re-verification.
+gate "kernel-provenance" fast \
+    python3 tests/regression/check_kernel_provenance.py
+gate "kernel-full-harness" fast \
+    python3 tests/regression/check_kernel_full_harness.py
+
+# C11 6.2.1p4: the visible object binding types the call result; a non-callable
+# shadow must not fall back to a hidden file-scope function.
+gate "fnptr-result-shadowing" fast \
+    bash tests/regression/check_fnptr_result_shadowing.sh
+
 # Three compiles and two runs: pins that a loop-carried accumulator keeps its
 # callee-saved home when a call inside the loop forces the value to be
 # call-spanning, instead of being displaced by a loop-invariant constant that
