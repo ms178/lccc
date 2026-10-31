@@ -211,3 +211,39 @@ not disable ASLR for code — it stops paying for position independence the
 resulting binary never had. A hardened build is one flag away and now honoured
 end to end: `-pie` (or `-fPIE`) produces position-independent codegen *and* an
 ET_DYN image.
+
+## 7. What this unlocks, and what it does not
+
+The mode change is the whole of the measured address-generation gap, so the
+next levers are elsewhere. Ranked by measured size, with the reason each is a
+project rather than a commit:
+
+1. **ChaCha20 quarter-round SIMD** (`engineering/STATE.md` backlog 1). LCCC 592
+   instructions against ICX 74, Clang 176, GCC 232 on the same kernel: a 3-8x
+   code-size gap driven by scalar quarter-rounds under spill pressure. This is
+   vectorisation work in the loop/SLP passes, not a codegen tweak.
+2. **Leaf functions and the callee-saved bank.** After the mode change the
+   corpus still emits 741 `push`/`pop` against GCC's 271. The MachInst
+   allocator already prefers caller-saved registers; the mature linear-scan
+   path allocates from the callee-saved bank, so a leaf function that keeps
+   seven values live pays `push`/`pop` for registers it need not preserve at
+   all. Changing the pool changes every function the allocator touches, so it
+   needs its own differential run against the corpus, not a ride-along.
+3. **Loop rotation default-enable (PF-17).** The pass exists and removes the
+   extra entry jump in hot loops; it stays off until the remaining 15 edge-case
+   loop shapes are hardened.
+
+**Narrow integer ALU width — analysed, and why it is not in this change.**
+After the divide work, narrow integer arithmetic still runs at 64-bit width.
+It looks like a mechanical `addq` -> `addl` sweep and it is not: `addl` and
+`addq` are only equivalent on canonical operands when the *result* also stays
+canonical. `0xFFFFFFFF + 1` is `0` in 32 bits (CF=1, ZF=1) and `0x100000000` in
+64 (CF=0, ZF=0), so the width decides both the value's upper half and every
+flag a consumer reads; and the consumers — `setcc`, `cmov`, `jcc`, the
+`check_narrow_cmp_flag_law.sh` contracts — are chosen at the same width today.
+Making the ALU 32-bit is therefore a whole-lattice change: the ALU, the flag
+law and every flag consumer have to move together, or nothing moves. It is
+provably free of *lost* information (the canonical form is 32 bits) but it is
+not free of *work*, and a change of that size has to be measured against the
+corpus with a compiler in the loop, not reasoned about.
+
