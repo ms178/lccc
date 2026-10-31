@@ -200,9 +200,15 @@ impl LayoutProbe {
 
 const PAGE: u64 = 0x1000;
 
-fn align_up(v: u64, a: u64) -> u64 {
+fn align_up(v: u64, a: u64) -> Option<u64> {
     let a = a.max(1);
-    v.div_ceil(a) * a
+    let quotient = v / a;
+    let rounded = if v % a == 0 {
+        quotient
+    } else {
+        quotient.checked_add(1)?
+    };
+    rounded.checked_mul(a)
 }
 
 fn as_signed(v: u64) -> i64 {
@@ -293,7 +299,7 @@ struct Tracker<'p> {
     /// Size of each merged section once this trip has placed all of it.
     size_now: Vec<Option<u64>>,
     /// Shift of the writable segment once the RX segment is complete.
-    rw_delta: Option<i64>,
+    rw_delta: Option<i128>,
 }
 
 impl<'p> Tracker<'p> {
@@ -322,14 +328,19 @@ impl<'p> Tracker<'p> {
     }
 
     /// Enter merged section `m`: fix its address for the rest of the trip.
-    fn enter(&mut self, m: usize) {
+    fn enter(&mut self, m: usize) -> Result<(), String> {
         if let Some(pos) = self.p.rx_seq.iter().position(|&x| x == m) {
             let v = if pos == 0 {
                 self.p.vaddr[m]
             } else {
                 let prev = self.p.rx_seq[pos - 1];
-                let end = self.base(prev) + self.size_now[prev].unwrap_or(self.p.size[prev]);
-                align_up(end, self.p.align[m])
+                let end = self
+                    .base(prev)
+                    .checked_add(self.size_now[prev].unwrap_or(self.p.size[prev]))
+                    .ok_or_else(|| "RISC-V relaxation: RX section end overflows u64".to_owned())?;
+                align_up(end, self.p.align[m]).ok_or_else(|| {
+                    "RISC-V relaxation: aligned RX section address overflows u64".to_owned()
+                })?
             };
             self.vaddr_now[m] = Some(v);
         } else if self.p.vaddr[m] >= self.p.rw_start && self.p.rw_start != 0 {
@@ -338,19 +349,37 @@ impl<'p> Tracker<'p> {
             let delta = match self.rw_delta {
                 Some(d) => d,
                 None => {
-                    let d = self.p.rx_seq.last().map_or(0, |&l| {
-                        let new_end = self.base(l) + self.size_now[l].unwrap_or(self.p.size[l]);
-                        let old_end = self.p.vaddr[l] + self.p.size[l];
-                        as_signed(align_up(new_end, PAGE)) - as_signed(align_up(old_end, PAGE))
-                    });
+                    let d = if let Some(&last) = self.p.rx_seq.last() {
+                        let new_end = self
+                            .base(last)
+                            .checked_add(self.size_now[last].unwrap_or(self.p.size[last]))
+                            .ok_or_else(|| "RISC-V relaxation: RX section end overflows u64".to_owned())?;
+                        let old_end = self.p.vaddr[last]
+                            .checked_add(self.p.size[last])
+                            .ok_or_else(|| "RISC-V relaxation: original RX section end overflows u64".to_owned())?;
+                        let new_page = align_up(new_end, PAGE).ok_or_else(|| {
+                            "RISC-V relaxation: page-aligned RX end overflows u64".to_owned()
+                        })?;
+                        let old_page = align_up(old_end, PAGE).ok_or_else(|| {
+                            "RISC-V relaxation: original page-aligned RX end overflows u64".to_owned()
+                        })?;
+                        i128::from(new_page) - i128::from(old_page)
+                    } else {
+                        0
+                    };
                     self.rw_delta = Some(d);
                     d
                 }
             };
-            self.vaddr_now[m] = Some(as_unsigned(as_signed(self.p.vaddr[m]) + delta));
+            let address = i128::from(self.p.vaddr[m]) + delta;
+            let address = u64::try_from(address).map_err(|_| {
+                "RISC-V relaxation: translated writable section address is out of range".to_owned()
+            })?;
+            self.vaddr_now[m] = Some(address);
         } else {
             self.vaddr_now[m] = Some(self.p.vaddr[m]);
         }
+        Ok(())
     }
 }
 
@@ -478,7 +507,7 @@ fn trip(
     let mut tr = Tracker::new(p);
     let mut again = false;
     for &m in &p.order {
-        tr.enter(m);
+        tr.enter(m)?;
         let mut dot = 0u64;
         let mut prev_dot = 0u64;
         for &(o, s) in &inputs[m] {
@@ -504,15 +533,24 @@ fn trip(
             }
             // Place the input: ld's `size_input_section`.
             let align = objs[o].1.sections[s].addralign.max(1);
-            dot = align_up(dot, align);
+            dot = align_up(dot, align).ok_or_else(|| {
+                format!("{}: aligned input-section offset overflows u64", objs[o].0)
+            })?;
             tr.offset_now.insert((o, s), dot);
-            dot += objs[o].1.sections[s].size;
-            prev_dot = align_up(prev_dot, align) + size_prev;
+            dot = dot
+                .checked_add(objs[o].1.sections[s].size)
+                .ok_or_else(|| format!("{}: input-section extent overflows u64", objs[o].0))?;
+            prev_dot = align_up(prev_dot, align)
+                .and_then(|offset| offset.checked_add(size_prev))
+                .ok_or_else(|| format!("{}: previous input-section extent overflows u64", objs[o].0))?;
         }
         // Bytes after the last input (synthetic tails such as COMMON) keep
         // their size; only the input-backed part can have shrunk.
         let tail = p.size[m].saturating_sub(prev_dot);
-        tr.size_now[m] = Some(dot + tail);
+        tr.size_now[m] = Some(
+            dot.checked_add(tail)
+                .ok_or_else(|| "RISC-V relaxation: merged section size overflows u64".to_owned())?,
+        );
     }
     Ok(again)
 }
@@ -1454,6 +1492,17 @@ pub(super) fn fill_relax_probe(probe: &mut LayoutProbe, l: &RelaxProbeLayout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn align_up_handles_arbitrary_alignment_and_rejects_overflow() {
+        assert_eq!(align_up(0, 0), Some(0));
+        assert_eq!(align_up(10, 1), Some(10));
+        assert_eq!(align_up(10, 3), Some(12));
+        assert_eq!(align_up(12, 3), Some(12));
+        assert_eq!(align_up(u64::MAX - 1, u64::MAX), Some(u64::MAX));
+        assert_eq!(align_up(u64::MAX, 2), None);
+        assert_eq!(align_up(u64::MAX, u64::MAX - 1), None);
+    }
 
     #[test]
     fn immediate_ranges_match_the_bfd_macros() {
