@@ -181,5 +181,58 @@ if LCCC_STRICT_OPTIONS=1 "$CCC" -fno-strict-overflow -c "$tmp/shapes.c" -o "$tmp
     exit 1
 fi
 grep -q 'only partially implemented' "$tmp/strict.err"
+# The positive spelling asks for an assumption this compiler never makes, so
+# nothing is unmet: it must be accepted WITHOUT a diagnostic in normal mode
+# (measured: gcc-16 and clang-23 accept both spellings with empty stderr, and a
+# warning on every TU is noise when the request is already satisfied in the
+# conservative direction), while a strict capability probe must still refuse it
+# because "no such optimisation exists" is not "it is implemented".
+"$CCC" -fstrict-overflow -c "$tmp/shapes.c" -o "$tmp/strict_pos.o" >"$tmp/pos.err" 2>&1 || \
+    { echo '-fstrict-overflow must be accepted in normal mode' >&2; exit 1; }
+if [ -s "$tmp/pos.err" ]; then
+    echo '-fstrict-overflow must not diagnose anything in normal mode:' >&2
+    cat "$tmp/pos.err" >&2
+    exit 1
+fi
+if LCCC_STRICT_OPTIONS=1 "$CCC" -fstrict-overflow -c "$tmp/shapes.c" -o "$tmp/strict_pos2.o" >"$tmp/strict_pos.err" 2>&1; then
+    echo '-fstrict-overflow must fail a strict capability probe' >&2
+    exit 1
+fi
+grep -q 'signed-overflow assumptions this' "$tmp/strict_pos.err"
+
+# ── The archived A14-16 accepted-flag reproducer ────────────────────────────
+# `engineering/evidence/pr824-review/accepted-wrap-product.c` recorded a fault
+# at -O2 under an accepted `-fwrapv`: a signed product used as a byte offset
+# (`p[i * 4]`, `i` from 2^30) was strength-reduced into an out-of-range address.
+# It is kept here as a running leg because it is the only known shape where an
+# accepted flag's semantics were violated, and backlog MB-07d cites it. Both
+# wrapping spellings must produce GCC 16.2's answer at every level, with no
+# pointer-overflow warning suppressed: the umbrella still diagnoses its pointer
+# half, so its stderr is checked separately from `-fwrapv`'s.
+cat > "$tmp/wrap_product.c" <<'C'
+__attribute__((noinline)) int f(char *p, int start, int end) {
+    int sum = 0;
+    for (int i = start; i < end; i++)
+        sum += p[i * 4];
+    return sum;
+}
+int main(void) {
+    char p[16] = {1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4};
+    return f(p, 1073741824, 1073741828) != 10;
+}
+C
+for opt in -O0 -O1 -O2 -O3; do
+    "$CCC" $opt -fwrapv "$tmp/wrap_product.c" -o "$tmp/wp" 2>"$tmp/wp.err"
+    if [ -s "$tmp/wp.err" ]; then
+        echo "wrap-product $opt -fwrapv diagnosed something:" >&2; cat "$tmp/wp.err" >&2; exit 1
+    fi
+    "$tmp/wp" || { echo "wrap-product $opt -fwrapv: wrong answer or fault" >&2; exit 1; }
+    "$CCC" $opt -fno-strict-overflow "$tmp/wrap_product.c" -o "$tmp/wp2" 2>/dev/null
+    "$tmp/wp2" || { echo "wrap-product $opt -fno-strict-overflow: wrong answer or fault" >&2; exit 1; }
+    if command -v "${GCC_ORACLE:-gcc-16}" >/dev/null; then
+        "${GCC_ORACLE:-gcc-16}" $opt -fwrapv "$tmp/wrap_product.c" -o "$tmp/wp_ref" 2>/dev/null
+        "$tmp/wp_ref" || { echo "wrap-product $opt: the oracle disagrees" >&2; exit 1; }
+    fi
+done
 
 echo "iabs-cmp-fold gate OK"

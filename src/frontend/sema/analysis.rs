@@ -3403,8 +3403,8 @@ impl SemanticAnalyzer {
                 // `0 && x` and `1 || x` never evaluate `x`, and GCC's
                 // division verdict follows that (`u() && 1 / 0` still warns).
                 let short_circuited = match op {
-                    BinOp::LogicalAnd => self.div_zero_constant_bool(lhs) == Some(false),
-                    BinOp::LogicalOr => self.div_zero_constant_bool(lhs) == Some(true),
+                    BinOp::LogicalAnd => self.constant_truth_value(lhs) == Some(false),
+                    BinOp::LogicalOr => self.constant_truth_value(lhs) == Some(true),
                     _ => false,
                 };
                 if short_circuited {
@@ -3538,7 +3538,7 @@ impl SemanticAnalyzer {
             }
             Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
-                match self.div_zero_constant_bool(cond) {
+                match self.constant_truth_value(cond) {
                     Some(false) => {
                         self.analyze_unevaluated_by_constant(then_expr);
                         self.analyze_expr(else_expr);
@@ -3558,7 +3558,7 @@ impl SemanticAnalyzer {
             }
             Expr::GnuConditional(cond, else_expr, span) => {
                 self.analyze_expr(cond);
-                if self.div_zero_constant_bool(cond) == Some(true) {
+                if self.constant_truth_value(cond) == Some(true) {
                     self.analyze_unevaluated_by_constant(else_expr);
                 } else {
                     self.analyze_expr(else_expr);
@@ -4511,6 +4511,16 @@ impl SemanticAnalyzer {
                 .exact_operand_ctype(inner)
                 .is_some_and(|ty| operand_constraints::is_void_pointer(&ty)),
             Expr::Comma(_, rhs, _) => self.is_exact_void(rhs),
+            // A statement expression's type is exactly its value expression's
+            // type, and `void` when the tail cannot produce a value
+            // (`({ int y; })`, `({ ; })`), so the verdict is never an
+            // inference failure. Without this, a used void statement
+            // expression was silently typed and initialized with garbage
+            // (`int r = ({ (void)2; });` is GCC's void-value error).
+            Expr::StmtExpr(compound, _) => match compound.value_expr() {
+                Some(value) => self.is_exact_void(value),
+                None => true,
+            },
             Expr::FunctionCall(callee, _, _) => matches!(
                 callee.as_ref(),
                 Expr::Identifier(name, _)
@@ -5477,12 +5487,9 @@ impl SemanticAnalyzer {
                 if under_ext_vector {
                     return true;
                 }
-                match compound.syntactic_last_item() {
-                    Some(BlockItem::Statement(Stmt::Expr(Some(tail)))) => {
-                        self.is_known_rvalue(tail, false)
-                    }
-                    _ => false,
-                }
+                compound
+                    .value_expr()
+                    .is_some_and(|tail| self.is_known_rvalue(tail, false))
             }
             _ => false,
         }
@@ -8322,7 +8329,64 @@ dereference it before applying '->' to it?"
     /// `0u - 1u < 1u` is false, not true. Nor may a folded ordinary `const`
     /// object quiet this syntactic warning. ICE checking enforces that rule;
     /// disabling the generic value cache also prevents such values leaking in.
-    fn div_zero_constant_bool(&self, expr: &Expr) -> Option<bool> {
+    /// The truth value GCC's front end can decide for `expr`, including the
+    /// one-constant-side rule it applies to `&&` and `||`.
+    ///
+    /// GCC folds `a && b` to 0 when *either* side is a constant false and
+    /// `a || b` to 1 when either side is a constant true, and it folds through
+    /// `!`, integer casts and both conditional forms. That is why
+    /// `x / (x && 0)` is a `-Wdiv-by-zero` for it although `x` is unknown
+    /// (measured on 16.2; Clang 23.1.4 folds only the left operand and stays
+    /// silent, and LCCC followed Clang until this helper existed).
+    ///
+    /// This is a **value** fold. It must not be used for operand elision: GCC
+    /// elides an operand only when the operand itself is a constant, so
+    /// `(0 && g()) && (1 / 0)` still reports the division while
+    /// `folded_truth(0 && g())` is `Some(false)`.
+    ///
+    /// Known remainder, deliberately not modelled: `x / (x ? 0 : x)` is a
+    /// division by zero for GCC because its value-range pass knows the else arm
+    /// is only reached when `x` is 0, so both arms yield 0. Deciding that
+    /// needs facts propagated from the controlling expression into the arms;
+    /// here it stays silent, which can only *miss* a warning and never invent
+    /// one.
+    fn folded_truth(&self, expr: &Expr) -> Option<bool> {
+        if let Some(value) = self.constant_truth_value(expr) {
+            return Some(value);
+        }
+        match expr {
+            Expr::BinaryOp(BinOp::LogicalAnd, lhs, rhs, _) => {
+                match (self.folded_truth(lhs), self.folded_truth(rhs)) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                }
+            }
+            Expr::BinaryOp(BinOp::LogicalOr, lhs, rhs, _) => {
+                match (self.folded_truth(lhs), self.folded_truth(rhs)) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+            Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => self.folded_truth(inner).map(|v| !v),
+            // An integer cast preserves truth value, including `_Bool`.
+            Expr::Cast(_, inner, ..) => self.folded_truth(inner),
+            Expr::GnuConditional(cond, else_expr, _) => match self.folded_truth(cond) {
+                Some(true) => Some(true),
+                Some(false) => self.folded_truth(else_expr),
+                None => None,
+            },
+            Expr::Conditional(cond, then_expr, else_expr, _) => match self.folded_truth(cond) {
+                Some(true) => self.folded_truth(then_expr),
+                Some(false) => self.folded_truth(else_expr),
+                None => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn constant_truth_value(&self, expr: &Expr) -> Option<bool> {
         match expr {
             Expr::IntLiteral(v, _) | Expr::LongLiteral(v, _) | Expr::LongLongLiteral(v, _) => {
                 return Some(*v != 0);
@@ -8360,7 +8424,9 @@ dereference it before applying '->' to it?"
             .expr_type_checker()
             .infer_expr_ctype(lhs)
             .is_some_and(|ty| ty.is_floating());
-        if is_floating || self.div_zero_constant_bool(rhs) != Some(false) {
+        // The divisor's *value* decides this warning, not its constant-expression
+        // status: GCC reports `x / (x && 0)` and `x / ((x && 0) || (1 && 0))`.
+        if is_floating || self.folded_truth(rhs) != Some(false) {
             return;
         }
         self.diagnostics.borrow_mut().warning_with_kind(

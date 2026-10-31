@@ -871,6 +871,13 @@ gate "attribute-diagnostics" fast \
 # target modes; an untaken zero division must not become -Werror.
 gate "div-zero-constant-arms" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_divzero_constant_arms.sh
+# A statement expression's value comes from the last item that can produce
+# one; the kernel's `sizeof(struct { _Static_assert(...); })` idiom depends on
+# it, and a used void statement expression must be diagnosed rather than
+# silently initialized with whatever the block left behind.
+gate "stmt-expr-tail-parity" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" CLANG="${CLANG:-clang-23}" \
+        bash tests/regression/check_stmt_expr_tail_parity.sh
 # Pointer-target qualifiers of implicit conversions (-Wdiscarded-qualifiers
 # and the multi-level incompatible-pointer-types errors), byte-for-byte
 # against required GCC 16.2, including all suppression and promotion variants.

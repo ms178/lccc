@@ -227,7 +227,7 @@ def main():
     # jump relaxation and a fail-closed backwards-location verdict. Keep it
     # in this existing hosted + local gate, rather than an orphan script.
     x86_test = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "check_x86_location_assignment.sh")
+                            "x86_location_assignment_fixture.sh")
     env = {**os.environ, "CCC": os.path.abspath(args.lccc)}
     result = subprocess.run(["bash", x86_test], env=env, check=False)
     rows += 1

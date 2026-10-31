@@ -2275,6 +2275,52 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Ok(())
     }
 
+    /// Resolve a `.org` operand to its base position inside `sec_idx`.
+    ///
+    /// GAS accepts four spellings: an omitted operand (base 0), `.` (base is
+    /// here), a named label, and a local numeric label (`1b`). A *forward*
+    /// target is not one of them -- GAS 2.47 dies with "Infinite loop
+    /// encountered whilst attempting to compute the addresses of symbols"
+    /// because the addresses cannot converge -- so refusing an unresolvable
+    /// symbol is parity, not strictness.
+    ///
+    /// Three places have to agree on the three accepted spellings: emission,
+    /// the relaxation fixup and the final no-backwards verdict. They used to
+    /// carry different subsets. `process_org` and the verdict handled named and
+    /// numeric labels, but the fixup looked the marker's label up in
+    /// `label_positions`, which holds *named* labels only: every numeric
+    /// `.org` target therefore fell into its `continue` arm and kept the
+    /// provisional padding it was given before relaxation. Measured on
+    /// `1: nop; jmp 2f; .org 1b + 12, 0x77; .space 200; 2: ret`, the jump grows
+    /// from two bytes to five, so the pad must shrink from nine bytes to six;
+    /// the fixup left nine and every following byte moved. One resolver, three
+    /// callers, and the regression is pinned in
+    /// tests/regression/check_asm_directive_contract.py (`org_relax_local`).
+    ///
+    /// `current` is the position the operand is evaluated at: it is the base for
+    /// `.` and it selects the nearest numeric label. An undefined symbol is an
+    /// error rather than GAS's "symbol undefined; zero assumed" warning, because
+    /// assuming zero silently discards the padding and misplaces every
+    /// following byte.
+    fn resolve_org_base(&self, sym: &str, current: u64, sec_idx: usize) -> Result<u64, String> {
+        match sym {
+            "" => return Ok(0),
+            "." => return Ok(current),
+            _ => {}
+        }
+        if let Some(&(label_sec, label_off)) = self.label_positions.get(sym) {
+            if label_sec != sec_idx {
+                return Err(format!(".org symbol {sym} not in current section"));
+            }
+            return Ok(label_off);
+        }
+        // `resolve_numeric_label` only ever returns positions in `sec_idx`.
+        if let Some((_, label_off)) = self.resolve_numeric_label(sym, current, sec_idx) {
+            return Ok(label_off);
+        }
+        Err(format!(".org: unknown symbol {sym}"))
+    }
+
     fn process_org(&mut self, sym: &str, offset: i64, fill: u8) -> Result<(), String> {
         let after_insn = self.last_item_was_insn();
         // GAS: `.org` before any section directive positions within `.text`;
@@ -2282,30 +2328,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.ensure_section()?;
         let sec_idx = self.current_section.ok_or("no active section for .org")?;
         let current = self.sections[sec_idx].cursor();
-        let base = if sym.is_empty() {
-            0
-        } else if sym == "." {
-            // A relative position must advance; unlike a label target it
-            // cannot become valid after jump relaxation.
-            if offset < 0 {
-                return Err(".org: attempt to move .org backwards".into());
-            }
-            current
-        } else if let Some(&(label_sec, label_off)) = self.label_positions.get(sym) {
-            if label_sec != sec_idx {
-                return Err(format!(".org symbol {} not in current section", sym));
-            }
-            label_off
-        } else if let Some((label_sec, label_off)) =
-            self.resolve_numeric_label(sym, current, sec_idx)
-        {
-            if label_sec != sec_idx {
-                return Err(format!(".org symbol {} not in current section", sym));
-            }
-            label_off
-        } else {
-            return Err(format!(".org: unknown symbol {}", sym));
-        };
+        // A relative position must advance; unlike a label target it cannot
+        // become valid after jump relaxation.
+        if sym == "." && offset < 0 {
+            return Err("attempt to move .org backwards".into());
+        }
+        let base = self.resolve_org_base(sym, current, sec_idx)?;
         let target = u64::try_from(i128::from(base) + i128::from(offset))
             .map_err(|_| ".org: target outside section range".to_string())?;
         let padding = if target > current {
@@ -3881,19 +3909,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         for (sec_idx, section) in self.sections.iter().enumerate() {
             for marker in &section.align_markers {
                 if let AlignMarkerKind::Org { label, addend, .. } = &marker.kind {
-                    let base = if label.is_empty() {
-                        0
-                    } else if let Some(&(label_sec, label_off)) = self.label_positions.get(label) {
-                        if label_sec != sec_idx {
-                            return Err(format!(".org symbol {label} not in current section"));
-                        }
-                        label_off
-                    } else {
-                        return Err(format!(".org: unknown symbol {label}"));
-                    };
+                    let base = self.resolve_org_base(label, marker.offset as u64, sec_idx)?;
                     let target = i128::from(base) + i128::from(*addend);
                     if target < marker.offset as i128 {
-                        return Err(".org: attempt to move .org backwards".into());
+                        return Err("attempt to move .org backwards".into());
                     }
                 }
             }
@@ -4982,26 +5001,27 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             // GAS `rs_org`: the label's value is updated once
                             // reached this pass, else its old position (no
                             // stretch); a backwards `.org` keeps its padding.
+                            // A numeric reference resolves through the same
+                            // helper, so `1f` stretches like a named label
+                            // instead of keeping its provisional padding. An
+                            // unresolvable label keeps its padding here and is
+                            // judged by the final verdict, which reports it.
                             let end = if label.is_empty() {
                                 *addend
                             } else {
-                                match self.label_positions.get(label.as_str()) {
-                                    Some(&(l_sec, l_off)) if l_sec == sec_idx => {
-                                        let l_seq = self
-                                            .label_seq
-                                            .get(label.as_str())
-                                            .copied()
-                                            .unwrap_or(0);
-                                        let l_off = l_off as usize;
-                                        let reached =
-                                            l_off < off || (l_off == off && l_seq < marker.seq);
-                                        if reached {
-                                            moved(&visited, &cumulative, l_off, l_seq) + *addend
-                                        } else {
-                                            l_off as i64 + *addend
-                                        }
-                                    }
-                                    _ => continue,
+                                let Ok(label_off) =
+                                    self.resolve_org_base(label, off as u64, sec_idx)
+                                else {
+                                    continue;
+                                };
+                                let l_seq =
+                                    self.label_seq.get(label.as_str()).copied().unwrap_or(0);
+                                let l_off = label_off as usize;
+                                let reached = l_off < off || (l_off == off && l_seq < marker.seq);
+                                if reached {
+                                    moved(&visited, &cumulative, l_off, l_seq) + *addend
+                                } else {
+                                    l_off as i64 + *addend
                                 }
                             };
                             if end < here {

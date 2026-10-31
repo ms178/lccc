@@ -566,11 +566,26 @@ libraries and shadow memory; do not fake them. Test: seeded-bug programs per
 check, rc/trap observed, no false trap on the corpus (all 39 benchmark workloads
 must pass with `-fsanitize-trap=undefined`).
 
-**MB-07d `-fwrapv`/`-fno-strict-overflow` soundness** (A14-16 tail in
-[`engineering/archive/BACKLOG-2026-10-16.md`](engineering/archive/BACKLOG-2026-10-16.md)):
-the archived reproducer (`p[i*4]` with `i` starting at 2^30 faulting at -O1/-O2)
-must be re-run first; it is the only known case of an accepted flag whose
-semantics the optimiser violates.
+**MB-07d `-fno-strict-overflow` pointer half** (A14-16 tail). The archived
+reproducer was **re-run on 2026-10-31 and no longer reproduces**:
+`engineering/evidence/pr824-review/accepted-wrap-product.c` (`p[i * 4]` with `i`
+from 2^30) exits 0 with the expected answer at `-O0`, `-O1`, `-O2` and `-O3`
+under `-fwrapv` and under `-fno-strict-overflow`, byte-for-byte with GCC 16.2 —
+the `-11` that
+[`accepted-wrap-product-open.json`](engineering/evidence/pr824-review/accepted-wrap-product-open.json)
+recorded is gone. It is now a running leg of
+`tests/regression/check_iabs_cmp_fold.sh`, so a regression fails a gate instead
+of waiting for a backlog review. What remains open is the *other* half of the
+umbrella: `-fno-strict-overflow` also requests pointer-overflow semantics
+(GCC documents `-fno-strict-overflow` as implying `-fwrapv` **and** disabling
+pointer-overflow UB), and no pointer-overflow assumption is established or
+audited here. That is why the flag still warns once per translation unit and
+why `LCCC_STRICT_OPTIONS=1` refuses it; closing this item means auditing every
+pointer comparison and pointer-plus-offset fold against `-fno-strict-overflow`
+and then dropping the warning. `-fstrict-overflow` is not part of the item: it
+asks for an assumption this compiler never makes, so normal mode accepts it
+silently and only strict mode refuses it (see
+[`docs/builtin-libcall-policy.md`](docs/builtin-libcall-policy.md)).
 
 **MB-07e `-ftls-model=`, `-fzero-call-used-regs=`, `-ftrivial-auto-var-init=zero|pattern`.**
 `-ftls-model` is cheap (select GD/LD/IE/LE per variable; the i686 linker already

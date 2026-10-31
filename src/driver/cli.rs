@@ -42,8 +42,12 @@
 //! mode's diagnostic is therefore not a safety guarantee. The signed part of
 //! `-fno-strict-overflow` is implemented, while its pointer semantics remain
 //! unaudited and explicitly diagnosed; strict mode rejects that partial
-//! implementation as well as unknown flags. `scripts/lccc_capability_probe.py`
-//! uses strict mode for capability checks.
+//! implementation as well as unknown flags. Its positive counterpart
+//! `-fstrict-overflow` grants an assumption this compiler never exploits, so
+//! normal mode accepts it silently (there is nothing unmet to report) and only
+//! strict mode refuses it -- "no such optimisation exists" is not
+//! "the optimisation is implemented".
+//! `scripts/lccc_capability_probe.py` uses strict mode for capability checks.
 //!
 //! Escalation is spelled with the `LCCC_STRICT_` prefix already established by
 //! `LCCC_STRICT_MFLAGS` below.
@@ -3128,24 +3132,46 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 "-ftrapping-math" => self.fp_trapping_math = true,
                 "-fno-trapping-math" => self.fp_trapping_math = false,
                 // GCC's umbrella also changes pointer-overflow assumptions.
-                // Honour the signed-arithmetic part now, but do not claim the
-                // pointer part is implemented: a strict capability probe must
-                // still fail and ordinary builds receive a specific warning.
-                arg @ ("-fno-strict-overflow" | "-fstrict-overflow") => {
+                //
+                // `-fno-strict-overflow` asks for signed wraparound, which is
+                // honoured (`wrap_signed_overflow`), and for pointer-overflow
+                // semantics this compiler does not establish. Half of the
+                // request is therefore unmet, so normal builds get one warning
+                // and strict mode refuses it: a capability probe must not read
+                // a partial implementation as a full one.
+                //
+                // `-fstrict-overflow` asks for the *opposite* -- permission to
+                // assume signed overflow never happens. Nothing here exploits
+                // that assumption, so the request is already satisfied in the
+                // only direction that can change an answer (this compiler is
+                // strictly more conservative than the flag allows). Warning
+                // about it on every translation unit would be noise without a
+                // consequence to warn about, so normal mode accepts it
+                // silently; strict mode still refuses it, because "no such
+                // optimisation exists" is not "the optimisation is implemented".
+                "-fno-strict-overflow" => {
                     if strict_options {
-                        return Err(format!(
-                            "'{arg}' is only partially implemented: pointer-overflow semantics are not established; LCCC_STRICT_OPTIONS is set"
-                        ));
+                        return Err("'-fno-strict-overflow' is only partially implemented: \
+                             pointer-overflow semantics are not established; \
+                             LCCC_STRICT_OPTIONS is set"
+                            .to_string());
                     }
-                    if arg == "-fno-strict-overflow" {
-                        self.wrap_signed_overflow = true;
-                        self.trapv = false;
-                    } else {
-                        self.wrap_signed_overflow = false;
-                    }
-                    if unknown_options.insert(arg.to_string()) {
+                    self.wrap_signed_overflow = true;
+                    self.trapv = false;
+                    if unknown_options.insert("-fno-strict-overflow".to_string()) {
                         eprintln!(
-                            "warning: '{arg}' implements signed-overflow policy only; pointer-overflow semantics are not established; set LCCC_STRICT_OPTIONS=1 to make this an error"
+                            "warning: '-fno-strict-overflow' implements signed-overflow policy only; pointer-overflow semantics are not established; set LCCC_STRICT_OPTIONS=1 to make this an error"
+                        );
+                    }
+                }
+                "-fstrict-overflow" => {
+                    self.wrap_signed_overflow = false;
+                    if strict_options {
+                        return Err(
+                            "'-fstrict-overflow' asks for signed-overflow assumptions this \
+                             compiler never makes, so there is no implementation to enable; \
+                             LCCC_STRICT_OPTIONS is set"
+                                .to_string(),
                         );
                     }
                 }

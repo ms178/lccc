@@ -182,6 +182,20 @@ printf '#define UTS_VERSION "#1 SMP PREEMPT_DYNAMIC kconfigless"\n' \
     > "$K/include/generated/utsversion.h"
 
 # ---- boot stubs (SIZE-independent; see header comment) ----------------------
+# Scope: these two headers are stubs for a *kconfigless* staging tree, never for
+# a tree whose Kbuild generated real offsets. Writing them unconditionally meant
+# a workdir shared with a real build had its `setup_size.o`-derived offsets
+# replaced by zeros, and the boot image placed its sections at the wrong
+# addresses -- a silent, architecture-wide misplacement that the boot gate would
+# have attributed to codegen. The staging marker records that this workdir was
+# staged here, so re-runs stay idempotent while a foreign tree is refused.
+marker="$WORK/.lccc-kconfigless-stage"
+if [ ! -e "$marker" ] && [ -e "$K/arch/x86/boot/zoffset.h" ]; then
+    echo "boot_kconfigless_stage: $K already has generated boot offsets and was not staged here;" >&2
+    echo "  refusing to replace them with stubs (use a fresh workdir for a kconfigless build)" >&2
+    exit 1
+fi
+: > "$marker"
 printf '/* stub: header.S uses no voffset symbol */\n' > "$K/arch/x86/boot/voffset.h"
 {
     printf '/* stub: SIZE independent of ZO_* (immediates) */\n'

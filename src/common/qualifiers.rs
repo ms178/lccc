@@ -166,10 +166,9 @@ pub fn expr_const_base(expr: &Expr, lookup: &impl ConstLookup) -> bool {
                     && !lookup.is_pointer(base)
                     && expr_const_base(base, lookup))
         }
-        Expr::StmtExpr(compound, _) => match compound.syntactic_last_item() {
-            Some(BlockItem::Statement(Stmt::Expr(Some(last)))) => expr_const_base(last, lookup),
-            _ => false,
-        },
+        Expr::StmtExpr(compound, _) => compound
+            .value_expr()
+            .is_some_and(|last| expr_const_base(last, lookup)),
         Expr::FunctionCall(callee, _, _) => lookup.call_const_base(callee).unwrap_or(false),
         _ => false,
     }
@@ -209,10 +208,9 @@ fn expr_const_recorded(expr: &Expr, lookup: &impl ConstLookup) -> bool {
         Expr::GenericSelection(controlling, associations, _) => lookup
             .select_generic(controlling, associations)
             .is_some_and(|selected| expr_const_recorded(selected, lookup)),
-        Expr::StmtExpr(compound, _) => match compound.syntactic_last_item() {
-            Some(BlockItem::Statement(Stmt::Expr(Some(last)))) => expr_const_recorded(last, lookup),
-            _ => false,
-        },
+        Expr::StmtExpr(compound, _) => compound
+            .value_expr()
+            .is_some_and(|last| expr_const_recorded(last, lookup)),
         Expr::FunctionCall(callee, _, _) => lookup.call_const_base(callee).is_some(),
         _ => false,
     }

@@ -50,4 +50,24 @@ case_one if-zero-still-warns error 'int f(void){if(0)return 1/0;return 1;}'
 case_one gnu-live error 'int f(void){return 0 ?: 1/0;}'
 case_one nested-live error 'int f(void){return (1/0)?1:1/0;}'
 case_one floating-condition error 'int f(void){return 1.0?1:1/0;}'
+# GCC folds a constant operand of `&&`/`||` on EITHER side, and folds through
+# `!`, integer casts and conditionals, so the divisor's *value* decides the
+# warning rather than its constant-expression status (measured on 16.2: Clang
+# 23.1.4 folds only the left operand, which is why LCCC used to miss these).
+case_one and-right-zero error 'int f(int x){return x/(x && 0);}'
+case_one and-chain-zero error 'int f(int x){return x/(0 && x && x);}'
+case_one and-nested-zero error 'int f(int x){return x/((x && 0) && 0);}'
+case_one or-of-zeros error 'int f(int x){return x/((x && 0) || (1 && 0));}'
+case_one not-and-zero error 'int f(int x){return x/(!x && 0);}'
+case_one cast-of-and-zero error 'int f(int x){return x/((int)(0 && x));}'
+case_one all-zero-or error 'int f(int x){return x/((0 || 0) && x);}'
+case_one gnu-conditional-zero error 'int f(int x){return x/(0 ?: (0 && x));}'
+case_one folded-conditional-zero error 'int f(int x){return x/((1 || x) ? 0 : x);}'
+case_one and-true-silent ok 'int f(int x){return x/(x && 1);}'
+case_one or-unknown-silent ok 'int f(int x){return x/(x || 0);}'
+case_one or-true-silent ok 'int f(int x){return x/(x || 1);}'
+case_one or-chain-silent ok 'int f(int x){return x/(0 || 0 || x);}'
+case_one and-plus-one-silent ok 'int f(int x){return x/((0 && x) + 1);}'
+case_one cond-unknown-arms-silent ok 'int f(int x){return x/(1 ? x : 0);}'
+
 echo 'div-zero constant arms: PASS (GCC differential, 32/64-bit)'

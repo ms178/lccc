@@ -12816,7 +12816,7 @@ def _kernel_no_warn_rwx_test(args, _oracles):
     cc = os.path.abspath(args.lccc)
     ld = os.path.join(os.path.dirname(cc), "lccc-ld")
     env = {**os.environ, "LCCC": cc, "LCCC_LD": ld}
-    script = os.path.join(REPO, "tests/regression/check_ld_no_warn_rwx.sh")
+    script = os.path.join(REPO, "tests/regression/ld_no_warn_rwx_fixture.sh")
     result = subprocess.run(["bash", script], env=env, capture_output=True, text=True)
     detail = (result.stdout + result.stderr)[-1000:]
     return Result(name, "PASS" if result.returncode == 0 else "FAIL", detail)

@@ -9,7 +9,13 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 CCC=${CCC:-"$root/target/fastbuild/lccc"}
-CC=${CC:-gcc}
+# Pin the reference: the fixture relies on C23 enumerator typing
+# (`WB = 0x80000000u` is `unsigned int`), which GCC 13 and later implement, so a
+# developer box whose `gcc` is older would report a false LCCC failure. Hosted CI
+# symlinks gcc-16 to `gcc`, so the fallback is what old local images get.
+if [ -z "${CC:-}" ]; then
+    if command -v gcc-16 >/dev/null 2>&1; then CC=gcc-16; else CC=gcc; fi
+fi
 [[ -x "$CCC" ]] || { echo "missing LCCC compiler: $CCC" >&2; exit 1; }
 command -v "$CC" >/dev/null 2>&1 || { echo "missing C oracle: $CC" >&2; exit 1; }
 work=$(mktemp -d)
