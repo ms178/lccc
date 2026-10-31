@@ -353,15 +353,21 @@ impl<'p> Tracker<'p> {
                         let new_end = self
                             .base(last)
                             .checked_add(self.size_now[last].unwrap_or(self.p.size[last]))
-                            .ok_or_else(|| "RISC-V relaxation: RX section end overflows u64".to_owned())?;
+                            .ok_or_else(|| {
+                                "RISC-V relaxation: RX section end overflows u64".to_owned()
+                            })?;
                         let old_end = self.p.vaddr[last]
                             .checked_add(self.p.size[last])
-                            .ok_or_else(|| "RISC-V relaxation: original RX section end overflows u64".to_owned())?;
+                            .ok_or_else(|| {
+                                "RISC-V relaxation: original RX section end overflows u64"
+                                    .to_owned()
+                            })?;
                         let new_page = align_up(new_end, PAGE).ok_or_else(|| {
                             "RISC-V relaxation: page-aligned RX end overflows u64".to_owned()
                         })?;
                         let old_page = align_up(old_end, PAGE).ok_or_else(|| {
-                            "RISC-V relaxation: original page-aligned RX end overflows u64".to_owned()
+                            "RISC-V relaxation: original page-aligned RX end overflows u64"
+                                .to_owned()
                         })?;
                         i128::from(new_page) - i128::from(old_page)
                     } else {
@@ -542,15 +548,17 @@ fn trip(
                 .ok_or_else(|| format!("{}: input-section extent overflows u64", objs[o].0))?;
             prev_dot = align_up(prev_dot, align)
                 .and_then(|offset| offset.checked_add(size_prev))
-                .ok_or_else(|| format!("{}: previous input-section extent overflows u64", objs[o].0))?;
+                .ok_or_else(|| {
+                    format!("{}: previous input-section extent overflows u64", objs[o].0)
+                })?;
         }
         // Bytes after the last input (synthetic tails such as COMMON) keep
         // their size; only the input-backed part can have shrunk.
         let tail = p.size[m].saturating_sub(prev_dot);
-        tr.size_now[m] = Some(
-            dot.checked_add(tail)
-                .ok_or_else(|| "RISC-V relaxation: merged section size overflows u64".to_owned())?,
-        );
+        tr.size_now[m] =
+            Some(dot.checked_add(tail).ok_or_else(|| {
+                "RISC-V relaxation: merged section size overflows u64".to_owned()
+            })?);
     }
     Ok(again)
 }
