@@ -4855,6 +4855,46 @@ impl RmwWidth {
             Self::B => 'b',
         }
     }
+
+    /// The `MoveSize` carrying this width's register spelling.
+    fn move_size(self) -> MoveSize {
+        match self {
+            Self::Q => MoveSize::Q,
+            Self::L => MoveSize::L,
+            Self::W => MoveSize::W,
+            Self::B => MoveSize::B,
+        }
+    }
+
+    /// Operand width in bits, so two widths can be ordered.
+    fn bits(self) -> u16 {
+        match self {
+            Self::Q => 64,
+            Self::L => 32,
+            Self::W => 16,
+            Self::B => 8,
+        }
+    }
+}
+
+/// Split an `add`/`sub` mnemonic into its operation stem and its operand
+/// width (`addq` -> `("add", Q)`).  Only the two operations the fold re-emits
+/// are recognized, and the stem must be spelled out in full: `sub` on its own
+/// ends in `b`, so a bare suffix strip would read it as a byte operation.
+fn split_alu_width(mnemonic: &str) -> Option<(&str, RmwWidth)> {
+    for (suffix, width) in [
+        ('b', RmwWidth::B),
+        ('w', RmwWidth::W),
+        ('l', RmwWidth::L),
+        ('q', RmwWidth::Q),
+    ] {
+        if let Some(stem) = mnemonic.strip_suffix(suffix) {
+            if matches!(stem, "add" | "sub") {
+                return Some((stem, width));
+            }
+        }
+    }
+    None
 }
 
 /// Widths of a load mnemonic: `(memory width, register width)`.
@@ -4945,16 +4985,47 @@ fn parse_const_increment<'a>(
     let sp = t.find(' ')?;
     let (mnemonic, rest) = t.split_at(sp);
     let rest = rest.trim_start();
-    let op = match mnemonic.strip_suffix(width.mnemonic_suffix()) {
-        Some("add") => Some(IncOp::Add),
-        Some("sub") => Some(IncOp::Sub),
-        _ => None,
-    };
-    if let Some(op) = op {
+    // The increment may be spelled at ANY width that is not narrower than the
+    // load's register width.  The fused form only has to reproduce the value's
+    // LOW `mem_width` bits -- `add{b,w,l,q} $imm,MEM` wraps modulo the same
+    // power of two -- and an add at a wider width leaves those low bits
+    // identical (`(x + K) mod 2^w` does not depend on the width the addition
+    // ran at, for every `w` the narrow operation can see).  The backend really
+    // does emit the mixed spelling, because staging a narrow value into the
+    // 64-bit accumulator canonicalizes it there while the load stays 32-bit:
+    //
+    //     movzwl (%rdx), %eax
+    //     addq   $1, %rax        <- address width, load was `movzwl`
+    //     movw   %ax, (%rdx)
+    //
+    // A NARROWER increment is refused: its low bits would no longer be the sum
+    // the load's width implies once its own width drops below the store's.
+    if let Some((stem, inc_width)) = split_alu_width(mnemonic) {
+        let op = match stem {
+            "add" => IncOp::Add,
+            _ => IncOp::Sub,
+        };
         let (imm, dst) = split_two_operands(rest)?;
         let imm = imm.strip_prefix('$')?;
-        if dst != reg {
+        if inc_width.bits() < width.bits() {
             return None;
+        }
+        if inc_width == width {
+            // Same width: the destination is the loaded register, exactly as
+            // spelled by the load.
+            if dst != reg {
+                return None;
+            }
+        } else {
+            // Wider: the destination must be the SAME FAMILY's spelling at the
+            // increment's own width, and nothing else.
+            let fam = register_family_fast(reg);
+            if fam == REG_NONE || fam > REG_GP_MAX {
+                return None;
+            }
+            if dst != reg_id_to_name(fam, inc_width.move_size()) {
+                return None;
+            }
         }
         parse_plain_imm(imm)?;
         return Some((reg, imm, op));
@@ -5185,6 +5256,61 @@ mod rmw_increment_form_tests {
         ));
         assert!(changed, "{out:?}");
         assert_eq!(out[0], "subl $-2147483648, (%rdi)", "{out:?}");
+    }
+
+    /// Staging a narrow value into the 64-bit accumulator canonicalizes it
+    /// there, so a `uint16_t` counter is loaded at 32-bit width and incremented
+    /// at address width.  The fused `addw` reproduces the low 16 bits either
+    /// way, so the mixed spelling folds -- this is `g_c16[c]++` at `-O2`, and
+    /// refusing it here is what `check_rmw_sib_folds.sh` contract 2b catches.
+    #[test]
+    fn folds_wider_increment_than_the_load() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %rax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addw $1, (%rdx)", "{out:?}");
+    }
+
+    /// The same shape with the accumulator's own re-canonicalization in
+    /// between: one narrow copy of the value family is transparent.
+    #[test]
+    fn folds_wider_increment_behind_a_narrow_copy() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %rax\n    movzwl %ax, %eax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addw $1, (%rdx)", "{out:?}");
+    }
+
+    /// `sub` at address width folds as a `sub`, never as a negated `add`.
+    #[test]
+    fn folds_wider_sub_increment() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    subq $5, %rax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "subw $5, (%rdx)", "{out:?}");
+    }
+
+    /// A NARROWER increment is refused: once the addition runs at a width
+    /// below the store's, its low bits are no longer the sum the store needs.
+    #[test]
+    fn refuses_narrower_increment_than_the_load() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %eax\n    addb $1, %al\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// The wider increment must name the SAME family and that family's own
+    /// width spelling: `%r10` is not an increment of `%eax`.
+    #[test]
+    fn refuses_wider_increment_of_other_family() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %r10\n    movw %r10w, (%rdx)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
     }
 
     /// A `sub` of a register other than the loaded one is not an increment.
