@@ -1260,24 +1260,10 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 LineKind::Other { .. } => {
                     let rbp_off = infos[k].rbp_offset;
                     let line = infos[k].trimmed(store.get(k));
-                    // An `(%rbp)` operand is only a frame reference when %rbp IS
-                    // the frame pointer. Under -fomit-frame-pointer %rbp is an
-                    // ordinary data register, so `leal -1(%rbp), %eax` is an
-                    // address computation on a data value: it touches no frame
-                    // slot at all. The old prefix test only recognised the
-                    // 64-bit spelling, so the 32-bit `leal` fell through to the
-                    // generic rbp-offset arm, where `frame_read_extent` has no
-                    // LEA entry and bailed the whole function — a single
-                    // `leal -1(%rbp)` disabled never-read store elimination
-                    // everywhere (glibc_strstr kept two dead spill stores in
-                    // its hottest loop).
                     let lea = is_lea_instruction(line);
-                    // `(%rbp)` names a frame slot only when %rbp IS the frame
-                    // pointer. Under -fomit-frame-pointer it is a data register,
-                    // so a LEA on it computes an address from a data value and
-                    // touches no frame slot; any *other* instruction on a data
-                    // %rbp stays on the generic path below, unchanged.
-                    if lea && !rbp_is_frame && line.contains("%rbp") && !line.contains("%rsp") {
+                    // A LEA never reads memory, and on a data-register %rbp it
+                    // names an address derived from a data value: no frame slot.
+                    if lea && lea_on_data_register_rbp_touches_no_frame_slot(line, rbp_is_frame) {
                         continue;
                     }
                     if lea {
@@ -1721,6 +1707,21 @@ fn step_rsp_depth(
         return false;
     }
     true
+}
+
+/// True when `line` is a LEA whose `(%rbp)` operand names a DATA register, not
+/// the frame pointer, so it computes an address from a data value and touches
+/// no frame slot at all.
+///
+/// Under `-fomit-frame-pointer` %rbp is an ordinary register. The old prefix
+/// test only recognised the 64-bit spelling, so `leal -1(%rbp), %eax` fell
+/// through to the generic rbp-offset arm, where `frame_read_extent` has no LEA
+/// entry and bailed the whole function: one such line disabled never-read store
+/// elimination everywhere (glibc_strstr kept two dead spill stores in its
+/// hottest loop). Any *other* instruction on a data %rbp stays on the
+/// conservative generic path below, unchanged.
+fn lea_on_data_register_rbp_touches_no_frame_slot(line: &str, rbp_is_frame: bool) -> bool {
+    !rbp_is_frame && line.contains("%rbp") && !line.contains("%rsp") && is_lea_instruction(line)
 }
 
 /// True for an address-computing LEA in any width (`leaq`/`leal`/`leaw`/`lea`).
