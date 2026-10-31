@@ -441,6 +441,14 @@ pub(super) fn phys_reg_name_32(reg: PhysReg) -> &'static str {
     }
 }
 
+/// `%rax`: the accumulator, and the first register of the divide/remainder
+/// pair. Every 64-bit consumer that reads it reads the *whole* register, which
+/// is why narrow values are canonicalized when they are staged here.
+pub(super) const R_RAX: PhysReg = PhysReg(0);
+/// `%rcx`: the secondary staging register (`operand_to_rcx`) and the divisor of
+/// `divq`/`idivq`. Its home may equally hold only a 32-bit-canonical value.
+pub(super) const R_RCX: PhysReg = PhysReg(7);
+
 /// Get the typed register name for a PhysReg at a given IrType width.
 /// E.g., PhysReg(1)=rbx → for I32 returns "ebx", for I8 returns "bl".
 pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
@@ -3289,8 +3297,8 @@ impl X86Codegen {
             return;
         }
         let (reg, dest64, dest32) = match scratch {
-            "rax" => (PhysReg(0), "rax", "eax"),
-            "rcx" => (PhysReg(7), "rcx", "ecx"),
+            "rax" => (R_RAX, "rax", "eax"),
+            "rcx" => (R_RCX, "rcx", "ecx"),
             _ => return,
         };
         let source = typed_phys_reg_name(reg, ty);
@@ -3412,8 +3420,13 @@ impl X86Codegen {
                 // narrow integer values after the copy; a cached home can have
                 // only 8/16/32-bit canonical producer bits.
                 if self.state.sec_has_verified(v.0, is_alloca) {
-                    self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
-                    self.extend_narrow_scratch(v.0, "rax");
+                    // Narrow values are extended straight out of the cache
+                    // register (`movswq %cx, %rax`): one instruction instead of
+                    // "copy, then extend the copy", and the plain copy alone is
+                    // what made a 32-bit-canonical home reach 64-bit consumers.
+                    if !self.extend_narrow_home_to(v.0, R_RCX, "rax", "eax") {
+                        self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
+                    }
                     self.state.park_acc(v.0, is_alloca);
                     return;
                 }
@@ -4565,9 +4578,12 @@ impl X86Codegen {
                     || self.state.acc_has_verified(v.0, true)
                 {
                     // ACC-RESIDENT FIRST (exposed-forward fix): read the
-                    // %rax copy before touching the slot.
-                    self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
-                    self.extend_narrow_scratch(v.0, "rcx");
+                    // %rax copy before touching the slot. Narrow values are
+                    // extended directly out of %rax for the same reason as the
+                    // secondary-cache path above.
+                    if !self.extend_narrow_home_to(v.0, R_RAX, "rcx", "ecx") {
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                    }
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rcx");
                 } else {

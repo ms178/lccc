@@ -1,18 +1,57 @@
 name: GCC 17 C torture (x86)
 
+# Full gcc.c-torture/{execute,compile} campaign against a revision-pinned GCC
+# 17-git trunk checkout, for both x86 targets. Deliberately NOT part of the
+# pull-request critical path: a full corpus is minutes of wall clock, so it runs
+# manually, weekly, and on main-branch changes to the compiler or to the harness
+# that drives it -- the inputs whose breakage it can detect and a PR cannot
+# afford to wait for.
+#
+# Two EXPLICIT jobs rather than a `strategy.matrix`: scripts/check_ci_gate_parity.py
+# models a hosted workflow as a job DAG and rejects any job carrying a `strategy`
+# block, so a matrix here would permanently fail a mandatory fast gate on every
+# PR. Each job instead calls the one leg definition in `gcc17-torture-leg.yml`,
+# the same reusable-workflow convention ci.yml uses for bench.yml -- the legs
+# cannot drift, and the arch-specific values exist exactly once.
+
 on:
   workflow_dispatch:
+    inputs:
+      flags:
+        description: 'Comma-separated optimization configurations (default: -O2)'
+        required: false
+        default: '-O2'
+      filter:
+        description: 'Regular expression over test basenames (empty: whole corpus)'
+        required: false
+        default: ''
+      ref:
+        description: 'GCC trunk commit to pin (empty: resolve current master)'
+        required: false
+        default: ''
   schedule:
     - cron: '17 3 * * 1'
   push:
     branches: [main]
+    # Every input whose change can alter this lane's verdict. `tests/**` matters
+    # because the corpus runner and its contract tests live there; the
+    # provisioning scripts matter because a broken gcc-16 install surfaces here
+    # first. Without them a breakage lands on main unobserved until the next cron.
     paths:
       - 'src/**'
       - 'include/**'
+      - 'tests/**'
       - 'scripts/ci_gcc17_torture.sh'
       - 'scripts/ensure_gcc_torture_git.py'
       - 'scripts/x86_gcc_torture.py'
+      - 'scripts/x86_gcc_torture_i686.py'
+      - 'scripts/build_lccc_fast.sh'
+      - 'scripts/ci_install_gcc16.sh'
+      - 'scripts/ci_provision_toolchain.sh'
+      - 'scripts/ci_verify_oracles.sh'
+      - 'scripts/ci_enable_swap.sh'
       - '.github/workflows/gcc17-torture.yml'
+      - '.github/workflows/gcc17-torture-leg.yml'
 
 permissions:
   contents: read
@@ -76,64 +115,22 @@ jobs:
           if-no-files-found: error
           retention-days: 2
 
-  torture:
-    name: GCC 17 torture — ${{ matrix.arch }}
+  torture-x86_64:
+    name: GCC 17 torture — x86_64
     needs: [build]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86_64, i686]
-    env:
-      CARGO_BUILD_JOBS: '2'
-      GCC_TORTURE_JOBS: '2'
-      GCC_BIN: gcc-16
-      GCC_TORTURE_FLAGS: '-O2'
-      LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - name: Compute weekly apt cache epoch
-        id: apt-epoch
-        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
-      - name: Cache GCC package downloads
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/lccc-apt
-          key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
-          restore-keys: |
-            lccc-apt-debs-v1-${{ runner.os }}-
-      - name: Cache provisioned oracle toolchain
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/lccc-toolchain
-          key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
-      - name: Provision GCC 16 multilib and cached oracle toolchain
-        run: bash scripts/ci_provision_toolchain.sh --multilib
-      - name: Verify GCC 16 and i686 multilib
-        run: bash scripts/ci_verify_oracles.sh
-      - name: Download compiler artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: lccc-fast-${{ github.sha }}
-          path: target/fastbuild
-      - name: Verify compiler artifact identity
-        run: |
-          set -euo pipefail
-          test "$(cat target/fastbuild/ci-build.commit)" = "$(git rev-parse HEAD)"
-          sha256sum -c target/fastbuild/ci-build.sha256
-      - name: Run full GCC 17 compile + execute corpus at -O2
-        env:
-          GCC_TORTURE_RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ matrix.arch }}
-        run: bash scripts/ci_gcc17_torture.sh "${{ matrix.arch }}"
-      - name: Publish machine-readable reports and failures
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: gcc17-torture-${{ matrix.arch }}-${{ github.sha }}
-          path: ${{ runner.temp }}/gcc17-torture/${{ matrix.arch }}
-          if-no-files-found: warn
-          retention-days: 14
+    uses: ./.github/workflows/gcc17-torture-leg.yml
+    with:
+      arch: x86_64
+      flags: ${{ inputs.flags || '-O2' }}
+      filter: ${{ inputs.filter || '' }}
+      ref: ${{ inputs.ref || '' }}
+
+  torture-i686:
+    name: GCC 17 torture — i686
+    needs: [build]
+    uses: ./.github/workflows/gcc17-torture-leg.yml
+    with:
+      arch: i686
+      flags: ${{ inputs.flags || '-O2' }}
+      filter: ${{ inputs.filter || '' }}
+      ref: ${{ inputs.ref || '' }}

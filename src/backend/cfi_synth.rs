@@ -228,13 +228,175 @@ fn parse_insn(t: &str) -> Option<Insn<'_>> {
     })
 }
 
+/// The 64-bit general-purpose register `r` aliases, and how many bytes of it a
+/// write through that alias defines. `None` for anything the model cannot name
+/// exactly -- an 8- or 16-bit alias (a write through `%ax` keeps the upper bits
+/// of the previous value, so it does not define a constant at all), a vector or
+/// segment register, or a name that is not a register.
+///
+/// Aliases of one register are the same storage: `movl $imm, %eax` and
+/// `movq $imm, %rax` both leave a value in `%rax`, which is why the family, not
+/// the spelling, is what the stack-adjust relation compares.
+fn gpr_family(r: &str) -> Option<(&'static str, u8)> {
+    const LEGACY: [(&str, &str); 8] = [
+        ("rax", "eax"),
+        ("rcx", "ecx"),
+        ("rdx", "edx"),
+        ("rbx", "ebx"),
+        ("rsp", "esp"),
+        ("rbp", "ebp"),
+        ("rsi", "esi"),
+        ("rdi", "edi"),
+    ];
+    for &(full, short) in &LEGACY {
+        if r == full {
+            return Some((full, 8));
+        }
+        if r == short {
+            return Some((full, 4));
+        }
+    }
+    // %r8..%r31 and their 32-bit aliases (%r8d..%r31d). The extended set is
+    // spelled this way by the backend's own register tables (APX EGPRs
+    // included), so the same rule covers them.
+    const EXT: [&str; 24] = [
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "r16", "r17", "r18", "r19", "r20",
+        "r21", "r22", "r23", "r24", "r25", "r26", "r27", "r28", "r29", "r30", "r31",
+    ];
+    let (base, bytes) = match r.strip_suffix('d') {
+        Some(b) => (b, 4),
+        None => (r, 8),
+    };
+    EXT.iter()
+        .find(|&&name| name == base)
+        .map(|&name| (name, bytes))
+}
+
+/// The value a `mov $imm, %reg` leaves in that register, when `reg` is a plain
+/// GPR and the write defines the whole 64-bit value.
+///
+/// x86 has no `add/sub r64, imm64`: the encoding carries only a sign-extended
+/// imm32, so the backend materializes larger stack adjustments through a
+/// scratch register (`emit_stack_adjust_x86` in the x86 prologue). This is the
+/// only shape in the emitted stream where a stack-pointer delta lives in a
+/// register instead of an immediate.
+///
+/// The width of the destination is not cosmetic: a 64-bit `mov` writes the
+/// literal sign-extended, while a 32-bit `movl` **zero-extends** into the
+/// parent register -- `movl $-1, %eax` leaves `0x00000000FFFFFFFF` in `%rax`.
+/// Folding the two together would apply the wrong delta to `%sp`.
+fn mov_imm_into_gpr<'a>(insn: &Insn<'a>, arch: CfiArch) -> Option<(&'static str, i64)> {
+    if !matches!(insn.mnem, "mov" | "movq" | "movl" | "movabs" | "movabsq") {
+        return None;
+    }
+    let [src, dst] = insn.ops.as_slice() else {
+        return None;
+    };
+    let literal = parse_imm(src)?;
+    let name = dst.strip_prefix('%')?;
+    // A write to %sp/%fp is not a scratch materialization: those are the pointer
+    // updates the model either tracks directly or declares unknown. The check is
+    // family-wide (`%esp`/`%sp` included), not just the full-width spelling.
+    if writes_reg_family(dst, arch, arch.sp()) || writes_reg_family(dst, arch, arch.fp()) {
+        return None;
+    }
+    let (family, bytes) = gpr_family(name)?;
+    let value = if bytes == 8 {
+        literal
+    } else if bytes == 4 {
+        i64::from(literal as u32)
+    } else {
+        return None;
+    };
+    Some((family, value))
+}
+
+/// Resolve `mov $imm, %scratch` + `add/sub %scratch, %sp` into the constant the
+/// adjustment applies, per line: `out[k]` is `Some(imm)` when line `k` is the
+/// register-form stack adjustment and the IMMEDIATELY preceding instruction
+/// materialized that register.
+///
+/// Without this relation the pair is an "unmodelled stack pointer write": the
+/// model drops the `%sp` offset, the CFA goes opaque for the rest of the
+/// function, and functions with frames larger than signed imm32 -- exactly the
+/// ones the materialization makes compilable at all -- lose their unwind
+/// information.
+///
+/// The relation is deliberately LOCAL rather than a fact propagated through the
+/// label lattice: the constant must be written by the previous *instruction*,
+/// with only CFI directives (no machine effect) between the two, and never
+/// across a label -- a label is a branch target whose incoming state this pass
+/// derives from its own edges, so a value observed on the fallthrough path
+/// means nothing there. Every other shape keeps the pre-existing, honest
+/// "unknown" verdict instead of guessing at a value the stream does not pin.
+fn materialized_stack_adjustments(
+    body: &[&str],
+    ctx: &[LineCtx],
+    arch: CfiArch,
+) -> Vec<Option<i64>> {
+    let sp = arch.sp();
+    let sfx = arch.suffix();
+    let add = format!("add{}", sfx);
+    let sub = format!("sub{}", sfx);
+    let mut out = vec![None; body.len()];
+    // Register and constant written by the previous instruction, if any.
+    let mut prev: Option<(&'static str, i64)> = None;
+    for k in 0..body.len() {
+        let t = body[k].trim();
+        if !ctx[k].in_fn || ctx[k].app {
+            prev = None;
+            continue;
+        }
+        // A local label starts with '.' as well, so the branch-target test has to
+        // come FIRST: crossing a label would let a constant observed on the
+        // fallthrough path be applied to a block reached from elsewhere.
+        if t.ends_with(':') {
+            prev = None;
+            continue;
+        }
+        // Everything else with no machine effect keeps the relation: directives
+        // (`.loc`, `.cfi_*`, alignment, section markers -- under `-g` a `.loc`
+        // sits between the two instructions), comments, and blank lines.
+        if t.is_empty() || t.starts_with('.') || t.starts_with('#') {
+            continue;
+        }
+        let Some(insn) = parse_insn(t) else {
+            prev = None;
+            continue;
+        };
+        // Padding nops (alignment) do not touch the register either.
+        if insn.mnem.starts_with("nop") {
+            continue;
+        }
+        if let Some((family, value)) = prev {
+            let adjusts_sp = insn.ops.len() == 2
+                && (insn.mnem == add || insn.mnem == sub)
+                && is_reg(insn.ops[1], sp)
+                && insn.ops[0]
+                    .strip_prefix('%')
+                    .and_then(gpr_family)
+                    .is_some_and(|(f, _)| f == family);
+            if adjusts_sp {
+                out[k] = Some(value);
+            }
+        }
+        prev = mov_imm_into_gpr(&insn, arch);
+    }
+    out
+}
+
 /// Apply one instruction to the frame model. Returns the control-flow
 /// effect and, for direct branches, the target label.
+///
+/// `materialized` carries the constant of a preceding `mov $imm, %scratch` when
+/// this instruction is the register-form stack adjustment that consumes it (see
+/// [`materialized_stack_adjustments`]); it is `None` for every other line.
 fn step<'a>(
     f: &mut Frame,
     insn: &Insn<'a>,
     arch: CfiArch,
     call_pop: Option<i64>,
+    materialized: Option<i64>,
     unknown: &mut bool,
 ) -> (Flow, Option<&'a str>) {
     let slot = arch.slot();
@@ -324,7 +486,9 @@ fn step<'a>(
     if is_reg(dst, sp) && ops.len() == 2 {
         let src = ops[0];
         if m == add || m == sub {
-            if let Some(n) = parse_imm(src) {
+            // An immediate delta, or the constant a preceding `mov $imm, %reg`
+            // materialized into the register operand (frames past imm32).
+            if let Some(n) = parse_imm(src).or(materialized) {
                 bump(f, if m == sub { n } else { -n });
                 return (Flow::Next, None);
             }
@@ -1019,6 +1183,11 @@ fn synthesize_function<'b>(
         }
     }
     let call_pop = call_pops(body, &ctx, arch, name, pops, debug);
+    // Stack-pointer deltas materialized into a scratch register (frames past
+    // signed imm32), resolved per line by strict adjacency. Computed once: all
+    // three passes below must agree on it or they would derive different CFA
+    // rules for the same program point.
+    let materialized = materialized_stack_adjustments(body, &ctx, arch);
     let sfx = arch.suffix();
     let push_m = format!("push{}", sfx);
     let mov_m = format!("mov{}", sfx);
@@ -1048,7 +1217,14 @@ fn synthesize_function<'b>(
                 // Part of the prologue: stopping here would leave the
                 // frame allocation after it out of `body_state`.
                 clobbered.push(r);
-                let _ = step(&mut f, &insn, arch, call_pop[k], &mut unknown);
+                let _ = step(
+                    &mut f,
+                    &insn,
+                    arch,
+                    call_pop[k],
+                    materialized[k],
+                    &mut unknown,
+                );
                 body_state = f;
                 continue;
             }
@@ -1086,7 +1262,14 @@ fn synthesize_function<'b>(
                     }
                 }
             }
-            let _ = step(&mut f, &insn, arch, call_pop[k], &mut unknown);
+            let _ = step(
+                &mut f,
+                &insn,
+                arch,
+                call_pop[k],
+                materialized[k],
+                &mut unknown,
+            );
             body_state = f;
         }
     }
@@ -1158,7 +1341,14 @@ fn synthesize_function<'b>(
                     continue;
                 };
                 let mut unknown = false;
-                let (flow, target) = step(&mut f, &insn, arch, call_pop[k], &mut unknown);
+                let (flow, target) = step(
+                    &mut f,
+                    &insn,
+                    arch,
+                    call_pop[k],
+                    materialized[k],
+                    &mut unknown,
+                );
                 // `call .Llocal` (the inline retpoline) is a push and a
                 // jump: the target runs with one more slot on the stack.
                 let local_call = (insn.mnem == "call" || insn.mnem == format!("call{}", sfx))
@@ -1269,7 +1459,14 @@ fn synthesize_function<'b>(
             continue;
         };
         let mut unknown = false;
-        let (flow, _) = step(&mut f, &insn, arch, call_pop[k], &mut unknown);
+        let (flow, _) = step(
+            &mut f,
+            &insn,
+            arch,
+            call_pop[k],
+            materialized[k],
+            &mut unknown,
+        );
         if unknown && debug && !reported_unknown {
             eprintln!(
                 "lccc: cfi: {}: unmodelled stack pointer write `{}`",
@@ -1405,6 +1602,116 @@ mod tests {
             );
             assert!(!out.contains("offset 0\n"), "{ret}: {out}");
             assert!(!out.contains(".cfi_undefined"), "{ret}: {out}");
+        }
+    }
+
+    /// A stack adjustment past signed imm32 is materialized into a scratch GPR
+    /// (`movq $imm, %r11`; `subq %r11, %rsp`). Before that relation was
+    /// modelled the pair read as an unmodelled %sp write, so the CFA went
+    /// opaque for the remainder of every function large enough to need it --
+    /// precisely the functions the materialization exists to compile. The
+    /// exact offset must be described in both directions, and CFI directives
+    /// between the two instructions change nothing.
+    #[test]
+    fn materialized_stack_adjustment_keeps_the_cfa_exact() {
+        const BIG: i64 = 0x0100_0000_0000; // 1 TiB: imm32 cannot encode it
+        let out = synth(&format!(
+            "    movq ${BIG}, %r11\n    subq %r11, %rsp\n    movq ${BIG}, %r11\n    addq %r11, %rsp\n    ret\n"
+        ));
+        assert!(
+            out.contains(&format!(
+                "    movq ${BIG}, %r11\n    subq %r11, %rsp\n    .cfi_def_cfa_offset {}\n",
+                BIG + 8
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("    addq %r11, %rsp\n    .cfi_def_cfa_offset 8\n"),
+            "{out}"
+        );
+        assert!(!out.contains(".cfi_undefined"), "{out}");
+        // State-neutral lines between the two do not break the relation: a CFI
+        // directive describes the frame rather than changing it, a `.loc` sits
+        // there under `-g`, and an alignment nop touches nothing.
+        for filler in [
+            ".cfi_def_cfa_offset 120",
+            ".loc 1 23 1",
+            "nop",
+            "nopl (%rax)",
+        ] {
+            let out = synth(&format!(
+                "    movq ${BIG}, %r11\n    {filler}\n    subq %r11, %rsp\n    ret\n"
+            ));
+            assert!(
+                out.contains(&format!("    .cfi_def_cfa_offset {}\n", BIG + 8)),
+                "filler {filler:?}: {out}"
+            );
+        }
+    }
+
+    /// The relation is adjacency, not a guess: a label (a branch target whose
+    /// incoming state comes from its own edges), an intervening instruction,
+    /// a different register, or a non-immediate source must all keep the old
+    /// "unknown" verdict rather than inventing an offset.
+    #[test]
+    fn materialized_stack_adjustment_requires_adjacency() {
+        const BIG: i64 = 0x0100_0000_0000;
+        for body in [
+            // A label between the materialization and its use: the branch-target
+            // case, and the one a naive "ignore lines starting with '.'" rule
+            // gets wrong.
+            format!("    movq ${BIG}, %r11\n.Lk:\n    subq %r11, %rsp\n    ret\n"),
+            // An instruction that is not state-neutral between them.
+            format!("    movq ${BIG}, %r11\n    xchg %ax, %ax\n    subq %r11, %rsp\n    ret\n"),
+            // The constant is in a different register.
+            format!("    movq ${BIG}, %rax\n    subq %r11, %rsp\n    ret\n"),
+            // The register is overwritten before it is used.
+            format!("    movq ${BIG}, %r11\n    xorl %r11d, %r11d\n    subq %r11, %rsp\n    ret\n"),
+        ] {
+            let out = synth(&body);
+            assert!(
+                !out.contains(&format!("offset {}\n", BIG + 8)),
+                "invented an offset for {body:?}: {out}"
+            );
+        }
+    }
+
+    /// `materialized_stack_adjustments` is the relation every pass reads; unit
+    /// test its mapping directly, including the shapes it must refuse.
+    #[test]
+    fn materialized_stack_adjustment_map_is_adjacency_only() {
+        let body: Vec<&str> = vec![
+            "    movq $1099511627776, %r11",
+            "    .cfi_def_cfa_offset 16",
+            "    subq %r11, %rsp",
+            "    movl $256, %eax",
+            "    addq %rax, %rsp",
+            "    movq %rcx, %r11",
+            "    subq %r11, %rsp",
+            "    movq $8, %rsp",
+            "    subq %r11, %rsp",
+        ];
+        let ctx: Vec<LineCtx> = body
+            .iter()
+            .map(|_| LineCtx {
+                in_fn: true,
+                app: false,
+            })
+            .collect();
+        let got = materialized_stack_adjustments(&body, &ctx, CfiArch::X86_64);
+        assert_eq!(got[2], Some(0x0100_0000_0000), "{got:?}");
+        // `movl $256, %eax` writes a zero-extended 32-bit constant; the
+        // register form then applies exactly 256.
+        assert_eq!(got[4], Some(256), "{got:?}");
+        // `movq %rcx, %r11` carries an unknown value, not a constant.
+        assert_eq!(got[6], None, "{got:?}");
+        // `movq $8, %rsp` is a direct %sp write, never a scratch value.
+        assert_eq!(got[8], None, "{got:?}");
+        // Nothing else in the body is a register-form stack adjustment.
+        for (k, slot) in got.iter().enumerate() {
+            if k != 2 && k != 4 {
+                assert_eq!(*slot, None, "line {k}: {got:?}");
+            }
         }
     }
 

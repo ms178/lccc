@@ -5144,23 +5144,38 @@ mod incoming_byval_tests {
     }
 }
 
-/// Adjust `%rsp` by a positive compile-time byte count. x86's `add/sub r64,
-/// imm` encodings carry only a sign-extended imm32; large legal C frame sizes
-/// need a `movabs` into caller-saved `%r11` followed by the register form.
-/// Keep the common immediate form for small frames (shorter and one µop).
+/// Adjust `%rsp` by a positive compile-time byte count.
+///
+/// `add/sub r64, imm` encodes only a **sign-extended imm32**, so a legal large
+/// automatic object produces a frame delta that has no immediate encoding at
+/// all. Deltas that fit keep the one-µop immediate form; larger ones
+/// materialize the constant into caller-saved `%r11` (not allocated across this
+/// point, and dead on both sides of the pair) and use the register form.
+///
+/// `%r11` is not arbitrary: the materialization must not clobber a value the
+/// surrounding code still needs, and `%r11` is the scratch the ABI leaves free
+/// here. The `movq $imm, %r11` spelling is deliberate — `gas` folds it to
+/// `movabs` (`49 bb …`), and LCCC's own encoder (`encode_mov_imm_reg`) resolves
+/// all three ranges identically: sign-extended `C7 /0` for `[i32::MIN, i32::MAX]`,
+/// the *zero-extending* 32-bit `B8+rd` form (6 bytes, not 10) for
+/// `(i32::MAX, 2^32)`, and `B8+rd io` above that. Spelling it `movabsq` would
+/// forfeit the middle range's shorter encoding.
+///
+/// `cfi_synth` models this exact adjacency (`mov $imm, %reg` immediately
+/// followed by `add/sub %reg, %sp`), which is what keeps the synthesized CFA
+/// exact for the giant-frame functions this path exists for.
 fn emit_stack_adjust_x86(
     state: &mut crate::backend::state::CodegenState,
     mnemonic: &'static str,
     amount: i64,
 ) {
-    debug_assert!(matches!(mnemonic, "addq" | "subq"));
-    debug_assert!(amount > 0);
+    debug_assert!(
+        matches!(mnemonic, "addq" | "subq"),
+        "unexpected stack-adjust mnemonic {mnemonic}"
+    );
+    debug_assert!(amount > 0, "stack adjustment must be positive: {amount}");
     if i32::try_from(amount).is_ok() {
-        match mnemonic {
-            "addq" => state.out.emit_instr_imm_reg("    addq", amount, "rsp"),
-            "subq" => state.out.emit_instr_imm_reg("    subq", amount, "rsp"),
-            _ => unreachable!("validated stack-adjust mnemonic"),
-        }
+        state.out.emit_instr_imm_reg(mnemonic, amount, "rsp");
     } else {
         state.out.emit_instr_imm_reg("    movq", amount, "r11");
         state.emit_fmt(format_args!("    {mnemonic} %r11, %rsp"));

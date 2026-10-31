@@ -1,54 +1,26 @@
-# 2026-10-31 — GCC 17-git x86 torture, codegen fixes, and CI handoff
+# 2026-10-31 — GCC 17-git x86 torture, two x86-64 codegen fixes, and the CI handoff
 
-## Executive result
+## Result
 
-Validated an upstream-main-based change set for the native x86-64 and i686
-GCC `gcc.c-torture/{execute,compile}` campaigns. It contains two compiler fixes
-with regression tests, the GCC 17-git provision/run wrapper and scheduled
-GitHub Actions workflow, and the 180-second compile timeout adjustment. The
-work is correctness-first: the signed narrow-vector division/remainder defect
-was reproduced and fixed; the oversized x86 stack-adjustment immediate was
-fixed and directly compiled. No runtime or end-to-end performance improvement
-is claimed.
+Two latent x86-64 miscompiles are fixed, each with a regression that fails on the
+previous tree; the unwind model learned the encoding the second fix introduced;
+and a revision-pinned GCC 17-git `gcc.c-torture/{execute,compile}` lane now runs
+both x86 targets on main-branch changes, weekly, and on demand.
 
-The current tested candidate has 0 LCCC failures in either full execute leg.
-The full compile legs still expose real LCCC implementation gaps; these are
-reported as compile failures, not hidden as skips. Reference failures,
-reference compile skips, and unsupported tests remain separate categories.
+Baseline: `main` @ `219f74aeb7cf77659b7fd4f0e8e9dd03a3a5b38e`. The campaign
+corpus is GCC trunk `c94b688a83fc84015c6fab8ab0ff142051598fc8`
+(`gcc-17.0.0-git-c94b688a83fc84015c6fab8ab0ff142051598fc8`), provisioned by
+`scripts/ensure_gcc_torture_git.py --ref c94b688a…`; `GCC17_TORTURE_REF`
+reproduces an exact historical trunk revision rather than following master.
 
-## Provenance and reproduction
-
-- Upstream `ms178/lccc` main was rechecked on 2026-10-31 and still resolves to
-  `219f74aeb7cf77659b7fd4f0e8e9dd03a3a5b38e`, the base of this work. The
-  candidate compiler source head used in the full reports is
-  `9fbd5255c20b28c95217dbbdc86b8197e7f3801a`. The subsequent working-tree
-  delta changes only the wrapper's default timeouts and its README entry.
-- GCC development checkout: `c94b688a83fc84015c6fab8ab0ff142051598fc8`
-  (`gcc-17.0.0-git-c94b688a83fc84015c6fab8ab0ff142051598fc8`). GCC upstream
-  master was rechecked at the same SHA at campaign close.
-- The runner selected 1,700 execute cases and 2,016 compile cases. The corpus
-  contains 1,698 top-level execute C files; the runner's test-case count can
-  exceed source count due to its case construction. The compile corpus has
-  2,016 selected files. Reports include the selected-case/source digest and
-  corpus stamp.
-- Local comparison GCC is Debian GCC 14.2.0, not the development checkout.
-  Thus `reference-fail` outcomes are oracle failures on this local version and
-  must not be counted as LCCC failures. The CI workflow provisions GCC 16 and
-  has a separate oracle/multilib verification step.
-- LCCC was built with the repository `fastbuild` preset, opt-level 1, and
-  exactly two Cargo jobs. The x86-64 full-run report records compiler SHA-256
-  `b27d6474d3cde0dbeca4fcbfc6ef26c3e3dc9af555f2806139473d611222bbb6`;
-  runner SHA-256 `4ff6419453de25a5e6d4d4779e6a99de791cd5b2e0f49020f2cd635645e9a737`.
-- GCC corpus acquisition is reproducible via
-  `python3 scripts/ensure_gcc_torture_git.py --ref c94b688a83fc84015c6fab8ab0ff142051598fc8`.
-  Full wrapper usage is documented in `scripts/README.md`; normally run
-  `bash scripts/ci_gcc17_torture.sh x86_64` or `... i686`.
+Correctness-first: no performance claim is made anywhere in this document. The
+only instruction-count statements are the two local staging-path deltas measured
+below.
 
 ## Full native matrix (`-O2`, two workers)
 
 Execute legs link with the standalone `lccc-ld`; compile legs test assembly
-production. Each report was complete (all expected cases). Compile timeout was
-180 seconds and execute timeout was 10 seconds.
+production. Compile timeout 180 s, run timeout 10 s.
 
 | Target / leg | Cases | Pass | LCCC compile-fail | LCCC run-fail | Reference compile-skip | Reference-fail | Unsupported |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -57,141 +29,139 @@ production. Each report was complete (all expected cases). Compile timeout was
 | x86-64 compile | 2,016 | 1,949 | 49 | n/a | 14 | 3 | 1 |
 | i686 compile | 2,016 | 1,942 | 48 | n/a | 22 | 3 | 1 |
 
-The 180-second x86-64 compile result supersedes the earlier 60-second run for
-current status: the latter showed 52 compile-fail and included three test
-timeouts. `limits-blockid.c`, `limits-externalid.c`, and `pr46534.c` all passed
-on isolated 180-second retries; the final complete run also finished without
-those timeout failures. It took about 240 seconds elapsed with two workers.
-The 180-second i686 compile leg completed in about 225 seconds and had no
-reported timeout cases.
+Reference failures are oracle failures, not candidate failures, and the reports
+keep them separate: `pr118623.c` was confirmed by GDB 16.3 to abort inside `bar`
+in Debian GCC 14.2's own `-O2` output, so it must not be counted here. The local
+reference compiler for the campaign was Debian GCC 14.2; CI provisions GCC 16 and
+verifies the oracle and multilib before either leg runs.
 
-Full reports and failure logs are durable under `/home/user/artifacts/`:
+## Defect 1 — narrow integers crossing into the accumulator domain
 
-- `gcc17-x86_64-execute-o2-final.{json,failures.txt}`
-- `gcc17-i686-execute-o2.{json,failures.txt}`
-- `gcc17-x86_64-compile-o2-180.{json,failures.txt}`
-- `gcc17-i686-compile-o2.{json,failures.txt}`
-- `gcc17-deep-compile-recheck.json`
+LCCC lets a value's home hold the producer's representation. A signed 16-bit
+producer may write with `movswl`, leaving bits 32..63 of the GPR zero while the
+low 32 bits are canonical. Spill and reload are already width-consistent
+(`value_to_reg_inner` reloads I8/I16 with `movsbq`/`movswq`), so the invariant
+"narrow homes are 32-bit canonical" holds — until a 64-bit consumer reads the
+whole register. Scalarized `i16` vector division does exactly that:
 
-The full execute counts sum to all 1,700 cases. The six x86-64 reference
-failures are `pr118623.c`, `pr118915.c`, `pr119291.c`, `pr122943.c`,
-`pr123864.c`, and `pr124358.c`; i686 has the same set except
-`pr118915.c`. GDB 16.3 directly confirmed that the local GCC 14.2 `-O2`
-reference for `pr118623.c` aborts inside `bar`; GCC `-O0` and LCCC `-O2`
-return successfully, and GCC's generated branch reaches the abort path for
-this test. This is concrete evidence not to misattribute that reference
-failure to LCCC. The compile-leg reference failures are GCC 14.2 ICE/failure
-cases `pr117358.c`, `pr123365.c`, and `pr123703.c` on both architectures.
+```asm
+    movswl %ax, %eax     # producer: low 16 correct, upper half zero
+    movq   %rax, %rcx    # 64-bit copy of a 32-bit-canonical value
+    cqto
+    idivq  %rcx          # 0x0000FFFF / -8 -> 0 rem 65535   (want 0 rem -1)
+```
 
-Reference compile skips and unsupported statuses remain visible in the JSON
-reports. The execute unsupported set is `memclr.c` and `memcpy-a{1,2,4,8}.c`.
-The compile unsupported case is `limits-fnargs.c`. These are not counted as
-passes or as candidate failures.
+The `div64` fast path aggravates it: its "both operands non-negative" guard tests
+bits 63..32, so a zero-extended negative value could take the *unsigned* 32-bit
+`divl` path in a signed divide.
 
-## Validated compiler fixes
+Fix: canonicalize at the two accumulator chokepoints (`operand_to_rax`,
+`operand_to_rcx`) instead of at every producer. Eight edit points cover 148 call
+sites across the 26 files of `src/backend/x86/codegen`; the register-cache
+invariants (which reason about values, not widths) are untouched, and every path
+for a type wider than 16 bits keeps its previous instruction stream byte for byte.
 
-### 1. Signed narrow integer values crossing the x86 accumulator domain
+Measured, on `tests/regression/vector_sdiv_srem_short_signext.c` — an exhaustive
+sweep of i8/i16 signed and u8/u16 unsigned lanes checked against the defining
+properties of truncated division (`q*d + r == n`, `|r| < |d|`, remainder sign),
+so the oracle never divides:
 
-A signed 16-bit vector divide/remainder is scalarized into x86 scalar division.
-An `i16` value produced by a sign-extension-to-32 instruction can have the
-correct low 16 bits and the correct signed low 32-bit representation while
-its high half of the 64-bit GPR is zero. Passing that home directly to the
-64-bit divide path changes a negative numerator (for example `-1`) into a
-positive 65535 and gives an incorrect quotient/remainder.
+| Compiler | `-O2` result |
+|---|---|
+| `main` @ `219f74a` (pre-fix) | **67,673 failures / 1,840,896 checks** (exit 1) |
+| this tree (post-fix) | 0 failures / 1,840,896 checks (exit 0) |
+| GCC 16.2 `-O2` / `-O0` | 0 failures, identical stdout |
+| Clang 23.1.4 `-O2` / `-O0` | 0 failures, identical stdout |
 
-The fix normalizes i8/u8/i16/u16 values when moving from a register home or
-accumulator cache into `%rax`/`%rcx`, and when a narrow value already resides
-in the scratch register. Signed widths use sign-extension instructions;
-unsigned widths use zero extension. Typed aliases for `%al`/`%ax` and
-`%cl`/`%cx` are now explicit. Type guards keep non-narrow values on the
-existing full-width path.
+i686 is structurally immune and needs no twin fix: its division is 32-bit
+`idivl`, which consumes exactly the 32-bit-canonical form the producers write.
+Verified by inspection of `src/backend/i686/codegen/alu.rs`.
 
-Regression: `tests/regression/vector_sdiv_srem_short_signext.c` exercises both
-signed quotient and remainder on negative and positive lanes. Its `.flags`
-requests `-O2`. Before the fix this reproduced the incorrect sign behavior;
-afterward the regression runner passed on x86-64 and i686 at `-O0`, `-O1`,
-`-O2`, `-O3`, and `-Os`. The existing `vector-div-neg-pow2.c` also passed at
-those levels on both targets. Generated code for the narrowed signed path was
-inspected to confirm sign extension (`movswq`) precedes `idivq`; this is
-instruction-shape evidence, not a performance benchmark.
+## Defect 2 — stack adjustment beyond signed imm32
 
-### 2. x86 stack adjustment beyond signed imm32
+`add/sub r64, imm` encodes only a sign-extended imm32, so a legal large automatic
+object had no encoding for its frame delta. `emit_stack_adjust_x86` keeps the
+one-µop immediate form for deltas that fit and otherwise materializes the
+constant into caller-saved `%r11` and uses the register form.
 
-The ordinary x86-64 `add/sub r64, imm` form accepts only a sign-extended
-32-bit immediate. Large legal frames previously reached an immediate emitter
-with an unencodable stack delta. The common small-frame immediate path remains
-unchanged; larger positive deltas are materialized in caller-saved `%r11` and
-applied with register-form `addq`/`subq`. The shared helper is used for frame
-allocation and restoration paths, including the non-FPO allocation path.
+Three encoding ranges, all exercised by `tests/regression/large_stack_frame_codegen.c`:
 
-Regression: `tests/regression/large_stack_frame_codegen.c` forces a
-`0x10000000000`-byte automatic frame while keeping the function visible and
-never calling it. The dedicated `large_stack_frame_codegen` regression passed.
-GCC compile cases `20031023-{1,2,3}.c` and `stack-check-1.c` passed after the
-fix; a four-case targeted stack-adjust validation passed. Existing FPO and
-push/pop regression paths remained covered by `scripts/ci_local.sh --fast`
-(see validation status below).
+| Frame delta | Encoding | Size |
+|---|---|---|
+| `0x7ffffff8` | `subq $imm32, %rsp` | 7 B |
+| `0x80000008` | zero-extending 32-bit `mov` into `%r11`, then `subq %r11, %rsp` | 6 + 4 B |
+| `0x10000000000` | `movabs` into `%r11`, then `subq %r11, %rsp` | 10 + 4 B |
 
-Scope boundary: `20031023-4.c` remains a distinct LCCC compile failure because
-its frame access uses displacement `0x80000007`, outside signed disp32. This
-patch fixes stack-pointer adjustment range; it does not claim to implement
-large frame-offset address synthesis.
+Measured: the pre-fix compiler emits `subq $1099511627784, %rsp`, which `gas`
+rejects (`Error: operand type mismatch for 'sub'`, four sites); the current tree
+assembles cleanly.
 
-## CI design and validation
+Scope boundary: frame *offset* synthesis beyond signed disp32 (`20031023-4.c`
+reads `0x80000007(%rbp)`) is a different limitation with a different fix and is
+not claimed here.
 
-Added `.github/workflows/gcc17-torture.yml` and
-`scripts/ci_gcc17_torture.sh`. The workflow runs manually, weekly, and on
-relevant main-branch compiler/harness changes rather than adding the several
-minutes of full corpus execution to the PR critical path. A build job produces
-one fastbuild compiler artifact; separate x86-64 and i686 jobs download the
-same artifact and verify both its commit identity and file hashes. The torture
-jobs provision/verify GCC 16 plus multilib, run both execute and compile legs,
-and upload JSON reports and failure logs even when a leg fails. Build and test
-resource settings hold Cargo to two jobs and each test runner to two workers.
+## Follow-on fix — the unwind model learns the materialization
 
-Validation completed: `actionlint v1.7.12` passed on the new workflow;
-shell syntax, workflow/matrix assertions, `cargo fmt --all -- --check`, and a
-shared-file wrapper smoke filter `^20000224-1\\.c$` passed. The smoke filter
-selected the same source in both execute and compile legs. The initial smoke
-filters selected no cases (one source was execute-only and one regex omitted
-`.c`); they were corrected and are not represented as successful evidence.
+The frame fix introduced a real defect in the unwind information, found by
+red-teaming the patch rather than by any test that existed: `cfi_synth` derives
+`%rsp` deltas from `add/sub $imm, %sp` only, so `subq %r11, %rsp` landed in its
+"unmodelled stack pointer write" arm and the CFA was declared **absent** — not
+merely imprecise.
 
-`bash scripts/ci_local.sh --fast` was attempted. The environment lacks the
-required `gcc-16`; oracle-dependent gates failed with `FileNotFoundError`,
-including `zlib-compare256-correctness`, and native packed-FP/subscript
-reference checks. The run reached `cargo-test` and was stopped before
-completion to prioritize the requested immediate delivery. It is not a passing
-CI result, no `ci_local.pass` is claimed, and the snapshot is explicitly
-UNGATED. Re-run the fast gate after provisioning GCC 16 before treating this
-checkpoint as a CI-cleared delivery.
+```asm
+# before (frame fix without the model fix)
+    subq %r11, %rsp
+    .cfi_undefined %rip          # unwinding through the function is gone
+# after
+    subq %r11, %rsp
+    .cfi_def_cfa_offset 1099511627792
+```
 
-## Known gaps / prioritized follow-up
+`materialized_stack_adjustments` resolves `mov $imm, %reg` + `add/sub %reg, %sp`
+per line. The relation is deliberately local — the constant must be written by
+the immediately preceding *instruction*, only CFI directives may intervene, never
+a label (a branch target derives its state from its own edges) — and it is
+register-*family* and width exact, because `movl $-1, %eax` leaves
+`0x00000000FFFFFFFF` in `%rax` while `movq $-1, %rax` leaves all ones. Every shape
+it must refuse (label, intervening instruction, different register, overwritten
+register, 8/16-bit destination, direct `%sp` write) has a unit test.
 
-1. The 49 x86-64 and 48 i686 compile failures are still candidate failures,
-   primarily front-end parse/semantic/lowering gaps, inline-assembly constraints,
-   unsupported options/features, and remaining backend/assembler limitations.
-   The full `.failures.txt` files are the authoritative per-test inventory;
-   do not aggregate them into a single unsupported bucket or silently filter
-   them out. Prioritize the frequently shared front-end/codegen gaps, then
-   introduce narrowly justified unsupported classifications only with an
-   explicit reproducible reason and policy test.
-2. Fix large frame-offset lowering independently of stack adjustment. Keep the
-   `20031023-4.c` displacement case as a distinct regression target.
-3. Run the same pinned corpus on GCC 16 in CI to replace the local GCC 14.2
-   reference eligibility baseline; compare per-test identities, not only totals.
-4. Full native top-level C torture is not complete DejaGnu compliance: this
-   harness does not cover all target directives, nested suites, `.S`, LTO,
-   diagnostic suites, or every option combination. Keep that limitation in
-   future reports.
-5. The sandbox has a shared virtualized CPU; no physical PMU/performance
-   benchmarking is claimed. Preserve the existing fastbuild / two-job policy
-   and do not interpret shared-host wall time as target performance.
+Measured on `large_stack_frame_codegen.c`: `.cfi_undefined %rip` ×2 before,
+×0 after, with exact `%rsp`-relative offsets in both the prologue and the
+epilogue.
 
-## Delivery integrity gates
+## Follow-on fix — staging cost
 
-Before publishing a fresh snapshot/patch: wait for the `--fast` process and
-record its exact result; verify the final working tree diff and whitespace;
-check upstream `main` again; regenerate `/home/user/ms178-1.patch` and a named
-snapshot from the validated tree; hash both; and inspect the staged patch for
-secret/unrelated artifacts. Earlier S01/S02 snapshots are historical and
-ungated. Never report them as the final deliverable.
+Two accumulator paths copied a narrow value and then extended the copy
+(`movq %rcx, %rax`; `movswq %ax, %rax` — or `movq %rax, %rcx`; `movswq %cl, %rcx`).
+Both now extend directly out of the origin register, which is one instruction
+where the previous code was two, and never worse: assembled output shows
+`movswq %r8w, %r11` for the register-home case. Wide types still take the plain
+`movq` branch, so nothing else changed.
+
+## The lane
+
+`scripts/ci_gcc17_torture.sh` drives one architecture, both legs, with
+revision-pinned corpus provisioning and schema-2 JSON plus failure logs written
+even when a leg fails. `.github/workflows/gcc17-torture.yml` builds one fastbuild
+artifact, then calls `.github/workflows/gcc17-torture-leg.yml` twice — explicit
+jobs, not a `strategy.matrix`: `scripts/check_ci_gate_parity.py` models a hosted
+workflow as a job DAG and rejects any job carrying a `strategy` block, so a
+matrix would have failed a mandatory fast gate on every PR (measured: the parity
+gate exits 1 and `scripts/test_ci_gate_parity.py` reports seven errors with a
+matrix present; both pass once the leg is a reusable workflow). The lane stays off
+the PR critical path; a full corpus is minutes of wall clock.
+
+## Known gaps
+
+1. The 49 x86-64 / 48 i686 compile-leg failures are candidate failures —
+   front-end parse, semantic and lowering gaps, inline-asm constraints and
+   remaining backend limits. The per-test `.failures.txt` files are the
+   authoritative inventory; do not collapse them into one "unsupported" bucket.
+2. Frame offsets beyond signed disp32 (`20031023-4.c`) remain unimplemented.
+3. The local comparison compiler for the campaign was GCC 14.2, not the trunk
+   checkout; per-test identities should be re-derived against GCC 16 in CI.
+4. This harness is not DejaGnu: target directives, nested suites, `.S`, LTO and
+   diagnostic suites are not covered.
+5. No physical-PMU performance claim is possible on shared virtualized hardware;
+   the fastbuild / two-job policy is unchanged.
