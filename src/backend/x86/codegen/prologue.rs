@@ -5144,33 +5144,13 @@ mod incoming_byval_tests {
     }
 }
 
-/// Adjust `%rsp` by a positive compile-time byte count.
-///
-/// `add/sub r64, imm` encodes only a **sign-extended imm32**, so a legal large
-/// automatic object produces a frame delta that has no immediate encoding at
-/// all. Deltas that fit keep the one-µop immediate form; larger ones
-/// materialize the constant into caller-saved `%r11` (not allocated across this
-/// point, and dead on both sides of the pair) and use the register form.
-///
-/// `%r11` is not arbitrary: the materialization must not clobber a value the
-/// surrounding code still needs, and `%r11` is the scratch the ABI leaves free
-/// here. The `movq $imm, %r11` spelling is deliberate — `gas` folds it to
-/// `movabs` (`49 bb …`), and LCCC's own encoder (`encode_mov_imm_reg`) resolves
-/// all three ranges identically: sign-extended `C7 /0` for `[i32::MIN, i32::MAX]`,
-/// the *zero-extending* 32-bit `B8+rd` form (6 bytes, not 10) for
-/// `(i32::MAX, 2^32)`, and `B8+rd io` above that. Spelling it `movabsq` would
-/// forfeit the middle range's shorter encoding.
-///
-/// `cfi_synth` models this exact adjacency (`mov $imm, %reg` immediately
-/// followed by `add/sub %reg, %sp`), which is what keeps the synthesized CFA
-/// exact for the giant-frame functions this path exists for.
-/// Direction of a stack-pointer adjustment, so the two legal spells cannot be
-/// confused with each other or with an unrelated mnemonic at a call site.
+/// Direction of a stack-pointer adjustment, so the two legal spellings cannot
+/// be confused with each other or with an unrelated mnemonic at a call site.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum StackAdjust {
-    /// `subq` — allocate frame space (prologue).
+    /// `subq` -- allocate frame space (prologue).
     Allocate,
-    /// `addq` — release frame space (epilogue).
+    /// `addq` -- release frame space (epilogue).
     Release,
 }
 
@@ -5183,9 +5163,9 @@ impl StackAdjust {
         }
     }
 
-    /// The register form. Spelled out rather than formatted: the register
-    /// operand is `%r11` in both directions and a single template keeps the
-    /// two shapes visibly identical to the CFI model that parses them.
+    /// The register form. Spelled out rather than formatted: the operand is
+    /// `%r11` in both directions, and one template keeps the two shapes
+    /// visibly identical to the CFI model that parses them.
     fn register_form(self) -> &'static str {
         match self {
             Self::Allocate => "    subq %r11, %rsp",
@@ -5193,7 +5173,8 @@ impl StackAdjust {
         }
     }
 
-    /// The CFI contract marker's payload sign.
+    /// The CFI contract marker's payload: the sign repeats the direction, so
+    /// the marker and the instruction cross-check each other.
     fn signed_amount(self, amount: i64) -> i64 {
         match self {
             Self::Allocate => amount,
@@ -5204,28 +5185,32 @@ impl StackAdjust {
 
 /// Adjust `%rsp` by `amount` (always positive; the direction is the enum).
 ///
-/// `addq/subq r64, imm` encodes a **sign-extended imm32** and nothing wider,
-/// so a frame delta above `i32::MAX` has no immediate encoding at all. The
-/// delta is then materialized into caller-saved `%r11` (dead at both
-/// adjustment points) and applied with the register form:
+/// `addq/subq r64, imm` encodes a **sign-extended imm32** and nothing wider, so
+/// a frame delta above `i32::MAX` has no immediate encoding at all. Deltas that
+/// fit keep the one-µop immediate form; larger ones materialize the constant
+/// into caller-saved `%r11` -- the scratch the ABI leaves free at both
+/// adjustment points -- and use the register form:
 ///
 /// ```text
 ///     movq $imm, %r11        # 6 bytes when zero-extendable, 10 above 2^32
 ///     subq %r11, %rsp        # 4 bytes
 /// ```
 ///
-/// `movq $imm, %r11` is the right spelling for BOTH assemblers: gas folds it
-/// to `movabs`, and LCCC's own encoder resolves all three ranges (sign-
-/// extended `C7 /0`, the zero-extending `B8+rd` form for `(i32::MAX, 2^32)`,
-/// and `B8+rd io` above that) — spelling it `movabsq` would forfeit the
-/// middle range's shorter encoding.
+/// `movq $imm, %r11` is the right spelling for BOTH assemblers: gas folds it to
+/// `movabs`, and LCCC's own encoder (`encode_mov_imm_reg`) resolves all three
+/// ranges identically -- sign-extended `C7 /0` for `[i32::MIN, i32::MAX]`, the
+/// *zero-extending* 32-bit `B8+rd` form (6 bytes, not 10) for
+/// `(i32::MAX, 2^32)`, and `B8+rd io` above that. Spelling it `movabsq` would
+/// forfeit the middle range's shorter encoding.
 ///
-/// The register form is invisible to `cfi_synth`'s immediate-delta rule, so
-/// the emitter states the delta for the unwind model rather than leaving it
-/// to be re-derived from the instruction stream: the `# LCCC_STACK_ADJUST`
-/// marker below is a contract between this function and
-/// `backend::cfi_synth::materialized_stack_adjustments`, which prefers it and
-/// falls back to the textual `mov`+`add/sub` relation when it is absent.
+/// The register form is invisible to `cfi_synth`'s immediate-delta rule, so the
+/// emitter STATES the delta instead of leaving it to be re-derived: the
+/// `# LCCC_STACK_ADJUST` marker below is a contract with
+/// `backend::cfi_synth::materialized_stack_adjustments`, which prefers the
+/// marker, falls back to the textual `mov` + `add/sub` relation, and refuses to
+/// describe the frame when the two disagree. That adjacency is also what keeps
+/// the synthesized CFA exact for the giant-frame functions this path exists
+/// for.
 fn emit_stack_adjust_x86(
     state: &mut crate::backend::state::CodegenState,
     direction: StackAdjust,
