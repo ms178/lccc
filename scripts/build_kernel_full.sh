@@ -62,30 +62,33 @@ else
   "$here/prepare_kernel_tree.sh" "$K"
 fi
 
-# ---- 2. LCCC-bootable configuration ----------------------------------------
-#   * Start from the x86_64 arch default (lean, bootable, fast on 2 cores).
-#   * Enable the package's CUSTOM scheduler functionality so the custom
-#     patches are exercised (not merely present in the tree).
-#   * Turn OFF the three LCCC back-end gaps:
-#       - FUNCTION_TRACER / -pg / __fentry__          (LCCC diagnoses -pg; no mcount)
-#       - STACKPROTECTOR (gs-based canary unsupported; LCCC refuses the -m flag)
-#       - OBJTOOL/ORC   (LCCC does not yet emit objtool-valid annotation sections)
-#     and select the frame-pointer unwinder that needs no objtool ORC data.
+# ---- 2. configuration: the package's own config, verbatim -------------------
+#   * PKGBUILD's prepare() does `cp ../config .config` for the package's full
+#     x86_64 configuration (CachyOS scheduler set, FUNCTION_TRACER/DYNAMIC_
+#     FTRACE, STACKPROTECTOR, OBJTOOL + UNWINDER_ORC, ...).  This script now
+#     does exactly that: the package config is the source of truth and it is
+#     copied unmodified (olddefconfig only absorbs symbols a newer tree adds).
+#     Earlier revisions of this script rebuilt a defconfig with the tracer,
+#     stack protector and ORC/objtool disabled as "documented prerequisites";
+#     those features are implemented now (LCCC emits `call __fentry__` under
+#     -pg -mfentry, byte-identical canary access under the kernel's exact
+#     -mstack-protector-guard-* spelling, and real objtool accepts and ORC-
+#     annotates LCCC objects), and disabling package features to make a build
+#     pass is not an acceptable trade.
 #   * olddefconfig absorbs NEW Kconfig symbols non-interactively (avoids the
 #     "Restart config..." prompt that otherwise stalls a headless build).
 cd "$K"
 if [[ $RECONFIG == 1 ]] || ! grep -q "^CONFIG_SCHED_BORE=y" .config; then
-  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" defconfig >/dev/null
-  ./scripts/config \
-    --enable CACHY \
-    --enable SCHED_BORE \
-    --enable SCHED_CACHE \
-    --enable SCHED_CLASS_EXT \
-    --disable STACKPROTECTOR --disable STACKPROTECTOR_STRONG \
-    --disable STACKPROTECTOR_PER_TASK \
-    --enable UNWINDER_FRAME_POINTER --disable UNWINDER_ORC \
-    --disable STACK_VALIDATION --disable OBJTOOL --disable OBJTOOL_WERROR \
-    --disable DEBUG_ENTRY --disable FUNCTION_TRACER --disable DYNAMIC_FTRACE
+  if [[ -n $PKGDIR && -r $PKGDIR/config ]]; then
+    cp -f "$PKGDIR/config" .config
+  else
+    make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" defconfig >/dev/null
+    ./scripts/config \
+      --enable CACHY \
+      --enable SCHED_BORE \
+      --enable SCHED_CACHE \
+      --enable SCHED_CLASS_EXT
+  fi
   make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" olddefconfig </dev/null >/dev/null
   make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" syncconfig </dev/null >/dev/null
   make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" prepare -j"$JOBS" >/dev/null

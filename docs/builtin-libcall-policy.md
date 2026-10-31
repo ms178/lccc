@@ -128,6 +128,23 @@ pair is how a capability probe gets a wrong answer:
   accepts it silently, because there is no unmet part to report; strict mode
   still refuses it, because "no such optimisation exists" is not "the
   optimisation is implemented".
+* `-fno-delete-null-pointer-checks` belongs to the *off-request* tier with
+  `-Wno-<unknown>`: it asks that a pointer never be treated as non-null merely
+  because it was dereferenced, and this compiler never derives null-check
+  facts from dereference UB in the first place — the state the flag requests
+  is already the state. It is accepted silently in normal **and** strict mode
+  (a warning would tell each kernel translation unit something false, and a
+  strict refusal would tell a capability probe the request is unmet when it is
+  met). The evidence is measured, not assumed: nine canonical shapes keep
+  their guards byte-identically with and without the flag at `-O2`/`-O3`,
+  GCC-default deletes guards that GCC-`-fno-delete` keeps (the fixture's
+  sensitivity check), and the positive `-fdelete-null-pointer-checks` spelling
+  — which asks to delete checks that nothing here will delete — stays on the
+  tolerated path and is refused by strict mode. All of it is pinned by
+  `tests/regression/check_nullptr_check_policy.sh`. If a
+  dereference-implies-nonnull fold is ever added, it must default off, be
+  gated on this flag, extend `scripts/check_no_ub_exploitation.py` in the same
+  change, and start setting a real driver policy bit from the flag's arm.
 
 The precondition behind both is checked, but the check is a **tripwire, not a
 proof**. `scripts/check_no_ub_exploitation.py` fails when one of an enumerated
