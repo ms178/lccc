@@ -1607,6 +1607,10 @@ pub(crate) fn run_passes(
     loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
     let self_recursion_clone = std::env::var("CCC_NO_SELF_RECURSION_CLONE").is_err();
     inline::set_self_recursion_clone_enabled(self_recursion_clone);
+    // Resolve this diagnostic toggle once per translation unit, alongside the
+    // other pass configuration, rather than rescanning the process environment
+    // during parameter remapping.
+    inline::set_paramref_debug_enabled(std::env::var_os("CCC_INLINE_PARAMREF_DEBUG").is_some());
     loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
     loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
     // Every remaining pass switch, resolved here for the same reason.  No pass
