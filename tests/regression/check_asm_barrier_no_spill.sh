@@ -182,6 +182,21 @@ else
                 note_fail "barrier loop is $lc_insns instructions, gcc-16 emits $gcc_insns"
             fi
         fi
+        # The barrier's memory operand must not keep an address alive: the
+        # accesses fold it into their addressing mode instead of re-deriving it
+        # with `leaq` every iteration.
+        leas=$(grep -cE '^[[:space:]]*lea' "$tmp/lc_body.s" || true)
+        if [ "${leas:-0}" -eq 0 ]; then
+            note_pass "the barrier loop derives no address of its own"
+        else
+            note_fail "the barrier loop keeps $leas lea address materialisation(s)"
+            sed 's/^/       /' "$tmp/lc_body.s"
+        fi
+        if grep -qE '^[[:space:]]*mov[zwb][[:space:]].*[(]%r[a-z0-9]+, *%r[a-z0-9]+' "$tmp/lc_body.s"; then
+            note_pass "the access uses a scaled indexed addressing mode"
+        else
+            note_fail "the access does not use an indexed addressing mode"
+        fi
     fi
 fi
 
@@ -217,6 +232,22 @@ if [ -s "$tmp/self_body.s" ] && [ "$(spill_stores "$tmp/self_body.s")" -eq 1 ] &
     note_pass "self-test: the checker recognises a spill pair"
 else
     note_fail "self-test: the checker misses a spill pair"
+fi
+cat >"$tmp/materialised.s" <<'EOF'
+.LBB2:
+    leaq (%r8, %r8), %r9
+    leaq (%rbx, %r9), %rcx
+    movzwl (%rcx), %edi
+    movw %di, (%rcx)
+    addq $1, %r8
+    cmpq %r11, %r8
+jb .LBB2
+EOF
+loop_body "$tmp/materialised.s" >"$tmp/mat_body.s"
+if [ -s "$tmp/mat_body.s" ] && [ "$(grep -cE '^[[:space:]]*lea' "$tmp/mat_body.s")" -eq 2 ]; then
+    note_pass "self-test: the checker recognises materialised addresses"
+else
+    note_fail "self-test: the checker misses materialised addresses"
 fi
 cat >"$tmp/clean.s" <<'EOF'
 .LBB2:
