@@ -93,7 +93,16 @@ batch stayed inside. They are the measured starting point for batch 6.
 The left shift drops the top `k` bits, the logical right shift returns zeros
 above them, so the pair keeps exactly the low `W-k` bits. `AShr` is not admitted
 (`(x << k) >>s k` sign-extends a low field), nor is `k == 0`, `k >= W`, a
-mismatched amount or a mismatched width. Only the consumer is rewritten: the
+mismatched amount or a mismatched width, nor a mask wider than 32 bits.
+
+That last guard is a measurement, not a guess. `(x << 1) >>u 1` on 64-bit needs
+`& 0x7fff_ffff_ffff_ffff`, which no supported target encodes as an immediate:
+LCCC emitted `movabsq $0x7fff…, %rax; andq %rax, %rdi` — four instructions and
+ten bytes of constant where the shift pair was four instructions and eight — and
+GCC emits `movq; btrq $63`, three. Counting instructions called it a tie; a sweep
+of all 3,016 test `.c` files found the case in `clang-c/C2y/n3369_3.c`. With the
+guard, only `k >= 32` folds at 64 bits, and that sweep drops to two differing
+files — the witness itself and `integer_order_networks.c`, both improvements. Only the consumer is rewritten: the
 shifts become dead and the ordinary dead-code pass removes them, so a live user
 of the left shift keeps its value.
 
@@ -142,7 +151,7 @@ index-preserving contract cannot insert. That is the first batch-6 item.
 | value differential: LCCC vs GCC 16.2 vs Clang 23.1.4 | identical on all probes and the sweep |
 | gate `check_llvm_batch5_scalar_sets.py` | PASS, 0.36 s, wired into `ci_local.sh`, `ci.yml` (shard b) and the lane plan |
 | gate against the pre-fold binary | **5 FAILs** (mechanism + oracle), so it is sensitive |
-| 40-file corpus instruction delta | 9,598 → 9,598 (**0**) — no regression, and the patterns are rare in the corpus |
+| 3,016-file test-corpus asm sweep vs the pre-fold binary | 2 files differ: the witness, and `integer_order_networks.c` (4 instructions → 2 on one network). No size or count regression anywhere. |
 | lane plan / shard partition / parity / workflow-shell | PASS (468 commands, backend-contracts 423.85 s / 423.86 s) |
 
 ## 5. What is not done

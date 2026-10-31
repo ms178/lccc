@@ -137,7 +137,13 @@ fn shl_lshr_mask_matches_boundaries_at_32_and_64() {
             s ^= s << 17;
             probes.push(s & full);
         }
-        for amount in [1u32, 2, bits / 2, bits - 2, bits - 1] {
+        // 64-bit widths admit only `k >= 32` (the mask must fit an immediate).
+        let amounts: &[u32] = if bits == 64 {
+            &[32, 33, 40, bits - 2, bits - 1]
+        } else {
+            &[1, 2, bits / 2, bits - 2, bits - 1]
+        };
+        for &amount in amounts {
             let (defs, inst) = shl_lshr_fixture(ty, amount as u64, None);
             let replacement = fold_shl_lshr_mask(&inst, &defs).expect("pair folds");
             assert!(
@@ -192,6 +198,15 @@ fn shl_lshr_mask_refuses_every_non_member() {
     assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
     let (defs, inst) = shl_lshr_fixture(IrType::U32, 40, None);
     assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+
+    // A mask wider than 32 bits needs a materialized constant on every
+    // supported target, which costs more than the pair it would replace.
+    let (defs, inst) = shl_lshr_fixture(IrType::U64, 1, None);
+    assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+    let (defs, inst) = shl_lshr_fixture(IrType::U64, 31, None);
+    assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+    let (defs, inst) = shl_lshr_fixture(IrType::U64, 32, None);
+    assert!(fold_shl_lshr_mask(&inst, &defs).is_some());
 
     // Mismatched amounts and mismatched widths are different operations.
     let (defs, inst) = shl_lshr_fixture(IrType::U32, 3, Some(4));

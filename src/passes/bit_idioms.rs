@@ -1497,6 +1497,17 @@ fn fold_shl_lshr_mask(inst: &Instruction, defs: &[Option<Instruction>]) -> Optio
     if amount == 0 || amount as usize >= bits {
         return None;
     }
+    // Only masks that fit an unsigned 32-bit immediate.  A wider mask has to be
+    // materialized: `(x << 1) >>u 1` on u64 became `movabsq $0x7fff…, %rax;
+    // andq %rax, %rdi`, four instructions and ten bytes of constant, where the
+    // shift pair was four instructions and eight bytes, and GCC emits
+    // `movq; btrq $63` — three.  Counting instructions alone called that a tie;
+    // the corpus sweep found it in clang-c/C2y/n3369_3.c.  The guard keeps the
+    // fold where every supported target has a one-instruction AND, and leaves
+    // wider masks to the backend, which can still choose the pair.
+    if bits - amount as usize > 32 {
+        return None;
+    }
     let Operand::Value(v) = peel_copies(*lhs, defs) else {
         return None;
     };
