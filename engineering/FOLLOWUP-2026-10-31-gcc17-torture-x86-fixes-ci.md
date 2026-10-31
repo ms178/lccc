@@ -126,9 +126,14 @@ register-*family* and width exact, because `movl $-1, %eax` leaves
 it must refuse (label, intervening instruction, different register, overwritten
 register, 8/16-bit destination, direct `%sp` write) has a unit test.
 
+`emit_stack_adjust_x86` also states the delta it applied (`# LCCC_STACK_ADJUST
+<±n>`) so the model has an authoritative source instead of only an inference: the
+marker is preferred, the textual `mov`+`add/sub` relation is the fallback, and a
+disagreement between the two is treated as unknown rather than described wrongly.
+
 Measured on `large_stack_frame_codegen.c`: `.cfi_undefined %rip` ×2 before,
 ×0 after, with exact `%rsp`-relative offsets in both the prologue and the
-epilogue.
+epilogue, and the CFA bytes now exact rather than truncated (above).
 
 ## Follow-on fix — staging cost
 
@@ -138,6 +143,53 @@ Both now extend directly out of the origin register, which is one instruction
 where the previous code was two, and never worse: assembled output shows
 `movswq %r8w, %r11` for the register-home case. Wide types still take the plain
 `movq` branch, so nothing else changed.
+
+## Follow-on fix — narrow divides run at 32-bit width
+
+A narrow value's canonical form is its 8/16-bit value extended to **32** bits, so
+both operands of a narrow divide already fit in `%eax`/`%ecx`. `emit_div_narrow`
+therefore uses the 32-bit divide:
+
+| Form | Sequence | SKL latency / throughput |
+|---|---|---|
+| before (all narrow widths) | `cqto; idivq %rcx` | 42 / 21 (signed), 36 / 21 (unsigned) |
+| after | `cltd; idivl %ecx` | 26 / 6, 22 / 6 |
+
+The quotient cannot trap: the dividend is bounded by the narrow width, so
+`INT32_MIN / -1` — the one `idiv` input that raises `#DE` independently of a zero
+divisor — is unreachable. The 32-bit divide leaves `%rax`/`%rdx` in the narrow
+type's canonical form (a 32-bit write zero-extends), which is exactly what every
+narrow consumer re-extends from, so no canonicalization instruction is added.
+Both the standalone and the fused div/rem-pair lowering take the new path.
+
+## Follow-on fix — the accumulator's canonical form is remembered, not re-derived
+
+Extending `%rax`/`%rcx` on every narrow staging is correct but redundant when the
+register already holds the value's full 64-bit form (an extending slot load, an
+extend emitted earlier, or a zero-extending load of an unsigned narrow value).
+`RegCache` now carries `acc_canonical64`/`sec_canonical64`, cleared by exactly the
+choke points every `%rax`/`%rcx` write already goes through (`set_acc`,
+`invalidate_acc`, `invalidate_all` — the same ones the debug epoch machinery
+enforces), and re-established only where the canonical form is known. A stale
+mark is therefore impossible: the mark names the value the cache says is in the
+register, and parking any value drops it.
+
+## Follow-on fix — large CFA offsets were truncated by the assembler
+
+The unwind model produced the right number and `gas` encoded it correctly, but
+LCCC's **own** assembler truncated it: `CfiDirective::DefCfaOffset(i32)` parsed
+`.cfi_def_cfa_offset 2147483664` through `i32`, which both wrapped the value to
+`-2147483632` and switched the opcode to `DW_CFA_def_cfa_offset_sf` (a *factored*
+operand, so an unwinder reads `rsp - 17179869056` instead of `rsp + 2147483664`).
+`lccc -c` is the default path, so every >2 GiB frame had a wrong unwind table even
+with the model fixed. Both `DefCfaOffset` and `Offset` now carry `i64`, and a unit
+test asserts the emitted bytes: `0x0e` followed by ULEB128 `90 80 80 80 08`, and
+no `0x13` anywhere in the section.
+
+Note for anyone verifying this by hand: `readelf --debug-dump=frames[-interp]`
+prints a CFA offset through 32 bits, so it shows `-2147483632` for a correct
+encoding of `2147483664`. Decode the bytes (`objdump -s -j .eh_frame`) instead;
+`tests/regression/check_narrow_int_codegen.py` does exactly that.
 
 ## The lane
 
@@ -151,6 +203,26 @@ matrix would have failed a mandatory fast gate on every PR (measured: the parity
 gate exits 1 and `scripts/test_ci_gate_parity.py` reports seven errors with a
 matrix present; both pass once the leg is a reusable workflow). The lane stays off
 the PR critical path; a full corpus is minutes of wall clock.
+
+## The gate that pins all of it
+
+`tests/regression/check_narrow_int_codegen.py` runs in the fast-contract shard
+beside `check_cfi_unwind.sh` and asserts, in the emitted text and in the
+`.eh_frame` bytes rather than in behaviour alone:
+
+1. narrow divides never emit `idivq`/`divq`/`cqto`, and signed narrow indices are
+   sign-extended (the fixture's index lanes are negative, where a zero-extending
+   copy reads the wrong element);
+2. the same narrow value staged twice is re-canonicalized at most once;
+3. `large_frame_probe_boundary.c` — a 12 KiB frame that crosses three probe pages,
+   calls out of the probed region and is called — runs at `-O0`, `-O2` and
+   `-O2 -fno-omit-frame-pointer`, and the probe loop is closed by the
+   register-form `subq %r11, %rsp`;
+4. both `>2 GiB` CFA offsets are present as `DW_CFA_def_cfa_offset` + the exact
+   ULEB128, never as the factored form;
+5. both fixtures are clean at `-O0`…`-Os` × {-g, no -g}, with the pinned program
+   outputs confirmed against `gcc` and `clang` first, so the expectations are an
+   oracle rather than a snapshot.
 
 ## Known gaps
 

@@ -328,7 +328,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 422.76,
+      "predicted_gate_seconds": 428.76,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -363,6 +363,10 @@
         {
           "measured_s": 3.0,
           "name": "bash tests/regression/check_cfi_unwind.sh"
+        },
+        {
+          "measured_s": 6.0,
+          "name": "python3 tests/regression/check_narrow_int_codegen.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23"
         },
         {
           "measured_s": 0.96,

@@ -2675,6 +2675,10 @@ jobs:
         # Same leg split: unwinding through lccc frames and lccc-ld outputs,
         # and the builtin linkers' -shared/-l/-rpath semantics.
         bash tests/regression/check_cfi_unwind.sh
+        # Narrow-integer staging/divide width, the executed probe-boundary
+        # frame, and the >2 GiB CFA offsets decoded from .eh_frame bytes
+        # (`readelf` truncates large CFA offsets when it PRINTS them).
+        python3 tests/regression/check_narrow_int_codegen.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23
         # The architectural implicit-operand table is the single source of
         # truth for every pass that reasons about registers an instruction
         # does not name; its fixture is reviewed independently of the code.

@@ -3296,13 +3296,50 @@ impl X86Codegen {
         if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
             return;
         }
-        let (reg, dest64, dest32) = match scratch {
-            "rax" => (R_RAX, "rax", "eax"),
-            "rcx" => (R_RCX, "rcx", "ecx"),
+        let (reg, dest64, dest32, already) = match scratch {
+            "rax" => (
+                R_RAX,
+                "rax",
+                "eax",
+                self.state.reg_cache.acc_is_canonical64(value_id),
+            ),
+            "rcx" => (
+                R_RCX,
+                "rcx",
+                "ecx",
+                self.state.reg_cache.sec_is_canonical64(value_id),
+            ),
             _ => return,
         };
+        // The scratch already holds the value's full 64-bit form (it was
+        // loaded by a width-extending slot load, produced by an extend this
+        // file emitted, or zero-extended by an unsigned narrow load).
+        // Re-extending it is a wasted µop in the hot narrow-store path, and
+        // it used to cost the memory-RMW fold its shape.
+        if already {
+            return;
+        }
         let source = typed_phys_reg_name(reg, ty);
         self.emit_narrow_integer_extend(ty, source, dest64, dest32);
+    }
+
+    /// Record that `%rax`/`%rcx` now holds the 64-bit canonical form of
+    /// `value_id`, so a later [`Self::extend_narrow_scratch`] can skip the
+    /// extend. Only narrow integer types are tracked; wide values never need
+    /// the marker.
+    fn note_narrow_canonical(&mut self, value_id: u32, in_acc: bool) {
+        let narrow = matches!(
+            self.value_types.get(&value_id).copied(),
+            Some(IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
+        );
+        if !narrow {
+            return;
+        }
+        if in_acc {
+            self.state.reg_cache.mark_acc_canonical64(value_id);
+        } else {
+            self.state.reg_cache.mark_sec_canonical64(value_id);
+        }
     }
 
     /// Extend a narrow integer directly from its assigned GPR home into a
@@ -3428,6 +3465,7 @@ impl X86Codegen {
                         self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
                     }
                     self.state.park_acc(v.0, is_alloca);
+                    self.note_narrow_canonical(v.0, true);
                     return;
                 }
                 // Check register allocation: load from assigned register
@@ -3444,9 +3482,15 @@ impl X86Codegen {
                             .emit_instr_reg_reg("    movq", reg_name, "rax");
                     }
                     self.state.park_acc(v.0, false);
+                    self.note_narrow_canonical(v.0, true);
                 } else if self.state.get_slot(v.0).is_some() {
+                    // A narrow slot load is width-consistent (`movsbq`/
+                    // `movswq` for signed, zero-extending `movzbl`/`movzwl`
+                    // for unsigned), so the accumulator ends up holding the
+                    // value's full 64-bit form.
                     self.value_to_reg(v, "rax");
                     self.state.park_acc(v.0, is_alloca);
+                    self.note_narrow_canonical(v.0, true);
                 } else {
                     // A rematerialisable GlobalAddr deliberately has no home:
                     // its address computation is omitted at the definition and
@@ -4598,6 +4642,7 @@ impl X86Codegen {
                 }
                 // Record what's now in %rcx
                 self.state.park_sec(v.0, is_alloca);
+                self.note_narrow_canonical(v.0, false);
             }
         }
     }

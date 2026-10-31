@@ -107,6 +107,27 @@ pub struct RegCache {
     /// Tracked so that operand_to_rax can use `movq %rcx, %rax` instead of
     /// a stack reload when the value was recently loaded to %rcx.
     pub sec: Option<RegCacheEntry>,
+    /// Which value's **64-bit canonical** form is currently in `%rax`.
+    ///
+    /// The backend's narrow-integer invariant guarantees only that an i8/i16
+    /// home holds the producer's 8/16-bit value extended to *32* bits (a
+    /// signed narrow producer may have written with `movswl`). Cross-coupling
+    /// such a value into the 64-bit accumulator therefore needs an extend —
+    /// `movswq %cx, %rax` — but only when the accumulator does not already
+    /// hold the canonical form: an extending slot load, an extend this file
+    /// emitted, or a zero-extending load of an unsigned narrow value all
+    /// leave the full 64-bit value in place, and re-extending it is a wasted
+    /// µop in the hot narrow-store path.
+    ///
+    /// Cleared by `set_acc`/`invalidate_acc`/`invalidate_all`, i.e. by the
+    /// same choke points the debug epoch machinery already forces every
+    /// `%rax` write through (`CodegenState::park_acc`, and see the epoch
+    /// documentation above). A stale marker is therefore impossible: the
+    /// marker names the value the cache says is in `%rax`, and any new value
+    /// parked there drops it.
+    pub acc_canonical64: Option<u32>,
+    /// The `%rcx` mirror of [`Self::acc_canonical64`].
+    pub sec_canonical64: Option<u32>,
     /// DEBUG-ONLY: the `AsmOutput` %rax shadow epoch at the moment `acc`
     /// was last (re)written. Every park on an epoch-enabled target
     /// (x86-64, i686 — see `AsmOutput::rax_epoch_active`) goes through
@@ -133,13 +154,17 @@ pub struct RegCache {
 }
 
 impl RegCache {
-    /// Record that the accumulator now holds the given value.
+    /// Record that the accumulator now holds the given value. The
+    /// 64-bit-canonical marker is dropped: the caller must re-establish it
+    /// with [`Self::mark_acc_canonical64`] when it knows the content is the
+    /// value's full 64-bit form.
     #[inline]
     pub fn set_acc(&mut self, value_id: u32, is_alloca: bool) {
         self.acc = Some(RegCacheEntry {
             value_id,
             is_alloca,
         });
+        self.acc_canonical64 = None;
     }
 
     /// Record that the secondary register now holds the given value.
@@ -149,6 +174,31 @@ impl RegCache {
             value_id,
             is_alloca,
         });
+        self.sec_canonical64 = None;
+    }
+
+    /// Record that `%rax` holds the 64-bit canonical form of `value_id`.
+    #[inline]
+    pub fn mark_acc_canonical64(&mut self, value_id: u32) {
+        self.acc_canonical64 = Some(value_id);
+    }
+
+    /// Record that `%rcx` holds the 64-bit canonical form of `value_id`.
+    #[inline]
+    pub fn mark_sec_canonical64(&mut self, value_id: u32) {
+        self.sec_canonical64 = Some(value_id);
+    }
+
+    /// True when `%rax` already holds the 64-bit canonical form of `value_id`.
+    #[inline]
+    pub fn acc_is_canonical64(&self, value_id: u32) -> bool {
+        self.acc_canonical64 == Some(value_id)
+    }
+
+    /// True when `%rcx` already holds the 64-bit canonical form of `value_id`.
+    #[inline]
+    pub fn sec_is_canonical64(&self, value_id: u32) -> bool {
+        self.sec_canonical64 == Some(value_id)
     }
 
     /// Check if the accumulator holds the given value (with matching alloca status).
@@ -175,12 +225,14 @@ impl RegCache {
     #[inline]
     pub fn invalidate_acc(&mut self) {
         self.acc = None;
+        self.acc_canonical64 = None;
     }
 
     /// Invalidate the secondary register cache.
     #[inline]
     pub fn invalidate_sec(&mut self) {
         self.sec = None;
+        self.sec_canonical64 = None;
     }
 
     /// Invalidate all cached register values. Called on operations that may
@@ -189,6 +241,8 @@ impl RegCache {
     pub fn invalidate_all(&mut self) {
         self.acc = None;
         self.sec = None;
+        self.acc_canonical64 = None;
+        self.sec_canonical64 = None;
     }
 }
 

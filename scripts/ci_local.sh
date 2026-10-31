@@ -1663,6 +1663,12 @@ gate "tls-dynamic-witness" fast \
 gate "cfi-unwind" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_cfi_unwind.sh
 
+# Narrow-integer staging and divide width, the executed probe-boundary frame,
+# and the >2 GiB CFA offsets decoded from .eh_frame bytes (`readelf` truncates
+# a large CFA offset when it PRINTS it, so the gate decodes the section).
+gate "narrow-int-codegen" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_narrow_int_codegen.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23
+
 # The builtin linkers against gcc's link semantics: -shared startup files and
 # default libraries, user -l before the defaults, -rpath, as-needed libm.
 gate "builtin-dso-link" fast \

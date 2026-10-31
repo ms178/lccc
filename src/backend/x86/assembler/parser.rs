@@ -232,9 +232,17 @@ pub enum DataValue {
 pub enum CfiDirective {
     StartProc,
     EndProc,
-    DefCfaOffset(i32),
+    /// `i64`, not `i32`: the CFA offset of a frame larger than signed imm32
+    /// is an ordinary positive number above 2^31 (`subq %r11,%rsp` spends the
+    /// immediate form, not the frame). Truncating it here does not fail --
+    /// it produces `DW_CFA_def_cfa_offset_sf` with a negative operand, i.e. an
+    /// unwind table that describes `rsp-2147483632` for a 2 GiB frame. GNU as
+    /// encodes the same directive as `DW_CFA_def_cfa_offset` + ULEB128.
+    DefCfaOffset(i64),
     DefCfaRegister(String),
-    Offset(String, i32),
+    /// `.cfi_offset` save-slot offsets: i64 for the same reason (a saved
+    /// register above a 2 GiB frame really is past `i32::MAX`).
+    Offset(String, i64),
     Other(String),
 }
 
@@ -1117,7 +1125,7 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             // Accept full constant expressions (e.g. "8*2", "N*8+N").
             let val =
                 parse_integer_expr(args.trim()).map_err(|_| format!("bad cfi offset: {}", args))?;
-            Ok(AsmItem::Cfi(CfiDirective::DefCfaOffset(val as i32)))
+            Ok(AsmItem::Cfi(CfiDirective::DefCfaOffset(val)))
         }
         ".cfi_def_cfa_register" => {
             let reg = args.trim().trim_start_matches('%').to_string();
@@ -1132,7 +1140,7 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let reg = parts[0].trim().trim_start_matches('%').to_string();
             let off = parse_integer_expr(parts[1].trim())
                 .map_err(|_| format!("bad cfi offset value: {}", args))?;
-            Ok(AsmItem::Cfi(CfiDirective::Offset(reg, off as i32)))
+            Ok(AsmItem::Cfi(CfiDirective::Offset(reg, off)))
         }
         ".file" => Ok(match crate::backend::elf::parse_file_directive(args)? {
             Some((number, filename)) => AsmItem::File(number, filename),

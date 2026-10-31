@@ -272,6 +272,10 @@ fn gpr_family(r: &str) -> Option<(&'static str, u8)> {
         .map(|&name| (name, bytes))
 }
 
+/// The contract marker `emit_stack_adjust_x86` writes in front of a
+/// register-form stack adjustment: `# LCCC_STACK_ADJUST <signed delta>`.
+const STACK_ADJUST_MARKER: &str = "# LCCC_STACK_ADJUST";
+
 /// The value a `mov $imm, %reg` leaves in that register, when `reg` is a plain
 /// GPR and the write defines the whole 64-bit value.
 ///
@@ -341,16 +345,33 @@ fn materialized_stack_adjustments(
     let mut out = vec![None; body.len()];
     // Register and constant written by the previous instruction, if any.
     let mut prev: Option<(&'static str, i64)> = None;
+    // Signed delta the EMITTER stated for the next register-form adjustment
+    // (`emit_stack_adjust_x86`'s `# LCCC_STACK_ADJUST` marker). Authoritative
+    // when present: the emitter knows the delta, the textual relation only
+    // infers it, so a future encoding change (a different scratch register, a
+    // two-instruction materialization) cannot silently cost the frame its
+    // unwind information.
+    let mut marker: Option<i64> = None;
     for k in 0..body.len() {
         let t = body[k].trim();
         if !ctx[k].in_fn || ctx[k].app {
             prev = None;
+            marker = None;
             continue;
         }
         // A local label starts with '.' as well, so the branch-target test has to
         // come FIRST: crossing a label would let a constant observed on the
         // fallthrough path be applied to a block reached from elsewhere.
         if t.ends_with(':') {
+            prev = None;
+            marker = None;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(STACK_ADJUST_MARKER) {
+            // `# LCCC_STACK_ADJUST <signed delta>`: the sign repeats the
+            // mnemonic's direction (negative for the epilogue's `addq`), so
+            // the marker and the instruction cross-check each other.
+            marker = rest.trim().parse::<i64>().ok();
             prev = None;
             continue;
         }
@@ -368,19 +389,44 @@ fn materialized_stack_adjustments(
         if insn.mnem.starts_with("nop") {
             continue;
         }
-        if let Some((family, value)) = prev {
-            let adjusts_sp = insn.ops.len() == 2
-                && (insn.mnem == add || insn.mnem == sub)
-                && is_reg(insn.ops[1], sp)
-                && insn.ops[0]
-                    .strip_prefix('%')
-                    .and_then(gpr_family)
-                    .is_some_and(|(f, _)| f == family);
-            if adjusts_sp {
-                out[k] = Some(value);
+        if insn.ops.len() == 2 && (insn.mnem == add || insn.mnem == sub) && is_reg(insn.ops[1], sp)
+        {
+            let register_source = insn.ops[0]
+                .strip_prefix('%')
+                .and_then(gpr_family)
+                .is_some_and(|(_, bytes)| bytes == 8);
+            if register_source {
+                let textual = prev
+                    .filter(|&(family, _)| {
+                        insn.ops[0]
+                            .strip_prefix('%')
+                            .and_then(gpr_family)
+                            .is_some_and(|(f, _)| f == family)
+                    })
+                    .map(|(_, value)| value);
+                let stated = marker.and_then(|signed| {
+                    // The marker's sign must agree with the mnemonic: `subq`
+                    // allocates (positive marker), `addq` releases (negative).
+                    ((insn.mnem == sub) == (signed > 0))
+                        .then(|| signed.checked_abs())
+                        .flatten()
+                });
+                out[k] = match (stated, textual) {
+                    // Both sources present and disagreeing means the stream is
+                    // not what either of them believes; refuse rather than
+                    // describe the frame wrongly.
+                    (Some(a), Some(b)) if a != b => None,
+                    (Some(a), _) => Some(a),
+                    (None, text) => text,
+                };
             }
         }
+        // The marker covers exactly one adjustment; an instruction that is not
+        // the materialization it describes ends its reach.
         prev = mov_imm_into_gpr(&insn, arch);
+        if prev.is_none() {
+            marker = None;
+        }
     }
     out
 }

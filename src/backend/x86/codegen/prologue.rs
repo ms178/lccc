@@ -3459,7 +3459,7 @@ impl X86Codegen {
             if use_push_pop {
                 let local_size = frame_size - num_saved * 8;
                 if local_size > 0 {
-                    emit_stack_adjust_x86(&mut self.state, "addq", local_size);
+                    emit_stack_adjust_x86(&mut self.state, StackAdjust::Release, local_size);
                 }
                 for &reg in used_regs.iter().rev() {
                     let reg_name = phys_reg_name(reg);
@@ -3473,7 +3473,7 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
                 }
                 if frame_size > 0 {
-                    emit_stack_adjust_x86(&mut self.state, "addq", frame_size);
+                    emit_stack_adjust_x86(&mut self.state, StackAdjust::Release, frame_size);
                 }
             }
         } else {
@@ -5164,21 +5164,85 @@ mod incoming_byval_tests {
 /// `cfi_synth` models this exact adjacency (`mov $imm, %reg` immediately
 /// followed by `add/sub %reg, %sp`), which is what keeps the synthesized CFA
 /// exact for the giant-frame functions this path exists for.
+/// Direction of a stack-pointer adjustment, so the two legal spells cannot be
+/// confused with each other or with an unrelated mnemonic at a call site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum StackAdjust {
+    /// `subq` — allocate frame space (prologue).
+    Allocate,
+    /// `addq` — release frame space (epilogue).
+    Release,
+}
+
+impl StackAdjust {
+    /// The immediate form's mnemonic.
+    fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Allocate => "subq",
+            Self::Release => "addq",
+        }
+    }
+
+    /// The register form. Spelled out rather than formatted: the register
+    /// operand is `%r11` in both directions and a single template keeps the
+    /// two shapes visibly identical to the CFI model that parses them.
+    fn register_form(self) -> &'static str {
+        match self {
+            Self::Allocate => "    subq %r11, %rsp",
+            Self::Release => "    addq %r11, %rsp",
+        }
+    }
+
+    /// The CFI contract marker's payload sign.
+    fn signed_amount(self, amount: i64) -> i64 {
+        match self {
+            Self::Allocate => amount,
+            Self::Release => -amount,
+        }
+    }
+}
+
+/// Adjust `%rsp` by `amount` (always positive; the direction is the enum).
+///
+/// `addq/subq r64, imm` encodes a **sign-extended imm32** and nothing wider,
+/// so a frame delta above `i32::MAX` has no immediate encoding at all. The
+/// delta is then materialized into caller-saved `%r11` (dead at both
+/// adjustment points) and applied with the register form:
+///
+/// ```text
+///     movq $imm, %r11        # 6 bytes when zero-extendable, 10 above 2^32
+///     subq %r11, %rsp        # 4 bytes
+/// ```
+///
+/// `movq $imm, %r11` is the right spelling for BOTH assemblers: gas folds it
+/// to `movabs`, and LCCC's own encoder resolves all three ranges (sign-
+/// extended `C7 /0`, the zero-extending `B8+rd` form for `(i32::MAX, 2^32)`,
+/// and `B8+rd io` above that) — spelling it `movabsq` would forfeit the
+/// middle range's shorter encoding.
+///
+/// The register form is invisible to `cfi_synth`'s immediate-delta rule, so
+/// the emitter states the delta for the unwind model rather than leaving it
+/// to be re-derived from the instruction stream: the `# LCCC_STACK_ADJUST`
+/// marker below is a contract between this function and
+/// `backend::cfi_synth::materialized_stack_adjustments`, which prefers it and
+/// falls back to the textual `mov`+`add/sub` relation when it is absent.
 fn emit_stack_adjust_x86(
     state: &mut crate::backend::state::CodegenState,
-    mnemonic: &'static str,
+    direction: StackAdjust,
     amount: i64,
 ) {
-    debug_assert!(
-        matches!(mnemonic, "addq" | "subq"),
-        "unexpected stack-adjust mnemonic {mnemonic}"
-    );
     debug_assert!(amount > 0, "stack adjustment must be positive: {amount}");
     if i32::try_from(amount).is_ok() {
-        state.out.emit_instr_imm_reg(mnemonic, amount, "rsp");
+        state
+            .out
+            .emit_instr_imm_reg(direction.mnemonic(), amount, "rsp");
     } else {
+        state.emit_fmt(format_args!(
+            "    # LCCC_STACK_ADJUST {}",
+            direction.signed_amount(amount)
+        ));
         state.out.emit_instr_imm_reg("    movq", amount, "r11");
-        state.emit_fmt(format_args!("    {mnemonic} %r11, %rsp"));
+        state.emit(direction.register_form());
     }
 }
 
@@ -5201,7 +5265,7 @@ fn emit_fpo_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, mut
             state.emit("    orl $0, (%rsp)");
         }
     } else {
-        emit_stack_adjust_x86(state, "subq", size);
+        emit_stack_adjust_x86(state, StackAdjust::Allocate, size);
     }
 }
 
