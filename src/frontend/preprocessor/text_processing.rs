@@ -949,7 +949,12 @@ mod tests {
             SpliceState::LineComment,
             SpliceState::BlockComment,
         ];
-        fn walk(prefix: &mut Vec<u8>, depth: usize, states: &[SpliceState; 5], checked: &mut usize) {
+        fn walk(
+            prefix: &mut Vec<u8>,
+            depth: usize,
+            states: &[SpliceState; 5],
+            checked: &mut usize,
+        ) {
             for &state in states {
                 assert_eq!(
                     comment_open_at_eol(state, prefix),

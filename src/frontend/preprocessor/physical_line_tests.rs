@@ -492,7 +492,10 @@ fn a_bridged_comment_swallows_following_code_into_the_macro_body() {
     let (pp, out) = preprocess(src);
     assert!(pp.errors().is_empty(), "errors: {:?}", pp.errors());
     assert!(pp.macros.is_defined("D"), "{out}");
-    assert!(!out.contains("swallowed"), "code must stay macro body:\n{out}");
+    assert!(
+        !out.contains("swallowed"),
+        "code must stay macro body:\n{out}"
+    );
     assert!(squeeze(&out).contains("int after;"), "{out}");
 }
 
