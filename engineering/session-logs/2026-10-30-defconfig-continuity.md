@@ -215,8 +215,9 @@ is claimed here.
 
 After rebasing onto `2e1d460faf911cf57764ef26462024825ed5466d`, the clean
 6.18.58 defconfig build failed in `kernel/fork.o` and
-`arch/x86/kernel/sys_x86_64.o`: `include/linux/mman.h`'s `_calc_vm_trans`
-has a constant comparison choosing an arm, and new `-Wdiv-by-zero` reported
+`arch/x86/kernel/sys_x86_64.o`: the kernel's `include/linux/` `mman.h`, whose
+`_calc_vm_trans` has a constant comparison choosing an arm, and new
+`-Wdiv-by-zero` reported
 zero division in the *untaken* arm under kernel `-Werror`. GCC 16.2 accepted a
 small macro reproduction; the just-rebased LCCC rejected it. The error is a
 diagnostic defect, not evidence that the selected expression divides by zero.
