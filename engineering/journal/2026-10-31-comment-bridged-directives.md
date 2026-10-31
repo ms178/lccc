@@ -85,6 +85,30 @@ because it removes provable work (no scan on the majority of lines), costs one
 slower host or a pathological input. An earlier audit claim that this was a
 meaningful regression did not survive measurement.
 
+## The one approximation, and why it is safe
+
+`first_token_is_directive(line, starts_in_block_comment)` answers the phase-4
+question except in one case: a line whose comment was opened after *code* on an
+earlier physical line (`int y; /* c` / `*/ #define A 1`). Phase 4 merges the two
+lines through the comment, so the `#` is mid-line and the line is not a
+directive; the predicate says it is. That is conservative, and it is safe for
+two independent reasons:
+
+* its only consumer is `splittable`, and `false` there refuses a break elision.
+  Elision is an optimization over the phase-3 text, so refusing it always yields
+  the faithful splice — the predicate can lose a mapping opportunity, never a
+  token;
+* the directive reader does its own comment skipping on the joined text, so it
+  still sees the `#` as mid-line. Ten comment-prefix shapes (`/* c */ #define`,
+  `/* \` then `*/ #define`, a comment opened after code, after white space, a
+  line comment, two comments in a row, ...) were compared against GCC 16.2 and
+  all ten agree; two of them are now fixtures, one per direction, so a future
+  "tightening" of the predicate cannot turn the refusal into an elision without
+  re-deriving the argument.
+
+An exact answer would carry "is the logical line blank so far?" across joins.
+That buys no behaviour, so it is not bought.
+
 ## Why not phase-order the pipeline instead?
 
 Doing comment replacement before the join decision is the architecturally clean

@@ -247,9 +247,24 @@ fn block_comment_end(line: &[u8], from: usize) -> Option<usize> {
 /// `starts_in_block_comment` is the lexical state at the line's first byte. A
 /// line that starts inside a comment has no tokens until the comment closes,
 /// and one whose comment never closes on this line has none at all; both
-/// `false` answers are the phase-4 truth — what follows is comment text, not a
-/// token — and both keep the joiner's directive-context carry honest, because
+/// `false` answers are the phase-4 truth (what follows is comment text, not a
+/// token) and both keep the joiner's directive-context carry honest, because
 /// answering `true` there would refuse a split the source is entitled to.
+///
+/// The answer is deliberately conservative in one direction. When the comment
+/// was opened after *code* on an earlier physical line (`int y; /* c` then
+/// `*/ #define A 1`), phase 4 merges the two lines through the comment, so the
+/// `#` is not the logical line's first token and that line is NOT a directive —
+/// while this function answers `true`. That costs nothing and risks nothing
+/// here, for two reasons. The only consumer of `true` is `splittable`, and a
+/// `false` there merely refuses to elide a physical break; elision is an
+/// optimization over the phase-3 text, so declining it always yields the
+/// faithful splice. And the directive reader does its own comment skipping on
+/// the joined text, so it still sees the `#` as mid-line and leaves it inert
+/// (both directions are pinned against GCC by the `comment_prefix_*` fixtures
+/// in `tests/regression/check_pp_directive_comment_bridge.sh`). Deciding it
+/// exactly would mean carrying "is the logical line blank so far?" across
+/// joins, which buys no behaviour.
 fn first_token_is_directive(line: &[u8], starts_in_block_comment: bool) -> bool {
     let mut i = 0;
     if starts_in_block_comment {
@@ -898,6 +913,26 @@ mod tests {
     /// comment-skipping forms that make it different from `starts_directive`,
     /// and the near-misses that must answer `false` (comment text is not a
     /// token, and `%:%:` is not the `%:` introducer).
+    #[test]
+    fn first_token_is_directive_is_conservative_inside_a_bridged_comment() {
+        // `true` here where phase 4 says `false` (the comment was opened after
+        // code) is the documented conservative direction: it can only refuse a
+        // break elision. Pin it so a future "tightening" cannot quietly turn
+        // the refusal into an elision without re-deriving the argument.
+        assert!(first_token_is_directive(b"*/ #define A 1", true));
+        assert!(first_token_is_directive(b"*/\t#define A 1", true));
+        assert!(first_token_is_directive(b"  /* c */ #define A 1", false));
+        // Whitespace-only prefix: a real directive in both directions.
+        assert!(first_token_is_directive(b"#define A 1", false));
+        assert!(first_token_is_directive(b"%:define A 1", false));
+        // Comment text and line comments are not directive introducers.
+        assert!(!first_token_is_directive(b"/* c \\", false));
+        assert!(!first_token_is_directive(b"*/ int x;", true));
+        assert!(!first_token_is_directive(b"// x #define A 1", false));
+        assert!(!first_token_is_directive(b"", true));
+        assert!(!first_token_is_directive(b"", false));
+    }
+
     #[test]
     fn first_token_is_directive_answers_the_phase_four_question() {
         // (line, starts inside a block comment, does the first token introduce

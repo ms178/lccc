@@ -94,8 +94,10 @@ fi
 norm() { tr '\n\t' '  ' <"$1" | tr -s ' ' | sed 's/^ //; s/ $//'; }
 
 fail=0
+fixtures=0
 check() {
   local name=$1 src=$2
+  fixtures=$((fixtures + 1))
   printf '%s' "$src" > "$tmp/$name.c"
   "$GCC" -E -P "$tmp/$name.c" >"$tmp/$name.gcc" 2>"$tmp/$name.gcc.err" || {
     echo "FAIL[$name]: gcc -E rejected the fixture" >&2
@@ -233,6 +235,21 @@ check bridge_swallows_following_code '#define D 1 /* c
 int after;
 '
 
+# A comment that closes into a `#` is a directive only when the logical line
+# has nothing but white space before it. Phase 4 merges the lines through the
+# comment, so the `#` after `int y; /* c` is mid-line and must stay inert,
+# while after white space alone it introduces a real directive. This is the
+# phase-4 question the joiner approximates conservatively; both directions are
+# pinned against the oracle here.
+check comment_prefix_after_code 'int y; /* c
+*/ #define X 9
+X
+'
+check comment_prefix_after_blank '  /* c
+   d */ #define X 9
+X
+'
+
 # ---- 11. deterministic differential sweep -----------------------------------
 # The fixtures above are the shapes reasoned about by hand; this is the space
 # around them, generated from a fixed seed so a failure reproduces exactly.
@@ -366,4 +383,4 @@ if [ "$fail" -ne 0 ]; then
   echo "directive comment-bridge: FAIL" >&2
   exit 1
 fi
-echo "directive comment-bridge: PASS (10 fixtures x ${#frontends[@]} frontends, $sweep_cases seeded cases, value pin, vs $GCC -E -P)"
+echo "directive comment-bridge: PASS ($fixtures fixtures x ${#frontends[@]} frontends, $sweep_cases seeded cases, value pin, vs $GCC -E -P)"
