@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 426.38,
+      "predicted_gate_seconds": 427.62,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -48,7 +48,7 @@
           "name": "bash tests/regression/check_reduction_vecreg_codegen.sh"
         },
         {
-          "measured_s": 1.33,
+          "measured_s": 2.57,
           "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_divzero_constant_arms.sh"
         },
         {
@@ -741,7 +741,7 @@
     "codegen-a": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 410.17,
+      "predicted_gate_seconds": 411.24,
       "shards": 2,
       "steps": [
         {
@@ -865,7 +865,7 @@
           "name": "Pipefail/SIGPIPE detector"
         },
         {
-          "measured_s": 1.6,
+          "measured_s": 2.67,
           "name": "Pointer IV collapse and zero-guard count instruction selection"
         },
         {
@@ -1025,7 +1025,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 274.21,
+      "predicted_gate_seconds": 276.56,
       "shards": 3,
       "steps": [
         {
@@ -1207,6 +1207,10 @@
         {
           "measured_s": 0.25,
           "name": "ext_vector_type target widths and invalid element diagnostics"
+        },
+        {
+          "measured_s": 2.35,
+          "name": "Multiline comment and splice translation phases"
         }
       ]
     },

@@ -43,19 +43,19 @@
 //!   that edge and dominating the header;
 //! * every pointer phi of the group steps by the *same* constant `K`;
 //! * the back-edge add is used only by its own phi;
-//! * every use of a pointer phi is either the back-edge add or the `ptr`
-//!   operand of a `Load`/`Store` **in the header block**.  Confining the
-//!   uses to the header is what lets the new address computation be
-//!   inserted once, after the phis, with dominance guaranteed by
-//!   construction;
-//! * the index phi starts at the literal 0 and steps by the same `K` in the
+//! * every use of a pointer phi is either the back-edge add, a copy, or a
+//!   header `Load`/`Store` addressed by it.  Confining these uses to the
+//!   header lets the address be inserted after its phis; a self-store has
+//!   both its address and its stored value redirected;
+//! * the index phi starts at literal 0 and steps by the same `K` in the
 //!   same latch block;
-//! * the latch's condition compares the post-increment index (or the index
-//!   itself) against a **constant** bound, which bounds the trip count by
-//!   `BOUND / K`.  That is what makes the zero-extension exact: the index
-//!   can never wrap its own width, so `zext c` is the byte offset the
-//!   pointer phis had accumulated (pointer arithmetic overflow is UB, and
-//!   the index form cannot overflow at all here).
+//! * the latch branch returns directly to the header on the proven comparison
+//!   outcome. The comparison uses the index or exactly its recurrence
+//!   increment against a positive constant. Ordered comparisons must continue
+//!   below the bound; `!=` must have a reachable bound. An overflow-checked
+//!   worst-case bound covers the final increment, the comparison's signedness,
+//!   and sign-extension of a signed index. Thus the offset cannot wrap or
+//!   cross the relevant sign bit before termination.
 //!
 //! Anything else — a variable bound, a second use of the pointer, a
 //! different stride, a latch shared with another loop — is rejected and the
@@ -66,8 +66,8 @@ use crate::common::source::Span;
 use crate::common::types::IrType;
 use crate::ir::analysis::{self, CfgAnalysis};
 use crate::ir::instruction::{Instruction, Operand, Terminator, Value};
-use crate::ir::reexports::IrBinOp;
 use crate::ir::reexports::IrFunction;
+use crate::ir::reexports::{IrBinOp, IrCmpOp};
 use crate::passes::use_def::UseDefInfo;
 
 /// Maximum number of pointer phis collapsed in one rewrite.  The shape this
@@ -246,21 +246,28 @@ fn detect_group(
         let mut same_step = false;
         for (op, edge) in incoming {
             match op {
-                Operand::Const(c) if c.to_i64() == Some(0) => zero_start = true,
+                Operand::Const(c)
+                    if c.to_i64() == Some(0) && label_to_idx.get(&edge.0) != Some(&latch) =>
+                {
+                    zero_start = true;
+                }
                 Operand::Value(v) => {
-                    if label_to_idx.get(&edge.0) != Some(&latch) {
+                    if label_to_idx.get(&edge.0) != Some(&latch)
+                        || !matches!(ud.def_of(v.0).as_instruction(), Some((bi, _)) if bi as usize == latch)
+                    {
                         continue;
                     }
                     let Some(Instruction::BinOp {
                         op: IrBinOp::Add,
                         lhs: Operand::Value(lhs),
                         rhs: Operand::Const(c),
+                        ty: add_ty,
                         ..
                     }) = ud.def_inst(v.0, func)
                     else {
                         continue;
                     };
-                    if *lhs == *dest && c.to_i64() == Some(step) {
+                    if *lhs == *dest && *add_ty == *ty && c.to_i64() == Some(step) {
                         same_step = true;
                     }
                 }
@@ -279,7 +286,7 @@ fn detect_group(
     }
     let (index, index_ty) = found?;
 
-    if !index_bound_is_constant(func, ud, latch, index, step) {
+    if !index_bound_is_constant(func, ud, header, latch, index, index_ty, step) {
         return None;
     }
 
@@ -371,13 +378,17 @@ fn pointer_uses_are_addresses(
     in_latch_add == 1
 }
 
-/// The latch's condition compares the index (or its increment) against a
-/// literal bound, so the trip count is `BOUND / step` at most.
+/// Prove that the backedge is controlled by this exact induction variable and
+/// that neither it nor a signed comparison of it can wrap before termination.
+/// A literal bound alone proves nothing: `i != bound` need not reach `bound`,
+/// and `i > bound` may continue through an unsigned wrap.
 fn index_bound_is_constant(
     func: &IrFunction,
     ud: &UseDefInfo,
+    header: usize,
     latch: usize,
     index: Value,
+    index_ty: IrType,
     step: i64,
 ) -> bool {
     let Some(block) = func.blocks.get(latch) else {
@@ -385,37 +396,112 @@ fn index_bound_is_constant(
     };
     let Terminator::CondBranch {
         cond: Operand::Value(cond),
-        ..
+        true_label,
+        false_label,
     } = &block.terminator
     else {
         return false;
     };
+    let header_label = func.blocks[header].label;
+    let continue_on_true = match (*true_label == header_label, *false_label == header_label) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => return false,
+    };
     let Some(Instruction::Cmp {
+        op,
         lhs: Operand::Value(lhs),
         rhs: Operand::Const(bound),
+        ty: cmp_ty,
         ..
     }) = ud.def_inst(cond.0, func)
     else {
         return false;
     };
-    // The comparison must be against the index family (either the phi or its
-    // increment, which is a linear function of it) and a positive literal.
-    if !index_family_contains(func, ud, latch, *lhs, index) {
+    let width = match (index_ty, *cmp_ty) {
+        (IrType::I32 | IrType::U32, IrType::I32 | IrType::U32) => 32,
+        (IrType::I64 | IrType::U64, IrType::I64 | IrType::U64) => 64,
+        _ => return false,
+    };
+    if !index_family_contains(func, ud, latch, *lhs, index, index_ty, step) {
         return false;
     }
-    let Some(b) = bound.to_i64() else {
+    let Some(bound) = bound.to_i64() else {
         return false;
     };
-    b > 0 && b <= MAX_TRIP_BOUND && b >= step
+    bounded_progress(
+        *op,
+        continue_on_true,
+        bound,
+        step,
+        width,
+        matches!(index_ty, IrType::I32 | IrType::I64),
+    )
 }
 
-/// `v` is `index` or `index + K` defined in the latch.
+/// Conservative, overflow-checked bound for the header value and its next
+/// increment, including a comparison of the pre-increment phi.  Equality is
+/// finite (at most one backedge); inequality is finite only if the bound is
+/// actually reachable.  Ordered comparisons must continue while below the
+/// bound, not while above it.  Signed comparisons additionally cannot cross
+/// the sign bit before exiting.
+fn bounded_progress(
+    op: IrCmpOp,
+    continue_on_true: bool,
+    bound: i64,
+    step: i64,
+    width: u32,
+    signed_index: bool,
+) -> bool {
+    if bound <= 0 || bound > MAX_TRIP_BOUND || step <= 0 || bound < step {
+        return false;
+    }
+    let op = if continue_on_true {
+        op
+    } else {
+        match op {
+            IrCmpOp::Eq => IrCmpOp::Ne,
+            IrCmpOp::Ne => IrCmpOp::Eq,
+            IrCmpOp::Slt => IrCmpOp::Sge,
+            IrCmpOp::Sle => IrCmpOp::Sgt,
+            IrCmpOp::Sgt => IrCmpOp::Sle,
+            IrCmpOp::Sge => IrCmpOp::Slt,
+            IrCmpOp::Ult => IrCmpOp::Uge,
+            IrCmpOp::Ule => IrCmpOp::Ugt,
+            IrCmpOp::Ugt => IrCmpOp::Ule,
+            IrCmpOp::Uge => IrCmpOp::Ult,
+        }
+    };
+    // Widening a signed 32-bit index sign-extends it; crossing its sign
+    // bit would no longer denote the accumulated positive pointer offset.
+    let signed = signed_index || matches!(op, IrCmpOp::Slt | IrCmpOp::Sle);
+    let terminating = match op {
+        IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Eq => true,
+        IrCmpOp::Ne => bound % step == 0,
+        _ => false,
+    };
+    if !terminating || !(1..=64).contains(&width) {
+        return false;
+    }
+    // Compute in u128 so the proof itself cannot overflow even at 64 bits.
+    let limit = if signed {
+        (1u128 << (width - 1)) - 1
+    } else {
+        (1u128 << width) - 1
+    };
+    (bound as u128) + 2 * (step as u128) <= limit
+}
+
+/// `v` is `index` or exactly the recurrence increment `index + step` in the
+/// latch.  A different addend need not be monotone across integer wrap.
 fn index_family_contains(
     func: &IrFunction,
     ud: &UseDefInfo,
     latch: usize,
     v: Value,
     index: Value,
+    index_ty: IrType,
+    step: i64,
 ) -> bool {
     if v == index {
         return true;
@@ -427,9 +513,10 @@ fn index_family_contains(
             Some(Instruction::BinOp {
                 op: IrBinOp::Add,
                 lhs: Operand::Value(lhs),
-                rhs: Operand::Const(_),
+                rhs: Operand::Const(addend),
+                ty,
                 ..
-            }) if *lhs == index
+            }) if *lhs == index && *ty == index_ty && addend.to_i64() == Some(step)
         )
 }
 
@@ -441,7 +528,9 @@ fn value_dominates_block(ud: &UseDefInfo, idom: &[usize], v: Value, header: usiz
     match ud.def_of(v.0).as_instruction() {
         Some((bi, _)) => {
             let bi = bi as usize;
-            bi == header || analysis::dominates_idom(idom, bi, header)
+            // The inserted address precedes every non-phi in the header.
+            // Header-local definitions do not dominate that insertion point.
+            bi != header && analysis::dominates_idom(idom, bi, header)
         }
         None => false,
     }
@@ -518,9 +607,22 @@ fn apply(func: &mut IrFunction, group: &Group) -> bool {
         let block = &mut func.blocks[group.header];
         for inst in block.instructions.iter_mut() {
             match inst {
-                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+                Instruction::Load { ptr, .. } => {
                     if let Some((_, gep)) = geps.iter().find(|(phi, _)| phi == ptr) {
                         *ptr = *gep;
+                    }
+                }
+                Instruction::Store { ptr, val, .. } => {
+                    if let Some((_, gep)) = geps.iter().find(|(phi, _)| phi == ptr) {
+                        *ptr = *gep;
+                    }
+                    // `store p, p` uses the same phi twice. Redirecting only
+                    // the address would leave a dangling value after removing
+                    // that phi (UseDefInfo records each operand occurrence).
+                    if let Operand::Value(v) = val {
+                        if let Some((_, gep)) = geps.iter().find(|(phi, _)| phi == v) {
+                            *val = Operand::Value(*gep);
+                        }
                     }
                 }
                 Instruction::Copy { src, .. } => {
@@ -589,4 +691,175 @@ fn max_value_id(func: &IrFunction) -> u32 {
         }
     }
     max_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Group, IrCmpOp, IrFunction, IrType, PointerIv, apply, bounded_progress};
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrBinOp, IrConst, Operand, Terminator, Value,
+    };
+
+    #[test]
+    fn self_store_rewrites_both_occurrences_before_deleting_phi() {
+        let mut func = IrFunction::new("self_store".into(), IrType::Void, vec![], false);
+        func.next_value_id = 10;
+        func.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::Ptr,
+                        incoming: vec![
+                            (Operand::Value(Value(0)), BlockId(2)),
+                            (Operand::Value(Value(2)), BlockId(1)),
+                        ],
+                    },
+                    Instruction::Phi {
+                        dest: Value(3),
+                        ty: IrType::I64,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I64(0)), BlockId(2)),
+                            (Operand::Value(Value(4)), BlockId(1)),
+                        ],
+                    },
+                    Instruction::Store {
+                        val: Operand::Value(Value(1)),
+                        ptr: Value(1),
+                        ty: IrType::Ptr,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                ],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::Ptr,
+                }],
+                terminator: Terminator::Branch(BlockId(0)),
+                source_spans: vec![],
+            },
+        ];
+        let group = Group {
+            header: 0,
+            latch: 1,
+            index: Value(3),
+            index_ty: IrType::I64,
+            pointers: vec![PointerIv {
+                phi: Value(1),
+                init: Value(0),
+                backedge_add: Value(2),
+            }],
+        };
+        assert!(apply(&mut func, &group));
+        let store = func.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|inst| match inst {
+                Instruction::Store { ptr, val, .. } => Some((*ptr, *val)),
+                _ => None,
+            })
+            .expect("store remains");
+        assert_ne!(store.0, Value(1));
+        assert_eq!(store.1, Operand::Value(store.0));
+    }
+
+    #[test]
+    fn progress_proof_rejects_wrap_and_wrong_edge() {
+        let stride = 1i64 << 30;
+        assert!(!bounded_progress(
+            IrCmpOp::Ne,
+            true,
+            stride + 1,
+            stride,
+            32,
+            false
+        ));
+        assert!(!bounded_progress(IrCmpOp::Ugt, true, 16, 1, 32, false));
+        assert!(!bounded_progress(IrCmpOp::Ult, false, 16, 1, 32, false));
+        assert!(!bounded_progress(
+            IrCmpOp::Ult,
+            true,
+            (1 << 31) - 1,
+            1,
+            32,
+            true
+        ));
+        assert!(bounded_progress(IrCmpOp::Ult, true, 256, 8, 32, false));
+        assert!(bounded_progress(IrCmpOp::Uge, false, 256, 8, 32, false));
+        assert!(bounded_progress(IrCmpOp::Ne, true, 256, 8, 32, false));
+        assert!(bounded_progress(IrCmpOp::Eq, false, 256, 8, 32, false));
+    }
+
+    #[test]
+    fn progress_proof_exhaustive_eight_bit_model() {
+        // Exhaustively check every accepted comparison and both branch
+        // directions, for both phi and post-increment comparisons. The pass
+        // itself only accepts 32/64-bit indices; the reduced model exposes
+        // wrap and sign-boundary mistakes in a short, deterministic test.
+        let ops = [
+            IrCmpOp::Eq,
+            IrCmpOp::Ne,
+            IrCmpOp::Ult,
+            IrCmpOp::Ule,
+            IrCmpOp::Ugt,
+            IrCmpOp::Uge,
+            IrCmpOp::Slt,
+            IrCmpOp::Sle,
+            IrCmpOp::Sgt,
+            IrCmpOp::Sge,
+        ];
+        for signed_index in [false, true] {
+            for op in ops {
+                for continue_on_true in [false, true] {
+                    for bound in 1..=127i64 {
+                        for step in 1..=bound {
+                            if !bounded_progress(op, continue_on_true, bound, step, 8, signed_index)
+                            {
+                                continue;
+                            }
+                            for post in [false, true] {
+                                let mut value = 0i64;
+                                let mut terminated = false;
+                                for _ in 0..=256 {
+                                    let next = value + step;
+                                    assert!(next <= 255, "unsigned wrap: {op:?} {bound} {step}");
+                                    if signed_index
+                                        || matches!(
+                                            op,
+                                            IrCmpOp::Slt
+                                                | IrCmpOp::Sle
+                                                | IrCmpOp::Sgt
+                                                | IrCmpOp::Sge
+                                        )
+                                    {
+                                        assert!(next <= 127, "signed wrap: {op:?} {bound} {step}");
+                                    }
+                                    let compared = if post { next } else { value };
+                                    if op.eval_i64(compared, bound) != continue_on_true {
+                                        terminated = true;
+                                        break;
+                                    }
+                                    value = next;
+                                }
+                                assert!(
+                                    terminated,
+                                    "nonterminating proof: {op:?} {continue_on_true} {bound} {step} post={post}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

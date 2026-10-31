@@ -147,6 +147,32 @@ fn comment_in_a_directive_collapses_and_the_next_line_resynchronizes() {
 }
 
 #[test]
+fn directive_splice_after_multiline_comment_remains_joined() {
+    // Linux fs/nfs/callback_xdr.c: the line opening the block comment has
+    // no backslash, but the comment is replaced by one space in phase 3,
+    // leaving the directive open across the splice on the closing line.
+    let src = "#define N (1 + \\\n /* first\n  second */\\\n (2))\nint l5 = N;\nint l6;\n";
+    let out = assert_positions(src, 2);
+    assert!(squeeze(&out).contains("int l5 = (1 + (2));"), "{out}");
+}
+
+#[test]
+fn directive_splice_after_comment_delimiter_split_by_splice() {
+    // Phase 2 can form the opening /* from bytes on different physical
+    // lines; its later newline still belongs to the same directive comment.
+    let src = "#define N (1 + \\\n /\\\n* first\n  second */\\\n (2))\nint l6 = N;\nint l7;\n";
+    let out = assert_positions(src, 2);
+    assert!(squeeze(&out).contains("int l6 = (1 + (2));"), "{out}");
+}
+
+#[test]
+fn ordinary_splice_after_an_unrelated_comment_keeps_positions() {
+    // A comment elsewhere must not cause an ordinary safe splice to be
+    // joined: the tail token still needs its physical line and column.
+    assert_positions("/* header */\nint l2 = 1 + \\\n l3c2;\nint l4;\n", 3);
+}
+
+#[test]
 fn hash_after_a_comment_on_a_line_with_tokens_stays_a_stray_hash() {
     // C: `#` is not the first token of its line, so there is no directive;
     // splitting the comment would have created one.
@@ -513,6 +539,16 @@ fn a_bridged_ordinary_line_keeps_its_break() {
         "an ordinary bridged line lost its kept break:\n{out:?}"
     );
     assert!(squeeze(&out).contains("int a = 1 + 2 + 3;"), "{out}");
+    assert_positions("int l1 = 1 + /* c\n*/ 2 + \\\n l3c2;\n", 2);
+}
+
+#[test]
+fn comment_closing_delimiter_split_by_splice_stays_joined() {
+    // Starting inside a block comment is not sufficient to preserve a
+    // break: phase 2 forms `*/` from the star and slash on different lines.
+    let src = "int l1 = 1 + /* comment\n *\\\n/ 2 + \\\n l4c2;\n";
+    let out = assert_positions(src, 2);
+    assert!(squeeze(&out).contains("int l1 = 1 + 2 + l4c2;"), "{out}");
 }
 
 #[test]

@@ -47,13 +47,15 @@ condition is checked against the IR rather than assumed:
 * every pointer in the group steps by the same `K`;
 * each pointer's remaining uses are the `ptr` operand of a header
   `Load`/`Store` (or a header `Copy` of the phi);
-* the integer index phi starts at the literal `0`, steps by the same `K` in
-  the same latch, and the latch's `CondBranch` compares it against a literal
-  bound no larger than `1 << 31`. That bound is what makes `zext(index)`
-  exact — the index cannot wrap its own width, so the byte offset it produces
-  is the one the pointer phis had accumulated;
-* every base dominates the header (`CfgAnalysis::idom` plus
-  `analysis::dominates_idom`), which is what lets the new address computation
+* the integer index phi starts at `0` and steps by the same `K` in the latch.
+  The latch must branch directly to the header on a comparison of that index
+  or its exact increment against a positive literal no larger than `1 << 31`.
+  The comparison and branch direction must prove termination before wrapping;
+  for `!=`, the bound must be reachable by the stride. A checked bound also
+  prevents crossing the sign bit when the comparison or index extension is
+  signed. A literal alone is not a trip-count proof;
+* every base is a parameter or is defined outside and dominates the header
+  (`CfgAnalysis::idom` plus `analysis::dominates_idom`), so the address can
   be inserted once, after the phis;
 * at most four pointer phis per group.
 

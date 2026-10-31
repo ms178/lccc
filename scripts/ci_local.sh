@@ -853,6 +853,9 @@ gate "warning-precedence" fast \
 gate "macro-parity" fast \
     python3 tests/regression/check_macro_parity.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# Translation-phase interaction exposed by the NFS callback XDR macros.
+gate "multiline-comment-splice" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_multiline_comment_splice.sh
 gate "include-next-search" fast \
     python3 tests/regression/check_include_next_search.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"

@@ -432,6 +432,11 @@ def main() -> int:
         gcc = resolve_command(args.gcc)
         readelf = resolve_command(args.readelf)
         objcopy = resolve_command(args.objcopy)
+        # Exercise the line-state flags that ordinary C fixtures do not emit:
+        # compare row semantics against GNU as before and after linking.
+        print(run([sys.executable, str(ROOT / "tests/regression/check_dwarf_loc_options.py"),
+                   "--lccc", lccc, "--i686", lccc_i686,
+                   "--arm", lccc_arm, "--riscv", lccc_riscv]), end="")
         with tempfile.TemporaryDirectory(prefix="lccc-dwarf-") as tmp:
             work = Path(tmp)
             source_a = work / "unit_a.c"

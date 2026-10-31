@@ -66,8 +66,78 @@ if ! cmp -s "$tmp/values_gcc.out" "$tmp/values_lccc.out"; then
     fail=$((fail + 1))
 fi
 
+# &*p cancels even for a null pointer, but its operand must still be a
+# constant in a static initializer. Compile (not merely -fsyntax-only), so
+# these checks exercise lowering, the emitted relocations and runtime values.
+for width in 32 64; do
+    for std in gnu11 gnu2x; do
+        for opt in 0 2; do
+            flags=("-m$width" "-std=$std" "-O$opt")
+            for compiler in "$GCC_ORACLE_BIN" "$CCC"; do
+                "$compiler" "${flags[@]}" -c "$dir/addrof_deref_values.c" -o "$tmp/addrof.o"
+                "$GCC_ORACLE_BIN" "-m$width" "$tmp/addrof.o" -o "$tmp/addrof"
+                if [[ $("$tmp/addrof") != 1 ]]; then
+                    echo "FAIL addrof-deref values: $compiler ${flags[*]}" >&2
+                    fail=$((fail + 1))
+                fi
+            done
+        done
+    done
+done
+
+# String-literal truth in a static conditional: check values AND selected
+# pointer relocations, at both widths and optimization levels.
+for width in 32 64; do
+    for std in gnu11 gnu2x; do
+        for opt in 0 2; do
+            flags=("-m$width" "-std=$std" "-O$opt")
+            for compiler in "$GCC_ORACLE_BIN" "$CCC"; do
+                "$compiler" "${flags[@]}" -c "$dir/string_condition_values.c" -o "$tmp/string_cond.o"
+                "$GCC_ORACLE_BIN" "-m$width" "$tmp/string_cond.o" -o "$tmp/string_cond"
+                if [[ $("$tmp/string_cond") != 1 ]]; then
+                    echo "FAIL string-condition values: $compiler ${flags[*]}" >&2
+                    fail=$((fail + 1))
+                fi
+            done
+        done
+    done
+done
+# Nonconstant conditions, including an address truncated to an integer, must
+# not become true merely because a string occurs somewhere beneath a cast.
+for decl in \
+    'extern char *p; int x = p ? 1 : 2;' \
+    'int x = (unsigned char)(unsigned long)"s" ? 1 : 2;'; do
+    printf '%s\n' "$decl" > "$tmp/string_cond_bad.c"
+    for compiler in "$GCC_ORACLE_BIN" "$CCC"; do
+        if "$compiler" -std=gnu11 -w -c "$tmp/string_cond_bad.c" -o "$tmp/string_cond_bad.o" >"$tmp/string_cond_bad.log" 2>&1; then
+            echo "FAIL string-condition nonconstant: $compiler accepted $decl" >&2
+            fail=$((fail + 1))
+        fi
+    done
+done
+
+# Cancellation does not make a read of a mutable pointer or a call constant,
+# and an address of an automatic object remains invalid at static scope.
+for decl in \
+    'int *p; int *q = &*p;' \
+    'int *get(void); int *q = &*get();' \
+    'void f(int *p) { static int *q = &*p; }' \
+    'void f(void) { int a; static int *q = &*(&a); }'; do
+    printf '%s\n' "$decl" > "$tmp/addrof_bad.c"
+    for compiler in "$GCC_ORACLE_BIN" "$CCC"; do
+        if "$compiler" -std=gnu11 -c "$tmp/addrof_bad.c" -o "$tmp/addrof_bad.o" >"$tmp/addrof_bad.log" 2>&1; then
+            echo "FAIL addrof-deref nonconstant: $compiler accepted $decl" >&2
+            fail=$((fail + 1))
+        elif ! grep -q 'not constant' "$tmp/addrof_bad.log"; then
+            echo "FAIL addrof-deref nonconstant: $compiler missing diagnostic for $decl" >&2
+            cat "$tmp/addrof_bad.log" >&2
+            fail=$((fail + 1))
+        fi
+    done
+done
+
 if (( fail > 0 )); then
     echo "check_file_scope_init: FAILED ($fail failure(s) of $rows rows + values)" >&2
     exit 1
 fi
-echo "check_file_scope_init: PASSED ($rows rows vs GCC $GCC_ORACLE_MAJOR; values match)"
+echo "check_file_scope_init: PASSED ($rows rows vs GCC $GCC_ORACLE_MAJOR; values match; &* m32/m64 GNU11/GNU2x O0/O2 and nonconstant controls)"

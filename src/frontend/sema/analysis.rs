@@ -1806,6 +1806,15 @@ impl SemanticAnalyzer {
             if let Some(init) = &init_decl.init {
                 self.analyze_initializer(init);
                 self.check_object_initializer(decl, init_decl, init);
+                if !static_duration && Self::has_direct_compound_initializer(init) {
+                    if let Some(ty) = self
+                        .symbol_table
+                        .lookup(&init_decl.name)
+                        .map(|s| s.ty.clone())
+                    {
+                        self.check_automatic_array_members(&ty, init);
+                    }
+                }
                 if decl.is_constexpr() {
                     self.check_constexpr_initializer(decl, init_decl, init);
                 }
@@ -6277,6 +6286,99 @@ dereference it before applying '->' to it?"
         }
     }
 
+    /// Cheap structural prefilter for the automatic-member walk: only direct
+    /// compound-literal initializer leaves can trigger its diagnostic.
+    fn has_direct_compound_initializer(init: &Initializer) -> bool {
+        match init {
+            Initializer::Expr(expr) => matches!(expr, Expr::CompoundLiteral(..)),
+            Initializer::List(items) => items
+                .iter()
+                .any(|item| Self::has_direct_compound_initializer(&item.init)),
+        }
+    }
+
+    /// Reject an automatic array member initialized from a same-typed array
+    /// compound literal. GCC accepts that spelling for static storage but
+    /// rejects it for automatic objects, including nested and designated
+    /// members. Walk the actual subobject slots so an array literal that
+    /// decays into a pointer *element* remains valid.
+    fn check_automatic_array_members(&self, target: &CType, init: &Initializer) {
+        let Initializer::List(items) = init else {
+            return;
+        };
+        if !target.is_struct_or_union() && !matches!(target, CType::Array(..)) {
+            if let Some(first) = items.first() {
+                self.check_automatic_array_slot(&mut Vec::new(), target, &first.init);
+            }
+            return;
+        }
+        let mut stack = vec![WalkFrame {
+            ty: target.clone(),
+            next: 0,
+        }];
+        for item in items {
+            let slot = if item.designators.is_empty() {
+                self.take_initializer_slot(&mut stack)
+            } else if let Some((frames, leaf)) = self.designated_slot(target, &item.designators) {
+                stack = frames;
+                Some(leaf)
+            } else {
+                None
+            };
+            if let Some(slot) = slot {
+                self.check_automatic_array_slot(&mut stack, &slot, &item.init);
+            }
+        }
+    }
+
+    fn check_automatic_array_slot(
+        &self,
+        stack: &mut Vec<WalkFrame>,
+        slot: &CType,
+        init: &Initializer,
+    ) {
+        let Initializer::Expr(expr) = init else {
+            self.check_automatic_array_members(slot, init);
+            return;
+        };
+        if let CType::Array(target_elem, target_len) = slot {
+            if matches!(expr, Expr::CompoundLiteral(..)) {
+                if let Some(CType::Array(source_elem, source_len)) =
+                    self.expr_type_checker().infer_expr_ctype(expr)
+                {
+                    let same_len = match (*target_len, source_len) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    };
+                    if *target_elem == source_elem && same_len {
+                        self.diagnostics.borrow_mut().error(
+                            "array initialized from non-constant array expression".to_string(),
+                            expr.span(),
+                        );
+                        return;
+                    }
+                }
+            }
+            if matches!(
+                expr,
+                Expr::StringLiteral(..)
+                    | Expr::WideStringLiteral(..)
+                    | Expr::Char16StringLiteral(..)
+            ) {
+                return;
+            }
+        } else if self.expr_initializes_whole(slot, expr) {
+            return;
+        }
+        stack.push(WalkFrame {
+            ty: slot.clone(),
+            next: 0,
+        });
+        if let Some(inner) = self.take_initializer_slot(stack) {
+            self.check_automatic_array_slot(stack, &inner, init);
+        }
+    }
+
     /// The type of the next subobject a positional initializer takes. Full
     /// aggregates are popped, so the next slot belongs to the enclosing object.
     /// `None` when the braced object is full: an excess element that sema diagnoses.
@@ -8354,6 +8456,23 @@ dereference it before applying '->' to it?"
         if let Some(value) = self.constant_truth_value(expr) {
             return Some(value);
         }
+        // A divisor's folded value and the safety of suppressing a branch
+        // diagnostic are different questions. GCC can diagnose division by
+        // the wrapped zero value of an overflowing ICE, even though it will
+        // not generally elide a branch based on that overflowing condition.
+        // This value-only fold must never be used for operand elision.
+        if self.is_integer_constant_expr(expr) {
+            let value = SemaConstEval {
+                const_values: None,
+                named_constants_only: true,
+                ..self.sema_const_eval()
+            }
+            .eval_required_constant(expr)
+            .and_then(|v| v.to_i128());
+            if let Some(value) = value {
+                return Some(value != 0);
+            }
+        }
         match expr {
             Expr::BinaryOp(BinOp::LogicalAnd, lhs, rhs, _) => {
                 match (self.folded_truth(lhs), self.folded_truth(rhs)) {
@@ -8370,8 +8489,63 @@ dereference it before applying '->' to it?"
                 }
             }
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => self.folded_truth(inner).map(|v| !v),
-            // An integer cast preserves truth value, including `_Bool`.
-            Expr::Cast(_, inner, ..) => self.folded_truth(inner),
+            Expr::Cast(_, inner, ..) => {
+                // Truth alone is not enough for a narrowing conversion:
+                // `(unsigned char)256` is zero although 256 is nonzero.
+                // First try the typed evaluator even when the whole expression
+                // is not an ICE, e.g. `(unsigned char)(1 ? 256 : x)`. This is
+                // a value-only diagnostic fold, never operand elision; disable
+                // ordinary const-object caches and reject evaluated overflow.
+                if self.div_zero_overflow_free(expr) {
+                    let value = SemaConstEval {
+                        const_values: None,
+                        named_constants_only: true,
+                        ..self.sema_const_eval()
+                    }
+                    .eval_required_constant(expr)
+                    .and_then(|v| v.to_i128());
+                    if let Some(value) = value {
+                        return Some(value != 0);
+                    }
+                }
+                let value = self.folded_truth(inner)?;
+                if !value {
+                    return Some(false);
+                }
+                let checker = self.expr_type_checker();
+                let (Some(src), Some(dst)) = (
+                    checker.infer_expr_ctype(inner),
+                    checker.infer_expr_ctype(expr),
+                ) else {
+                    return None;
+                };
+                // Integer logical/comparison operators have values 0 or 1;
+                // no integer conversion can turn their nonzero value into 0.
+                let boolean_value = matches!(
+                    inner.as_ref(),
+                    Expr::UnaryOp(UnaryOp::LogicalNot, ..)
+                        | Expr::BinaryOp(
+                            BinOp::LogicalAnd
+                                | BinOp::LogicalOr
+                                | BinOp::Eq
+                                | BinOp::Ne
+                                | BinOp::Lt
+                                | BinOp::Le
+                                | BinOp::Gt
+                                | BinOp::Ge,
+                            ..
+                        )
+                );
+                if matches!(dst, CType::Bool)
+                    || (src.is_integer()
+                        && dst.is_integer()
+                        && (boolean_value || dst.size() >= src.size()))
+                {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
             Expr::GnuConditional(cond, else_expr, _) => match self.folded_truth(cond) {
                 Some(true) => Some(true),
                 Some(false) => self.folded_truth(else_expr),
@@ -8396,7 +8570,7 @@ dereference it before applying '->' to it?"
             }
             _ => {}
         }
-        if !self.is_integer_constant_expr(expr) {
+        if !self.is_integer_constant_expr(expr) || !self.div_zero_overflow_free(expr) {
             return None;
         }
         SemaConstEval {
@@ -8407,6 +8581,162 @@ dereference it before applying '->' to it?"
         .eval_required_constant(expr)
         .and_then(|v| v.to_i128())
         .map(|v| v != 0)
+    }
+
+    /// Whether GCC can use this ICE to suppress a branch diagnostic. The
+    /// general ICE evaluator accepts signed overflow as a GNU extension and
+    /// returns the wrapped carrier, so its value alone is insufficient: GCC
+    /// preserves an overflow flag through arithmetic even with -fwrapv.
+    /// Conditional expressions propagate the selected arm's flag instead.
+    /// Unknown shapes are conservative: they cannot suppress a warning.
+    fn div_zero_overflow_free(&self, expr: &Expr) -> bool {
+        let eval = |e: &Expr| {
+            SemaConstEval {
+                const_values: None,
+                named_constants_only: true,
+                ..self.sema_const_eval()
+            }
+            .eval_required_constant(e)
+            .and_then(|v| v.to_i128())
+        };
+        match expr {
+            Expr::IntLiteral(..)
+            | Expr::UIntLiteral(..)
+            | Expr::LongLiteral(..)
+            | Expr::ULongLiteral(..)
+            | Expr::LongLongLiteral(..)
+            | Expr::ULongLongLiteral(..)
+            | Expr::CharLiteral(..)
+            | Expr::FloatLiteral(..)
+            | Expr::FloatLiteralF32(..)
+            | Expr::FloatLiteralLongDouble(..)
+            | Expr::FloatLiteralF128(..)
+            | Expr::Identifier(..)
+            | Expr::Sizeof(..)
+            | Expr::Countof(..)
+            | Expr::Alignof(..)
+            | Expr::GnuAlignof(..)
+            | Expr::AlignofExpr(..)
+            | Expr::GnuAlignofExpr(..)
+            | Expr::BuiltinTypesCompatibleP(..) => true,
+            Expr::Cast(_, inner, _, _) => self.div_zero_overflow_free(inner),
+            Expr::UnaryOp(op, inner, _) => {
+                if !self.div_zero_overflow_free(inner) {
+                    return false;
+                }
+                if *op != UnaryOp::Neg {
+                    return true;
+                }
+                let Some(ty) = self.expr_type_checker().infer_expr_ctype(inner) else {
+                    return false;
+                };
+                let ty = ty.integer_promoted();
+                if !ty.is_integer() || !ty.is_signed() {
+                    return true;
+                }
+                let Some(value) = eval(inner) else {
+                    return false;
+                };
+                let bits = ty.size() * 8;
+                if bits == 0 || bits > 128 {
+                    return false;
+                }
+                let min = if bits == 128 {
+                    i128::MIN
+                } else {
+                    -(1i128 << (bits - 1))
+                };
+                value != min
+            }
+            Expr::BinaryOp(op, lhs, rhs, _) => {
+                if !self.div_zero_overflow_free(lhs) {
+                    return false;
+                }
+                if matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
+                    let Some(left) = eval(lhs) else { return false };
+                    let skip = (*op == BinOp::LogicalAnd && left == 0)
+                        || (*op == BinOp::LogicalOr && left != 0);
+                    return skip || self.div_zero_overflow_free(rhs);
+                }
+                if !self.div_zero_overflow_free(rhs) {
+                    return false;
+                }
+                if !matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                ) {
+                    return true;
+                }
+                let checker = self.expr_type_checker();
+                let (Some(left_ty), Some(right_ty)) =
+                    (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
+                else {
+                    return false;
+                };
+                let ty = CType::usual_arithmetic_conversion(&left_ty, &right_ty);
+                if !ty.is_integer() || !ty.is_signed() {
+                    return true;
+                }
+                // A narrower unsigned operand promoted to a wider signed type
+                // must be zero-extended, not interpreted as a signed carrier.
+                let value = |e: &Expr, source_ty: &CType| -> Option<i128> {
+                    let raw = eval(e)?;
+                    let bits = source_ty.size() * 8;
+                    if source_ty.is_unsigned() && bits < 128 {
+                        Some(((raw as u128) & ((1u128 << bits) - 1)) as i128)
+                    } else {
+                        Some(raw)
+                    }
+                };
+                let (Some(a), Some(b)) = (value(lhs, &left_ty), value(rhs, &right_ty)) else {
+                    return false;
+                };
+                let bits = ty.size() * 8;
+                if bits == 0 || bits > 128 {
+                    return false;
+                }
+                let (min, max) = if bits == 128 {
+                    (i128::MIN, i128::MAX)
+                } else {
+                    (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+                };
+                if matches!(op, BinOp::Div | BinOp::Mod) && a == min && b == -1 {
+                    return false;
+                }
+                let result = match op {
+                    BinOp::Add => a.checked_add(b),
+                    BinOp::Sub => a.checked_sub(b),
+                    BinOp::Mul => a.checked_mul(b),
+                    BinOp::Div => a.checked_div(b),
+                    BinOp::Mod => a.checked_rem(b),
+                    _ => None,
+                };
+                result.is_some_and(|v| (min..=max).contains(&v))
+            }
+            Expr::Conditional(cond, yes, no, _) => {
+                // GCC propagates the selected arm's overflow state to a
+                // conditional result, not the condition's. In particular,
+                // `(INT_MAX + 1 ? 0 : 0)` has a decidable zero result for
+                // branch-warning suppression, although the overflowing
+                // condition on its own cannot suppress that warning.
+                match eval(cond) {
+                    Some(0) => self.div_zero_overflow_free(no),
+                    Some(_) => self.div_zero_overflow_free(yes),
+                    None => false,
+                }
+            }
+            Expr::GnuConditional(cond, no, _) => {
+                if !self.div_zero_overflow_free(cond) {
+                    return false;
+                }
+                match eval(cond) {
+                    Some(0) => self.div_zero_overflow_free(no),
+                    Some(_) => true,
+                    None => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// `-Wdiv-by-zero`: a constant zero divisor in an *integer* division or

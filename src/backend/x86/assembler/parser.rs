@@ -120,7 +120,7 @@ pub enum AsmItem {
     /// Debug file directive: `.file N "filename"`; retained for DWARF line emission.
     File(u32, String),
     /// Debug location: `.loc filenum line column`; retained for DWARF line emission.
-    Loc(u32, u32, u32),
+    Loc(u32, u32, u32, crate::backend::elf::DwarfLocOptions),
     /// x86-64 instruction
     Instruction(Instruction),
     /// `.option norelax` (RISC-V, ignored for x86)
@@ -1147,8 +1147,8 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             None => AsmItem::Empty,
         }),
         ".loc" => {
-            let (file, line, column) = crate::backend::elf::parse_loc_directive(args)?;
-            Ok(AsmItem::Loc(file, line, column))
+            let (file, line, column, options) = crate::backend::elf::parse_loc_directive(args)?;
+            Ok(AsmItem::Loc(file, line, column, options))
         }
         ".pushsection" => {
             // .pushsection name,"flags",@type - same syntax as .section

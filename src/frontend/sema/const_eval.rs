@@ -578,6 +578,11 @@ impl<'a> SemaConstEval<'a> {
 
             // Ternary conditional
             Expr::Conditional(cond, then_e, else_e, _) => {
+                // The array behind a string literal has a non-null address;
+                // retain the selected expression's value, not the address.
+                if shared_const_eval::string_literal_condition(cond) {
+                    return self.eval_const_expr(then_e);
+                }
                 let cond_val = self.eval_const_expr(cond)?;
                 if self.const_truth(&cond_val, cond) {
                     self.eval_const_expr(then_e)

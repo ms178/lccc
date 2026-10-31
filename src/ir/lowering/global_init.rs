@@ -552,7 +552,7 @@ impl Lowerer {
             Expr::UnaryOp(_, inner, _) => {
                 self.materialize_compound_literals_in_expr(inner);
             }
-            Expr::AddressOf(inner, _) => {
+            Expr::AddressOf(inner, _) | Expr::Deref(inner, _) => {
                 self.materialize_compound_literals_in_expr(inner);
             }
             Expr::Conditional(cond, then_e, else_e, _) => {
@@ -2234,7 +2234,7 @@ impl Lowerer {
     ) -> bool {
         match &item.init {
             Initializer::Expr(expr) => {
-                if Self::expr_contains_label_addr(expr) {
+                if Self::expr_contains_label_addr(expr) || Self::expr_contains_compound_addr(expr) {
                     return true;
                 }
                 if h::expr_contains_string_literal(expr)
@@ -2332,10 +2332,38 @@ impl Lowerer {
         false
     }
 
+    /// Whether an expression explicitly takes the address of a compound
+    /// literal. Its symbol may not exist yet when choosing an image. A bare
+    /// literal is NOT enough: in an array member initializer it can denote
+    /// the member's whole value rather than a decayed address.
+    pub(super) fn expr_contains_compound_addr(expr: &Expr) -> bool {
+        match expr {
+            Expr::AddressOf(inner, _) => {
+                matches!(inner.as_ref(), Expr::CompoundLiteral(..))
+                    || Self::expr_contains_compound_addr(inner)
+            }
+            Expr::Deref(inner, _) | Expr::Cast(_, inner, _, _) => {
+                Self::expr_contains_compound_addr(inner)
+            }
+            Expr::BinaryOp(_, lhs, rhs, _) => {
+                Self::expr_contains_compound_addr(lhs) || Self::expr_contains_compound_addr(rhs)
+            }
+            Expr::Conditional(cond, yes, no, _) => {
+                Self::expr_contains_compound_addr(cond)
+                    || Self::expr_contains_compound_addr(yes)
+                    || Self::expr_contains_compound_addr(no)
+            }
+            _ => false,
+        }
+    }
+
     /// Check if an initializer contains address expressions (recursive).
     fn init_has_addr_exprs(&self, init: &Initializer) -> bool {
         match init {
             Initializer::Expr(expr) => {
+                if Self::expr_contains_compound_addr(expr) {
+                    return true;
+                }
                 if Self::expr_contains_label_addr(expr) {
                     return true;
                 }

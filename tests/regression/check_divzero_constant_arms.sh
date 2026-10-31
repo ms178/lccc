@@ -69,5 +69,37 @@ case_one or-true-silent ok 'int f(int x){return x/(x || 1);}'
 case_one or-chain-silent ok 'int f(int x){return x/(0 || 0 || x);}'
 case_one and-plus-one-silent ok 'int f(int x){return x/((0 && x) + 1);}'
 case_one cond-unknown-arms-silent ok 'int f(int x){return x/(1 ? x : 0);}'
+# Truth is not preserved by narrowing conversions. These expressions are not
+# syntactic ICEs because their untaken branches refer to x, but the selected
+# value is known and its converted value must decide the diagnostic.
+case_one narrow-selected-zero error 'int f(int x){return x/(unsigned char)(1 ? 256 : x);}'
+case_one narrow-selected-zero-neg error 'int f(int x){return x/(unsigned char)(1 ? -256 : x);}'
+case_one narrow-selected-nonzero ok 'int f(int x){return x/(unsigned char)(1 ? 257 : x);}'
+case_one narrow-int-zero error 'int f(int x){return x/(int)(1 ? 4294967296LL : x);}'
+case_one narrow-short-zero error 'int f(int x){return x/(unsigned short)(0 ? x : 65536);}'
+case_one cast-boolean-zero error 'int f(int x){return x/(unsigned char)(x && 0);}'
+case_one cast-boolean-one-silent ok 'int f(int x){return x/(unsigned char)(x || 1);}'
+case_one not-cast-boolean-one error 'int f(int x){return x/!(unsigned char)(x || 1);}'
+case_one cast-bool-selected-one ok 'int f(int x){return x/(_Bool)(1 ? 256 : x);}'
+case_one cast-bool-selected-zero error 'int f(int x){return x/(_Bool)(1 ? 0 : x);}'
+case_one selected-ordinary-const-silent ok 'int f(int x){const int c=0;return x/(1 ? c : x);}'
 
+# GCC keeps the warning after an evaluated signed overflow, even with
+# -fwrapv. An overflowing *unevaluated* subexpression must not poison it.
+case_one signed-add-overflow error 'int f(void){return (2147483647+2147483647)==2 ? 1/0 : 1;}'
+case_one signed-sub-overflow error 'int f(void){return (-2147483647-2)<0 ? 1/0 : 1;}'
+case_one signed-mul-overflow error 'int f(void){return (100000*100000)==2 ? 1/0 : 1;}'
+case_one unsigned-mixed-valid ok 'int f(void){return ((1LL+4294967295u)==4294967296LL) ? 1 : 1/0;}'
+case_one skipped-overflow ok 'int f(void){return (1 || (2147483647+1)) ? 1 : 1/0;}'
+case_one selected-overflow error 'int f(void){return ((2147483647+1) || 1) ? 1 : 1/0;}'
+# GCC uses the wrapped value of an overflowing ICE to diagnose a divisor,
+# but will not generally suppress a branch warning based on overflow. A
+# conditional selects an arm and carries that arm's overflow flag, not the
+# condition's flag; exercise both the direct and nested diagnostic paths.
+case_one overflow-zero-divisor error 'int f(int x){return x/((2147483647+2147483647)==2);}'
+case_one overflow-condition-selected-zero-divisor error 'int f(int x){return x/((2147483647+1)?0:0);}'
+case_one overflow-condition-selected-dead ok 'int f(void){return ((2147483647+1)?0:0) ? 1/0 : 1;}'
+case_one overflow-condition-selected-live error 'int f(void){return ((2147483647+1)?0:0) ? 1 : 1/0;}'
+case_one overflow-selected-arm-still-warns error 'int f(void){return (1 ? 2147483647+1 : 0) ? 1/0 : 1;}'
+python3 "$root/tests/regression/check_divzero_constant_matrix.py" --lccc "$CCC" --gcc "$GCC"
 echo 'div-zero constant arms: PASS (GCC differential, 32/64-bit)'

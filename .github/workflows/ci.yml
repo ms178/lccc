@@ -687,6 +687,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
     - name: Static-local constant initializers
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_static_local_init.sh
+    - name: Multiline comment and splice translation phases
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_multiline_comment_splice.sh
     needs:
     - build
   frontend-b:
