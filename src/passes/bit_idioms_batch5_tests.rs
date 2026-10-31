@@ -42,7 +42,11 @@ fn pair_value(x: u64, k: u32, bits: u32) -> u64 {
     (shifted >> k) & mask
 }
 
-fn shl_lshr_fixture(ty: IrType, amount: u64, shift_amount: Option<u64>) -> (Vec<Option<Instruction>>, Instruction) {
+fn shl_lshr_fixture(
+    ty: IrType,
+    amount: u64,
+    shift_amount: Option<u64>,
+) -> (Vec<Option<Instruction>>, Instruction) {
     let mut defs = vec![None; 4];
     defs[1] = Some(Instruction::BinOp {
         dest: Value(1),
@@ -111,9 +115,21 @@ fn shl_lshr_mask_matches_the_pair_exhaustively() {
 fn shl_lshr_mask_matches_boundaries_at_32_and_64() {
     // Not exhaustive at these widths by construction; boundaries, the mask
     // edge, alternating bits and a deterministic sweep.
-    for (ty, bits) in [(IrType::U32, 32u32), (IrType::I32, 32), (IrType::U64, 64), (IrType::I64, 64)] {
+    for (ty, bits) in [
+        (IrType::U32, 32u32),
+        (IrType::I32, 32),
+        (IrType::U64, 64),
+        (IrType::I64, 64),
+    ] {
         let full = ring_mask(bits);
-        let mut probes = vec![0, 1, full, full - 1, 1u64 << (bits - 1), (1u64 << (bits - 1)) - 1];
+        let mut probes = vec![
+            0,
+            1,
+            full,
+            full - 1,
+            1u64 << (bits - 1),
+            (1u64 << (bits - 1)) - 1,
+        ];
         let mut s = 0x9E37_79B9_7F4A_7C15u64;
         for _ in 0..64 {
             s ^= s << 13;
@@ -124,7 +140,10 @@ fn shl_lshr_mask_matches_boundaries_at_32_and_64() {
         for amount in [1u32, 2, bits / 2, bits - 2, bits - 1] {
             let (defs, inst) = shl_lshr_fixture(ty, amount as u64, None);
             let replacement = fold_shl_lshr_mask(&inst, &defs).expect("pair folds");
-            assert!(expect_and_mask(&replacement, ty, bits, amount), "{ty:?} k={amount}");
+            assert!(
+                expect_and_mask(&replacement, ty, bits, amount),
+                "{ty:?} k={amount}"
+            );
             let Instruction::BinOp {
                 rhs: Operand::Const(mask),
                 ..
@@ -134,7 +153,11 @@ fn shl_lshr_mask_matches_boundaries_at_32_and_64() {
             };
             let mask = mask.to_i128().expect("integer constant") as u64;
             for &x in &probes {
-                assert_eq!(pair_value(x, amount, bits), x & mask, "{ty:?} k={amount} x={x:#x}");
+                assert_eq!(
+                    pair_value(x, amount, bits),
+                    x & mask,
+                    "{ty:?} k={amount} x={x:#x}"
+                );
             }
         }
     }
@@ -251,13 +274,9 @@ fn cmp_holds(op: IrCmpOp, a: u64, b: u64, bits: u32) -> bool {
         IrCmpOp::Ugt => a > b,
         IrCmpOp::Uge => a >= b,
         IrCmpOp::Slt => ((a ^ sign).wrapping_sub(sign)) < ((b ^ sign).wrapping_sub(sign)),
-        IrCmpOp::Sle => {
-            ((a ^ sign).wrapping_sub(sign)) <= ((b ^ sign).wrapping_sub(sign))
-        }
+        IrCmpOp::Sle => ((a ^ sign).wrapping_sub(sign)) <= ((b ^ sign).wrapping_sub(sign)),
         IrCmpOp::Sgt => ((a ^ sign).wrapping_sub(sign)) > ((b ^ sign).wrapping_sub(sign)),
-        IrCmpOp::Sge => {
-            ((a ^ sign).wrapping_sub(sign)) >= ((b ^ sign).wrapping_sub(sign))
-        }
+        IrCmpOp::Sge => ((a ^ sign).wrapping_sub(sign)) >= ((b ^ sign).wrapping_sub(sign)),
     }
 }
 
