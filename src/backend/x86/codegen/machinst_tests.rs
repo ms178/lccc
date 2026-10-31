@@ -2114,10 +2114,10 @@ fn narrow_divide_the_selector_builds_computes_the_narrow_quotient_when_executed(
                 _ => ((*a as u16) / (*b as u16)) as i64,
             };
             let narrow_got = match ty {
-                IrType::I8 => (g as i8) as i64,
-                IrType::I16 => (g as i16) as i64,
-                IrType::U8 => (g as u8) as i64,
-                _ => (g as u16) as i64,
+                IrType::I8 => (*g as i8) as i64,
+                IrType::I16 => (*g as i16) as i64,
+                IrType::U8 => (*g as u8) as i64,
+                _ => (*g as u16) as i64,
             };
             assert_eq!(
                 narrow_got, want,
