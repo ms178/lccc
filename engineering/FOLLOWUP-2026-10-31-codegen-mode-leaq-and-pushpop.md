@@ -313,4 +313,3 @@ and printing the same table to the log either way. The first run through it
 1.078 and `nbody` 1.064. Those six are the next round's work list, in that
 order, and every future change now has a number attached to it before it is
 argued about.
-
