@@ -404,6 +404,12 @@ gate "shift-signext-fold" fast \
 gate "generator-map" fast \
     env CCC="$LCCC" bash tests/regression/check_generator_map.sh
 
+# RA holdout harness: deterministic generated sources, GCC checksum agreement,
+# plus unit checks for the loop-local push/pop and stack-operand census. Full
+# O0/O1/O2/O3 differential sweeps are the slow-lane/manual oracle invocation.
+gate "ra-holdout-harness" fast \
+    python3 tests/ra/test_harness.py
+
 # Register-offset symbol folds (`Add(symbol, register)` -> `sym(%off,%idx)`):
 # the sliding-window shape `const u8 *m = window + cur; m[i]` must fold the
 # symbol into the memory operand where the derived pointer has no other use,
