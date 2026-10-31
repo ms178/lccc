@@ -93,14 +93,13 @@ So every default build was linked **position-fixed** while its codegen still
 paid the full PIC price from §2. The two halves of the driver disagreed, and
 the losing half was the one that costs instructions, `leaq`s and registers.
 
-A candidate fix was implemented and measured as
-`pic_codegen_effective(pic, pie, fixed_exec_link) = pic || (pie &&
-!fixed_exec_link)` (a PIE request is honoured only when the image is really
-relocatable), plus `-pie`/`-no-pie` setting the codegen half so the two can no
-longer drift apart. It delivers the §2 numbers on default builds and leaves
-`-S`/`-c` output byte-identical (absolute forms stay gated on
-`fixed_exec_link`, exactly like absolute switch tables). It is **not landed**
-because of the blocker below.
+The fix is `pic_codegen_effective(pic, pie, fixed_exec_link, pie_explicit)`
+(a PIE request is honoured only when the image is really relocatable, or when
+the user spelled `-fPIE`), plus a `-pie` link forcing the codegen half so the
+two can no longer drift apart. It delivers the §2 numbers on default builds and
+leaves `-S`/`-c` output byte-identical (absolute forms stay gated on
+`fixed_exec_link`, exactly like absolute switch tables). **Landed** — see §6 for
+the final shape; the blocker below is what had to be fixed first.
 
 ## 4. Blocker: a latent miscompile in non-PIC codegen at `-O1`
 
@@ -149,14 +148,66 @@ Impact today: `-fno-pie` (already supported) inherits it; `-no-pie` does not
 
 ## 5. Next steps
 
-1. Fix the `-O1` non-PIC miscompile (§4): make the non-PIC symbol-SIB arms go
-   through the same index-form normalisation as the PIC arm, and add the
-   `gzip_longest_match`-at-`-O1` case to `scripts/check_benchmark_outputs.sh`
-   as a `-O1 -fno-pie` variant so the path is covered by CI from then on.
-2. Re-land `pic_codegen_effective` (the candidate patch is described in §3).
-   Expected: -306 instructions, -179 `leaq`, -54 `push`/`pop` on the linked
-   benchmark binaries; `-S`/`-c` output unchanged.
+1. ~~Fix the `-O1` non-PIC miscompile (§4)~~ — done:
+   `tests/regression/check_reg_off_sym_fold.sh` contract 5 runs the gzip
+   longest-match kernel at `-O1 -fno-pie` against gcc and the kill switch, so
+   the level and mode that used to answer "foldable" for a live base are
+   covered by CI from then on.
+2. ~~Re-land `pic_codegen_effective` (§3)~~ — done, see §6. Expected: -306
+   instructions, -179 `leaq`, -54 `push`/`pop` on the linked benchmark
+   binaries; `-S`/`-c` output unchanged.
 3. Register-pressure work beyond that is small: pool size (+%rax/%rcx) buys
    -4 %, save-set compaction is already worth -30 pushes, and 88 % of the
    remaining pushes live in call-free functions where they are the ABI cost of
    keeping more than six values live — not a defect.
+
+## 6. Landed: the codegen mode follows the link mode
+
+`Driver` carries two facts, not one:
+
+* `pie` — what the `-f` flags say. It still drives `__PIE__`/`__PIC__`,
+  because those macros describe the option, not the image.
+* `pie_explicit` — whether `-fPIE`/`-fpie` was *spelled*. It exists for exactly
+  one case: an explicit request for position-independent CODE must not be
+  overridden by a position-fixed LINK.
+
+`compile_translation_unit` then computes, once, from the same argument list the
+linker receives:
+
+```rust
+let link_pie         = linker_pie_effective(&self.build_linker_args());
+let fixed_exec_link  = matches!(self.mode, CompileMode::Full)
+                       && !self.shared_lib && !self.relocatable && !link_pie;
+let pic_codegen      = self.pic || self.shared_lib;
+let pie_codegen      = (self.pie && (!fixed_exec_link || self.pie_explicit)) || link_pie;
+```
+
+`fixed_exec_link` already existed for the absolute switch-table form; symbol
+addressing now rides the same predicate, so there is one answer to "can this
+image be relocated" rather than two that could disagree — which is what the
+original defect was.
+
+What each invocation gets:
+
+| invocation | image | codegen | why |
+|---|---|---|---|
+| `lccc -O2 a.c -o a` (default) | ET_EXEC | position-fixed | the image cannot move; PIC buys nothing |
+| `lccc -O2 -c a.c` / `-S` | object | position-independent | a later link may be `-pie` |
+| `lccc -O2 -pie a.c -o a` | ET_DYN | position-independent | `R_X86_64_32S` is unresolvable in ET_DYN |
+| `lccc -O2 -fpie a.c -o a` | ET_EXEC | position-independent | the user asked for PIC code |
+| `lccc -O2 -fPIC` / `-shared` | — | full PIC | interposition-safe |
+
+`tests/regression/check_default_codegen_mode.sh` pins all six arms, in the
+linked images (the only place a FULL invocation's codegen mode is observable,
+since `-S`/`-c` are deliberately mode-independent): the absolute symbol+index
+SIB form `0x404040(,%rax,4)` exists by default and never in a `-pie`/`-fpie`/
+`-c` image, `-fPIC` still reaches a preemptible global through
+`@GOTPCREL`, every arm prints gcc's own output, and `-S` is byte-identical with
+and without `-no-pie`.
+
+The security posture is unchanged and worth stating: lccc's default link was
+already non-PIE (`linker_pie_effective` defaults to false), so this change does
+not disable ASLR for code — it stops paying for position independence the
+resulting binary never had. A hardened build is one flag away and now honoured
+end to end: `-pie` (or `-fPIE`) produces position-independent codegen *and* an
+ET_DYN image.

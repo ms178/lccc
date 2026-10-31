@@ -1731,6 +1731,12 @@ gate "cfi-unwind" fast \
 gate "narrow-int-codegen" fast \
     env CCC=target/fastbuild/lccc python3 tests/regression/check_narrow_int_codegen.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23
 
+# The codegen mode and the link mode are one decision: a position-fixed
+# ET_EXEC pays no position-independent price, while -pie, -fpie, -c, -S and
+# -fPIC stay position independent.
+gate "default-codegen-mode" fast \
+    bash tests/regression/check_default_codegen_mode.sh
+
 # The builtin linkers against gcc's link semantics: -shared startup files and
 # default libraries, user -l before the defaults, -rpath, as-needed libm.
 gate "builtin-dso-link" fast \
