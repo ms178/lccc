@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 546,
+  "knob_literals": 547,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -542,6 +542,7 @@
     "LCCC_RET_XMM",
     "LCCC_RET_XMM_BITS",
     "LCCC_SCHEDULE",
+    "LCCC_STACK_ADJUST",
     "LCCC_STRICT_MFLAGS",
     "LCCC_STRICT_OPTIONS",
     "LCCC_SYSROOT",

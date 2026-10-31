@@ -441,6 +441,14 @@ pub(super) fn phys_reg_name_32(reg: PhysReg) -> &'static str {
     }
 }
 
+/// `%rax`: the accumulator, and the first register of the divide/remainder
+/// pair. Every 64-bit consumer that reads it reads the *whole* register, which
+/// is why narrow values are canonicalized when they are staged here.
+pub(super) const R_RAX: PhysReg = PhysReg(0);
+/// `%rcx`: the secondary staging register (`operand_to_rcx`) and the divisor of
+/// `divq`/`idivq`. Its home may equally hold only a 32-bit-canonical value.
+pub(super) const R_RCX: PhysReg = PhysReg(7);
+
 /// Get the typed register name for a PhysReg at a given IrType width.
 /// E.g., PhysReg(1)=rbx → for I32 returns "ebx", for I8 returns "bl".
 pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
@@ -448,7 +456,9 @@ pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
         IrType::I64 | IrType::U64 | IrType::Ptr => phys_reg_name(reg),
         IrType::I32 | IrType::U32 | IrType::F32 => phys_reg_name_32(reg),
         IrType::I16 | IrType::U16 => match reg.0 {
+            0 => "ax",
             1 => "bx",
+            7 => "cx",
             2 => "r12w",
             3 => "r13w",
             4 => "r14w",
@@ -465,7 +475,9 @@ pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
             _ => phys_reg_name(reg),
         },
         IrType::I8 | IrType::U8 => match reg.0 {
+            0 => "al",
             1 => "bl",
+            7 => "cl",
             2 => "r12b",
             3 => "r13b",
             4 => "r14b",
@@ -3243,6 +3255,113 @@ impl X86Codegen {
         }
     }
 
+    /// Integer narrow homes are permitted to contain only the producer's
+    /// narrow/sign-extended-to-32 representation (a 16-bit signed producer may
+    /// have written with `movswl`, which zeroes the high half of its GPR).
+    /// Normalize the low 8/16 bits whenever such a value crosses into the
+    /// backend's 64-bit accumulator domain. `operand_to_rax` and
+    /// `operand_to_rcx` are used by 64-bit divide lowering even for narrow IR
+    /// types, so blindly copying a home with `movq` changes -1 into 0x0000ffff.
+    fn emit_narrow_integer_extend(
+        &mut self,
+        ty: IrType,
+        source: &str,
+        dest64: &str,
+        dest32: &str,
+    ) -> bool {
+        let mnemonic = match ty {
+            IrType::I8 => "movsbq",
+            IrType::U8 => "movzbl",
+            IrType::I16 => "movswq",
+            IrType::U16 => "movzwl",
+            _ => return false,
+        };
+        let dest = if matches!(ty, IrType::U8 | IrType::U16) {
+            dest32
+        } else {
+            dest64
+        };
+        self.state
+            .emit_fmt(format_args!("    {mnemonic} %{source}, %{dest}"));
+        true
+    }
+
+    /// Normalize a narrow integer already staged in an accumulator scratch
+    /// register. The typed aliases are centralized in `typed_phys_reg_name`
+    /// so this works for both legacy and REX byte registers.
+    fn extend_narrow_scratch(&mut self, value_id: u32, scratch: &str) {
+        let Some(ty) = self.value_types.get(&value_id).copied() else {
+            return;
+        };
+        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            return;
+        }
+        let (reg, dest64, dest32, already) = match scratch {
+            "rax" => (
+                R_RAX,
+                "rax",
+                "eax",
+                self.state.reg_cache.acc_is_canonical64(value_id),
+            ),
+            "rcx" => (
+                R_RCX,
+                "rcx",
+                "ecx",
+                self.state.reg_cache.sec_is_canonical64(value_id),
+            ),
+            _ => return,
+        };
+        // The scratch already holds the value's full 64-bit form (it was
+        // loaded by a width-extending slot load, produced by an extend this
+        // file emitted, or zero-extended by an unsigned narrow load).
+        // Re-extending it is a wasted µop in the hot narrow-store path, and
+        // it used to cost the memory-RMW fold its shape.
+        if already {
+            return;
+        }
+        let source = typed_phys_reg_name(reg, ty);
+        self.emit_narrow_integer_extend(ty, source, dest64, dest32);
+    }
+
+    /// Record that `%rax`/`%rcx` now holds the 64-bit canonical form of
+    /// `value_id`, so a later [`Self::extend_narrow_scratch`] can skip the
+    /// extend. Only narrow integer types are tracked; wide values never need
+    /// the marker.
+    fn note_narrow_canonical(&mut self, value_id: u32, in_acc: bool) {
+        let narrow = matches!(
+            self.value_types.get(&value_id).copied(),
+            Some(IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
+        );
+        if !narrow {
+            return;
+        }
+        if in_acc {
+            self.state.reg_cache.mark_acc_canonical64(value_id);
+        } else {
+            self.state.reg_cache.mark_sec_canonical64(value_id);
+        }
+    }
+
+    /// Extend a narrow integer directly from its assigned GPR home into a
+    /// scratch register. Returns false for values whose representation is
+    /// already handled by the ordinary full-width move path.
+    fn extend_narrow_home_to(
+        &mut self,
+        value_id: u32,
+        source: PhysReg,
+        dest64: &str,
+        dest32: &str,
+    ) -> bool {
+        let Some(ty) = self.value_types.get(&value_id).copied() else {
+            return false;
+        };
+        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            return false;
+        }
+        let source = typed_phys_reg_name(source, ty);
+        self.emit_narrow_integer_extend(ty, source, dest64, dest32)
+    }
+
     /// Load an operand into %rax. Uses the register cache to skip the load
     /// if the value is already in %rax.
     pub(super) fn operand_to_rax(&mut self, op: &Operand) {
@@ -3330,13 +3449,23 @@ impl X86Codegen {
                 let is_alloca = self.state.is_alloca(v.0);
                 // Check cache: skip load if value is already in %rax
                 if self.state.acc_has_verified(v.0, is_alloca) {
+                    self.extend_narrow_scratch(v.0, "rax");
                     return;
                 }
                 // Check secondary cache: if value is in %rcx, use movq %rcx, %rax
-                // (3 bytes) instead of loading from stack (7-8 bytes)
+                // (3 bytes) instead of loading from stack (7-8 bytes). Normalize
+                // narrow integer values after the copy; a cached home can have
+                // only 8/16/32-bit canonical producer bits.
                 if self.state.sec_has_verified(v.0, is_alloca) {
-                    self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
+                    // Narrow values are extended straight out of the cache
+                    // register (`movswq %cx, %rax`): one instruction instead of
+                    // "copy, then extend the copy", and the plain copy alone is
+                    // what made a 32-bit-canonical home reach 64-bit consumers.
+                    if !self.extend_narrow_home_to(v.0, R_RCX, "rax", "eax") {
+                        self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
+                    }
                     self.state.park_acc(v.0, is_alloca);
+                    self.note_narrow_canonical(v.0, true);
                     return;
                 }
                 // Check register allocation: load from assigned register
@@ -3345,16 +3474,23 @@ impl X86Codegen {
                     if is_xmm_reg(reg) {
                         let reg_name = phys_reg_name(reg);
                         self.emit_scalar_xmm_to_gpr(reg_name, "rax", None);
-                    } else {
+                        self.extend_narrow_scratch(v.0, "rax");
+                    } else if !self.extend_narrow_home_to(v.0, reg, "rax", "eax") {
                         let reg_name = phys_reg_name(reg);
                         self.state
                             .out
                             .emit_instr_reg_reg("    movq", reg_name, "rax");
                     }
                     self.state.park_acc(v.0, false);
+                    self.note_narrow_canonical(v.0, true);
                 } else if self.state.get_slot(v.0).is_some() {
+                    // A narrow slot load is width-consistent (`movsbq`/
+                    // `movswq` for signed, zero-extending `movzbl`/`movzwl`
+                    // for unsigned), so the accumulator ends up holding the
+                    // value's full 64-bit form.
                     self.value_to_reg(v, "rax");
                     self.state.park_acc(v.0, is_alloca);
+                    self.note_narrow_canonical(v.0, true);
                 } else {
                     // A rematerialisable GlobalAddr deliberately has no home:
                     // its address computation is omitted at the definition and
@@ -4462,7 +4598,11 @@ impl X86Codegen {
                 let is_alloca = self.state.is_alloca(v.0);
                 // Check if already in %rcx (sec cache hit)
                 if self.state.sec_has_verified(v.0, is_alloca) {
-                    // Already in %rcx — nothing to do
+                    // Already in %rcx. Normalize only narrow integer values;
+                    // the typed move is idempotent for their low bits and
+                    // prevents zero-extended producer homes from being used
+                    // as signed 64-bit operands.
+                    self.extend_narrow_scratch(v.0, "rcx");
                     return;
                 }
                 // Check register allocation: load from callee-saved register
@@ -4472,7 +4612,8 @@ impl X86Codegen {
                     if is_xmm_reg(reg) {
                         // SSE1-only code has no MOVQ form.
                         self.emit_scalar_xmm_to_gpr(reg_name, "rcx", None);
-                    } else {
+                        self.extend_narrow_scratch(v.0, "rcx");
+                    } else if !self.extend_narrow_home_to(v.0, reg, "rcx", "ecx") {
                         self.state
                             .out
                             .emit_instr_reg_reg("    movq", reg_name, "rcx");
@@ -4481,8 +4622,12 @@ impl X86Codegen {
                     || self.state.acc_has_verified(v.0, true)
                 {
                     // ACC-RESIDENT FIRST (exposed-forward fix): read the
-                    // %rax copy before touching the slot.
-                    self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                    // %rax copy before touching the slot. Narrow values are
+                    // extended directly out of %rax for the same reason as the
+                    // secondary-cache path above.
+                    if !self.extend_narrow_home_to(v.0, R_RAX, "rcx", "ecx") {
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                    }
                 } else if self.state.get_slot(v.0).is_some() {
                     self.value_to_reg(v, "rcx");
                 } else {
@@ -4497,6 +4642,7 @@ impl X86Codegen {
                 }
                 // Record what's now in %rcx
                 self.state.park_sec(v.0, is_alloca);
+                self.note_narrow_canonical(v.0, false);
             }
         }
     }
@@ -11451,6 +11597,10 @@ mod machinst_resolution_tests {
         assert_eq!(phys_reg_name(PhysReg(55)), "r31");
         assert_eq!(phys_reg_name_32(PhysReg(40)), "r16d");
         assert_eq!(phys_reg_name_32(PhysReg(55)), "r31d");
+        assert_eq!(typed_phys_reg_name(PhysReg(0), IrType::I8), "al");
+        assert_eq!(typed_phys_reg_name(PhysReg(7), IrType::U8), "cl");
+        assert_eq!(typed_phys_reg_name(PhysReg(0), IrType::I16), "ax");
+        assert_eq!(typed_phys_reg_name(PhysReg(7), IrType::U16), "cx");
         assert_eq!(typed_phys_reg_name(PhysReg(40), IrType::I16), "r16w");
         assert_eq!(typed_phys_reg_name(PhysReg(55), IrType::U16), "r31w");
         assert_eq!(typed_phys_reg_name(PhysReg(40), IrType::I8), "r16b");

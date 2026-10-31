@@ -813,6 +813,87 @@ impl X86Codegen {
         self.state.out.emit_named_label(&done);
     }
 
+    /// Divide for an integer type NARROWER than 32 bits, using the 32-bit form.
+    ///
+    /// A narrow value's canonical home form is its 8/16-bit value extended to
+    /// 32 bits (the backend-wide invariant `value_to_reg_inner` and the
+    /// narrow accumulator staging both maintain), so both operands of a narrow
+    /// divide already fit in `%eax`/`%ecx` and `idivl`/`divl` produces the
+    /// exact quotient and remainder the 64-bit form would -- at `DIV r32`
+    /// latency/throughput instead of `DIV r64` (uops.info SKL: 26/6 vs 42/21
+    /// for signed, 22/6 vs 36/21 for unsigned).  The quotient cannot trap:
+    /// the dividend is bounded by the narrow width, so `INT32_MIN / -1` (the
+    /// one `idiv` input that raises `#DE` independently of the divisor being
+    /// zero) is unreachable.
+    ///
+    /// The 32-bit divide leaves `%rax`/`%rdx` in the narrow type's canonical
+    /// 32-bit form -- a 32-bit write zero-extends the upper half -- which is
+    /// exactly the invariant every narrow consumer already re-extends from.
+    /// No extra canonicalization instruction is therefore emitted, and the
+    /// pre-existing width-consistency of slot reloads keeps it sufficient.
+    /// Divide `%rax` by `%rcx`, selecting the width the operand type needs and
+    /// leaving the quotient in `%rax` (remainder moved there when `op` is a
+    /// `rem`). Extracted from `emit_int_binop_impl` so that function stays
+    /// under the audit-census ceiling; the three arms are the three widths.
+    fn emit_divrem_reg(&mut self, op: IrBinOp, ty: IrType, use_32bit: bool) {
+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+        let is_rem = matches!(op, IrBinOp::SRem | IrBinOp::URem);
+        // Narrow integers are 32-bit canonical, so the 32-bit divide is exact
+        // for them (see `emit_div_narrow`). The staging the caller performs
+        // has already put the 64-bit canonical form in %rax/%rcx, whose low
+        // 32 bits ARE the canonical 32-bit operand.
+        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            self.emit_div_narrow(signed);
+            if is_rem {
+                self.state.emit("    movl %edx, %eax");
+            }
+        } else if use_32bit {
+            self.state.emit(if signed {
+                "    cltd"
+            } else {
+                "    xorl %edx, %edx"
+            });
+            self.state.emit(if signed {
+                "    idivl %ecx"
+            } else {
+                "    divl %ecx"
+            });
+            if is_rem {
+                self.state.emit("    movl %edx, %eax");
+            }
+        } else {
+            self.emit_div64(signed);
+            if is_rem {
+                self.state.emit("    movq %rdx, %rax");
+            }
+        }
+    }
+
+    /// Emit the 32-bit divide that is exact for a NARROW (I8/U8/I16/U16)
+    /// dividend and divisor, both already staged in `%rax`/`%rcx` in 64-bit
+    /// canonical form -- whose low 32 bits ARE the canonical 32-bit operands.
+    ///
+    /// `cqto; idivq` would compute with the upper half of a quantity that has
+    /// none, and it costs 42/21 latency/throughput against 26/6 for the 32-bit
+    /// form (SKL, signed; 36/21 against 22/6 unsigned). It cannot trap: the
+    /// dividend is bounded by the narrow width, so the one `idiv` input that
+    /// raises `#DE` independently of a zero divisor -- `INT32_MIN / -1` -- is
+    /// unreachable. `cltd` / `xorl %edx, %edx` set up `%edx`, and a 32-bit
+    /// write leaves `%rax`/`%rdx` in the narrow canonical form every consumer
+    /// re-extends from, so no canonicalization instruction is added.
+    ///
+    /// The MachInst backend mirrors this: `isel::emit_narrow_dividend` stages
+    /// the dividend and `isel::lower_divrem` widens the whole sequence.
+    fn emit_div_narrow(&mut self, signed: bool) {
+        if signed {
+            self.state.emit("    cltd");
+            self.state.emit("    idivl %ecx");
+        } else {
+            self.state.emit("    xorl %edx, %edx");
+            self.state.emit("    divl %ecx");
+        }
+    }
+
     /// Emit one divide serving a same-block div/rem pair and store BOTH
     /// results. Returns false when the home combination is unstoreable
     /// (deadlock) — the caller falls back to standalone divisions for both
@@ -836,7 +917,12 @@ impl X86Codegen {
             self.operand_to_rax(lhs);
         }
         self.operand_to_rcx(rhs);
-        if !use_32bit {
+        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            // The 32-bit divide is exact for narrow operands (see
+            // `emit_div_narrow`) and leaves both results in the narrow type's
+            // canonical 32-bit form, which is what the two stores below keep.
+            self.emit_div_narrow(signed);
+        } else if !use_32bit {
             self.emit_div64(signed);
         } else if signed {
             self.state.emit("    cltd");
@@ -1853,28 +1939,7 @@ impl X86Codegen {
                 }
             }
             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
-                let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
-                let is_rem = matches!(op, IrBinOp::SRem | IrBinOp::URem);
-                if use_32bit {
-                    self.state.emit(if signed {
-                        "    cltd"
-                    } else {
-                        "    xorl %edx, %edx"
-                    });
-                    self.state.emit(if signed {
-                        "    idivl %ecx"
-                    } else {
-                        "    divl %ecx"
-                    });
-                    if is_rem {
-                        self.state.emit("    movl %edx, %eax");
-                    }
-                } else {
-                    self.emit_div64(signed);
-                    if is_rem {
-                        self.state.emit("    movq %rdx, %rax");
-                    }
-                }
+                self.emit_divrem_reg(op, ty, use_32bit)
             }
             IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
                 // Count already in %rcx, lhs in %rax: on Intel the VEX
