@@ -271,3 +271,46 @@ provably free of *lost* information (the canonical form is 32 bits) but it is
 not free of *work*, and a change of that size has to be measured against the
 corpus with a compiler in the loop, not reasoned about.
 
+## 8. Why the narrow-ALU width stays 64-bit here (the lattice, stated exactly)
+
+The tempting reading of "narrow values live in the low half" is "so emit the
+32-bit ALU form". The reason that is wrong is not the *low* half; it is that
+lccc's 64-bit form and its flag consumers are a matched pair, and only the pair
+can move.
+
+Two canonical i32 values `a = 0xFFFF_FFFF` and `b = 1` demonstrate it. `addl`
+produces `0` in the destination with `ZF=1, CF=1`; `addq` produces
+`0x1_0000_0000` with `ZF=0, CF=0`. Both are "correct" for the type — the IR
+result is a 32-bit value — but they disagree about the *value* in bits 32-63
+and about every flag bit a consumer reads. Today lccc emits `addq` and compares
+at 64 bits (`cmpq`), which is internally consistent: the compare sees the same
+`0x1_0000_0000` the add produced, and a `jcc` on it answers the question the IR
+asked. Switching the add alone would leave the compare reading a different
+number than the one produced; switching the add *and* the compare changes the
+answer for the wrap case unless the truncation is materialised somewhere.
+
+That is what `tests/regression/check_narrow_cmp_flag_law.sh` pins: which
+`cmp` width a narrow compare emits, and that the `jcc`/`setcc` consumer reads
+at that same width. The work is therefore a lattice move — every narrow ALU
+op, its narrow compare, and its `setcc`/`cmov`/`jcc` consumer, at once — and
+the value contract that came with it (`check_narrow_alu_arithmetic.sh`) is the
+half of the proof that already exists. The other half, a flag-consumer audit,
+does not exist yet, and a change of that shape cannot be validated by reading
+it: it needs a compiler in the loop on the whole corpus.
+
+## 9. How the next tuning round is measured
+
+The corpus ratios used to be unreachable from outside a run: the job log
+redirects to a blob host and a reusable-workflow job's step summary does not
+surface in `output.summary`, so "the lane passed" was all anyone could see.
+`.github/scripts/ci_bench_ratios.py` now publishes the shard's paired medians as
+one checks annotation — the geomean with best/worst, then the worst kernels
+first — gated on `LCCC_BENCH_RATIOS` like the codegen gate's `LCCC_CODEGEN_ASM`,
+and printing the same table to the log either way. The first run through it
+(86-program corpus, `-O2`, reps=9) reports shard a geomean **0.600** and shard b
+**0.956** against GCC 16.2, with the widest losses at `double_reduction` 1.184,
+`expat_xml_scan` 1.174, `binary_trees` 1.136, `matmul` 1.084, `zlib_ng_compare256`
+1.078 and `nbody` 1.064. Those six are the next round's work list, in that
+order, and every future change now has a number attached to it before it is
+argued about.
+
