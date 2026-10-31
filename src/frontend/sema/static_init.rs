@@ -305,13 +305,20 @@ impl<'s> StaticInitChecker<'s> {
                 _ => Kind::Bad,
             },
             Expr::BinaryOp(op, lhs, rhs, _) => self.binary(*op, lhs, rhs),
-            Expr::Conditional(cond, then_e, else_e, _) => match (self.eval)(cond) {
-                // Only the selected operand is evaluated, so the other one may
-                // name an automatic object (GCC accepts `0 ? &a : 0`).
-                Some(v) if is_false_condition(&v) => self.value(else_e),
-                Some(_) => self.value(then_e),
-                None => Kind::Bad,
-            },
+            Expr::Conditional(cond, then_e, else_e, _) => {
+                // A string literal selects its first arm without turning the
+                // literal's address into an invented numeric constant.
+                if crate::common::const_eval::string_literal_condition(cond) {
+                    return self.value(then_e);
+                }
+                match (self.eval)(cond) {
+                    // Only the selected operand is evaluated, so the other one may
+                    // name an automatic object (GCC accepts `0 ? &a : 0`).
+                    Some(v) if is_false_condition(&v) => self.value(else_e),
+                    Some(_) => self.value(then_e),
+                    None => Kind::Bad,
+                }
+            }
             // `c ?: f` yields `c` when it is nonzero, which is a constant here.
             Expr::GnuConditional(cond, else_e, _) => match (self.eval)(cond) {
                 Some(v) if is_false_condition(&v) => self.value(else_e),

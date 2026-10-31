@@ -222,7 +222,7 @@ pub enum AsmDirective {
     /// `.file N "name"`: a DWARF line-table file.
     File(u32, String),
     /// `.loc FILE LINE COLUMN`: a line row at the current location.
-    Loc(u32, u32, u32),
+    Loc(u32, u32, u32, crate::backend::elf::DwarfLocOptions),
     /// Directives that place no bytes and change nothing this assembler
     /// models (`.ident`, `.arch`, `.cpu`, ...).
     Ignored,
@@ -1596,8 +1596,8 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             None => AsmDirective::Ignored,
         },
         ".loc" => {
-            let (file, line, column) = crate::backend::elf::parse_loc_directive(args)?;
-            AsmDirective::Loc(file, line, column)
+            let (file, line, column, options) = crate::backend::elf::parse_loc_directive(args)?;
+            AsmDirective::Loc(file, line, column, options)
         }
         // A literal pool is dumped only where the source asks (GNU as):
         // anywhere else its data would land between instructions.

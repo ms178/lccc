@@ -403,7 +403,11 @@ impl Lowerer {
                 Some(IrConst::I64(align as i64))
             }
             Expr::Conditional(cond, then_e, else_e, _) => {
-                // Ternary in constant expr: evaluate condition and pick branch
+                // A literal's array address is non-null, even though it has no
+                // numeric IrConst. Keep this in sync with sema's selection.
+                if shared_const_eval::string_literal_condition(cond) {
+                    return self.eval_const_expr(then_e);
+                }
                 let cond_val = self.eval_const_expr(cond)?;
                 if self.const_truth(&cond_val, cond) {
                     self.eval_const_expr(then_e)
@@ -433,8 +437,14 @@ impl Lowerer {
                     None
                 }
             }
-            // Handle &((type*)0)->member pattern (offsetof)
-            Expr::AddressOf(inner, _) => self.eval_offsetof_pattern(inner),
+            // C11 6.5.3.2p3: in &*p neither operator is evaluated and
+            // the value is p. This also applies to null and integer-cast
+            // pointer constants; it is not a dereference of the pointer.
+            Expr::AddressOf(inner, _) => match inner.as_ref() {
+                Expr::Deref(ptr, _) => self.eval_const_expr(ptr),
+                // Handle &((type*)0)->member pattern (offsetof).
+                _ => self.eval_offsetof_pattern(inner),
+            },
             Expr::BuiltinTypesCompatibleP(type1, type2, qualifiers1, qualifiers2, _) => {
                 let result = self.eval_types_compatible(type1, type2, qualifiers1, qualifiers2);
                 Some(IrConst::I64(result as i64))

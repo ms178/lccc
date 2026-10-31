@@ -77,16 +77,73 @@ fn string_operand(s: &str) -> Result<(String, &str), String> {
     Ok((String::from_utf8_lossy(&bytes).into_owned(), &s[end + 1..]))
 }
 
-/// `.loc FILE LINE [COLUMN] [OPTIONS]`.  The options (`prologue_end`,
-/// `is_stmt 0`, `discriminator N`, `view V`, ...) are not recorded: the
-/// line program carries addresses, files, lines and columns.
-pub(crate) fn parse_loc_directive(args: &str) -> Result<(u32, u32, u32), String> {
-    let mut words = args.split_whitespace();
-    let mut number = || words.next().and_then(|w| w.parse::<u32>().ok());
-    match (number(), number()) {
-        (Some(file), Some(line)) => Ok((file, line, number().unwrap_or(0))),
-        _ => Err(format!("expected .loc FILE LINE [COLUMN]: .loc {args}")),
+/// Row attributes carried by a GAS `.loc`. `is_stmt` and `isa` persist
+/// until changed; the other fields apply only to the next emitted row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DwarfLocOptions {
+    pub is_stmt: Option<bool>,
+    pub isa: Option<u64>,
+    pub basic_block: bool,
+    pub prologue_end: bool,
+    pub epilogue_begin: bool,
+    pub discriminator: Option<u64>,
+}
+
+/// Parse `.loc FILE LINE [COLUMN] [OPTIONS]`. GNU view annotations are not
+/// yet represented; retain compatibility with the previously ignored option.
+pub(crate) fn parse_loc_directive(args: &str) -> Result<(u32, u32, u32, DwarfLocOptions), String> {
+    let mut words = args.split_whitespace().peekable();
+    let invalid = || format!("invalid .loc directive: .loc {args}");
+    let file = words
+        .next()
+        .and_then(|w| w.parse().ok())
+        .ok_or_else(invalid)?;
+    let line = words
+        .next()
+        .and_then(|w| w.parse().ok())
+        .ok_or_else(invalid)?;
+    let column = if words.peek().is_some_and(|w| w.parse::<u32>().is_ok()) {
+        words
+            .next()
+            .and_then(|w| w.parse().ok())
+            .ok_or_else(invalid)?
+    } else {
+        0
+    };
+    let mut options = DwarfLocOptions::default();
+    while let Some(word) = words.next() {
+        match word {
+            "basic_block" => options.basic_block = true,
+            "prologue_end" => options.prologue_end = true,
+            "epilogue_begin" => options.epilogue_begin = true,
+            "is_stmt" => match words.next() {
+                Some("0") => options.is_stmt = Some(false),
+                Some("1") => options.is_stmt = Some(true),
+                _ => return Err(invalid()),
+            },
+            "isa" => {
+                options.isa = Some(
+                    words
+                        .next()
+                        .and_then(|w| w.parse().ok())
+                        .ok_or_else(invalid)?,
+                )
+            }
+            "discriminator" => {
+                options.discriminator = Some(
+                    words
+                        .next()
+                        .and_then(|w| w.parse().ok())
+                        .ok_or_else(invalid)?,
+                )
+            }
+            "view" => {
+                words.next().ok_or_else(invalid)?;
+            }
+            _ => return Err(invalid()),
+        }
     }
+    Ok((file, line, column, options))
 }
 
 /// `DW_LNE_set_address`, relocated against `symbol` + `addend`; `base` is
@@ -120,6 +177,7 @@ pub(crate) struct DwarfLineLocation {
     pub file_number: u32,
     pub line: u32,
     pub column: u32,
+    pub options: DwarfLocOptions,
     /// Assembly source order, used to keep rows stable when offsets tie.
     pub sequence: u64,
 }
@@ -195,9 +253,20 @@ pub(crate) fn build_dwarf_line_section(
             .map(|i| i as u64 + 1)
     };
 
-    let mut rows_by_section: Vec<Vec<&DwarfLineLocation>> =
+    // GAS carries is_stmt and ISA across section switches. Resolve those
+    // persistent states in source order before sorting rows into per-section
+    // line programs; each program itself starts with DWARF defaults.
+    let mut rows_by_section: Vec<Vec<(&DwarfLineLocation, bool, u64)>> =
         (0..sections.len()).map(|_| Vec::new()).collect();
+    let mut source_is_stmt = true;
+    let mut source_isa = 0;
     for location in locations {
+        if let Some(value) = location.options.is_stmt {
+            source_is_stmt = value;
+        }
+        if let Some(value) = location.options.isa {
+            source_isa = value;
+        }
         let Some(section) = sections.get(location.section_index) else {
             return Err(format!(
                 "internal: DWARF line record refers to missing section {}",
@@ -208,7 +277,7 @@ pub(crate) fn build_dwarf_line_section(
             continue;
         }
         if file_index(location.file_number).is_some() {
-            rows_by_section[location.section_index].push(location);
+            rows_by_section[location.section_index].push((location, source_is_stmt, source_isa));
         }
     }
 
@@ -223,7 +292,7 @@ pub(crate) fn build_dwarf_line_section(
             offset: data.len() as u64,
             section_index,
         });
-        rows.sort_by_key(|row| (row.offset, row.sequence));
+        rows.sort_by_key(|(row, _, _)| (row.offset, row.sequence));
         let code_section = &sections[section_index];
         let mut unit = Vec::new();
         unit.extend_from_slice(&[0; 4]); // unit_length, patched below
@@ -256,7 +325,7 @@ pub(crate) fn build_dwarf_line_section(
 
         // Set the initial code address. The linker resolves this relocation
         // against the executable section symbol and folds in the row offset.
-        let first_offset = rows[0].offset;
+        let first_offset = rows[0].0.offset;
         let (symbol_name, addend) = match symbol_at.as_deref_mut() {
             Some(symbol_at) => (symbol_at(section_index, first_offset), 0),
             None => (
@@ -280,13 +349,25 @@ pub(crate) fn build_dwarf_line_section(
         let mut current_file = 1u64;
         let mut current_line = 1i64;
         let mut current_column = 0u32;
-        for row in rows.iter() {
+        let mut current_is_stmt = true;
+        let mut current_isa = 0u64;
+        for &(row, is_stmt, isa) in rows.iter() {
             let next_file = file_index(row.file_number).unwrap_or(1);
             if row.offset < address {
                 return Err("internal: DWARF line rows are not address ordered".to_string());
             }
             let advance = row.offset - address;
-            if advance != 0 {
+            let next_line = row.line as i64;
+            let line_delta = next_line - current_line;
+            // Special opcodes both advance the machine and emit the row in
+            // one byte. Relocatable per-row addresses (used for linker
+            // relaxation) must keep their set_address relocations instead.
+            let special = if symbol_at.is_none() {
+                line_special_opcode(advance, line_delta)
+            } else {
+                None
+            };
+            if advance != 0 && special.is_none() {
                 if let Some(symbol_at) = symbol_at.as_deref_mut() {
                     let symbol_name = symbol_at(section_index, row.offset);
                     push_set_address(
@@ -302,8 +383,8 @@ pub(crate) fn build_dwarf_line_section(
                     unit.push(2); // DW_LNS_advance_pc
                     write_uleb128(advance, &mut unit);
                 }
-                address = row.offset;
             }
+            address = row.offset;
             if next_file != current_file {
                 unit.push(4); // DW_LNS_set_file
                 write_uleb128(next_file, &mut unit);
@@ -314,14 +395,41 @@ pub(crate) fn build_dwarf_line_section(
                 write_uleb128(row.column as u64, &mut unit);
                 current_column = row.column;
             }
-            let next_line = row.line as i64;
-            let line_delta = next_line - current_line;
-            if line_delta != 0 {
+            if line_delta != 0 && special.is_none() {
                 unit.push(3); // DW_LNS_advance_line
                 write_sleb128(line_delta, &mut unit);
-                current_line = next_line;
             }
-            unit.push(1); // DW_LNS_copy: emit this source row
+            current_line = next_line;
+            if is_stmt != current_is_stmt {
+                unit.push(6); // DW_LNS_negate_stmt
+                current_is_stmt = is_stmt;
+            }
+            if isa != current_isa {
+                unit.push(12); // DW_LNS_set_isa
+                write_uleb128(isa, &mut unit);
+                current_isa = isa;
+            }
+            if row.options.basic_block {
+                unit.push(7);
+            }
+            if row.options.prologue_end {
+                unit.push(10);
+            }
+            if row.options.epilogue_begin {
+                unit.push(11);
+            }
+            if let Some(discriminator) = row.options.discriminator {
+                // ULEB128 needs at least one byte, even for zero. Write it
+                // directly into the unit without a per-row allocation.
+                let bits = (u64::BITS - discriminator.leading_zeros()).max(1);
+                let operand_len = bits.div_ceil(7);
+                unit.push(0); // DW_LNE_extended_op
+                write_uleb128(1 + u64::from(operand_len), &mut unit);
+                unit.push(4); // DW_LNE_set_discriminator
+                write_uleb128(discriminator, &mut unit);
+            }
+            // A special opcode emits the row; otherwise copy does so.
+            unit.push(special.unwrap_or(1));
         }
 
         let end_offset = code_section.size;
@@ -586,6 +694,19 @@ pub(crate) fn build_dwarf_info_sections(
     )))
 }
 
+/// Encode the v4 header's min-instruction-length=1, line-base=-5,
+/// line-range=14 and opcode-base=13. Return None when the pair does not fit.
+fn line_special_opcode(address_delta: u64, line_delta: i64) -> Option<u8> {
+    if !(-5..=8).contains(&line_delta) {
+        return None;
+    }
+    address_delta
+        .checked_mul(14)?
+        .checked_add((line_delta + 5) as u64)?
+        .checked_add(13)
+        .and_then(|value| u8::try_from(value).ok())
+}
+
 fn write_uleb128(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -617,6 +738,19 @@ fn write_sleb128(mut value: i64, out: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn line_special_opcode_boundaries_and_overflow() {
+        assert_eq!(line_special_opcode(0, -5), Some(13));
+        assert_eq!(line_special_opcode(0, 8), Some(26));
+        assert_eq!(line_special_opcode(17, -5), Some(251));
+        assert_eq!(line_special_opcode(17, -1), Some(255));
+        assert_eq!(line_special_opcode(17, 0), None);
+        assert_eq!(line_special_opcode(18, -5), None);
+        assert_eq!(line_special_opcode(0, -6), None);
+        assert_eq!(line_special_opcode(0, 9), None);
+        assert_eq!(line_special_opcode(u64::MAX, 0), None);
+    }
+
     const ABS32: u32 = 10; // R_X86_64_32
     const ABS64: u32 = 1; // R_X86_64_64
 
@@ -637,6 +771,7 @@ mod tests {
             file_number: 1,
             line: 2,
             column: 5,
+            options: DwarfLocOptions::default(),
             sequence: 0,
         }];
         let (_, units) = build_dwarf_line_section(&files, &rows, &text_section(), 8, ABS64, None)
@@ -778,10 +913,38 @@ mod tests {
         assert_eq!(parse_file_directive("\"unit.c\"").unwrap(), None);
         assert!(parse_file_directive("x \"a.c\"").is_err());
         assert!(parse_file_directive("1 \"open").is_err());
-        assert_eq!(parse_loc_directive("1 7 3").unwrap(), (1, 7, 3));
-        assert_eq!(parse_loc_directive("1 7 prologue_end").unwrap(), (1, 7, 0));
-        assert_eq!(parse_loc_directive("2 9 0 is_stmt 0").unwrap(), (2, 9, 0));
-        assert!(parse_loc_directive("1").is_err());
+        assert_eq!(
+            parse_loc_directive("1 7 3").unwrap(),
+            (1, 7, 3, DwarfLocOptions::default())
+        );
+        assert!(
+            parse_loc_directive("1 7 prologue_end")
+                .unwrap()
+                .3
+                .prologue_end
+        );
+        assert_eq!(
+            parse_loc_directive("2 9 0 is_stmt 0").unwrap().3.is_stmt,
+            Some(false)
+        );
+        let (_, _, _, options) = parse_loc_directive(
+            "2 9 4 basic_block prologue_end epilogue_begin discriminator 257 isa 3 is_stmt 0",
+        )
+        .unwrap();
+        assert_eq!(
+            options,
+            DwarfLocOptions {
+                is_stmt: Some(false),
+                isa: Some(3),
+                basic_block: true,
+                prologue_end: true,
+                epilogue_begin: true,
+                discriminator: Some(257),
+            }
+        );
+        for invalid in ["1", "1 2 is_stmt 2", "1 2 isa", "1 2 discriminator -1"] {
+            assert!(parse_loc_directive(invalid).is_err(), "{invalid}");
+        }
     }
 
     /// Relaxation-safe addresses: every row, the sequence end and both PCs
@@ -796,6 +959,7 @@ mod tests {
             file_number: 1,
             line,
             column: 0,
+            options: DwarfLocOptions::default(),
             sequence,
         };
         let rows = [row(0, 1, 0), row(8, 2, 1), row(8, 3, 2), row(0x20, 4, 3)];

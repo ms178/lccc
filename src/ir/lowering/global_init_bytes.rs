@@ -130,7 +130,10 @@ impl Lowerer {
                     };
                     let (member, consumed) =
                         self.member_array_init(rel, &items[item_idx..], &field_layout.ty, &geo);
-                    if matches!(member, MemberArrayInit::Whole(_)) {
+                    if matches!(
+                        member,
+                        MemberArrayInit::Whole(_) | MemberArrayInit::WholeArrayLiteral(_)
+                    ) {
                         // The member's own initializer replaces all of it (p19).
                         let end = (field_offset + geo.total * geo.elem_size()).min(bytes.len());
                         if let Some(span) = bytes.get_mut(field_offset..end) {

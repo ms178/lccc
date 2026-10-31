@@ -127,11 +127,10 @@ impl LineResolver {
 /// Lexical state at a line splice, as far as [`join_continued_lines`] needs
 /// it to decide whether the splice may be replaced by a line break.
 ///
-/// Scanning starts afresh (`Code`) at every joined line, so a block comment
-/// opened on an earlier joined line is not seen. Every misjudgement is safe:
-/// taking comment text for a literal or a `//` comment only joins (the
-/// conservative choice), and taking a block comment's inside for code only
-/// splits inside a comment, which already spans lines.
+/// Scanning starts afresh (`Code`) at every joined line, so this state alone
+/// cannot see a comment opened on an earlier physical line. The independent
+/// `PhysicalContext` check also carries comment, literal and directive state
+/// across splices and real newlines before allowing a break to be retained.
 ///
 /// [`join_continued_lines`]: Preprocessor::join_continued_lines
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,16 +139,23 @@ enum SpliceState {
     Literal(u8),
     LineComment,
     BlockComment,
+    // A star at the end of a spliced part may pair with '/' in the next.
+    BlockCommentStar,
 }
 
 impl SpliceState {
-    /// The state after `bytes`, starting in `self`.
-    fn scan(mut self, bytes: &[u8]) -> Self {
-        let mut i = 0;
-        while i < bytes.len() {
+    fn in_block(self) -> bool {
+        matches!(self, Self::BlockComment | Self::BlockCommentStar)
+    }
+
+    /// The state after one physical part of the phase-2 stream. The complete
+    /// stream supplies context for C23 separators that straddle splices.
+    fn scan_part(mut self, bytes: &[u8], from: usize, end: usize) -> Self {
+        let mut i = from;
+        while i < end {
             let b = bytes[i];
             match self {
-                Self::Code => match (b, bytes.get(i + 1)) {
+                Self::Code => match (b, bytes.get(i + 1).filter(|_| i + 1 < end)) {
                     (b'"' | b'\'', _) if !is_digit_separator(bytes, i) => self = Self::Literal(b),
                     (b'/', Some(b'*')) => {
                         self = Self::BlockComment;
@@ -165,17 +171,21 @@ impl SpliceState {
                         self = Self::Code;
                     }
                 }
-                Self::BlockComment => {
-                    if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                        self = Self::Code;
-                        i += 1;
-                    }
-                }
+                Self::BlockComment if b == b'*' => self = Self::BlockCommentStar,
+                Self::BlockComment => {}
+                Self::BlockCommentStar if b == b'/' => self = Self::Code,
+                Self::BlockCommentStar if b == b'*' => {}
+                Self::BlockCommentStar => self = Self::BlockComment,
                 Self::LineComment => return Self::LineComment,
             }
             i += 1;
         }
         self
+    }
+
+    #[cfg(test)]
+    fn scan(self, bytes: &[u8]) -> Self {
+        self.scan_part(bytes, 0, bytes.len())
     }
 }
 
@@ -200,8 +210,97 @@ impl SpliceState {
 /// [`join_continued_lines`]: Preprocessor::join_continued_lines
 #[inline]
 fn comment_open_at_eol(state: SpliceState, bytes: &[u8]) -> bool {
-    (state == SpliceState::BlockComment || bytes.contains(&b'/'))
-        && state.scan(bytes) == SpliceState::BlockComment
+    (state.in_block() || bytes.contains(&b'/')) && state.scan_part(bytes, 0, bytes.len()).in_block()
+}
+
+/// Lexical state in the actual phase-2 stream, carried across physical lines.
+/// Unlike `SpliceState`, it must also track directives across real newlines
+/// inside block comments and delimiters/escapes split by phase-2 splices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicalLex {
+    Code,
+    Slash,
+    Literal(u8),
+    Escape(u8),
+    Block,
+    Star,
+    Line,
+}
+
+struct PhysicalContext {
+    lex: PhysicalLex,
+    prefix: bool,
+    directive: bool,
+}
+
+impl PhysicalContext {
+    fn new() -> Self {
+        Self {
+            lex: PhysicalLex::Code,
+            prefix: true,
+            directive: false,
+        }
+    }
+
+    fn in_block(&self) -> bool {
+        matches!(self.lex, PhysicalLex::Block | PhysicalLex::Star)
+    }
+
+    // `all` is the whole phase-2 stream. Looking beyond this part is needed
+    // for C23 separators and digraphs whose bytes straddle physical splices.
+    fn scan(&mut self, all: &[u8], from: usize, end: usize) {
+        let mut i = from;
+        while i < end {
+            let b = all[i];
+            match self.lex {
+                PhysicalLex::Code => match b {
+                    b'/' => self.lex = PhysicalLex::Slash,
+                    b'"' | b'\'' if !is_digit_separator(all, i) => {
+                        self.prefix = false;
+                        self.lex = PhysicalLex::Literal(b);
+                    }
+                    b' ' | b'\t' | b'\r' | 0x0b | 0x0c => {}
+                    _ => {
+                        if self.prefix && hash_token_len(&all[i..]) != 0 {
+                            self.directive = true;
+                        }
+                        self.prefix = false;
+                    }
+                },
+                PhysicalLex::Slash => match b {
+                    b'*' => self.lex = PhysicalLex::Block,
+                    b'/' => self.lex = PhysicalLex::Line,
+                    _ => {
+                        self.prefix = false;
+                        self.lex = PhysicalLex::Code;
+                        continue;
+                    }
+                },
+                PhysicalLex::Literal(q) if b == b'\\' => self.lex = PhysicalLex::Escape(q),
+                PhysicalLex::Literal(q) if b == q => self.lex = PhysicalLex::Code,
+                PhysicalLex::Literal(_) => {}
+                PhysicalLex::Escape(q) => self.lex = PhysicalLex::Literal(q),
+                PhysicalLex::Block if b == b'*' => self.lex = PhysicalLex::Star,
+                PhysicalLex::Block => {}
+                PhysicalLex::Star if b == b'/' => self.lex = PhysicalLex::Code,
+                PhysicalLex::Star if b == b'*' => {}
+                PhysicalLex::Star => self.lex = PhysicalLex::Block,
+                PhysicalLex::Line => {}
+            }
+            i += 1;
+        }
+    }
+
+    fn real_newline(&mut self) {
+        if self.in_block() {
+            // A star cannot close a block across an actual newline.
+            self.lex = PhysicalLex::Block;
+        } else {
+            self.lex = PhysicalLex::Code;
+            self.prefix = true;
+            self.directive = false;
+        }
+    }
 }
 
 /// First byte of `line` that is not a space or tab.
@@ -610,11 +709,27 @@ impl Preprocessor {
         &self,
         source: &'a str,
     ) -> (std::borrow::Cow<'a, str>, Option<Vec<LineSegments>>) {
-        // Fast path: if the source contains no backslashes at all, there can't
-        // be any line continuations. We check for '\\' rather than "\\\\n"
-        // because GCC/Clang treat backslash + whitespace + newline as a
-        // continuation too.
+        // Fast path, in two steps. Sources without any backslash have never
+        // been copied here, so that branch stays exactly as it was.
         if !source.contains('\\') {
+            return (std::borrow::Cow::Borrowed(source), None);
+        }
+        // A backslash is necessary but not sufficient for a splice: string
+        // escapes make it ordinary in files that never splice, and until the
+        // joiner was asked the right question such a file was still copied
+        // through the whole loop (and, since the phase-2 stream was added, a
+        // second time into that stream).
+        //
+        // `has_continuation` is the loop's own per-line predicate, so when it
+        // answers `false` every part takes the "not spliced" branch, which
+        // appends the line and one '\n' and leaves `any_spliced` false. Two
+        // properties of that branch decide whether the result is byte-identical
+        // to the input, and they are checked here rather than assumed:
+        //   * `str::lines()` drops a trailing '\r', so the loop would normalise
+        //     CRLF to LF - a CRLF source keeps taking the loop.
+        //   * the loop terminates a final line that had no newline, so a source
+        //     without a trailing '\n' keeps taking the loop as well.
+        if !Self::has_continuation(source) && !source.contains('\r') && source.ends_with('\n') {
             return (std::borrow::Cow::Borrowed(source), None);
         }
 
@@ -629,6 +744,22 @@ impl Preprocessor {
         // Physical line (0-based) of the physical line being processed.
         let mut phys: usize = 0;
 
+        // A separate exact phase-2 byte stream supplies lookbehind and
+        // lookahead to the physical scanner, even across multiple splices.
+        // Reached only for sources that actually splice: the fast path above
+        // already returned for every other file, including the ones whose only
+        // backslash is a string escape.
+        let mut phase2 = String::with_capacity(source.len());
+        for line in source.lines() {
+            if let Some(pos) = Self::find_continuation_backslash(line) {
+                phase2.push_str(&line[..pos]);
+            } else {
+                phase2.push_str(line);
+                phase2.push('\n');
+            }
+        }
+        let mut physical = PhysicalContext::new();
+        let mut phase2_offset = 0usize;
         // Lexical state at the end of the open joined line's last part.
         let mut splice_state = SpliceState::Code;
         // Whether the open joined line may be split at all (not a directive).
@@ -676,6 +807,14 @@ impl Preprocessor {
         let may_keep_break = !self.macros.asm_mode;
         while let Some(line) = lines.next() {
             let bs_pos = Self::find_continuation_backslash(line);
+            let starts_in_block = physical.in_block();
+            let part_len = bs_pos.unwrap_or(line.len());
+            physical.scan(phase2.as_bytes(), phase2_offset, phase2_offset + part_len);
+            phase2_offset += part_len;
+            if bs_pos.is_none() {
+                physical.real_newline();
+                phase2_offset += 1;
+            }
             if let Some(pos) = bs_pos {
                 if !continuation {
                     // New joined line: inherit an open block comment (and the
@@ -697,13 +836,28 @@ impl Preprocessor {
                         || first_token_is_directive(line.as_bytes(), carry_block);
                     splittable = !join_dir && first_non_blank(line.as_bytes()) != Some(b'/');
                 }
-                splice_state = splice_state.scan(&line.as_bytes()[..pos]);
+                splice_state = splice_state.scan_part(
+                    phase2.as_bytes(),
+                    phase2_offset - part_len,
+                    phase2_offset,
+                );
                 let next = lines.peek().map_or(&b""[..], |l| l.as_bytes());
                 let boundary = pos == 0
                     || matches!(line.as_bytes()[pos - 1], b' ' | b'\t')
                     || matches!(next.first(), None | Some(b' ' | b'\t'));
                 if may_keep_break
                     && splittable
+                    // A line that entered inside a block comment is safe to
+                    // split only after both scanners have seen its complete
+                    // terminator. In particular, a `*` before the splice and
+                    // `/` after it must remain joined as the `*/` delimiter.
+                    && (!starts_in_block
+                        || (physical.lex == PhysicalLex::Code && splice_state == SpliceState::Code))
+                    && !physical.directive
+                    && matches!(
+                        physical.lex,
+                        PhysicalLex::Code | PhysicalLex::Block | PhysicalLex::Star
+                    )
                     && boundary
                     && matches!(splice_state, SpliceState::Code | SpliceState::BlockComment)
                     && !starts_directive(next)
@@ -823,6 +977,18 @@ impl Preprocessor {
         } else {
             None
         }
+    }
+
+    /// Whether any physical line ends in a continuation backslash.
+    ///
+    /// This is the joiner's own per-line predicate, asked once up front. It is
+    /// deliberately not a cheaper approximation (`contains("\\\\\n")` would
+    /// reject the GCC extension `backslash + trailing space + newline`), so a
+    /// `false` answer is exactly "the joining loop has nothing to do".
+    fn has_continuation(source: &str) -> bool {
+        source
+            .lines()
+            .any(|line| Self::find_continuation_backslash(line).is_some())
     }
 }
 
@@ -983,17 +1149,18 @@ mod tests {
             SpliceState::Literal(b'\''),
             SpliceState::LineComment,
             SpliceState::BlockComment,
+            SpliceState::BlockCommentStar,
         ];
         fn walk(
             prefix: &mut Vec<u8>,
             depth: usize,
-            states: &[SpliceState; 5],
+            states: &[SpliceState; 6],
             checked: &mut usize,
         ) {
             for &state in states {
                 assert_eq!(
                     comment_open_at_eol(state, prefix),
-                    state.scan(prefix) == SpliceState::BlockComment,
+                    state.scan(prefix).in_block(),
                     "{state:?} over {prefix:?}"
                 );
                 *checked += 1;
@@ -1009,7 +1176,7 @@ mod tests {
         }
         let mut checked = 0usize;
         walk(&mut Vec::with_capacity(4), 4, &states, &mut checked);
-        // 8^0 + 8^1 + 8^2 + 8^3 + 8^4 strings, five entry states each.
+        // 8^0 + 8^1 + 8^2 + 8^3 + 8^4 strings, six entry states each.
         assert_eq!(checked, (1 + 8 + 64 + 512 + 4096) * states.len());
     }
 
@@ -1030,5 +1197,69 @@ mod tests {
             "carried across a join"
         );
         assert_eq!(BlockComment.scan(b"still */ x"), Code);
+        assert_eq!(BlockComment.scan(b"still *"), BlockCommentStar);
+        assert_eq!(BlockCommentStar.scan(b"/ x"), Code);
+        assert_eq!(BlockCommentStar.scan(b"**/ x"), Code);
+        // The star in an opening delimiter cannot also close it.
+        assert_eq!(Code.scan(b"/*"), BlockComment);
+        assert_eq!(BlockComment.scan(b"/"), BlockComment);
+        for text in [b"*/".as_slice(), b"**/ x", b"*a*/", b"abc*", b"abc"] {
+            let whole = BlockComment.scan(text);
+            for split in 0..=text.len() {
+                let parts =
+                    BlockComment
+                        .scan_part(text, 0, split)
+                        .scan_part(text, split, text.len());
+                assert_eq!(parts, whole, "{text:?} split at {split}");
+            }
+        }
+    }
+
+    /// The joiner's fast path must not be "contains a backslash": a string or
+    /// character escape is a backslash that cannot splice, and the point of
+    /// `has_continuation` is that such a source is returned borrowed instead of
+    /// being copied through the loop (and into the phase-2 stream).
+    #[test]
+    fn a_source_without_a_continuation_is_never_copied() {
+        let pp = Preprocessor::new();
+        for source in [
+            "",
+            "int a = 1;\n",
+            "const char *s = \"tab\\there\";\nint b = 2;\n",
+            "char c = '\\\\';\n",
+            "/* a comment with a \\ backslash */\n",
+            "%:define PASTE(a, b) a %:%: b\n",
+        ] {
+            let (joined, map) = pp.join_continued_lines(source);
+            assert!(
+                matches!(&joined, std::borrow::Cow::Borrowed(_)),
+                "joiner copied a source with no continuation: {source:?}"
+            );
+            assert_eq!(&*joined, source);
+            assert!(map.is_none(), "no join, so no line map: {source:?}");
+        }
+    }
+
+    /// Two properties of the joining loop would be silently swallowed by a
+    /// fast path that only asked "is there a splice?": the loop normalises CRLF
+    /// to LF (`str::lines` drops the `\r`) and terminates a final line that had
+    /// no newline. Both stay the loop's job, so both stay observable here.
+    #[test]
+    fn the_joiner_still_normalises_crlf_and_a_missing_final_newline() {
+        let pp = Preprocessor::new();
+        let (joined, map) = pp.join_continued_lines("const char *s = \"x\\ty\";\r\nint b;\r\n");
+        assert_eq!(&*joined, "const char *s = \"x\\ty\";\nint b;\n");
+        assert!(map.is_none());
+        let (joined, _) = pp.join_continued_lines("const char *s = \"x\\ty\";");
+        assert_eq!(&*joined, "const char *s = \"x\\ty\";\n");
+        // A real splice still takes the loop and still joins without a break
+        // (no whitespace on either side of the removed backslash-newline).
+        let (joined, map) = pp.join_continued_lines("int a = 1+\\\n2;\n");
+        assert!(
+            !matches!(&joined, std::borrow::Cow::Borrowed(_)),
+            "a splicing source must not take the fast path"
+        );
+        assert_eq!(&*joined, "int a = 1+2;\n");
+        assert!(map.is_some(), "a join produces a line map");
     }
 }

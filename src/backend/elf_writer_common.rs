@@ -1667,7 +1667,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             | AsmItem::Size(_, _)
             | AsmItem::Cfi(_)
             | AsmItem::File(_, _)
-            | AsmItem::Loc(_, _, _)
+            | AsmItem::Loc(..)
             | AsmItem::OptionDirective(_)
             | AsmItem::Symver(_, _, _)
             | AsmItem::Empty
@@ -2257,7 +2257,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     self.debug_files.push((*number, filename.clone()));
                 }
             }
-            AsmItem::Loc(file_number, line, column) => {
+            AsmItem::Loc(file_number, line, column, options) => {
                 self.ensure_section()?;
                 let section_index = self.current_section.ok_or("no active section for .loc")?;
                 let offset = self.sections[section_index].cursor();
@@ -2267,6 +2267,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     file_number: *file_number,
                     line: *line,
                     column: *column,
+                    options: *options,
                     sequence: self.seq,
                 });
             }

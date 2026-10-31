@@ -67,6 +67,10 @@ impl Lowerer {
             // &x -> GlobalAddr("x")
             Expr::AddressOf(inner, _) => {
                 match inner.as_ref() {
+                    // &*p is p, without evaluating either operator (C11
+                    // 6.5.3.2p3). Preserve symbolic relocations and offsets,
+                    // rather than treating it as a load through p.
+                    Expr::Deref(ptr, _) => self.eval_global_addr_expr(ptr),
                     Expr::Identifier(name, _) => {
                         // Check static local names first (local statics shadow globals)
                         if let Some(ref fs) = self.func_state {
@@ -980,6 +984,9 @@ impl Lowerer {
     /// `_OF_DECLARE` `fn == (fn_type)NULL`.
     pub(super) fn eval_init_condition(&self, cond: &Expr) -> Option<IrConst> {
         self.eval_const_expr(cond)
+            .or_else(|| {
+                crate::common::const_eval::string_literal_condition(cond).then_some(IrConst::I32(1))
+            })
             .or_else(|| self.eval_addr_comparison_cond(cond))
     }
 

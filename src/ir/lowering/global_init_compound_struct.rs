@@ -690,11 +690,24 @@ impl Lowerer {
                         elements.push(addr_init);
                     } else if let Some(addr_init) = self.eval_string_literal_addr_expr(expr) {
                         elements.push(addr_init);
-                    } else if let Some(addr_init) = self.eval_global_addr_expr(expr) {
-                        elements.push(addr_init);
+                    } else if let Some(val) = self.eval_const_expr(expr) {
+                        // Address expressions can also fold to scalar pointer
+                        // values, notably &*(T *)0 and integer-cast pointers.
+                        let val = self.coerce_init_const(
+                            val,
+                            expr,
+                            IrType::from_ctype(field_ty),
+                            Some(field_ty),
+                        );
+                        self.push_const_as_bytes(elements, &val, field_size);
                     } else {
-                        self.diagnose_non_constant(expr);
-                        push_zero_bytes(elements, field_size);
+                        self.materialize_compound_literals_in_expr(expr);
+                        if let Some(addr_init) = self.eval_global_addr_expr(expr) {
+                            elements.push(addr_init);
+                        } else {
+                            self.diagnose_non_constant(expr);
+                            push_zero_bytes(elements, field_size);
+                        }
                     }
                 } else if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = expr {
                     if field_is_pointer {

@@ -925,8 +925,8 @@ impl ElfWriter {
                 self.base.debug_file(*number, name.clone());
                 Ok(())
             }
-            Directive::Loc(file, line, column) => {
-                self.base.debug_loc(*file, *line, *column);
+            Directive::Loc(file, line, column, options) => {
+                self.base.debug_loc(*file, *line, *column, *options);
                 Ok(())
             }
             Directive::Ignored => Ok(()),

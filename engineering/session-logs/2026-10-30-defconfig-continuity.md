@@ -286,3 +286,37 @@ finishes" — is answered for the null-pointer family:
 * The preprocessor half of the same kernel run (comment-bridged directives) is
   recorded in `engineering/journal/2026-10-31-comment-bridged-directives.md`;
   it fixes two truncation shapes and names the residual gap it does not close.
+
+## Adversarial overflow audit of the new diagnostic
+
+After S19, a randomized signed/unsigned comparison screen found two mismatches
+in 120 conditions: `2147483647 + 2147483647` and another overflowing signed
+addition were folded as wrapped by the general ICE evaluator, causing the new
+diagnostic to suppress a zero-division warning that GCC 16.2 emits. GCC keeps
+that warning even under `-fwrapv` and `-fno-strict-overflow`. This is a real
+limitation in S19, not a kernel boot result. CI had reached 88 passing gates
+before being intentionally stopped for the correction; a further reset then
+terminated the in-progress frozen-compiler kernel build at 531 CC entries.
+Neither run completed.
+
+Added a diagnostic-only, conservative signed-overflow walk on evaluated ICE
+paths. It uses C integer promotions/usual arithmetic conversions and checked
+signed add/subtract/multiply/divide/remainder and unary negation, with
+zero-extension for narrower unsigned operands. Logical and conditional
+short-circuiting skips genuinely unevaluated subexpressions; an unknown shape
+cannot suppress a warning. The existing ICE checker and optimizer semantics
+remain unchanged. Literal fast paths avoid invoking this walk on simple
+conditions. This deliberately does not claim complete GCC warning equivalence
+or measured compilation-speed impact.
+
+Fastbuild `-O1 -j2`, named kernel-macro and signed-overflow examples, and 680
+seeded GCC 16.2 differential comparisons across 32/64-bit modes passed on the
+new binary. The matrix includes unsigned wrap, mixed-width promotions,
+multiply/divide/remainder and evaluated versus skipped overflow. The earlier
+S19 targeted `kernel/fork.o` and `arch/x86/kernel/sys_x86_64.o` did build with
+LCCC after the first correction, but those objects predate this last change and
+must be rebuilt. Restored the exact S19 Git history and current upstream after
+the reset, reinstalled Rust/oracles, and prepared the 29-patch kernel from
+the SHA256-verified 6.18.58 archive. S21 remains an **UNGATED** interim patch;
+complete fast CI, a final full build, true setup-size check and a QEMU boot are
+still required. Strict pointer-wrap and null-check semantics remain unaudited.

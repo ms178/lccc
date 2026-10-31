@@ -199,7 +199,7 @@ pub enum Directive {
     /// `.file N "name"`: a DWARF line-table file.
     File(u32, String),
     /// `.loc FILE LINE COLUMN`: a line row at the current location.
-    Loc(u32, u32, u32),
+    Loc(u32, u32, u32, crate::backend::elf::DwarfLocOptions),
     /// Other ignorable directives: .ident, .addrsig, etc.
     Ignored,
     /// `.org new-lc [, fill]` -- resolved by `ElfWriterBase::emit_org`.
@@ -703,8 +703,8 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             None => Directive::Ignored,
         },
         ".loc" => {
-            let (file, line, column) = crate::backend::elf::parse_loc_directive(args)?;
-            Directive::Loc(file, line, column)
+            let (file, line, column, options) = crate::backend::elf::parse_loc_directive(args)?;
+            Directive::Loc(file, line, column, options)
         }
         ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes" | ".eabi_attribute"
         | ".end" | ".noaltmacro" | ".purgem" => Directive::Ignored,

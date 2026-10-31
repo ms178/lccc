@@ -69,8 +69,8 @@ pub use object_writer::{ElfConfig, ObjReloc, ObjSection, write_relocatable_objec
 
 // DWARF line tables
 pub(crate) use dwarf::{
-    DwarfFunction, DwarfLineLocation, DwarfLineUnit, DwarfSectionInfo, build_dwarf_info_sections,
-    build_dwarf_line_section, parse_file_directive, parse_loc_directive,
+    DwarfFunction, DwarfLineLocation, DwarfLineUnit, DwarfLocOptions, DwarfSectionInfo,
+    build_dwarf_info_sections, build_dwarf_line_section, parse_file_directive, parse_loc_directive,
 };
 
 // numeric_labels

@@ -1219,7 +1219,16 @@ impl Lowerer {
             let ir_ty = IrType::from_ctype(ty);
             Self::purge_ptr_ranges_in(ptr_ranges, offset, ir_ty.size());
             self.write_const_to_bytes(bytes, offset, &val, ir_ty);
-        } else if self.member_holds_addr_constant(expr, ty) {
+        } else if self.member_holds_addr_constant(expr, ty)
+            || (self.ctype_can_hold_addr_constant(ty)
+                && Self::expr_contains_compound_addr(expr)
+                && {
+                    // A nested compound literal has no symbol until it is
+                    // materialized; do that before asking for its relocation.
+                    self.materialize_compound_literals_in_expr(expr);
+                    self.member_holds_addr_constant(expr, ty)
+                })
+        {
             // A pointer-sized *integer* member can hold an address constant
             // (C11 6.6p9): the kernel's `struct x86_cpu_id` keeps
             // `(unsigned long)&model` in `unsigned long driver_data`.  The

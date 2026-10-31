@@ -188,26 +188,49 @@ fn proves_nonzero(
 /// copies and constant casts, together with the bit width it is seen at.
 /// Frontends routinely materialise small literals as `Cast(Const)` pairs, so a
 /// literal-only test would miss the `x | 1` guard entirely.
+fn integer_mask(bits: u32) -> u128 {
+    u128::MAX >> (128 - bits)
+}
+
 fn resolved_constant(
     func: &IrFunction,
     defs: &FxHashMap<Value, (usize, usize)>,
     mut operand: Operand,
-) -> Option<(u64, u32)> {
-    for _ in 0..8 {
+) -> Option<(u128, u32)> {
+    // A single budget covers both copies and casts. The old recursive cast
+    // walk reset its budget at each cast and could exhaust the compiler stack.
+    let mut conversions: Vec<(IrType, IrType)> = Vec::new();
+    for _ in 0..64 {
         match operand {
-            Operand::Const(c) => return c.to_u64().map(|n| (n, 64)),
+            Operand::Const(c) => {
+                let mut n = c.to_i128()? as u128;
+                let mut bits = 128;
+                for (from, to) in conversions.into_iter().rev() {
+                    let from_bits = (from.size() * 8) as u32;
+                    let to_bits = (to.size() * 8) as u32;
+                    n &= integer_mask(from_bits);
+                    if from.is_signed()
+                        && to_bits > from_bits
+                        && n & (1u128 << (from_bits - 1)) != 0
+                    {
+                        n |= !integer_mask(from_bits);
+                    }
+                    n &= integer_mask(to_bits);
+                    bits = to_bits;
+                }
+                return Some((n, bits));
+            }
             Operand::Value(v) => {
                 let &(bi, ii) = defs.get(&v)?;
                 match &func.blocks[bi].instructions[ii] {
-                    Instruction::Cast { src, to_ty: to, .. } if to.is_integer() => {
-                        let bits = (to.size() * 8) as u32;
-                        let (n, _) = resolved_constant(func, defs, *src)?;
-                        let mask = if bits >= 64 {
-                            u64::MAX
-                        } else {
-                            (1u64 << bits) - 1
-                        };
-                        return Some((n & mask, bits));
+                    Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    } if from_ty.is_integer() && to_ty.is_integer() => {
+                        conversions.push((*from_ty, *to_ty));
+                        operand = *src;
                     }
                     Instruction::Copy { src, .. } => operand = *src,
                     _ => return None,
@@ -235,16 +258,26 @@ fn def_proves_nonzero(
     casts: &FxHashMap<Value, (Operand, IrType, IrType)>,
     value: Value,
 ) -> bool {
-    let mut value = zero_equivalent_root(value, casts);
-    for _ in 0..32 {
-        let Some(&(bi, ii)) = defs.get(&value) else {
+    // OR is nonzero if either operand is. Search both sides without recursion,
+    // and cap work for malformed or adversarially deep SSA graphs.
+    let mut pending = vec![value];
+    let mut seen = FxHashSet::default();
+    while let Some(value) = pending.pop() {
+        let value = zero_equivalent_root(value, casts);
+        if !seen.insert(value) {
+            continue;
+        }
+        if seen.len() > 256 {
             return false;
+        }
+        let Some(&(bi, ii)) = defs.get(&value) else {
+            continue;
         };
         match &func.blocks[bi].instructions[ii] {
             Instruction::Copy {
                 src: Operand::Value(next),
                 ..
-            } => value = zero_equivalent_root(*next, casts),
+            } => pending.push(*next),
             Instruction::BinOp {
                 op: crate::ir::reexports::IrBinOp::Or,
                 lhs,
@@ -252,29 +285,23 @@ fn def_proves_nonzero(
                 ty,
                 ..
             } if ty.is_integer() => {
-                // The OR sets every bit of a nonzero constant operand, so its
-                // result cannot be zero regardless of the other operand.
                 let constant_nonzero = |o: &Operand| {
                     resolved_constant(func, defs, *o).is_some_and(|(n, w)| {
-                        let bits = (w as usize).min(ty.size() * 8).min(127);
-                        (n as u128) & ((1u128 << bits) - 1) != 0
+                        let bits = w.min((ty.size() * 8) as u32);
+                        n & integer_mask(bits) != 0
                     })
                 };
                 if constant_nonzero(lhs) || constant_nonzero(rhs) {
                     return true;
                 }
-                // Otherwise recurse into whichever operand might be the proof.
-                let next = match (lhs, rhs) {
-                    (Operand::Value(v), _) => *v,
-                    (_, Operand::Value(v)) => *v,
-                    _ => return false,
-                };
-                if def_proves_nonzero(func, defs, casts, next) {
-                    return true;
+                if let Operand::Value(v) = lhs {
+                    pending.push(*v);
                 }
-                return false;
+                if let Operand::Value(v) = rhs {
+                    pending.push(*v);
+                }
             }
-            _ => return false,
+            _ => {}
         }
     }
     false
@@ -1234,6 +1261,121 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
 mod tests {
     use super::*;
     use crate::ir::reexports::{BasicBlock, IrBinOp, IrUnaryOp};
+
+    #[test]
+    fn constant_cast_resolution_respects_source_width_and_signedness() {
+        let mut f = IrFunction::new("constants".into(), IrType::Void, vec![], false);
+        f.blocks = vec![mk(
+            0,
+            vec![
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(256)),
+                    from_ty: IrType::U8,
+                    to_ty: IrType::U32,
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Const(IrConst::I32(128)),
+                    from_ty: IrType::I8,
+                    to_ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Const(IrConst::I32(255)),
+                    from_ty: IrType::U8,
+                    to_ty: IrType::U32,
+                },
+                Instruction::Cast {
+                    dest: Value(4),
+                    src: Operand::Const(IrConst::I64(1 << 40)),
+                    from_ty: IrType::U64,
+                    to_ty: IrType::U8,
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        let defs = (0..4).map(|i| (Value((i + 1) as u32), (0, i))).collect();
+        assert_eq!(
+            resolved_constant(&f, &defs, Operand::Value(Value(1))),
+            Some((0, 32))
+        );
+        assert_eq!(
+            resolved_constant(&f, &defs, Operand::Value(Value(2))),
+            Some((0xffff_ff80, 32))
+        );
+        assert_eq!(
+            resolved_constant(&f, &defs, Operand::Value(Value(3))),
+            Some((255, 32))
+        );
+        assert_eq!(
+            resolved_constant(&f, &defs, Operand::Value(Value(4))),
+            Some((0, 8))
+        );
+    }
+
+    #[test]
+    fn nonzero_definition_search_checks_both_or_operands_and_is_bounded() {
+        let mut f = IrFunction::new("or_search".into(), IrType::Void, vec![], false);
+        let mut instructions = vec![
+            Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::U32,
+            },
+            Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(2)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(4),
+                src: Operand::Const(IrConst::I32(256)),
+                from_ty: IrType::U8,
+                to_ty: IrType::U32,
+            },
+            Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Value(Value(4)),
+                ty: IrType::U32,
+            },
+            Instruction::BinOp {
+                dest: Value(6),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I128(i128::MIN)),
+                ty: IrType::U128,
+            },
+        ];
+        // A long OR chain must fail closed without recursive stack growth.
+        for id in 10..310 {
+            instructions.push(Instruction::BinOp {
+                dest: Value(id),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(if id == 10 { 0 } else { id - 1 })),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ty: IrType::U32,
+            });
+        }
+        f.blocks = vec![mk(0, instructions, Terminator::Return(None))];
+        let defs = f.blocks[0]
+            .instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, inst)| inst.dest().map(|v| (v, (0, i))))
+            .collect();
+        let casts = FxHashMap::default();
+        assert!(def_proves_nonzero(&f, &defs, &casts, Value(3)));
+        assert!(!def_proves_nonzero(&f, &defs, &casts, Value(5)));
+        assert!(def_proves_nonzero(&f, &defs, &casts, Value(6)));
+        assert!(!def_proves_nonzero(&f, &defs, &casts, Value(309)));
+    }
 
     #[test]
     fn truth_sets_signed_and_unsigned() {

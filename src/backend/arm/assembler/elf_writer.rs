@@ -707,8 +707,8 @@ impl ElfWriter {
                 self.base.debug_file(*number, name.clone());
                 Ok(())
             }
-            AsmDirective::Loc(file, line, column) => {
-                self.base.debug_loc(*file, *line, *column);
+            AsmDirective::Loc(file, line, column, options) => {
+                self.base.debug_loc(*file, *line, *column, *options);
                 Ok(())
             }
             AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),

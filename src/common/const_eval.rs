@@ -23,6 +23,17 @@ use super::types::{CType, target_is_32bit, target_ptr_size};
 use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier};
 use crate::ir::reexports::IrConst;
 
+/// A string literal decays to the address of its static-storage array, which
+/// is non-null in a scalar condition. Do not look through casts here: a cast
+/// to a narrower integer can discard address bits and is not proven nonzero.
+#[inline]
+pub(crate) fn string_literal_condition(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..)
+    )
+}
+
 /// Evaluate a literal expression to an IrConst.
 /// Returns None for non-literal expressions.
 #[inline]

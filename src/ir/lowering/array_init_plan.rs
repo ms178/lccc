@@ -149,6 +149,9 @@ pub(super) enum MemberArrayInit<'a> {
     /// The member's own initializer: a braced list, or a string for a
     /// character array.
     Whole(&'a Initializer),
+    /// A same-typed array compound literal's payload is the entire member's
+    /// initializer, not an expression for its first scalar element.
+    WholeArrayLiteral(&'a [InitializerItem]),
     /// A brace-elided run (p20): the first item re-designated relative to
     /// the member, then the undesignated items that continue inside it.
     Run(Vec<InitializerItem>),
@@ -517,6 +520,9 @@ impl Lowerer {
     ) -> (MemberArrayInit<'a>, usize) {
         let first = &items[0];
         if rel.is_empty() {
+            if let Some(payload) = self.array_initializer_payload(&first.init, field_ty) {
+                return (MemberArrayInit::WholeArrayLiteral(payload), 1);
+            }
             let whole = match (&first.init, field_ty) {
                 (Initializer::List(_), _) => true,
                 (Initializer::Expr(e), CType::Array(elem, _)) => {
@@ -546,6 +552,7 @@ impl Lowerer {
     ) -> ArrayInitPlan<'a> {
         match init {
             MemberArrayInit::Whole(init) => self.plan_array_initializer(init, geo),
+            MemberArrayInit::WholeArrayLiteral(items) => self.plan_array_init(items, geo),
             MemberArrayInit::Run(items) => self.plan_array_init(items, geo),
         }
     }

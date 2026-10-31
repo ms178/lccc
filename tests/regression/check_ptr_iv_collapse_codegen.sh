@@ -83,6 +83,25 @@ if ! cmp -s "$tmp/scan.out" "$tmp/scan_off.out"; then
   bad "collapsed and uncollapsed builds disagree on ptr_iv_collapse_scan output"
 fi
 
+# A constant comparison is not by itself a trip-count proof. The unequal
+# bound below is unreachable, so a 32-bit index wraps while the pointers
+# continue through a sparse 4-GiB mapping. Limit runtime so a regression is
+# a bounded failure rather than a stuck CI worker. Compare both LCCC modes
+# against the pinned GCC oracle; a mapping failure is not silently skipped.
+wrapsrc="$repo/tests/regression/ptr_iv_counter_wrap.c"
+"${GCC:-gcc-16}" -O2 "$wrapsrc" -o "$tmp/wrap-gcc"
+"$CCC" -O2 "$wrapsrc" -o "$tmp/wrap-on"
+CCC_DISABLE_PASSES=ptr_iv_collapse "$CCC" -O2 "$wrapsrc" -o "$tmp/wrap-off"
+for mode in gcc on off; do
+  if ! timeout 5s "$tmp/wrap-$mode" >"$tmp/wrap-$mode.out"; then
+    bad "counter-wrap witness failed or timed out ($mode)"
+  fi
+done
+if ! cmp -s "$tmp/wrap-gcc.out" "$tmp/wrap-on.out" ||
+   ! cmp -s "$tmp/wrap-gcc.out" "$tmp/wrap-off.out"; then
+  bad "counter-wrap witness disagrees with GCC"
+fi
+
 # ── 2. zero-guard count promotion ───────────────────────────────────────────
 gatesrc="$repo/tests/regression/clz_zero_guard.c"
 "$CCC" -O2 -S "$gatesrc" -o "$tmp/counts.s"

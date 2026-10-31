@@ -332,6 +332,11 @@ impl Lowerer {
                 return;
             }
         }
+        // An address of a nested compound literal needs its backing global
+        // before the pure address resolver can produce a relocation.
+        if Self::expr_contains_compound_addr(expr) {
+            self.materialize_compound_literals_in_expr(expr);
+        }
         // For pointer/address contexts, try address resolution first
         if let Expr::LabelAddr(label_name, _) = expr {
             // GCC &&label extension: emit label address as GlobalAddr

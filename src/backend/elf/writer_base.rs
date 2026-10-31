@@ -467,7 +467,7 @@ pub struct ElfWriterBase {
     debug_files: Vec<(u32, String)>,
     /// `.loc` rows as (label at the row's address, file, line, column): a
     /// label, so subsection merging moves the row with its code.
-    debug_rows: Vec<(String, u32, u32, u32)>,
+    debug_rows: Vec<(String, u32, u32, u32, super::dwarf::DwarfLocOptions)>,
 }
 
 impl ElfWriterBase {
@@ -559,12 +559,18 @@ impl ElfWriterBase {
 
     /// `.loc FILE LINE COLUMN`: a line row at the current location (in
     /// `.text` before any section directive, as in GNU as).
-    pub fn debug_loc(&mut self, file: u32, line: u32, column: u32) {
+    pub fn debug_loc(
+        &mut self,
+        file: u32,
+        line: u32,
+        column: u32,
+        options: super::dwarf::DwarfLocOptions,
+    ) {
         self.ensure_text_section();
         let label = format!(".Lloc\u{1}{}", self.debug_rows.len());
         let at = (self.current_section.clone(), self.current_offset());
         self.labels.insert(label.clone(), at);
-        self.debug_rows.push((label, file, line, column));
+        self.debug_rows.push((label, file, line, column, options));
     }
 
     /// GNU as `dwarf2_finish`: the `.loc` rows become a DWARF v4
@@ -609,7 +615,7 @@ impl ElfWriterBase {
         // The row labels answer `symbol_at` for their own addresses.
         let mut at_labels: FxHashMap<(usize, u64), String> = FxHashMap::default();
         let mut locations = Vec::with_capacity(self.debug_rows.len());
-        for (sequence, (label, file, line, column)) in (0u64..).zip(&self.debug_rows) {
+        for (sequence, (label, file, line, column, options)) in (0u64..).zip(&self.debug_rows) {
             let Some((section, offset)) = self.labels.get(label) else {
                 continue;
             };
@@ -625,6 +631,7 @@ impl ElfWriterBase {
                 file_number: *file,
                 line: *line,
                 column: *column,
+                options: *options,
                 sequence,
             });
         }

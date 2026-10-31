@@ -206,7 +206,7 @@ impl CfiStream for AsmItem {
             | AsmItem::SymbolType(_, _)
             | AsmItem::Size(_, _)
             | AsmItem::File(_, _)
-            | AsmItem::Loc(_, _, _)
+            | AsmItem::Loc(..)
             | AsmItem::OptionDirective(_)
             | AsmItem::Symver(_, _, _)
             | AsmItem::Set(_, _)
