@@ -3413,14 +3413,23 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 }
                 "-shared" => self.shared_lib = true,
                 "-r" | "-relocatable" => self.relocatable = true,
-                // Codegen already defaults to PIC, but the *link* only becomes
-                // ET_DYN when the linker is told.  Record the flag positionally
-                // so `parse_linker_args` sees it; dropping it silently produced
-                // ET_EXEC at a fixed base, i.e. no ASLR on every binary.
+                // `-pie` is the single switch that owns position independence:
+                // it selects PIE codegen AND records the flag positionally so
+                // `parse_linker_args` sees it.  Dropping the link half silently
+                // produced ET_EXEC at a fixed base (no ASLR) while the codegen
+                // half still paid for position independence.
                 "-pie" | "--pie" | "--pic-executable" => {
+                    // The link mode decides the codegen mode too: a PIE image
+                    // has no link-time constant address, so absolute `disp32`
+                    // symbol operands are unusable there. Setting both halves
+                    // from the same switch keeps them in agreement whichever
+                    // order `-pie`/`-fno-pie` appear in (each spelling is
+                    // last-wins over its own flag only).
+                    self.pie = true;
                     self.linker_ordered_items.push("-pie".to_string());
                 }
                 "-no-pie" | "--no-pie" | "--no-pic-executable" => {
+                    self.pie = false;
                     self.linker_ordered_items.push("-no-pie".to_string());
                 }
                 // The three GNU link-file switches are recorded here and
@@ -7135,5 +7144,67 @@ mod prefetch_isa_tests {
         }
         assert!(!parse(&["i686-ccc", "-mno-mmx"]).resolved_i686_mmx());
         assert!(!parse(&["ccc", "-mno-mmx", "-mmmx"]).mmx_explicitly_disabled);
+    }
+}
+
+#[cfg(test)]
+mod pie_codegen_mode_tests {
+    //! Codegen position-independence must follow the link mode.
+    //!
+    //! The default link is a position-fixed ET_EXEC (`linker_pie_effective`
+    //! answers false for an argument list with no `-pie`), so the default
+    //! codegen mode is non-PIC: a PIE codegen flag buys position independence
+    //! that nothing in the output uses, and it costs a `leaq sym(%rip), %rcx`
+    //! scratch per indexed global access where the absolute `disp32` operand
+    //! is legal, plus a base register held across the loop.
+    use crate::driver::Driver;
+
+    fn parse(flags: &[&str]) -> Driver {
+        let mut d = Driver::new();
+        let args: Vec<String> = std::iter::once("ccc")
+            .chain(flags.iter().copied())
+            .chain(std::iter::once("x.c"))
+            .map(str::to_string)
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok(), "{flags:?}");
+        d
+    }
+
+    fn links_pie(d: &Driver) -> bool {
+        crate::backend::common::linker_pie_effective(&d.build_linker_args())
+    }
+
+    #[test]
+    fn the_default_codegen_mode_matches_the_default_fixed_link() {
+        let d = parse(&[]);
+        assert!(!d.pic, "default is not full PIC");
+        assert!(!d.pie, "default codegen is not PIE");
+        assert!(!links_pie(&d), "default link is a fixed ET_EXEC");
+    }
+
+    #[test]
+    fn dash_pie_turns_on_both_halves() {
+        let d = parse(&["-pie"]);
+        assert!(d.pie, "-pie must also select PIE codegen");
+        assert!(links_pie(&d), "-pie must reach the linker");
+    }
+
+    #[test]
+    fn last_pie_switch_wins_for_both_halves() {
+        let off = parse(&["-pie", "-no-pie"]);
+        assert!(!off.pie, "-no-pie after -pie");
+        assert!(!links_pie(&off), "-no-pie after -pie (link)");
+    }
+
+    #[test]
+    fn fpie_still_selects_pie_codegen() {
+        let d = parse(&["-fpie"]);
+        assert!(d.pie, "-fpie is an explicit codegen request");
+    }
+
+    #[test]
+    fn fpic_stays_full_pic() {
+        let d = parse(&["-fPIC"]);
+        assert!(d.pic, "-fPIC stays full PIC");
     }
 }
