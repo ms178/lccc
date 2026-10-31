@@ -1,0 +1,139 @@
+name: GCC 17 C torture (x86)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'scripts/ci_gcc17_torture.sh'
+      - 'scripts/ensure_gcc_torture_git.py'
+      - 'scripts/x86_gcc_torture.py'
+      - '.github/workflows/gcc17-torture.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gcc17-torture-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build fastbuild compiler artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Enable temporary CI swap
+        run: bash scripts/ci_enable_swap.sh
+      - name: Cache Cargo registry
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Cargo git dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build LCCC (fastbuild, -O1, two jobs)
+        run: bash scripts/build_lccc_fast.sh
+      - name: Record and package compiler artifacts
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > target/fastbuild/ci-build.commit
+          sha256sum target/fastbuild/lccc target/fastbuild/lccc-x86 \
+            target/fastbuild/lccc-arm target/fastbuild/lccc-riscv \
+            target/fastbuild/lccc-i686 target/fastbuild/lccc-ld \
+            > target/fastbuild/ci-build.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lccc-fast-${{ github.sha }}
+          path: |
+            target/fastbuild/lccc
+            target/fastbuild/lccc-x86
+            target/fastbuild/lccc-arm
+            target/fastbuild/lccc-riscv
+            target/fastbuild/lccc-i686
+            target/fastbuild/lccc-ld
+            target/fastbuild/ci-build.commit
+            target/fastbuild/ci-build.sha256
+          if-no-files-found: error
+          retention-days: 2
+
+  torture:
+    name: GCC 17 torture — ${{ matrix.arch }}
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, i686]
+    env:
+      CARGO_BUILD_JOBS: '2'
+      GCC_TORTURE_JOBS: '2'
+      GCC_BIN: gcc-16
+      GCC_TORTURE_FLAGS: '-O2'
+      LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Compute weekly apt cache epoch
+        id: apt-epoch
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - name: Cache GCC package downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-apt
+          key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+          restore-keys: |
+            lccc-apt-debs-v1-${{ runner.os }}-
+      - name: Cache provisioned oracle toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-toolchain
+          key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+      - name: Provision GCC 16 multilib and cached oracle toolchain
+        run: bash scripts/ci_provision_toolchain.sh --multilib
+      - name: Verify GCC 16 and i686 multilib
+        run: bash scripts/ci_verify_oracles.sh
+      - name: Download compiler artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: lccc-fast-${{ github.sha }}
+          path: target/fastbuild
+      - name: Verify compiler artifact identity
+        run: |
+          set -euo pipefail
+          test "$(cat target/fastbuild/ci-build.commit)" = "$(git rev-parse HEAD)"
+          sha256sum -c target/fastbuild/ci-build.sha256
+      - name: Run full GCC 17 compile + execute corpus at -O2
+        env:
+          GCC_TORTURE_RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ matrix.arch }}
+        run: bash scripts/ci_gcc17_torture.sh "${{ matrix.arch }}"
+      - name: Publish machine-readable reports and failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gcc17-torture-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/gcc17-torture/${{ matrix.arch }}
+          if-no-files-found: warn
+          retention-days: 14

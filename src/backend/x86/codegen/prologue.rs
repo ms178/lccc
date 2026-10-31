@@ -3459,9 +3459,7 @@ impl X86Codegen {
             if use_push_pop {
                 let local_size = frame_size - num_saved * 8;
                 if local_size > 0 {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    addq", local_size, "rsp");
+                    emit_stack_adjust_x86(&mut self.state, "addq", local_size);
                 }
                 for &reg in used_regs.iter().rev() {
                     let reg_name = phys_reg_name(reg);
@@ -3475,9 +3473,7 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
                 }
                 if frame_size > 0 {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    addq", frame_size, "rsp");
+                    emit_stack_adjust_x86(&mut self.state, "addq", frame_size);
                 }
             }
         } else {
@@ -5148,6 +5144,29 @@ mod incoming_byval_tests {
     }
 }
 
+/// Adjust `%rsp` by a positive compile-time byte count. x86's `add/sub r64,
+/// imm` encodings carry only a sign-extended imm32; large legal C frame sizes
+/// need a `movabs` into caller-saved `%r11` followed by the register form.
+/// Keep the common immediate form for small frames (shorter and one µop).
+fn emit_stack_adjust_x86(
+    state: &mut crate::backend::state::CodegenState,
+    mnemonic: &'static str,
+    amount: i64,
+) {
+    debug_assert!(matches!(mnemonic, "addq" | "subq"));
+    debug_assert!(amount > 0);
+    if i32::try_from(amount).is_ok() {
+        match mnemonic {
+            "addq" => state.out.emit_instr_imm_reg("    addq", amount, "rsp"),
+            "subq" => state.out.emit_instr_imm_reg("    subq", amount, "rsp"),
+            _ => unreachable!("validated stack-adjust mnemonic"),
+        }
+    } else {
+        state.out.emit_instr_imm_reg("    movq", amount, "r11");
+        state.emit_fmt(format_args!("    {mnemonic} %r11, %rsp"));
+    }
+}
+
 /// Allocate `size` bytes on `%rsp` in an FPO prologue. When
 /// `-fstack-clash-protection` is active and `size > 4096`, unroll 4096-byte
 /// page probes so `cfi_synth` maintains an exact static `%rsp` CFA at every PC.
@@ -5167,7 +5186,7 @@ fn emit_fpo_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, mut
             state.emit("    orl $0, (%rsp)");
         }
     } else {
-        state.out.emit_instr_imm_reg("    subq", size, "rsp");
+        emit_stack_adjust_x86(state, "subq", size);
     }
 }
 
