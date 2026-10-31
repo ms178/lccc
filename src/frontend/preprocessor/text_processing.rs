@@ -709,11 +709,27 @@ impl Preprocessor {
         &self,
         source: &'a str,
     ) -> (std::borrow::Cow<'a, str>, Option<Vec<LineSegments>>) {
-        // Fast path: if the source contains no backslashes at all, there can't
-        // be any line continuations. We check for '\\' rather than "\\\\n"
-        // because GCC/Clang treat backslash + whitespace + newline as a
-        // continuation too.
+        // Fast path, in two steps. Sources without any backslash have never
+        // been copied here, so that branch stays exactly as it was.
         if !source.contains('\\') {
+            return (std::borrow::Cow::Borrowed(source), None);
+        }
+        // A backslash is necessary but not sufficient for a splice: string
+        // escapes make it ordinary in files that never splice, and until the
+        // joiner was asked the right question such a file was still copied
+        // through the whole loop (and, since the phase-2 stream was added, a
+        // second time into that stream).
+        //
+        // `has_continuation` is the loop's own per-line predicate, so when it
+        // answers `false` every part takes the "not spliced" branch, which
+        // appends the line and one '\n' and leaves `any_spliced` false. Two
+        // properties of that branch decide whether the result is byte-identical
+        // to the input, and they are checked here rather than assumed:
+        //   * `str::lines()` drops a trailing '\r', so the loop would normalise
+        //     CRLF to LF - a CRLF source keeps taking the loop.
+        //   * the loop terminates a final line that had no newline, so a source
+        //     without a trailing '\n' keeps taking the loop as well.
+        if !Self::has_continuation(source) && !source.contains('\r') && source.ends_with('\n') {
             return (std::borrow::Cow::Borrowed(source), None);
         }
 
@@ -730,6 +746,9 @@ impl Preprocessor {
 
         // A separate exact phase-2 byte stream supplies lookbehind and
         // lookahead to the physical scanner, even across multiple splices.
+        // Reached only for sources that actually splice: the fast path above
+        // already returned for every other file, including the ones whose only
+        // backslash is a string escape.
         let mut phase2 = String::with_capacity(source.len());
         for line in source.lines() {
             if let Some(pos) = Self::find_continuation_backslash(line) {
@@ -959,6 +978,18 @@ impl Preprocessor {
             None
         }
     }
+
+    /// Whether any physical line ends in a continuation backslash.
+    ///
+    /// This is the joiner's own per-line predicate, asked once up front. It is
+    /// deliberately not a cheaper approximation (`contains("\\\\\n")` would
+    /// reject the GCC extension `backslash + trailing space + newline`), so a
+    /// `false` answer is exactly "the joining loop has nothing to do".
+    fn has_continuation(source: &str) -> bool {
+        source
+            .lines()
+            .any(|line| Self::find_continuation_backslash(line).is_some())
+    }
 }
 
 /// Strip a // comment from a directive line, but not inside string literals.
@@ -1182,5 +1213,53 @@ mod tests {
                 assert_eq!(parts, whole, "{text:?} split at {split}");
             }
         }
+    }
+
+    /// The joiner's fast path must not be "contains a backslash": a string or
+    /// character escape is a backslash that cannot splice, and the point of
+    /// `has_continuation` is that such a source is returned borrowed instead of
+    /// being copied through the loop (and into the phase-2 stream).
+    #[test]
+    fn a_source_without_a_continuation_is_never_copied() {
+        let pp = Preprocessor::new();
+        for source in [
+            "",
+            "int a = 1;\n",
+            "const char *s = \"tab\\there\";\nint b = 2;\n",
+            "char c = '\\\\';\n",
+            "/* a comment with a \\ backslash */\n",
+            "%:define PASTE(a, b) a %:%: b\n",
+        ] {
+            let (joined, map) = pp.join_continued_lines(source);
+            assert!(
+                matches!(&joined, std::borrow::Cow::Borrowed(_)),
+                "joiner copied a source with no continuation: {source:?}"
+            );
+            assert_eq!(&*joined, source);
+            assert!(map.is_none(), "no join, so no line map: {source:?}");
+        }
+    }
+
+    /// Two properties of the joining loop would be silently swallowed by a
+    /// fast path that only asked "is there a splice?": the loop normalises CRLF
+    /// to LF (`str::lines` drops the `\r`) and terminates a final line that had
+    /// no newline. Both stay the loop's job, so both stay observable here.
+    #[test]
+    fn the_joiner_still_normalises_crlf_and_a_missing_final_newline() {
+        let pp = Preprocessor::new();
+        let (joined, map) = pp.join_continued_lines("const char *s = \"x\\ty\";\r\nint b;\r\n");
+        assert_eq!(&*joined, "const char *s = \"x\\ty\";\nint b;\n");
+        assert!(map.is_none());
+        let (joined, _) = pp.join_continued_lines("const char *s = \"x\\ty\";");
+        assert_eq!(&*joined, "const char *s = \"x\\ty\";\n");
+        // A real splice still takes the loop and still joins without a break
+        // (no whitespace on either side of the removed backslash-newline).
+        let (joined, map) = pp.join_continued_lines("int a = 1+\\\n2;\n");
+        assert!(
+            !matches!(&joined, std::borrow::Cow::Borrowed(_)),
+            "a splicing source must not take the fast path"
+        );
+        assert_eq!(&*joined, "int a = 1+2;\n");
+        assert!(map.is_some(), "a join produces a line map");
     }
 }
