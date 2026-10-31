@@ -34,6 +34,7 @@ pub(crate) mod copy_prop;
 pub(crate) mod cvp;
 pub(crate) mod dce;
 mod dead_statics;
+pub(crate) mod difference_compare;
 pub(crate) mod div_by_const;
 pub(crate) mod dse;
 pub(crate) mod expr_sink;
@@ -48,6 +49,7 @@ pub(crate) mod inline;
 pub(crate) mod instrument;
 pub(crate) mod int_const_hoist;
 pub(crate) mod integer_bounds;
+pub(crate) mod interval_compare;
 pub(crate) mod ip_purity;
 pub(crate) mod ipa_pta;
 pub(crate) mod ipcp;
@@ -85,6 +87,7 @@ pub(crate) mod round_cap;
 pub(crate) mod saturating_sub;
 pub(crate) mod sccp;
 pub(crate) mod set_membership;
+pub(crate) mod sign_magnitude;
 pub(crate) mod simplify;
 pub(crate) mod slp_vectorizer;
 pub(crate) mod sret_copy_elision;
@@ -2982,6 +2985,25 @@ pub(crate) fn run_passes(
             total_changes += n;
             total_changes_excl_dce += n;
 
+            // Sign-magnitude lowering: `x < 0 ? -x : x` and
+            // `a > b ? a - b : b - a` become the branch-free
+            // mask/XOR/subtract identity, which needs no compare and no
+            // conditional move.  Runs before if-conversion, so the frontend's
+            // own select is still visible, and after `simplify`, which may
+            // already have folded the arms.  Pass name for
+            // CCC_DISABLE_PASSES: "signmag".
+            if !pass_disabled(&disabled, "signmag") {
+                let n = timed_pass!(
+                    "signmag",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        sign_magnitude::run(func)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
@@ -4243,6 +4265,30 @@ pub(crate) fn run_passes(
     // operation. Signed compares require the pass's nonnegative-domain proof;
     // shared compare/subtract nodes and all other widths stay unchanged.
     // Pass name for CCC_DISABLE_PASSES: "satsub".
+    // Late predicate canonicalization.  These two rewrites are profitable
+    // wherever they apply but *destructive* to shapes other passes still want:
+    // an interval test written as two compares is exactly what the
+    // vectorizers' mask-fusion matchers and `range_check`'s branch folds
+    // recognize, and a difference compare is a shape `div_by_const` and the
+    // conditional-move selector both prefer.  Measured on 3,016 test files,
+    // running them early cost 141 instructions in
+    // tests/regression/vec_range_mask_fusion.c and 19 in range_fold_branch.c
+    // while gaining nothing those passes did not already recover; run here,
+    // after every vectorizer and after range_check, scalar leftovers still
+    // fold and no optimized pattern is taken apart.  Both passes only replace
+    // a node and never insert a duplicate computation, so they are safe to run
+    // last.  Pass names: "interval" and "diffcmp".
+    if !pass_disabled(&disabled, "interval") {
+        let n = interval_compare::run_on_module(module);
+        verify::verify_after_pass(module, "interval");
+        let _ = n;
+    }
+    if !pass_disabled(&disabled, "diffcmp") {
+        let n = difference_compare::run_on_module(module);
+        verify::verify_after_pass(module, "diffcmp");
+        let _ = n;
+    }
+
     if matches!(
         target,
         crate::backend::Target::X86_64 | crate::backend::Target::I686

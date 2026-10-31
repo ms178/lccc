@@ -33,7 +33,12 @@ int a_delta(int x, int y) { return abs(x - y) <= 3; }
 C
 
 "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/shapes.s"
-CCC_SIMPLIFY_SKIP=cmp "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/shapes_ctl.s"
+# The control must show the *original* abs sequence, so the sign-magnitude
+# rewrite is switched off as well: it turns `x < 0 ? -x : x` into the
+# mask/XOR/subtract identity and would otherwise hide the negate the control
+# is looking for.  Both folds must be off for the control to mean anything.
+CCC_SIMPLIFY_SKIP=cmp CCC_DISABLE_PASSES="${CCC_DISABLE_PASSES:+$CCC_DISABLE_PASSES,}signmag" \
+    "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/shapes_ctl.s"
 
 fn_body() { # $1 = asm file, $2 = label; body between the label and ret
     sed -n "/^$2:/,/ret/p" "$1"

@@ -336,7 +336,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 426.63,
+      "predicted_gate_seconds": 428.73,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -735,6 +735,14 @@
         {
           "measured_s": 7.97,
           "name": "python3 tests/regression/check_inline_devirt_hot_leaf.py"
+        },
+        {
+          "measured_s": 0.61,
+          "name": "python3 tests/regression/check_mask_and_interval_folds.py"
+        },
+        {
+          "measured_s": 1.49,
+          "name": "python3 tests/regression/check_predicate_differences_and_ranges.py"
         }
       ]
     },

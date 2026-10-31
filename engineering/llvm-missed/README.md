@@ -210,6 +210,20 @@ remain deferred**: the ledger is now 170 reviewed (52 limited, 118 deferred),
 algebra; matching private shuffles factor around safe integer/bitwise binops.
 Existing machine-level adjacent shuffle composition is not claimed as new.
 
+## The 2026-10-31 re-inventory: 151-report audit and five scalar rewrites
+
+The audit and the code it produced are split in two documents:
+
+* [AUDIT-2026-10-31.md](AUDIT-2026-10-31.md) — the re-inventory delta, the 151
+  per-report verdicts, the eight measured gaps, and what remains deferred.
+* [SCALAR-PREDICATE-FOLDS.md](SCALAR-PREDICATE-FOLDS.md) — the rewrites
+  themselves: `diffcmp` (difference compares), `interval` (range and membership
+  predicates), `signmag` (sign magnitude), and the two matchers
+  `fold_shift_pair_into_mask` / `fold_unit_interval_test`, with the three-oracle
+  measurements and the honest attribution table.
+
+Passes are named for what they do; nothing in the tree carries a batch number.
+
 ## Packed shifts and canonical masks
 
 [Packed mask shifts](PACKED-MASK-SHIFTS.md) adds **250 new excerpt-based report

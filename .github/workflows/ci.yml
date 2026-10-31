@@ -2825,6 +2825,12 @@ jobs:
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_iabs_cmp_fold.sh
         python3 scripts/edg_changes_mine.py verify-artifacts
+        # Mask and interval folds: shift-pair masks and {0,1} membership, with a
+        # {0,2} negative control and a disabled-pass attribution leg.
+        python3 tests/regression/check_mask_and_interval_folds.py
+        # Predicate differences and ranges: difference compares, interval and
+        # membership tests, sign-magnitude selects, five near-miss controls.
+        python3 tests/regression/check_predicate_differences_and_ranges.py
         # The architectural implicit-operand table is the single source of
         # truth for every pass that reasons about registers an instruction
         # does not name; its fixture is reviewed independently of the code.
