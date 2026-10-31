@@ -1527,6 +1527,7 @@ pub(crate) fn run_passes(
     // keeps the kill-switch unit test from racing its siblings (see
     // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
     loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
+    inline::set_self_recursion_clone_enabled(std::env::var("CCC_NO_SELF_RECURSION_CLONE").is_err());
     loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
     loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
     // Every remaining pass switch, resolved here for the same reason.  No pass

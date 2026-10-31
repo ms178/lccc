@@ -52,8 +52,11 @@ static void free_tree(Node *n) {
 
 /* Large non-tail recursion: the one-level clone is bounded by
    MAX_SELF_CLONE_INSTRUCTIONS, so this body must stay a single call. */
-static int big_walk(int depth, int seed) {
-    int v = seed;
+static unsigned big_walk(int depth, unsigned seed) {
+    /* Unsigned arithmetic: the wrap is defined, so every compiler must agree
+       on the checksum. (Signed overflow here was UB and the corpus
+       differential rejected it: lccc and GCC printed different values.) */
+    unsigned v = seed;
     v = v * 1103515245 + 12345;
     v ^= v >> 7;
     v = v * 1103515245 + 12346;
@@ -135,7 +138,7 @@ static int big_walk(int depth, int seed) {
     v = v * 1103515245 + 12384;
     v ^= v >> 7;
     if (depth <= 0) return v;
-    return v + big_walk(depth - 1, seed + 1);
+    return v + big_walk(depth - 1, seed + 1u);
 }
 
 /* Tail recursion: `tail_call_elim` converts this to a loop, so the cloner
@@ -159,8 +162,8 @@ int main(void) {
     sum += (unsigned long long)tail_sum(seed * 170, 0);
     /* Two call sites keep `big_walk` outlined: a single-site static body is
        inlined by the called-once rule, which would hide the size gate. */
-    sum += (unsigned long long)big_walk(seed, 7);
-    sum += (unsigned long long)big_walk(seed - 21, 11);
+    sum += (unsigned long long)big_walk(seed, 7u);
+    sum += (unsigned long long)big_walk(seed - 21, 11u);
     printf("%llu\n", sum);
     return 0;
 }

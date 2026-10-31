@@ -348,6 +348,25 @@ const MAX_SMALL_INLINE_INSTRUCTIONS: usize = 20;
 /// Maximum blocks for a callee to be considered "small" (see above).
 const MAX_SMALL_INLINE_BLOCKS: usize = 3;
 
+thread_local! {
+    /// Whether the one-level self-recursion clone runs. Resolved ONCE by the
+    /// driver (`passes::mod`, `CCC_NO_SELF_RECURSION_CLONE`) into per-thread
+    /// state: the pass pipeline must not read the process environment per call
+    /// (`tests/regression/check_env_test_hygiene.sh` ratchets that count), and
+    /// a process-global read would make the kill-switch test race its siblings
+    /// on cargo's thread pool.
+    static SELF_RECURSION_CLONE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Resolve the self-recursion clone kill switch for this thread.
+pub(crate) fn set_self_recursion_clone_enabled(enabled: bool) {
+    SELF_RECURSION_CLONE_ENABLED.with(|cell| cell.set(enabled));
+}
+
+fn self_recursion_clone_enabled() -> bool {
+    SELF_RECURSION_CLONE_ENABLED.with(|cell| cell.get())
+}
+
 /// Largest body this pass duplicates when it clones one level of a *directly
 /// self-recursive* callee into itself (see `clone_self_recursion_sites`).
 /// GCC's recursive inliner is bounded by
@@ -1545,8 +1564,7 @@ fn inline_run_with(
     // bodies. It is a one-shot transform, so it cannot interact with the
     // fixpoint below. `-Os` keeps the small body it has; the always-inline-only
     // invocation is a restricted mode and must not add ordinary inlining.
-    let self_clone_enabled = std::env::var("CCC_NO_SELF_RECURSION_CLONE").is_err();
-    if !size_optimized && !always_inline_only && self_clone_enabled {
+    if !size_optimized && !always_inline_only && self_recursion_clone_enabled() {
         let cloned = clone_self_recursion_sites(
             module,
             &callee_map,
