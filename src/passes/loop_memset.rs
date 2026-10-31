@@ -122,6 +122,34 @@ pub fn run(func: &mut IrFunction) -> usize {
 /// surgery builds (strcmp-1: the guard chain detached and v250/v295 were
 /// orphaned). When the counter is healthy this is exactly `next_label` /
 /// `next_label + 1`, so healthy-pipeline behavior is unchanged.
+/// Move the blocks labelled `moved` (in that order) to directly after the
+/// block labelled `anchor`.  The rewrite appends its guard and call blocks;
+/// they execute where the loop's preheader does, and the linear-scan
+/// allocator sees layout order -- left at the end of the function, their
+/// argument values' intervals spanned every block in between (glibc_strstr:
+/// a `memset` length and fill byte held two caller-saved registers across
+/// the whole search-loop nest and forced a spill in its innermost loop).
+fn place_after(
+    func: &mut IrFunction,
+    anchor: crate::ir::reexports::BlockId,
+    moved: &[crate::ir::reexports::BlockId],
+) {
+    let mut taken = Vec::with_capacity(moved.len());
+    for label in moved {
+        if let Some(i) = func.blocks.iter().position(|b| b.label == *label) {
+            taken.push(func.blocks.remove(i));
+        }
+    }
+    let at = func
+        .blocks
+        .iter()
+        .position(|b| b.label == anchor)
+        .map_or(func.blocks.len(), |i| i + 1);
+    for (k, b) in taken.into_iter().enumerate() {
+        func.blocks.insert(at + k, b);
+    }
+}
+
 fn fresh_labels(
     func: &mut IrFunction,
 ) -> (crate::ir::reexports::BlockId, crate::ir::reexports::BlockId) {
@@ -149,9 +177,18 @@ fn run_once(func: &mut IrFunction) -> usize {
 enum StartOff {
     /// `scale*init + base_off` folded to a constant (zero -> use `base`).
     Const(i64),
-    /// A runtime entry offset with scale 1 and no constant base_off: the
-    /// init value itself.
-    Value(Value),
+    /// A runtime entry offset `scale*init + base_off` with `init` of the
+    /// counter's type `ty`. The loop brings the counter to address width
+    /// with the extension its signedness implies (`resolve_affine` refuses
+    /// any other) or truncates it to exactly address width, and every
+    /// address step is mod 2^ptr_bits, so the emitted entry offset applies
+    /// the same cast and then the affine map at address width.
+    Value {
+        init: Value,
+        ty: IrType,
+        scale: i64,
+        off: i64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -163,13 +200,13 @@ enum AddrForm {
     /// wrote, not at the array base — an iv that does not start at zero
     /// (a constant start like `for (i = 3; ...)` or a runtime cursor like
     /// zlib-ng's running `length`) moves the fill window. `Value` carries
-    /// the loop-entry offset (scale 1, base_off 0); a runtime init under a
-    /// scale != 1 is refused — it would need an instruction the resolve
-    /// phase cannot emit.
+    /// a runtime init's affine map, emitted in the guard block.
     Indexed {
         base: Value,
         scale: i64,
         start_off: StartOff,
+        /// The counter phi the offset is affine in (None: constant).
+        counter: Option<Value>,
     },
     /// A phi stepping +1 byte per iteration.
     Advancing { init: Value },
@@ -193,10 +230,16 @@ struct Iv {
     phi: Value,
     /// Operand carried into the loop on the guard edge.
     init: Operand,
-    /// The per-iteration update value (the Add(phi, 1) dest).
+    /// The per-iteration update value (the Add(phi, 1) dest, or the
+    /// truncation of a wider `phi + 1`).
     next: Value,
     /// The phi's IR type (Ptr for advancing pointers).
     ty: IrType,
+    /// The update is `(ty)(phi + 1)` computed in a wider type: C's integer
+    /// promotion of a `short`/`char` counter. The conversion back wraps
+    /// (modulo for unsigned, implementation-defined modulo for signed, never
+    /// undefined), so the counter can wrap whatever its signedness.
+    truncating: bool,
 }
 
 impl Iv {
@@ -227,8 +270,8 @@ struct Plan {
     exit_idx: usize,
     /// The iv the exit compare uses (counter or advancing pointer).
     exit_iv: Iv,
-    /// Additional recognized iv (at most one more), for exit-value
-    /// reconstruction.
+    /// Additional recognized iv (at most one more): the DoWhile exit-value
+    /// reconstruction, and (both forms) the address counter's wrap check.
     other_iv: Option<Iv>,
     /// While-form: every iv used outside the loop (reconstructed at the
     /// exit). DoWhile: empty (E-phi incomings already carry the values).
@@ -276,7 +319,9 @@ fn find_idiom(func: &IrFunction) -> Option<Plan> {
     headers.sort_unstable();
 
     for header_idx in headers {
-        if let Some(plan) = try_recognize(func, header_idx, &cfg) {
+        if let Some(plan) =
+            try_recognize(func, header_idx, &cfg).filter(|p| counter_never_wraps(func, p))
+        {
             return Some(plan);
         }
     }
@@ -304,11 +349,103 @@ fn find_idiom(func: &IrFunction) -> Option<Plan> {
                 && lp.contains(header_idx)
                 && lp.contains(body_idx)
         });
-        if let Some(plan) = try_recognize_while(func, header_idx, body_idx, nested, &cfg) {
+        if let Some(plan) = try_recognize_while(func, header_idx, body_idx, nested, &cfg)
+            .filter(|p| counter_never_wraps(func, p))
+        {
             return Some(plan);
         }
     }
     None
+}
+
+/// The fill window `[start, start + scale*trip)` is the loop's address
+/// sequence only while the address counter steps by +1 without wrapping
+/// in its own type. A counter at least address width wraps exactly as the
+/// address arithmetic does; a signed counter cannot wrap (overflow is
+/// undefined) unless `-fwrapv` or the update truncates a promoted `phi + 1`
+/// (`short`/`char` counters). Any other counter (`unsigned` on LP64) can
+/// legally run through `UINT_MAX -> 0`, and the extended address jumps back
+/// by 2^32: `for (unsigned i = a; i != n; i++) d[i] = 0;` with `a > n`
+/// writes `d[a..UINT_MAX]` and `d[0..n)`, while one memset of `n - a`
+/// (mod 2^32) bytes from `d + a` runs past the object. It cannot wrap when
+/// it is the exit counter under `<` of its own signedness (the latch and
+/// rotate guard keep every continuing value below the bound), or under
+/// `!=` when the entry value is provably not above the bound. Another
+/// counter with an unrelated entry value can wrap mid-loop. GCC 16.2 and
+/// Clang 23 refuse the same shapes.
+fn counter_never_wraps(func: &IrFunction, plan: &Plan) -> bool {
+    let AddrForm::Indexed {
+        counter: Some(phi), ..
+    } = &plan.store_addr
+    else {
+        return true;
+    };
+    let iv = if plan.exit_iv.phi.0 == phi.0 {
+        &plan.exit_iv
+    } else if let Some(other) = plan.other_iv.as_ref().filter(|iv| iv.phi.0 == phi.0) {
+        other
+    } else {
+        // resolve_affine only resolves to recognized ivs; unreachable in
+        // practice, refuse rather than assume.
+        if trace_enabled() {
+            eprintln!("[loop-memset] refuse: address counter is not a recognized iv");
+        }
+        return false;
+    };
+    let may_wrap = iv.ty.size() < crate::common::types::target_ptr_size()
+        && (iv.ty.is_unsigned() || iv.truncating || func.pass_policy.wrap_signed_overflow);
+    let ok = !may_wrap
+        || plan.exit_iv.phi.0 == phi.0
+            && match plan.exit_op {
+                // `<` in the counter's own signedness keeps every continuing
+                // value below a representable bound. A mismatched compare
+                // does not: `Slt` lets an unsigned counter sit at
+                // 0xFFFFFFFF (-1 < n) and step to 0.
+                IrCmpOp::Ult => iv.ty.is_unsigned(),
+                IrCmpOp::Slt => iv.ty.is_signed(),
+                IrCmpOp::Ne => init_not_above_bound(&iv.init, &plan.bound, iv.ty),
+                _ => false,
+            };
+    if !ok && trace_enabled() {
+        eprintln!(
+            "[loop-memset] refuse: address counter {:?} may wrap in its type",
+            iv.ty
+        );
+    }
+    ok
+}
+
+/// `init <= bound` in `ty`'s order, proven from constants (an unsigned 0
+/// init is below every bound).
+fn init_not_above_bound(init: &Operand, bound: &Operand, ty: IrType) -> bool {
+    let Operand::Const(i) = init else {
+        return false;
+    };
+    if ty.is_unsigned() && const_to_u64(i) == Some(0) {
+        return true;
+    }
+    let Operand::Const(b) = bound else {
+        return false;
+    };
+    let bits = ty.size() as u32 * 8;
+    if bits == 0 || bits > 64 {
+        return false;
+    }
+    let (Some(i), Some(b)) = (const_to_u64(i), const_to_u64(b)) else {
+        return false;
+    };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let (i, b) = (i & mask, b & mask);
+    if ty.is_signed() {
+        let sh = 64 - bits;
+        ((i << sh) as i64 >> sh) <= ((b << sh) as i64 >> sh)
+    } else {
+        i <= b
+    }
 }
 
 fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Option<Plan> {
@@ -580,27 +717,40 @@ fn slt_trip_count(
     bound_arith: &Operand,
     iv_arith_ty: IrType,
     size_ty: IrType,
-) -> Operand {
-    let init_wide = em.cast(init_arith.clone(), iv_arith_ty, size_ty);
-    let bound_wide = em.cast(bound_arith.clone(), iv_arith_ty, size_ty);
-    let diff_wide = em.binop(
-        IrBinOp::Sub,
-        Operand::Value(bound_wide),
-        Operand::Value(init_wide),
-        size_ty,
-    );
-    let c = em.cmp(
-        IrCmpOp::Slt,
-        init_arith.clone(),
-        bound_arith.clone(),
-        iv_arith_ty,
-    );
-    Operand::Value(em.select(
+    zero_init: bool,
+) -> TripCount {
+    let bound_wide = Operand::Value(em.cast(bound_arith.clone(), iv_arith_ty, size_ty));
+    let diff_wide = if zero_init {
+        bound_wide
+    } else {
+        let init_wide = em.cast(init_arith.clone(), iv_arith_ty, size_ty);
+        Operand::Value(em.binop(IrBinOp::Sub, bound_wide, Operand::Value(init_wide), size_ty))
+    };
+    let c = em.init_below_bound(IrCmpOp::Slt, init_arith, bound_arith, iv_arith_ty);
+    let n = Operand::Value(em.select(
         Operand::Value(c),
-        Operand::Value(diff_wide),
+        diff_wide.clone(),
         Operand::Const(zero_const(size_ty)),
         size_ty,
-    ))
+    ));
+    TripCount {
+        n,
+        len: diff_wide,
+        nonzero: Some(c),
+    }
+}
+
+/// A trip count as the rewrite consumes it. `n` is exact on every path
+/// (exit-value reconstruction reads it). `nonzero`, when present, is a
+/// condition equivalent to `n != 0`, and `len` equals `n` wherever it holds:
+/// the guarded call then needs neither the clamp nor a second compare. For
+/// `init < bound` (signed or unsigned) the clamp's condition is exactly
+/// that: `bound > init` makes `bound - init` nonzero, and the clamp is 0
+/// otherwise.
+struct TripCount {
+    n: Operand,
+    len: Operand,
+    nonzero: Option<Value>,
 }
 
 // ── Small IR utilities ───────────────────────────────────────────────────────
@@ -706,19 +856,54 @@ fn recognize_ivs(
         if defs.get(&nv.0) != Some(&update_block) {
             continue;
         }
+        let def_in_update = |v: Value| {
+            func.blocks[update_block]
+                .instructions
+                .iter()
+                .find(|i| i.dest().is_some_and(|d| d.0 == v.0))
+        };
+        // `(ty)(phi + 1)` with the add in a wider integer type (the add may
+        // read the phi directly or through its extension).
+        let (add_dest, truncating) = match def_in_update(*nv) {
+            Some(Instruction::Cast {
+                src: Operand::Value(x),
+                from_ty,
+                to_ty,
+                ..
+            }) if *to_ty == *ty
+                && ty.is_integer()
+                && from_ty.is_integer()
+                && from_ty.size() > ty.size() =>
+            {
+                (*x, true)
+            }
+            _ => (*nv, false),
+        };
         let Some(Instruction::BinOp {
             op: IrBinOp::Add,
             lhs: Operand::Value(lv),
             rhs: Operand::Const(r),
             ..
-        }) = func.blocks[update_block]
-            .instructions
-            .iter()
-            .find(|i| i.dest().is_some_and(|d| d.0 == nv.0))
+        }) = def_in_update(add_dest)
         else {
             continue;
         };
-        if lv.0 != dest.0 || const_to_u64(r) != Some(1) {
+        let reads_phi = lv.0 == dest.0
+            || truncating
+                && matches!(
+                    def_in_update(*lv).or_else(|| {
+                        func.blocks[phi_block]
+                            .instructions
+                            .iter()
+                            .find(|i| i.dest().is_some_and(|d| d.0 == lv.0))
+                    }),
+                    Some(Instruction::Cast {
+                        src: Operand::Value(p),
+                        from_ty,
+                        ..
+                    }) if p.0 == dest.0 && *from_ty == *ty
+                );
+        if !reads_phi || const_to_u64(r) != Some(1) {
             continue;
         }
         // Unsigned, signed and pointer ivs (the exit forms are Ne/Ult/Slt).
@@ -728,6 +913,7 @@ fn recognize_ivs(
                 init,
                 next: *nv,
                 ty: *ty,
+                truncating,
             });
         }
     }
@@ -1071,6 +1257,7 @@ fn try_recognize_while(
         .map(|&p| p as usize)
         .find(|&p| p != body_idx)?;
     let exit_iv = ivs[iv_pos].clone();
+    let other_iv = ivs.iter().find(|iv| iv.phi.0 != exit_iv.phi.0).cloned();
 
     Some(Plan {
         form: Form::While,
@@ -1080,7 +1267,7 @@ fn try_recognize_while(
         pre_idx,
         exit_idx,
         exit_iv,
-        other_iv: None,
+        other_iv,
         used_ivs: used_ivs.into_iter().map(|p| ivs[p].clone()).collect(),
         exit_op: cmp_op,
         bound,
@@ -1259,8 +1446,11 @@ fn census_body(
             // Address-affine helpers (`iv << 2`, `iv * 4`): validated for
             // real by resolve_affine when the store address resolves; any
             // that end up unused die with the removed block.
+            // `iv + k` / `iv - k` (`d[i + 2]`) likewise. A non-iv
+            // accumulator built from them is harmless: its value dies with
+            // the loop, or leaves through an exit phi, which refuses.
             Instruction::BinOp {
-                op: IrBinOp::Shl | IrBinOp::Mul,
+                op: IrBinOp::Shl | IrBinOp::Mul | IrBinOp::Add | IrBinOp::Sub,
                 rhs: Operand::Const(_),
                 ..
             } => {}
@@ -1496,15 +1686,14 @@ fn resolve_addr(
                                     .ok_or_else(|| format!("{which} GEP start offset overflows"))?,
                             )
                         }
-                        Operand::Value(v) => {
-                            if scale == 1 && off == 0 {
-                                StartOff::Value(v)
-                            } else {
-                                return Err(format!(
-                                    "{which} GEP start offset needs runtime scaling (unsupported)"
-                                ));
-                            }
-                        }
+                        Operand::Value(v) => StartOff::Value {
+                            init: v,
+                            ty: counter_ty(ivs, Some(phi)).ok_or_else(|| {
+                                format!("{which} GEP counter has no recognized iv")
+                            })?,
+                            scale,
+                            off,
+                        },
                     }
                 }
             };
@@ -1512,6 +1701,7 @@ fn resolve_addr(
                 base: bv,
                 scale,
                 start_off,
+                counter,
             })
         }
         _ => Err(format!(
@@ -1522,6 +1712,16 @@ fn resolve_addr(
 }
 
 /// Resolve `op` as `scale*counter + base` with recursion fuel.
+///
+/// The result is an identity over the integers (then mod 2^64 as an
+/// address) for every counter value the loop visits, so each step from the
+/// counter must preserve values over the counter's range:
+/// * no narrowing cast (`d[(unsigned char)i]` wraps every 256 elements; it
+///   became one `memset` of `n` bytes, writing past the object);
+/// * an extension must be the one the counter's signedness implies
+///   (`d[(unsigned)i]` with a signed `i` is not affine for negative `i`);
+/// * arithmetic narrower than 64 bits must not wrap: it has to be signed
+///   with signed overflow undefined (not `-fwrapv`).
 fn resolve_affine(
     func: &IrFunction,
     header_idx: usize,
@@ -1548,52 +1748,159 @@ fn resolve_affine(
                 .iter()
                 .find(|i| i.dest().is_some_and(|d| d.0 == v.0))?;
             match def {
-                // Widening/narrowing casts of the counter are transparent.
-                Instruction::Cast { src, .. } => {
-                    resolve_affine(func, header_idx, src, ivs, defs, fuel + 1)
-                }
-                Instruction::BinOp {
-                    op: IrBinOp::Shl,
-                    lhs,
-                    rhs: Operand::Const(k),
+                Instruction::Cast {
+                    src,
+                    from_ty,
+                    to_ty,
                     ..
                 } => {
-                    let k = const_to_i64(k)?;
-                    if !(0..4).contains(&k) {
-                        return None;
+                    let (s, b, iv) = resolve_affine(func, header_idx, src, ivs, defs, fuel + 1)?;
+                    if s != 0 {
+                        let counter_signed = counter_ty(ivs, iv)?.is_signed();
+                        if !counter_cast_preserves_value(*from_ty, *to_ty, counter_signed) {
+                            return None;
+                        }
                     }
-                    let (s, b, iv) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
-                    if s != 0 && b != 0 {
-                        return None;
-                    }
-                    Some((s << k, b << k, iv))
+                    Some((s, b, iv))
                 }
-                Instruction::BinOp {
-                    op: IrBinOp::Mul,
-                    lhs,
-                    rhs: Operand::Const(k),
-                    ..
-                } => {
-                    let k = const_to_i64(k)?;
-                    let (s, b, iv) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
-                    Some((s.checked_mul(k)?, b.checked_mul(k)?, iv))
-                }
-                Instruction::BinOp {
-                    op: IrBinOp::Add,
-                    lhs,
-                    rhs,
-                    ..
-                } => {
-                    let (s1, b1, iv1) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
-                    let (s2, b2, iv2) = resolve_affine(func, header_idx, rhs, ivs, defs, fuel + 1)?;
-                    if s1 != 0 && s2 != 0 {
+                Instruction::BinOp { ty, .. } if !narrow_arith_cannot_wrap(func, *ty) => {
+                    // Only a counter-free (constant) operand may wrap freely;
+                    // resolve it to know.
+                    let Instruction::BinOp { lhs, rhs, .. } = def else {
+                        return None;
+                    };
+                    let (s1, _, _) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
+                    let (s2, _, _) = resolve_affine(func, header_idx, rhs, ivs, defs, fuel + 1)?;
+                    if s1 != 0 || s2 != 0 {
                         return None;
                     }
-                    Some((s1 + s2, b1 + b2, if s1 != 0 { iv1 } else { iv2 }))
+                    resolve_affine_binop(func, header_idx, def, ivs, defs, fuel)
+                }
+                Instruction::BinOp { .. } => {
+                    resolve_affine_binop(func, header_idx, def, ivs, defs, fuel)
                 }
                 _ => None,
             }
         }
+    }
+}
+
+/// The counter phi's type.
+fn counter_ty(ivs: &[Iv], counter: Option<Value>) -> Option<IrType> {
+    let phi = counter?;
+    ivs.iter().find(|iv| iv.phi.0 == phi.0).map(|iv| iv.ty)
+}
+
+/// The signed integer type of the target's address width.
+fn address_int_ty() -> IrType {
+    if crate::common::types::target_ptr_size() >= 8 {
+        IrType::I64
+    } else {
+        IrType::I32
+    }
+}
+
+/// `v` as a constant of integer type `ty` (I32 or I64).
+fn int_const(ty: IrType, v: i64) -> IrConst {
+    if ty.size() >= 8 {
+        IrConst::I64(v)
+    } else {
+        IrConst::I32(v as i32)
+    }
+}
+
+/// Whether `Cast from -> to` of a counter-derived value is the identity on
+/// every value the counter takes, as far as the address is concerned: same
+/// width; an extension whose kind (IR casts sign-extend signed and
+/// zero-extend unsigned sources) matches the counter's signedness; or a
+/// truncation to at least address width (GEP arithmetic is mod
+/// 2^ptr_bits, so the dropped bits never reach the address). Any narrower
+/// truncation wraps the index (`d[(unsigned char)i]`).
+fn counter_cast_preserves_value(from: IrType, to: IrType, counter_signed: bool) -> bool {
+    if !from.is_integer() || !to.is_integer() {
+        return false;
+    }
+    match to.size().cmp(&from.size()) {
+        std::cmp::Ordering::Less => to.size() >= crate::common::types::target_ptr_size(),
+        std::cmp::Ordering::Equal => true,
+        std::cmp::Ordering::Greater => from.is_signed() == counter_signed,
+    }
+}
+
+/// Arithmetic in `ty` agrees with the integer affine model for every
+/// in-range operand: at least address width (wrapping there is the GEP's
+/// own mod-2^ptr_bits arithmetic), or a narrower signed type whose overflow
+/// is undefined (no `-fwrapv`). Narrow unsigned arithmetic may wrap legally
+/// (`d[i + 2]` with `unsigned i` near UINT_MAX); GCC 16.2 and Clang 23 also
+/// refuse that shape.
+fn narrow_arith_cannot_wrap(func: &IrFunction, ty: IrType) -> bool {
+    ty.size() >= crate::common::types::target_ptr_size()
+        || ty.is_signed() && !func.pass_policy.wrap_signed_overflow
+}
+
+/// The `Shl`/`Mul`/`Add` arms of [`resolve_affine`].
+fn resolve_affine_binop(
+    func: &IrFunction,
+    header_idx: usize,
+    def: &Instruction,
+    ivs: &[Iv],
+    defs: &FxHashMap<u32, usize>,
+    fuel: u8,
+) -> Option<(i64, i64, Option<Value>)> {
+    match def {
+        Instruction::BinOp {
+            op: IrBinOp::Shl,
+            lhs,
+            rhs: Operand::Const(k),
+            ..
+        } => {
+            // `x << k` is `x * 2^k` in the affine model (overflow is
+            // excluded by `narrow_arith_cannot_wrap` / the checked
+            // multiplies); `(i + 2) << 2` is `4i + 8`.
+            let k = u32::try_from(const_to_i64(k)?).ok().filter(|&k| k < 63)?;
+            let m = 1i64 << k;
+            let (s, b, iv) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
+            Some((s.checked_mul(m)?, b.checked_mul(m)?, iv))
+        }
+        Instruction::BinOp {
+            op: IrBinOp::Mul,
+            lhs,
+            rhs: Operand::Const(k),
+            ..
+        } => {
+            let k = const_to_i64(k)?;
+            let (s, b, iv) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
+            Some((s.checked_mul(k)?, b.checked_mul(k)?, iv))
+        }
+        Instruction::BinOp {
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let (s1, b1, iv1) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
+            let (s2, b2, iv2) = resolve_affine(func, header_idx, rhs, ivs, defs, fuel + 1)?;
+            if s1 != 0 && s2 != 0 {
+                return None;
+            }
+            Some((
+                s1.checked_add(s2)?,
+                b1.checked_add(b2)?,
+                if s1 != 0 { iv1 } else { iv2 },
+            ))
+        }
+        // `x - k` (`d[i - 1]`): the frontend keeps the subtraction.
+        Instruction::BinOp {
+            op: IrBinOp::Sub,
+            lhs,
+            rhs: rhs @ Operand::Const(_),
+            ..
+        } => {
+            let (s, b, iv) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
+            let (_, k, _) = resolve_affine(func, header_idx, rhs, ivs, defs, fuel + 1)?;
+            Some((s, b.checked_sub(k)?, iv))
+        }
+        _ => None,
     }
 }
 
@@ -1602,6 +1909,11 @@ fn resolve_affine(
 struct Emitter {
     pending: Vec<Instruction>,
     next_id: u32,
+    /// Casts already in `pending` (src value, from, to, dest): the trip
+    /// count and the start offset both extend the init, and no CSE runs
+    /// after this pass (`movswq %si` was emitted twice). Every entry is in
+    /// the same pending block, before any later use, so reuse is dominated.
+    casts: Vec<(u32, IrType, IrType, Value)>,
 }
 
 impl Emitter {
@@ -1609,6 +1921,7 @@ impl Emitter {
         Self {
             pending: Vec::new(),
             next_id: func.next_value_id,
+            casts: Vec::new(),
         }
     }
 
@@ -1624,14 +1937,58 @@ impl Emitter {
         d
     }
 
+    /// `src` converted to `to_ty`. An identity conversion of a value is the
+    /// value itself: this pass runs after the last algebraic simplify, so an
+    /// emitted `Cast T -> T` would reach the backend as a register copy.
     fn cast(&mut self, src: Operand, from_ty: IrType, to_ty: IrType) -> Value {
+        if let (Operand::Value(v), true) = (&src, from_ty == to_ty) {
+            return *v;
+        }
+        let key = match &src {
+            Operand::Value(v) => Some(v.0),
+            Operand::Const(_) => None,
+        };
+        if let Some(k) = key {
+            if let Some(&(.., d)) = self
+                .casts
+                .iter()
+                .find(|&&(s, f, t, _)| s == k && f == from_ty && t == to_ty)
+            {
+                return d;
+            }
+        }
         let dest = self.value();
+        if let Some(k) = key {
+            self.casts.push((k, from_ty, to_ty, dest));
+        }
         self.push(Instruction::Cast {
             dest,
             src,
             from_ty,
             to_ty,
         })
+    }
+
+    /// `init < bound` (`op` is `Slt` or `Ult`), written `bound > init` when
+    /// `init` is a constant: no simplify runs after this pass, and a constant
+    /// left operand is materialized in a register (`xorl; cmpq`) where the
+    /// swapped form compares against an immediate (`testq`/`cmpq $k`).
+    fn init_below_bound(
+        &mut self,
+        op: IrCmpOp,
+        init: &Operand,
+        bound: &Operand,
+        ty: IrType,
+    ) -> Value {
+        match (init, op) {
+            (Operand::Const(_), IrCmpOp::Slt) => {
+                self.cmp(IrCmpOp::Sgt, bound.clone(), init.clone(), ty)
+            }
+            (Operand::Const(_), IrCmpOp::Ult) => {
+                self.cmp(IrCmpOp::Ugt, bound.clone(), init.clone(), ty)
+            }
+            _ => self.cmp(op, init.clone(), bound.clone(), ty),
+        }
     }
 
     fn binop(&mut self, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType) -> Value {
@@ -1695,19 +2052,68 @@ impl Emitter {
     }
 
     fn take(&mut self) -> Vec<Instruction> {
+        self.casts.clear();
         std::mem::take(&mut self.pending)
     }
+}
+
+/// Split the guard-block sequence: G keeps the backward dependency closure
+/// of its branch condition `cond`, in order; everything else (start
+/// addresses, byte count, fill byte) moves, in order, to the head of the call
+/// block M. G dominates M, so M may read G's values, and G never reads M's
+/// (a closure). The zero-trip path then executes only the compare, as
+/// GCC's does, and the guard's operands are dead before the call operands
+/// are computed, so the allocator can home those in the argument
+/// registers (`subq %rsi,%rdx; leaq (%rdi,%rsi),%rdi`, no staging copies).
+fn split_guard(insts: Vec<Instruction>, cond: Value) -> (Vec<Instruction>, Vec<Instruction>) {
+    let mut needed: FxHashSet<u32> = FxHashSet::default();
+    needed.insert(cond.0);
+    let mut keep = vec![false; insts.len()];
+    for (i, inst) in insts.iter().enumerate().rev() {
+        if inst.dest().is_some_and(|d| needed.contains(&d.0)) {
+            keep[i] = true;
+            inst.for_each_used_value(|v| {
+                needed.insert(v);
+            });
+        }
+    }
+    let mut guard = Vec::new();
+    let mut call = Vec::new();
+    for (inst, k) in insts.into_iter().zip(keep) {
+        if k {
+            guard.push(inst);
+        } else {
+            call.push(inst);
+        }
+    }
+    (guard, call)
 }
 
 fn zero_const(_ty: IrType) -> IrConst {
     IrConst::Zero
 }
 
-fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
-    let size_ty = crate::common::types::target_int_ir_type();
-    let ptr_math_ty = IrType::I64;
-    let mut em = Emitter::new(func);
+/// The guard-block computations of [`apply_idiom`]: the trip count, the
+/// guard condition and the memset operands (split between G and M by
+/// [`split_guard`] afterwards).
+struct CallOperands {
+    /// Trip count at the size type (exit-value reconstruction).
+    n_size: Operand,
+    /// The bound actually compared (a re-loaded invariant global, or
+    /// `plan.bound`).
+    bound_eff: Operand,
+    /// Guard condition: the loop runs at least once.
+    nz: Value,
+    /// `[dst, byte, bytes]`.
+    call_args: Vec<Operand>,
+}
 
+fn emit_trip_and_call_operands(
+    plan: &Plan,
+    em: &mut Emitter,
+    size_ty: IrType,
+    ptr_math_ty: IrType,
+) -> CallOperands {
     // ── G: trip count from the exit compare (exactness: module docs) ────
     // A loop-defined invariant-global bound is re-loaded here (the original
     // load died with the removed header; nothing in the loop or the call
@@ -1739,57 +2145,97 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             }
         }
     };
-    let diff = em.binop(
-        IrBinOp::Sub,
-        bound_arith.clone(),
-        init_arith.clone(),
-        iv_arith_ty,
-    );
-    let n_val: Operand = match plan.exit_op {
-        IrCmpOp::Ne => Operand::Value(diff),
-        IrCmpOp::Slt => slt_trip_count(&mut em, &init_arith, &bound_arith, iv_arith_ty, size_ty),
+    // `bound - init`, emitted only where used; a zero init is the bound
+    // itself (no simplify runs after this pass to fold `bound - 0`).
+    let zero_init = match &iv.init {
+        Operand::Const(c) => const_to_u64(c) == Some(0),
+        _ => false,
+    };
+    let diff = |em: &mut Emitter| -> Operand {
+        if zero_init {
+            bound_arith.clone()
+        } else {
+            // Ne/Ult only (Slt has its own arm): the count is the modular
+            // difference in [0, 2^w), so subtract unsigned.
+            Operand::Value(em.binop(
+                IrBinOp::Sub,
+                bound_arith.clone(),
+                init_arith.clone(),
+                iv_arith_ty.to_unsigned(),
+            ))
+        }
+    };
+    let trip: TripCount = match plan.exit_op {
+        IrCmpOp::Ne => {
+            let d = diff(em);
+            TripCount {
+                n: d.clone(),
+                len: d,
+                nonzero: None,
+            }
+        }
+        IrCmpOp::Slt => slt_trip_count(
+            em,
+            &init_arith,
+            &bound_arith,
+            iv_arith_ty,
+            size_ty,
+            zero_init,
+        ),
         _ => {
             // Ult with a zero init needs no select: n = bound - 0 = bound,
             // and bound == 0 yields n == 0, which the M-guard skips — the
-            // select's only job was clamping the init > bound case.
-            let zero_init = match &iv.init {
-                Operand::Const(c) => const_to_u64(c) == Some(0),
-                _ => false,
-            };
+            // select's only job was clamping the init > bound case. (The
+            // literal `bound - 0` reached x86 as `leaq 0(%reg)` plus a copy.)
             if zero_init {
-                let zero = Operand::Const(zero_const(iv_arith_ty));
-                Operand::Value(em.binop(IrBinOp::Sub, bound_arith.clone(), zero, iv_arith_ty))
+                TripCount {
+                    n: bound_arith.clone(),
+                    len: bound_arith.clone(),
+                    nonzero: None,
+                }
             } else {
-                let c = em.cmp(
-                    IrCmpOp::Ult,
-                    init_arith.clone(),
-                    bound_arith.clone(),
-                    iv_arith_ty,
-                );
-                Operand::Value(em.select(
+                let d = diff(em);
+                let c = em.init_below_bound(IrCmpOp::Ult, &init_arith, &bound_arith, iv_arith_ty);
+                let n = Operand::Value(em.select(
                     Operand::Value(c),
-                    Operand::Value(diff),
+                    d.clone(),
                     Operand::Const(zero_const(iv_arith_ty)),
                     iv_arith_ty,
-                ))
+                ));
+                TripCount {
+                    n,
+                    len: d,
+                    nonzero: Some(c),
+                }
             }
         }
     };
-    let n_size = if iv_arith_ty == size_ty || plan.exit_op == IrCmpOp::Slt {
-        // The Slt arm computes n directly in the pointer-width type (see
-        // above), so it needs no further widening.
-        n_val
+    // The Slt arm computes in the pointer-width type already.
+    // The Ne/Ult count is a modular difference in [0, 2^w): zero-extend.
+    // Sign-extending a signed counter's count was wrong past INT_MAX:
+    // `for (int i = -2000000000; i != 2000000000; i++)` runs 4e9 times
+    // (defined), and at -Os (no IV widening) the length became ~2^64.
+    let widen = |em: &mut Emitter, op: Operand| -> Operand {
+        if plan.exit_op == IrCmpOp::Slt {
+            op
+        } else {
+            Operand::Value(em.cast(op, iv_arith_ty.to_unsigned(), size_ty))
+        }
+    };
+    let n_size = widen(em, trip.n.clone());
+    let len_size = if trip.len == trip.n {
+        n_size.clone()
     } else {
-        Operand::Value(em.cast(n_val, iv_arith_ty, size_ty))
+        widen(em, trip.len.clone())
     };
 
     // ── G: byte count + start addresses ──────────────────────────────────
     let bytes: Operand = if plan.fill_width == 1 {
-        n_size
+        len_size
     } else {
         Operand::Value(em.binop(
             IrBinOp::Mul,
-            n_size,
+            len_size,
             Operand::Const(IrConst::I64(i64::from(plan.fill_width))),
             size_ty,
         ))
@@ -1802,12 +2248,47 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             } => match start_off {
                 StartOff::Const(0) => *base,
                 StartOff::Const(k) => em.gep(*base, Operand::Const(IrConst::I64(*k)), IrType::Ptr),
-                StartOff::Value(v) => em.gep(*base, Operand::Value(*v), IrType::Ptr),
+                StartOff::Value {
+                    init,
+                    ty,
+                    scale,
+                    off,
+                } => {
+                    // Signed counters sign-extend, unsigned ones zero-extend
+                    // (the IR `Cast` semantics), exactly as the loop did; the
+                    // raw 32-bit register has no defined upper half. A wider
+                    // counter truncates to address width, as the loop did.
+                    let addr_ty = address_int_ty();
+                    let mut x = if ty.size() == addr_ty.size() {
+                        Operand::Value(*init)
+                    } else {
+                        Operand::Value(em.cast(Operand::Value(*init), *ty, addr_ty))
+                    };
+                    if *scale != 1 {
+                        // scale is 2/4/8 (checked at resolve): a shift.
+                        let sh = i64::from(scale.trailing_zeros());
+                        x = Operand::Value(em.binop(
+                            IrBinOp::Shl,
+                            x,
+                            Operand::Const(int_const(addr_ty, sh)),
+                            addr_ty,
+                        ));
+                    }
+                    if *off != 0 {
+                        x = Operand::Value(em.binop(
+                            IrBinOp::Add,
+                            x,
+                            Operand::Const(int_const(addr_ty, *off)),
+                            addr_ty,
+                        ));
+                    }
+                    em.gep(*base, x, IrType::Ptr)
+                }
             },
             AddrForm::Advancing { init } => *init,
         }
     };
-    let dst0 = start_of(&mut em, &plan.store_addr);
+    let dst0 = start_of(em, &plan.store_addr);
     // Call shape mirrors the frontend's memset lowering (lower.rs
     // emit_memset_zero): args [dst, byte(I32), n(size_ty)]. A runtime fill
     // byte is widened from its 1-byte store type; memset consumes only the
@@ -1817,16 +2298,41 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
         Operand::Value(v) => Operand::Value(em.cast(Operand::Value(*v), IrType::I8, IrType::I32)),
     };
     let call_args = vec![Operand::Value(dst0), byte_arg, bytes];
-    let callee = "memset";
 
     // ── G: the n != 0 guard ──────────────────────────────────────────────
-    let nz = em.cmp(
-        IrCmpOp::Ne,
+    let nz = match trip.nonzero {
+        Some(c) => c,
+        None => em.cmp(
+            IrCmpOp::Ne,
+            n_size.clone(),
+            Operand::Const(zero_const(size_ty)),
+            size_ty,
+        ),
+    };
+    CallOperands {
         n_size,
-        Operand::Const(zero_const(size_ty)),
-        size_ty,
-    );
-    let guard_insts = em.take();
+        bound_eff,
+        nz,
+        call_args,
+    }
+}
+
+fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
+    let size_ty = crate::common::types::target_int_ir_type();
+    let ptr_math_ty = IrType::I64;
+    let mut em = Emitter::new(func);
+    let CallOperands {
+        n_size,
+        bound_eff,
+        nz,
+        call_args,
+    } = emit_trip_and_call_operands(&plan, &mut em, size_ty, ptr_math_ty);
+    let callee = "memset";
+
+    // G keeps only what its branch reads; the call operands move into M
+    // (see `split_guard`). Exit reconstructions below feed only the M -> E
+    // edge, so they go to M as well.
+    let (guard_insts, call_prep) = split_guard(em.take(), nz);
 
     if plan.form == Form::DoWhile {
         // ── G: exit-value reconstructions (dominate M and E) ─────────────────
@@ -1864,9 +2370,8 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             };
             exit_values.push((other.phi.0, Operand::Value(final_val)));
         }
-        let recon_insts = em.take();
-        let mut guard_insts = guard_insts;
-        guard_insts.extend(recon_insts);
+        let mut call_prep = call_prep;
+        call_prep.extend(em.take());
 
         // ── Block surgery ────────────────────────────────────────────────────
         let (guard_label, call_label) = fresh_labels(func);
@@ -1936,7 +2441,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             }
         }
 
-        // G block: n computation + exit-value reconstructions + CondBranch.
+        // G block: the guard condition's computation + CondBranch.
         func.blocks.push(BasicBlock {
             label: guard_label,
             instructions: guard_insts,
@@ -1948,42 +2453,45 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             source_spans: Vec::new(),
         });
 
-        // M block: the call + Branch -> E.
+        // M block: call operands + exit reconstructions + the call + Branch -> E.
         let call_dest = em.value();
+        let mut call_insts = std::mem::take(&mut call_prep);
+        call_insts.push(Instruction::Call {
+            func: callee.to_string(),
+            info: CallInfo {
+                dest: Some(call_dest),
+                args: call_args,
+                arg_types: vec![IrType::Ptr, IrType::I32, size_ty],
+                return_type: IrType::Ptr,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None, None, None],
+                struct_arg_aligns: vec![None, None, None],
+                struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
+                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: vec![false, false, false],
+                is_sret: false,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                // Created only under `BuiltinPolicy::may_synthesize`.
+                assume_library: true,
+                ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
+                cold: false,
+            },
+        });
         func.blocks.push(BasicBlock {
             label: call_label,
-            instructions: vec![Instruction::Call {
-                func: callee.to_string(),
-                info: CallInfo {
-                    dest: Some(call_dest),
-                    args: call_args,
-                    arg_types: vec![IrType::Ptr, IrType::I32, size_ty],
-                    return_type: IrType::Ptr,
-                    is_variadic: false,
-                    num_fixed_args: 3,
-                    struct_arg_sizes: vec![None, None, None],
-                    struct_arg_aligns: vec![None, None, None],
-                    struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
-                    struct_arg_riscv_float_classes: Vec::new(),
-                    struct_arg_is_f128_sse: vec![false, false, false],
-                    is_sret: false,
-                    is_fastcall: false,
-                    regparm: None,
-                    is_pure: false,
-                    is_const: false,
-                    // Created only under `BuiltinPolicy::may_synthesize`.
-                    assume_library: true,
-                    ret_eightbyte_classes: Vec::new(),
-                    ret_is_f128_sse: false,
-                    cold: false,
-                },
-            }],
+            instructions: call_insts,
             terminator: Terminator::Branch(exit_label),
             source_spans: Vec::new(),
         });
 
         // Remove the header block (last: all indices above are pre-removal).
         func.blocks.remove(header_idx);
+        place_after(func, pre_label, &[guard_label, call_label]);
         func.next_value_id = em.next_id;
         1
     } else {
@@ -2024,9 +2532,8 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             };
             exit_values.push((iv.phi.0, val));
         }
-        let recon_insts = em.take();
-        let mut guard_insts = guard_insts;
-        guard_insts.extend(recon_insts);
+        let mut call_prep = call_prep;
+        call_prep.extend(em.take());
 
         // ── Block surgery (while-form) ───────────────────────────────────────
         let (guard_label, call_label) = fresh_labels(func);
@@ -2037,11 +2544,12 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
         let exit_idx = plan.exit_idx;
         let header_label = func.blocks[header_idx].label;
         let exit_label = func.blocks[exit_idx].label;
+        let pre_label = func.blocks[pre_idx].label;
 
         // P: Branch -> H  becomes  Branch -> G.
         func.blocks[pre_idx].terminator = Terminator::Branch(guard_label);
 
-        // G block: n computation + reconstructions + CondBranch (n != 0?).
+        // G block: the guard condition's computation + CondBranch.
         func.blocks.push(BasicBlock {
             label: guard_label,
             instructions: guard_insts,
@@ -2053,36 +2561,38 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             source_spans: Vec::new(),
         });
 
-        // M block: the call + Branch -> E.
+        // M block: call operands + exit reconstructions + the call + Branch -> E.
         let call_dest = em.value();
+        let mut call_insts = std::mem::take(&mut call_prep);
+        call_insts.push(Instruction::Call {
+            func: callee.to_string(),
+            info: CallInfo {
+                dest: Some(call_dest),
+                args: call_args,
+                arg_types: vec![IrType::Ptr, IrType::I32, size_ty],
+                return_type: IrType::Ptr,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None, None, None],
+                struct_arg_aligns: vec![None, None, None],
+                struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
+                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: vec![false, false, false],
+                is_sret: false,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                // Created only under `BuiltinPolicy::may_synthesize`.
+                assume_library: true,
+                ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
+                cold: false,
+            },
+        });
         func.blocks.push(BasicBlock {
             label: call_label,
-            instructions: vec![Instruction::Call {
-                func: callee.to_string(),
-                info: CallInfo {
-                    dest: Some(call_dest),
-                    args: call_args,
-                    arg_types: vec![IrType::Ptr, IrType::I32, size_ty],
-                    return_type: IrType::Ptr,
-                    is_variadic: false,
-                    num_fixed_args: 3,
-                    struct_arg_sizes: vec![None, None, None],
-                    struct_arg_aligns: vec![None, None, None],
-                    struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
-                    struct_arg_riscv_float_classes: Vec::new(),
-                    struct_arg_is_f128_sse: vec![false, false, false],
-                    is_sret: false,
-                    is_fastcall: false,
-                    regparm: None,
-                    is_pure: false,
-                    is_const: false,
-                    // Created only under `BuiltinPolicy::may_synthesize`.
-                    assume_library: true,
-                    ret_eightbyte_classes: Vec::new(),
-                    ret_is_f128_sse: false,
-                    cold: false,
-                },
-            }],
+            instructions: call_insts,
             terminator: Terminator::Branch(exit_label),
             source_spans: Vec::new(),
         });
@@ -2124,13 +2634,14 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
                 .expect("recon exists for every used iv")
                 .1;
             new_phis.push((iv.phi.0, dest.0));
-            func.blocks[exit_idx].instructions.insert(
+            func.blocks[exit_idx].insert_inst(
                 0,
                 Instruction::Phi {
                     dest,
                     ty: iv.ty,
                     incoming: vec![(iv.init.clone(), guard_label), (val.clone(), call_label)],
                 },
+                crate::common::source::Span::dummy(),
             );
         }
         if !new_phis.is_empty() {
@@ -2193,6 +2704,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             func.blocks.remove(header_idx);
             func.blocks.remove(body_idx);
         }
+        place_after(func, pre_label, &[guard_label, call_label]);
         func.next_value_id = em.next_id;
         1
     }
@@ -2316,23 +2828,41 @@ mod tests {
         assert!(!f.blocks.iter().any(|b| b.label.0 == 2), "H removed");
         let g = f.blocks.iter().find(|b| b.label.0 == 4).expect("G block");
         assert!(matches!(g.terminator, Terminator::CondBranch { .. }));
-        // G computes n = N - 0 and guards on n != 0.
-        assert!(g.instructions.iter().any(|i| matches!(
-            i,
-            Instruction::BinOp {
-                op: IrBinOp::Sub,
-                ..
-            }
-        )));
+        // Zero init: the trip count IS the bound -- no `N - 0` and no clamping
+        // select anywhere in G or M (the literal `bound - 0` reached x86 as
+        // `leaq 0(%reg)` plus a copy) -- and G guards on n != 0.
         let m = f.blocks.iter().find(|b| b.label.0 == 5).expect("M block");
+        assert!(
+            !g.instructions
+                .iter()
+                .chain(&m.instructions)
+                .any(|i| matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::Sub,
+                        ..
+                    } | Instruction::Select { .. }
+                )),
+            "zero init needs neither `bound - 0` nor a clamp: G {:?} M {:?}",
+            g.instructions,
+            m.instructions
+        );
+        assert_eq!(guard_cmp(g), Some(IrCmpOp::Ne), "G guards on n != 0");
         assert!(
             m.instructions
                 .iter()
                 .any(|i| matches!(i, Instruction::Call { func, .. } if func == "memset")),
             "M must call memset"
         );
+        // G and M sit right after P, whose edge the rewrite reroutes: in
+        // this rotated form G runs before B_init (now only G's n == 0 arm),
+        // so P -> G -> M is the fall-through path and B_init and E follow.
+        // The allocator's intervals are linear, so a late-placed M would
+        // stretch every value live across it.
+        let order: Vec<u32> = f.blocks.iter().map(|b| b.label.0).collect();
+        assert_eq!(order, vec![0, 4, 5, 1, 3], "layout");
         // E phi carries the exit value (bound) on the M edge.
-        let e = &f.blocks[2];
+        let e = f.blocks.iter().find(|b| b.label.0 == 3).expect("E block");
         let Instruction::Phi { incoming, .. } = &e.instructions[0] else {
             panic!("E phi");
         };
@@ -2344,12 +2874,87 @@ mod tests {
             "E phi must carry the bound on the M edge, got {:?}",
             incoming
         );
-        // B_init's dead edge retargets to E and its phis rekeyed.
+        // B_init's dead edge retargets to E and its phis rekeyed (looked up
+        // by label: the layout above moved it behind G and M).
+        let b_init = f
+            .blocks
+            .iter()
+            .find(|b| b.label.0 == 1)
+            .expect("B_init block");
         assert!(matches!(
-            f.blocks[1].terminator,
+            b_init.terminator,
             Terminator::CondBranch { true_label, false_label, .. }
                 if true_label.0 == 3 && false_label.0 == 3
         ));
+    }
+
+    /// The compare that feeds G's conditional branch.
+    fn guard_cmp(g: &BasicBlock) -> Option<IrCmpOp> {
+        let Terminator::CondBranch {
+            cond: Operand::Value(c),
+            ..
+        } = &g.terminator
+        else {
+            return None;
+        };
+        g.instructions.iter().find_map(|i| match i {
+            Instruction::Cmp { dest, op, .. } if dest == c => Some(*op),
+            _ => None,
+        })
+    }
+
+    /// The counterpart of the zero-init shortcut: a nonzero `Ult` init keeps
+    /// the unsigned `bound - init` and the clamp (`init > bound` runs zero
+    /// times). G is exactly the guard, reusing the clamp's `bound > init`
+    /// compare; the difference and the clamp are emitted where used, in M.
+    #[test]
+    fn nonzero_init_keeps_the_difference_and_the_clamp() {
+        let mut f = zero_loop_func(1024);
+        let init = i64c(5);
+        for b in &mut f.blocks {
+            for inst in &mut b.instructions {
+                match inst {
+                    Instruction::Cmp { dest, lhs, .. } if dest.0 == 11 => *lhs = init.clone(),
+                    Instruction::Phi { incoming, .. } => {
+                        for (op, from) in incoming.iter_mut() {
+                            if from.0 == 1 {
+                                *op = init.clone();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(run(&mut f), 1, "the offset zero loop must transform");
+        let g = f.blocks.iter().find(|b| b.label.0 == 4).expect("G block");
+        let m = f.blocks.iter().find(|b| b.label.0 == 5).expect("M block");
+        assert_eq!(
+            g.instructions.len(),
+            1,
+            "G is the guard alone: {:?}",
+            g.instructions
+        );
+        assert_eq!(guard_cmp(g), Some(IrCmpOp::Ugt), "G reuses bound > init");
+        let has = |want: fn(&Instruction) -> bool| m.instructions.iter().any(want);
+        assert!(
+            has(|i| matches!(
+                i,
+                Instruction::BinOp {
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Const(a),
+                    rhs: Operand::Const(b),
+                    ..
+                } if const_to_i64(a) == Some(1024) && const_to_i64(b) == Some(5)
+            )),
+            "n = bound - init: {:?}",
+            m.instructions
+        );
+        assert!(
+            has(|i| matches!(i, Instruction::Select { .. })),
+            "clamp: {:?}",
+            m.instructions
+        );
     }
 
     #[test]

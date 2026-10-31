@@ -694,6 +694,7 @@ mod tests {
             section_data: vec![SectionData::empty(), SectionData::owned(vec![0xc3])],
             relocations: vec![Vec::new(), Vec::new()],
             source_name: sym_name.into(),
+            e_flags: 0,
         };
         let objs = vec![make_obj("f1"), make_obj("f2")];
         let tmp = std::env::temp_dir().join(format!("lccc_lk20_{}.o", std::process::id()));

@@ -1876,6 +1876,7 @@ mod tests {
             section_data,
             relocations: relocs,
             source_name: "<test>".into(),
+            e_flags: 0,
         }
     }
 
@@ -1899,6 +1900,7 @@ mod tests {
             section_data,
             relocations,
             source_name: "<test>".into(),
+            e_flags: 0,
         }
     }
 
@@ -2226,6 +2228,7 @@ mod tests {
             ],
             relocations: vec![Vec::new(), Vec::new()],
             source_name: "<test>".into(),
+            e_flags: 0,
         };
         let p = plan(&[o], false, &no_dead());
         assert!(

@@ -45,8 +45,10 @@
 #      still contain TWO `cmovb` -- one comparison feeding two conditional
 #      moves is the property; the count alone would not distinguish it from
 #      "the fold deleted a cmov too".
-#   3. NEGATIVE CONTROL. `CCC_PEEPHOLE_SKIP=flags_compare` must bring the
-#      duplicate BACK. Without this, a build where the pass silently stopped
+#   3. NEGATIVE CONTROL. `CCC_PEEPHOLE_SKIP=flags_compare,ebb_reuse` must
+#      bring the duplicate BACK. `ebb_reuse` is the extended-basic-block form
+#      of the same flags reuse and removes this duplicate on its own, so the
+#      control has to switch off both. Without this, a build where the pass silently stopped
 #      running -- renamed, re-ordered out of the pass list, skipped by a
 #      default -- would sail through 1 and 2 and this gate would be
 #      decoration rather than evidence.
@@ -94,7 +96,7 @@ fi
 
 # ── 2 & 3. assembly shape, with the pass disabled as the control ───────────
 "$CCC" -O3 -march=x86-64-v3 -S "$src" -o "$work/on.s" 2>/dev/null
-CCC_PEEPHOLE_SKIP=flags_compare \
+CCC_PEEPHOLE_SKIP=flags_compare,ebb_reuse \
     "$CCC" -O3 -march=x86-64-v3 -S "$src" -o "$work/off.s" 2>/dev/null
 
 # The hot block is the one holding the tail-arm cmovs.

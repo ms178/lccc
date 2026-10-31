@@ -169,6 +169,10 @@ pub struct Lowerer {
     /// Sema's `SemaResult::enumerator_refs`: identifier uses that denote an
     /// enumeration constant. Authoritative over the lowerer's own lookup.
     pub(super) sema_enumerator_refs: FxHashMap<ExprId, i64>,
+    /// Sema's `SemaResult::local_address_returns`: `return` expressions that
+    /// yield a dead local's address. They are evaluated for side effects and
+    /// return a null pointer (GCC 16.2's code generation).
+    pub(super) sema_local_address_returns: FxHashSet<ExprId>,
     /// Stack of local label scopes from GNU __label__ declarations.
     /// Each entry maps a label name to its scope-qualified name.
     /// When resolving a label, the stack is searched top-down so that
@@ -272,6 +276,13 @@ impl Lowerer {
     /// Attach sema's enumerator verdicts (`SemaResult::enumerator_refs`).
     pub fn with_enumerator_refs(mut self, refs: FxHashMap<ExprId, i64>) -> Self {
         self.sema_enumerator_refs = refs;
+        self
+    }
+
+    /// Attach sema's `-Wreturn-local-addr` verdicts
+    /// (`SemaResult::local_address_returns`).
+    pub fn with_local_address_returns(mut self, returns: FxHashSet<ExprId>) -> Self {
+        self.sema_local_address_returns = returns;
         self
     }
 
@@ -401,6 +412,7 @@ impl Lowerer {
             sema_expr_types,
             sema_const_values,
             sema_enumerator_refs: FxHashMap::default(),
+            sema_local_address_returns: FxHashSet::default(),
             local_label_scopes: Vec::new(),
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),

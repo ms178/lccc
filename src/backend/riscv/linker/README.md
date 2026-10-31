@@ -177,10 +177,12 @@ A merged output section containing data concatenated from multiple input section
 MergedSection {
     name:      String,    // output section name (".text", ".data", ...)
     sh_type:   u32,       // SHT_PROGBITS or SHT_NOBITS
-    sh_flags:  u64,       // union of all contributing input section flags
+    sh_flags:  u64,       // union of the inputs' flags; SHF_MERGE/SHF_STRINGS
+                          // only while every input agrees (GNU ld's rule)
     data:      Vec<u8>,   // concatenated section data
     vaddr:     u64,       // assigned virtual address (set in Phase 4)
     align:     u64,       // maximum alignment across all contributing sections
+    entsize:   u64,       // sh_entsize while SHF_MERGE is kept, else 0
 }
 ```
 
@@ -590,14 +592,23 @@ The final phase writes the complete ELF executable:
    `e_flags = 0x05` (RVC + double-float ABI), `e_entry` set to `_start`
    (or `main`, or start of `.text`).
 
-2. **Program Headers**:
-   - Dynamic linking (10 or 11 entries): `PT_PHDR`, `PT_INTERP`,
-     `PT_RISCV_ATTRIBUTES`, `PT_LOAD` (RX), `PT_LOAD` (RW), `PT_DYNAMIC`,
-     `PT_NOTE`, `PT_GNU_EH_FRAME`, `PT_GNU_STACK`, `PT_GNU_RELRO`,
-     and optionally `PT_TLS` (if TLS sections exist).
-   - Static linking (6 or 7 entries): `PT_LOAD` (RX), `PT_LOAD` (RW),
-     `PT_NOTE`, `PT_GNU_EH_FRAME`, `PT_GNU_STACK`, `PT_RISCV_ATTRIBUTES`,
-     and optionally `PT_TLS`.
+2. **Program Headers**, in GNU ld 2.47's order, each present only when GNU
+   ld would emit it (the bfd gate compares them exactly):
+   - Executables: `PT_PHDR` and `PT_INTERP` (dynamic only),
+     `PT_RISCV_ATTRIBUTES`, `PT_LOAD` RX, `PT_LOAD` RW (only when the RW
+     segment places bytes -- `.tbss` takes no address space), `PT_DYNAMIC`
+     (dynamic only), one `PT_NOTE` per note run, `PT_TLS`,
+     `PT_GNU_EH_FRAME`, `PT_GNU_STACK`, `PT_GNU_RELRO` (only when non-empty).
+   - Shared objects: `PT_PHDR`, `PT_RISCV_ATTRIBUTES`, `PT_LOAD` R, RX, R and
+     RW (separate code: no segment is both writable and executable, unlike
+     bfd's single RX+RO segment), then the same tail as executables.
+   - `PT_GNU_STACK` follows GNU ld: `-z execstack` gives RWX and
+     `-z noexecstack` RW; otherwise the header exists only if some input has
+     a `.note.GNU-stack` marker, and is RWX if a marker is executable (a
+     nested-function trampoline). That case prints GNU ld's warning
+     `<input>: requires executable stack (because the .note.GNU-stack section
+     is executable)`, silenced by `--no-warn-execstack`; `-z execstack` warns
+     only under `--warn-execstack`.
 
 3. **Segment Data**: Written in order -- RX segment contents, then RW segment
    contents, then `.riscv.attributes`, each padded to their file offsets.

@@ -942,6 +942,13 @@ impl I686Codegen {
     ///   the slot and every store writes within the low bytes of the 4-byte
     ///   argument slot.
     ///
+    /// Returns the home's *extent* -- the frame bytes whose operands must be
+    /// redirected along with it (`slot_base_disp`): the `Alloca`'s data size
+    /// when the web holds one (its constant-offset aliases address bytes
+    /// inside it), otherwise 1, the exact slot only (a sub-4-byte spill
+    /// slot does not own its neighbours, and without an `Alloca` there is no
+    /// interior address to redirect).
+    ///
     /// Kill switch: `CCC_NO_PARAM_DIRECT_HOME=1` restores the homing copy
     /// verbatim (bisection escape hatch, mirrors the other `CCC_NO_*` gates).
     fn stack_param_direct_home_eligible(
@@ -950,16 +957,17 @@ impl I686Codegen {
         dest_id: u32,
         slot: StackSlot,
         ty: IrType,
-    ) -> bool {
+    ) -> Option<i64> {
         if std::env::var_os("CCC_NO_PARAM_DIRECT_HOME").is_some() {
-            return false;
+            return None;
         }
         if self.state.alloca_over_align(dest_id).is_some() {
-            return false;
+            return None;
         }
         if ty.size() > 4 {
-            return false;
+            return None;
         }
+        let mut extent = 1i64;
         for block in &func.blocks {
             for inst in &block.instructions {
                 let Some(dest) = inst.dest() else { continue };
@@ -971,22 +979,23 @@ impl I686Codegen {
                     || self.state.vector_values.contains(&dest.0)
                     || self.state.vector128_values.contains(&dest.0)
                 {
-                    return false;
+                    return None;
                 }
                 if let Instruction::Alloca { size, .. } = inst {
                     if *size > 4 {
-                        return false;
+                        return None;
                     }
+                    extent = extent.max(*size as i64);
                     continue;
                 }
                 if let Some(res_ty) = inst.result_type() {
                     if res_ty.size() > 4 {
-                        return false;
+                        return None;
                     }
                 }
             }
         }
-        true
+        Some(extent)
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
@@ -1534,7 +1543,9 @@ impl I686Codegen {
                             emit!(self.state, "    movl {}, %eax", src_ref_hi);
                             emit!(self.state, "    movl %eax, {}", dst_ref_hi);
                         }
-                    } else if self.stack_param_direct_home_eligible(func, dest_id, slot, ty) {
+                    } else if let Some(extent) =
+                        self.stack_param_direct_home_eligible(func, dest_id, slot, ty)
+                    {
                         // Direct homing (GCC model): the callee owns the
                         // incoming argument slot, so the ParamRef dest lives
                         // THERE — no `movl 220(%esp),%eax; movl %eax,
@@ -1546,7 +1557,7 @@ impl I686Codegen {
                         // saved per eligible stack argument (measured on the
                         // Linux x86 boot corpus: the setup image's .text
                         // shrinks proportionally to the homing-pair census).
-                        self.param_direct_homes.insert(slot.0, src_offset);
+                        self.param_direct_homes.insert(slot.0, (src_offset, extent));
                     } else {
                         let load_instr = self.mov_load_for_type(ty);
                         let src_ref = self.param_ref(src_offset);

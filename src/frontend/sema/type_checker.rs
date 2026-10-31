@@ -148,7 +148,7 @@ impl<'a> ExprTypeChecker<'a> {
     /// alike); and the pointee record of the pointer that `*`, `->` or a
     /// subscript goes through (an array operand: the array object's own,
     /// which are its elements'). `None` when any link is unknown.
-    fn lvalue_object_cvr(&self, expr: &Expr) -> Option<u8> {
+    pub(crate) fn lvalue_object_cvr(&self, expr: &Expr) -> Option<u8> {
         match expr {
             Expr::Identifier(name, _) => self.symbols.object_cvr(name),
             Expr::MemberAccess(base, field, _) => {
@@ -1351,7 +1351,7 @@ impl<'a> ExprTypeChecker<'a> {
     /// Whether `__builtin_choose_expr` with condition `cond` selects its
     /// first operand ([`super::const_eval::SemaConstEval::eval_required_constant`];
     /// a condition that is no constant has been diagnosed by sema).
-    fn choose_expr_takes_first(&self, cond: &Expr) -> bool {
+    pub(crate) fn choose_expr_takes_first(&self, cond: &Expr) -> bool {
         self.sema_const_eval()
             .eval_required_constant(cond)
             .is_none_or(|c| c.is_nonzero())

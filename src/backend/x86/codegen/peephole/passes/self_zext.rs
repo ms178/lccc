@@ -245,8 +245,8 @@ fn eliminate_redundant_self_zext_with_policy(
         if infos[i].is_nop() {
             continue;
         }
-        if let Some(replacement) = xmm_bitcast_self_zext(store, infos, i, dest_reg) {
-            replace_line(store, &mut infos[i - 1], i - 1, replacement);
+        if let Some((p, replacement)) = xmm_bitcast_self_zext(store, infos, i, dest_reg) {
+            replace_line(store, &mut infos[p], p, replacement);
             mark_nop(&mut infos[i]);
             changed = true;
         }
@@ -258,9 +258,10 @@ fn eliminate_redundant_self_zext_with_policy(
 /// The `movd`/`vmovd` that replaces `movq %xmmN, %rX` when the line at `i` is
 /// the self-zext `movl %eX, %eX` of that same `%rX`.
 ///
-/// Returns `None` unless the previous *live* line is exactly that `movq`, the
-/// two lines are adjacent, both are editable, and the destination families
-/// agree. The VEX spelling is preserved: rewriting a `vmovq` to a legacy
+/// Returns the `movq` line and its replacement, or `None` unless the previous
+/// *live* line is exactly that `movq` (retired, blank and byteless comment
+/// lines between them are transparent -- earlier passes leave them behind),
+/// both are editable, and the destination families agree. The VEX spelling is preserved: rewriting a `vmovq` to a legacy
 /// `movd` inside VEX-encoded code would pay the SSE/AVX transition penalty the
 /// emitter avoided, and `vmovd` does the same zero-extending GPR write.
 fn xmm_bitcast_self_zext(
@@ -268,21 +269,23 @@ fn xmm_bitcast_self_zext(
     infos: &[LineInfo],
     i: usize,
     dest_reg: u8,
-) -> Option<String> {
-    if i == 0 || infos[i].pinned || infos[i - 1].pinned {
+) -> Option<(usize, String)> {
+    let p = (0..i).rev().find(|&n| {
+        let info = &infos[n];
+        !(info.is_nop()
+            || info.kind == LineKind::Empty
+            || super::flag_peepholes::is_byteless_comment(info.trimmed(store.get(n))))
+    })?;
+    if infos[i].pinned || infos[p].pinned {
         return None;
     }
-    let prev = infos[i - 1];
-    if prev.is_nop() || prev.kind == LineKind::Empty {
-        return None;
-    }
-    let text = prev.trimmed(store.get(i - 1));
+    let text = infos[p].trimmed(store.get(p));
     // `vmovq` is written by the AVX path; `movd`/`vmovd` already copy only the
     // low half, so there is nothing to fuse.
-    let (mnem, rest, fused) = if let Some(r) = text.strip_prefix("vmovq ") {
-        ("vmovq", r, "vmovd")
+    let (rest, fused) = if let Some(r) = text.strip_prefix("vmovq ") {
+        (r, "vmovd")
     } else if let Some(r) = text.strip_prefix("movq ") {
-        ("movq", r, "movd")
+        (r, "movd")
     } else {
         return None;
     };
@@ -301,10 +304,9 @@ fn xmm_bitcast_self_zext(
     if register_family_fast(a.trim()) != register_family_fast(b.trim()) {
         return None;
     }
-    let _ = mnem;
-    Some(format!(
-        "    {fused} {src}, {}",
-        REG_NAMES[1][dest_reg as usize]
+    Some((
+        p,
+        format!("    {fused} {src}, {}", REG_NAMES[1][dest_reg as usize]),
     ))
 }
 
@@ -325,9 +327,29 @@ fn implicit_32_bit_write(mnem: &str, t: &str) -> Option<[usize; 2]> {
     match mnem {
         // Widening multiply and divide: %edx:%eax both receive 32 bits.
         "mull" | "divl" | "idivl" => Some([RAX, RDX]),
-        "imull" if !t.contains(',') => Some([RAX, RDX]),
+        "imull" if top_level_operand_count(t) == 1 => Some([RAX, RDX]),
         _ => None,
     }
+}
+
+/// Operands of `t` separated by commas OUTSIDE parentheses: a memory
+/// operand's `8(%rsp,%rax,4)` is one operand, so `imull 8(%rsp,%rax,4)` is
+/// the single-operand widening form.
+fn top_level_operand_count(t: &str) -> usize {
+    let Some((_, ops)) = t.split_once(|c: char| c.is_ascii_whitespace()) else {
+        return 0;
+    };
+    let mut depth = 0i32;
+    let mut count = usize::from(!ops.trim().is_empty());
+    for c in ops.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// The explicit AT&T destination: the operand after the last comma, or the
@@ -374,7 +396,7 @@ fn writes_memory_only(mnem: &str, t: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::types::classify_line;
+    use super::super::super::types::{classify_line, mark_nop};
     use super::{eliminate_redundant_self_zext, eliminate_redundant_self_zext_with_policy};
     use crate::backend::peephole_common::LineStore;
 
@@ -443,6 +465,9 @@ mod tests {
             ("mull %edi", "movl %edx, %edx"),
             ("imull %edi", "movl %eax, %eax"),
             ("imull %edi", "movl %edx, %edx"),
+            // A memory multiplicand's addressing commas are not operands.
+            ("imull 8(%rsp,%rcx,4)", "movl %eax, %eax"),
+            ("divl (%rdi,%rsi)", "movl %edx, %edx"),
         ] {
             let asm = format!("    {writer}\n    {self_zext}\n");
             assert_eq!(survivors(&asm, self_zext), 0, "after `{writer}`");
@@ -513,6 +538,28 @@ mod tests {
             fuse("    vmovq %xmm3, %rcx\n    movl %ecx, %ecx\n"),
             vec!["vmovd %xmm3, %ecx"]
         );
+        // Blank and byteless comment lines between the pair are transparent.
+        assert_eq!(
+            fuse("    movq %xmm2, %rdx\n\n    # spill note\n    movl %edx, %edx\n"),
+            vec!["movd %xmm2, %edx", "# spill note"]
+        );
+    }
+
+    /// A line an earlier pass retired between the pair is transparent too:
+    /// the pair is adjacent in the instruction stream that reaches the
+    /// assembler.
+    #[test]
+    fn xmm_bitcast_fusion_sees_through_retired_lines() {
+        let mut store = LineStore::new(
+            "    movq %xmm9, %rax\n    movq %rsi, %r10\n    movl %eax, %eax\n".to_string(),
+        );
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        mark_nop(&mut infos[1]);
+        assert!(eliminate_redundant_self_zext(&mut store, &mut infos));
+        assert_eq!(store.get(0).trim(), "movd %xmm9, %eax");
+        assert!(infos[1].is_nop() && infos[2].is_nop());
     }
 
     /// Every refusal the fusion must make. Each case leaves BOTH lines intact

@@ -584,23 +584,9 @@ impl Lowerer {
         // Also from the entry block in case finalize already ran (it has
         // not — we are mid-body — but defensive).
         if let Some(block) = self.func_mut().blocks.first_mut() {
-            let mut keep = Vec::with_capacity(block.instructions.len());
-            let mut spans = std::mem::take(&mut block.source_spans);
-            let mut span_iter = spans.drain(..);
-            for inst in block.instructions.drain(..) {
-                let is_target = matches!(&inst, Instruction::Alloca { dest, .. } if dest.0 == id);
-                if !is_target {
-                    keep.push(inst);
-                } else {
-                    span_iter.next();
-                }
-            }
-            let mut rest: Vec<_> = span_iter.collect();
-            keep.extend(std::iter::empty());
-            block.instructions = keep;
-            let mut all = Vec::new();
-            all.extend(rest.drain(..));
-            block.source_spans = all;
+            block.retain_insts(
+                |inst| !matches!(inst, Instruction::Alloca { dest, .. } if dest.0 == id),
+            );
         }
     }
 
@@ -1366,7 +1352,8 @@ impl Lowerer {
         let ident = Expr::Identifier(entry.mangled.clone(), span);
         let result = self.lower_function_call(&ident, args);
         let mangled = entry.mangled.clone();
-        let instrs = &mut self.func_mut().instrs;
+        let fs = self.func_mut();
+        let instrs = &mut fs.instrs;
         // Scan BACKWARD: this invocation's Call is the LAST one to the
         // mangled name in the appended range (argument expressions may have
         // emitted calls to the same nested function earlier in the range).
@@ -1380,6 +1367,14 @@ impl Lowerer {
             }
         }
         if let Some(pos) = call_pos {
+            // `emit` keeps `instr_spans` parallel to `instrs`; a splice must
+            // too, or every later instruction of the block reports the line
+            // of its predecessor.  The chain setup is part of the call
+            // expression, so it takes the call's location.
+            if fs.instr_spans.len() == instrs.len() {
+                let call_span = fs.instr_spans[pos];
+                fs.instr_spans.insert(pos, call_span);
+            }
             instrs.insert(
                 pos,
                 Instruction::SetStaticChain {

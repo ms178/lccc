@@ -422,6 +422,13 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
         });
     }
 
+    // Which widening casts die once their readers are narrowed: the compare
+    // narrowing and the widened-condition rewrite share this one census, so
+    // neither can leave the other's cast alive beside its narrow source.
+    let widened_cond_live =
+        !simplify_skip("widened_cond") && std::env::var_os("CCC_NO_WIDENED_COND").is_none();
+    let cast_dies_if_narrowed = casts_dying_under_narrowing(func, &cast_defs, widened_cond_live);
+
     // Second pass: propagate boolean-ness through And/Or/Xor of boolean values.
     // A single pass is sufficient for most patterns since And/Or/Xor of Cmp results
     // are the dominant case. For deeply nested boolean expressions, this misses some
@@ -501,6 +508,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 &value_types,
                 &use_counts,
                 &cast_use_counts,
+                &cast_dies_if_narrowed,
             ) {
                 *inst = simplified;
                 total += 1;
@@ -563,7 +571,9 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
             let Terminator::CondBranch { cond, .. } = &mut block.terminator else {
                 continue;
             };
-            if let Some(narrow) = widened_cond_replacement(*cond, &cast_defs, &cast_use_counts) {
+            if let Some(narrow) =
+                widened_cond_replacement(*cond, &cast_defs, &cast_dies_if_narrowed)
+            {
                 *cond = narrow;
                 total += 1;
             }
@@ -2432,6 +2442,7 @@ fn try_simplify_with_types(
     value_types: &[Option<IrType>],
     use_counts: &[u32],
     cast_use_counts: &[u32],
+    cast_dies_if_narrowed: &[bool],
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp {
@@ -2471,16 +2482,21 @@ fn try_simplify_with_types(
             lhs,
             rhs,
             ty,
-        } => simplify_cmp(
-            *dest,
-            *op,
-            lhs,
-            rhs,
-            *ty,
-            cmp_defs,
-            cast_defs,
-            is_boolean,
-            cast_use_counts,
+        } => fold_sign_region_mask_test(*dest, *op, lhs, rhs, *ty, binop_defs, cast_defs).or_else(
+            || {
+                simplify_cmp(
+                    *dest,
+                    *op,
+                    lhs,
+                    rhs,
+                    *ty,
+                    cmp_defs,
+                    cast_defs,
+                    is_boolean,
+                    cast_use_counts,
+                    cast_dies_if_narrowed,
+                )
+            },
         ),
         Instruction::Load {
             dest,
@@ -2632,6 +2648,7 @@ fn try_simplify(
         &[],
         &[],
         is_boolean,
+        &[],
         &[],
         &[],
         &[],
@@ -3406,25 +3423,209 @@ fn swap_cmp_op(op: IrCmpOp) -> IrCmpOp {
 /// Return the narrow source for a condition that only observes whether a
 /// widened integer result is zero.  See the caller in `simplify_function` for
 /// the zero-ness proof and why truncating/non-integer casts are refused.
+///
+/// Only when the rewrite deletes the cast (`cast_dies_if_narrowed`, see
+/// [`casts_dying_under_narrowing`]): a cast that stays live for another reader
+/// would gain its narrow source as a second live value.
 fn widened_cond_replacement(
     cond: Operand,
     cast_defs: &[Option<CastDef>],
-    cast_use_counts: &[u32],
+    cast_dies_if_narrowed: &[bool],
 ) -> Option<Operand> {
     let Operand::Value(v) = cond else {
         return None;
     };
-    // An empty count slice is the direct unit-test API: production always
-    // supplies exact counts, while the pure proof tests intentionally exercise
-    // the type predicate independently of an enclosing function.
-    if !cast_use_counts.is_empty() && cast_use_counts.get(v.0 as usize).copied() != Some(1) {
+    // An empty slice is the direct unit-test API: production always supplies
+    // the census, while the pure proof tests intentionally exercise the type
+    // predicate independently of an enclosing function.
+    if !cast_dies_if_narrowed.is_empty()
+        && cast_dies_if_narrowed.get(v.0 as usize).copied() != Some(true)
+    {
         return None;
     }
     let cast = cast_defs.get(v.0 as usize).and_then(|d| d.as_ref())?;
-    (cast.from_ty.is_integer()
-        && cast.to_ty.is_integer()
-        && cast.from_ty.size() < cast.to_ty.size())
-    .then_some(cast.src)
+    is_integer_widening(cast).then_some(cast.src)
+}
+
+/// A conversion that preserves the zero/nonzero partition of every source
+/// value: integer to a strictly wider integer.
+fn is_integer_widening(cast: &CastDef) -> bool {
+    cast.from_ty.is_integer() && cast.to_ty.is_integer() && cast.from_ty.size() < cast.to_ty.size()
+}
+
+/// `(value, constant, op)` of a compare against a constant, with the operator
+/// swapped when the constant is on the left.
+fn cmp_against_const(
+    lhs: &Operand,
+    rhs: &Operand,
+    op: IrCmpOp,
+) -> Option<(Value, IrConst, IrCmpOp)> {
+    match (lhs, rhs) {
+        (Operand::Value(v), Operand::Const(c)) => Some((*v, *c, op)),
+        (Operand::Const(c), Operand::Value(v)) => Some((*v, *c, swap_cmp_op(op))),
+        _ => None,
+    }
+}
+
+/// `Cmp(op, cast(x: T -> W), C)` at width W as `Cmp(op, x, C')` at T, when the
+/// extension preserves the comparison's order and C fits in T:
+///   - unsigned T (zero-extend): Ult/Ule/Ugt/Uge + Eq/Ne, C in [0, 2^n);
+///   - signed   T (sign-extend): Slt/Sle/Sgt/Sge + Eq/Ne, C in signed range.
+///
+/// The rewrite in `simplify_cmp` and the reader census in
+/// [`casts_dying_under_narrowing`] both decide through this one predicate.
+fn narrow_cast_cmp(op: IrCmpOp, c: i64, cast: &CastDef, ty: IrType) -> Option<(IrConst, IrType)> {
+    let narrow_ty = cast.from_ty;
+    if cast.to_ty != ty || !narrow_ty.is_integer() || narrow_ty.size() >= ty.size() {
+        return None;
+    }
+    let bits = narrow_ty.size() * 8;
+    let fits = if narrow_ty.is_unsigned() {
+        c >= 0 && (c as u64) <= (1u64 << bits) - 1
+    } else {
+        c >= -(1i64 << (bits - 1)) && c <= (1i64 << (bits - 1)) - 1
+    };
+    let order_ok = match op {
+        IrCmpOp::Eq | IrCmpOp::Ne => true,
+        IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => narrow_ty.is_unsigned(),
+        IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => narrow_ty.is_signed(),
+    };
+    if !(fits && order_ok) {
+        return None;
+    }
+    Some((int_const_of_type(narrow_ty, c)?, narrow_ty))
+}
+
+/// For each value, whether it is a widening cast EVERY live reader of which is
+/// a rewrite that reads the cast's narrow source instead: a compare against a
+/// constant that [`narrow_cast_cmp`] accepts, or -- when the widened-condition
+/// rewrite is enabled -- a `CondBranch` on an integer widening. Narrowing all
+/// of them deletes the cast, so the narrow source replaces it one for one.
+///
+/// One live reader of any other kind keeps the cast live, and narrowing the
+/// rest would only add the narrow source as a second live value (sqlite's
+/// `serial_type >= 128` beside `vdbe_serial_get(body, serial_type, ..)` kept
+/// both the byte and its extension live across the call and spilled the
+/// byte). The sole-reader rule this replaces was the one-reader case of the
+/// same argument; it refused a byte classified by several compares -- Expat's
+/// `c < 0x80`, `c >= 0xc2`, `c <= 0xdf`, ... -- whose extension dies once
+/// every compare reads the byte.
+///
+/// Readers DCE will delete do not count ([`dead_pure_values`]): inlining
+/// leaves `Copy` instructions of a promoted byte that nothing reads, and such
+/// a copy vetoing the narrowing would make the result depend on pass order.
+/// Every operand read counts (`for_each_used_value`), so a compare reading the
+/// cast on both sides counts twice and narrows nowhere.
+fn casts_dying_under_narrowing(
+    func: &IrFunction,
+    cast_defs: &[Option<CastDef>],
+    widened_cond_live: bool,
+) -> Vec<bool> {
+    let dead = dead_pure_values(func);
+    let is_dead = |inst: &Instruction| {
+        inst.dest()
+            .is_some_and(|d| dead.get(d.0 as usize).copied().unwrap_or(false))
+    };
+    let is_cast = |id: u32| cast_defs.get(id as usize).is_some_and(|d| d.is_some());
+    let mut live_reads = vec![0u32; cast_defs.len()];
+    let mut narrowable = vec![0u32; cast_defs.len()];
+    let cmp_live = !simplify_skip("cmp");
+    let cast_of = |v: Value| cast_defs.get(v.0 as usize).and_then(|d| d.as_ref());
+    for block in &func.blocks {
+        for inst in block.instructions.iter().filter(|i| !is_dead(i)) {
+            inst.for_each_used_value(|id| {
+                if is_cast(id) {
+                    live_reads[id as usize] += 1;
+                }
+            });
+            let Instruction::Cmp {
+                op, lhs, rhs, ty, ..
+            } = inst
+            else {
+                continue;
+            };
+            let Some((v, c, op)) = cmp_against_const(lhs, rhs, *op).filter(|_| cmp_live) else {
+                continue;
+            };
+            let narrows = cast_of(v)
+                .zip(c.to_i64())
+                .is_some_and(|(cast, c)| narrow_cast_cmp(op, c, cast, *ty).is_some());
+            if narrows {
+                narrowable[v.0 as usize] += 1;
+            }
+        }
+        block.terminator.for_each_used_value(|id| {
+            if is_cast(id) {
+                live_reads[id as usize] += 1;
+            }
+        });
+        if let Terminator::CondBranch {
+            cond: Operand::Value(v),
+            ..
+        } = &block.terminator
+            && widened_cond_live
+            && cast_of(*v).is_some_and(is_integer_widening)
+        {
+            narrowable[v.0 as usize] += 1;
+        }
+    }
+    live_reads
+        .iter()
+        .zip(&narrowable)
+        .map(|(&reads, &n)| reads != 0 && reads == n)
+        .collect()
+}
+
+/// Values whose definitions dead-code elimination deletes: a definition with
+/// no side effects ([`super::dce::has_side_effects`]) all of whose readers are
+/// themselves such definitions. A worklist from the unread values, so a chain
+/// of dead copies dies whole. `Alloca` is excluded (DCE roots it
+/// conditionally), and a value with no `dest()` definition -- an inline-asm
+/// output, a parameter -- is never dead.
+fn dead_pure_values(func: &IrFunction) -> Vec<bool> {
+    let len = func.max_value_id() as usize + 1;
+    let mut uses = vec![0u32; len];
+    let mut def: Vec<Option<(usize, usize)>> = vec![None; len];
+    let mut count = |id: u32| {
+        if let Some(n) = uses.get_mut(id as usize) {
+            *n += 1;
+        }
+    };
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (i, inst) in block.instructions.iter().enumerate() {
+            inst.for_each_used_value(&mut count);
+            if let Some(slot) = inst.dest().and_then(|d| def.get_mut(d.0 as usize)) {
+                *slot = Some((b, i));
+            }
+        }
+        block.terminator.for_each_used_value(&mut count);
+    }
+    let removable = |at: Option<(usize, usize)>| {
+        at.is_some_and(|(b, i)| {
+            let inst = &func.blocks[b].instructions[i];
+            !matches!(inst, Instruction::Alloca { .. }) && !super::dce::has_side_effects(inst)
+        })
+    };
+    let mut dead = vec![false; len];
+    let mut work: Vec<usize> = (0..len)
+        .filter(|&v| uses[v] == 0 && removable(def[v]))
+        .collect();
+    while let Some(v) = work.pop() {
+        if std::mem::replace(&mut dead[v], true) {
+            continue;
+        }
+        let Some((b, i)) = def[v] else { continue };
+        func.blocks[b].instructions[i].for_each_used_value(|id| {
+            let u = id as usize;
+            if let Some(n) = uses.get_mut(u) {
+                *n = n.saturating_sub(1);
+                if *n == 0 && !dead[u] && removable(def[u]) {
+                    work.push(u);
+                }
+            }
+        });
+    }
+    dead
 }
 
 /// Narrow a comparison whose two operands are identically widened integer
@@ -3497,6 +3698,93 @@ fn narrow_widened_cmp_pair(
     })
 }
 
+/// `(x & C) ==/!= 0` where every bit `C` selects is a copy of one sign bit
+/// becomes the sign test `x' >=s 0` / `x' <s 0`.
+///
+/// Two shapes put a sign bit under the mask:
+/// * `sext(x: iN) & C`: bits `N-1 .. W` of the extension all copy `x`'s sign,
+///   so any nonzero `C` confined to them tests exactly that bit
+///   (`((long)*p & 0x100) != 0` on a `signed char`);
+/// * `x & 2^(W-1)` on a signed `x` at the compare's own width.
+///
+/// Both keep the tested value's own signed type. The unsigned analogues
+/// (`zext(x: uN) & 2^(N-1)`, `x & 2^(W-1)` on an unsigned `x`) would need a
+/// signed compare of an unsigned-typed value, and a backend that compares
+/// full registers relies on each value being extended per its declared type
+/// (RV64, AArch64 `cmp w`), so those stay mask tests here; the x86 peephole
+/// materializes them as a shift instead.
+///
+/// The sign test is the form every backend materializes best (GCC 16.2,
+/// Clang 23.1.4 and ICX 2026.2 all emit `shr $31`/`movsbl; shr` where the
+/// mask test costs `and; test; setne` or `test; setne; movzbl`), and it frees
+/// the widening cast when the compare was its only reader.
+fn fold_sign_region_mask_test(
+    dest: Value,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    binop_defs: &[Option<BinOpDef>],
+    cast_defs: &[Option<CastDef>],
+) -> Option<Instruction> {
+    if simplify_skip("sign_mask") || !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+        return None;
+    }
+    let v = match (lhs, rhs) {
+        (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v))
+            if c.to_i64() == Some(0) =>
+        {
+            *v
+        }
+        _ => return None,
+    };
+    let and = binop_defs.get(v.0 as usize).and_then(|d| d.as_ref())?;
+    if and.op != IrBinOp::And || and.ty != ty {
+        return None;
+    }
+    let (masked, mask) = match (and.lhs, and.rhs) {
+        (Operand::Value(m), Operand::Const(c)) | (Operand::Const(c), Operand::Value(m)) => {
+            (m, c.to_i64()?)
+        }
+        _ => return None,
+    };
+    let width = u32::try_from(ty.size()).ok()? * 8;
+    if !ty.is_integer() || width > 64 {
+        return None;
+    }
+    let mask = (mask as u64) & (u64::MAX >> (64 - width));
+    if mask == 0 {
+        return None;
+    }
+    let cast = cast_defs
+        .get(masked.0 as usize)
+        .and_then(|d| d.as_ref())
+        .filter(|c| c.to_ty == ty && c.from_ty.is_integer() && c.from_ty.size() < ty.size());
+    let (tested, narrow) = match cast {
+        Some(c) => {
+            let n = u32::try_from(c.from_ty.size()).ok()? * 8;
+            // Every bit at or above N-1 of a sign extension copies the sign.
+            if !c.from_ty.is_signed() || mask & ((1u64 << (n - 1)) - 1) != 0 {
+                return None;
+            }
+            (c.src, c.from_ty)
+        }
+        None if ty.is_signed() && mask == 1u64 << (width - 1) => (Operand::Value(masked), ty),
+        None => return None,
+    };
+    Some(Instruction::Cmp {
+        dest,
+        op: if op == IrCmpOp::Ne {
+            IrCmpOp::Slt
+        } else {
+            IrCmpOp::Sge
+        },
+        lhs: tested,
+        rhs: Operand::Const(int_const_of_type(narrow, 0)?),
+        ty: narrow,
+    })
+}
+
 /// Simplify a Cmp instruction.
 ///
 /// Handles:
@@ -3521,6 +3809,7 @@ fn simplify_cmp(
     cast_defs: &[Option<CastDef>],
     is_boolean: &[bool],
     cast_use_counts: &[u32],
+    cast_dies_if_narrowed: &[bool],
 ) -> Option<Instruction> {
     if simplify_skip("cmp") {
         return None;
@@ -3566,44 +3855,26 @@ fn simplify_cmp(
     //
     // A value widened for C's integer promotions (e.g. a `movzbl`-loaded byte
     // promoted to int for `c < 0x80`) is compared AT ITS NATIVE WIDTH, so the
-    // widening cast — and its register copy — disappears and the backend emits
+    // widening cast -- and its register copy -- disappears and the backend emits
     // `cmpb`/`testb` directly (GCC's `test dl,dl; jns`, ICX's `cmp cl,-62`).
-    // The extension must preserve the comparison's ordering, and the constant
-    // must fit in T:
-    //   - unsigned T (zero-extend):  Ult/Ule/Ugt/Uge + Eq/Ne, C in [0, 2^n).
-    //   - signed   T (sign-extend):  Slt/Sle/Sgt/Sge + Eq/Ne, C in signed range.
-    if let Some(const_i64) = const_i64 {
-        if let Some(Some(cdef)) = cast_defs.get(val.0 as usize) {
-            let narrow_ty = cdef.from_ty;
-            if cdef.to_ty == ty && narrow_ty.is_integer() && narrow_ty.size() < ty.size() {
-                let bits = narrow_ty.size() * 8;
-                let fits = if narrow_ty.is_unsigned() {
-                    const_i64 >= 0 && (const_i64 as u64) <= (1u64 << bits) - 1
-                } else {
-                    const_i64 >= -(1i64 << (bits - 1)) && const_i64 <= (1i64 << (bits - 1)) - 1
-                };
-                let order_ok = match effective_op {
-                    IrCmpOp::Eq | IrCmpOp::Ne => true,
-                    IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => {
-                        narrow_ty.is_unsigned()
-                    }
-                    IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => {
-                        narrow_ty.is_signed()
-                    }
-                };
-                if fits && order_ok {
-                    if let Some(narrowed_const) = int_const_of_type(narrow_ty, const_i64) {
-                        return Some(Instruction::Cmp {
-                            dest,
-                            op: effective_op,
-                            lhs: cdef.src,
-                            rhs: Operand::Const(narrowed_const),
-                            ty: narrow_ty,
-                        });
-                    }
-                }
-            }
-        }
+    // `narrow_cast_cmp` holds the order and range conditions. Only when every
+    // reader of the cast narrows (`casts_dying_under_narrowing`): a cast that
+    // stays live saves nothing and gives its narrow source a second reader.
+    let cast_dies = cast_dies_if_narrowed.is_empty()
+        || cast_dies_if_narrowed.get(val.0 as usize).copied() == Some(true);
+    if let Some(const_i64) = const_i64
+        && cast_dies
+        && let Some(Some(cdef)) = cast_defs.get(val.0 as usize)
+        && let Some((narrowed_const, narrow_ty)) =
+            narrow_cast_cmp(effective_op, const_i64, cdef, ty)
+    {
+        return Some(Instruction::Cmp {
+            dest,
+            op: effective_op,
+            lhs: cdef.src,
+            rhs: Operand::Const(narrowed_const),
+            ty: narrow_ty,
+        });
     }
 
     // Check if the value is known boolean (0 or 1). This includes:
@@ -6280,6 +6551,122 @@ mod tests {
         )
     }
 
+    /// `(v3 = v2 & mask) OP 0` with `v2 = cast(v1: from -> to)`.
+    fn sign_mask_case(op: IrCmpOp, from: IrType, to: IrType, mask: i64) -> Option<Instruction> {
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 8];
+        cast_defs[2] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: from,
+            to_ty: to,
+        });
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 8];
+        binop_defs[3] = Some(BinOpDef {
+            op: IrBinOp::And,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I64(mask)),
+            ty: to,
+        });
+        fold_sign_region_mask_test(
+            Value(4),
+            op,
+            &Operand::Value(Value(3)),
+            &Operand::Const(IrConst::I64(0)),
+            to,
+            &binop_defs,
+            &cast_defs,
+        )
+    }
+
+    #[test]
+    fn sign_region_mask_tests_become_sign_tests() {
+        // ((long)*p & 0x100) != 0 on a signed char: bit 8 copies the sign.
+        for (mask, op, want) in [
+            (0x100, IrCmpOp::Ne, IrCmpOp::Slt),
+            (0x80, IrCmpOp::Ne, IrCmpOp::Slt),
+            (-128, IrCmpOp::Eq, IrCmpOp::Sge),
+            (i64::MIN, IrCmpOp::Ne, IrCmpOp::Slt),
+        ] {
+            let got = sign_mask_case(op, IrType::I8, IrType::I64, mask);
+            assert!(
+                matches!(
+                    got,
+                    Some(Instruction::Cmp {
+                        op: o,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I8(0)),
+                        ty: IrType::I8,
+                        ..
+                    }) if o == want
+                ),
+                "mask {mask:#x}: {got:?}"
+            );
+        }
+        // Same width, signed: x & INT_MIN.
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 8];
+        binop_defs[3] = Some(BinOpDef {
+            op: IrBinOp::And,
+            lhs: Operand::Const(IrConst::I32(i32::MIN)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        });
+        let got = fold_sign_region_mask_test(
+            Value(4),
+            IrCmpOp::Ne,
+            &Operand::Const(IrConst::I32(0)),
+            &Operand::Value(Value(3)),
+            IrType::I32,
+            &binop_defs,
+            &[],
+        );
+        assert!(
+            matches!(
+                got,
+                Some(Instruction::Cmp {
+                    op: IrCmpOp::Slt,
+                    ty: IrType::I32,
+                    ..
+                })
+            ),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn sign_region_mask_test_refusals() {
+        // A mask bit below the sign region reads a value bit.
+        assert!(sign_mask_case(IrCmpOp::Ne, IrType::I8, IrType::I64, 0x140).is_none());
+        assert!(sign_mask_case(IrCmpOp::Ne, IrType::I8, IrType::I64, 0x40).is_none());
+        // Zero-extended sources: the upper bits are zero, and the narrow sign
+        // bit would need a signed compare of an unsigned-typed value.
+        assert!(sign_mask_case(IrCmpOp::Ne, IrType::U8, IrType::I32, 0x80).is_none());
+        assert!(sign_mask_case(IrCmpOp::Ne, IrType::U8, IrType::I32, 0x100).is_none());
+        // Ordered compares and an empty mask are not mask tests.
+        assert!(sign_mask_case(IrCmpOp::Slt, IrType::I8, IrType::I64, 0x100).is_none());
+        assert!(sign_mask_case(IrCmpOp::Ne, IrType::I8, IrType::I64, 0).is_none());
+        // A mask that lives entirely above the compare width is empty there.
+        assert!(sign_mask_case(IrCmpOp::Ne, IrType::I8, IrType::I32, 1 << 40).is_none());
+        // Same width, unsigned: no reinterpretation.
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 8];
+        binop_defs[3] = Some(BinOpDef {
+            op: IrBinOp::And,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(i32::MIN)),
+            ty: IrType::U32,
+        });
+        assert!(
+            fold_sign_region_mask_test(
+                Value(4),
+                IrCmpOp::Ne,
+                &Operand::Value(Value(3)),
+                &Operand::Const(IrConst::I32(0)),
+                IrType::U32,
+                &binop_defs,
+                &[],
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn test_zero_value_replacement_collapses_highbit_and_fls() {
         let mut cast_defs: Vec<Option<CastDef>> = vec![None; 8];
@@ -7443,8 +7830,10 @@ mod tests {
             .is_some()
         );
 
-        uses[1] = 2;
-        assert!(widened_cond_replacement(Operand::Value(Value(1)), &defs, &uses).is_none());
+        // A cast that survives the rewrite (another reader) keeps its condition.
+        let mut dies = vec![true; uses.len()];
+        dies[1] = false;
+        assert!(widened_cond_replacement(Operand::Value(Value(1)), &defs, &dies).is_none());
     }
 
     #[test]
@@ -11432,5 +11821,275 @@ mod pack_extract_tests {
                 }
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod cast_narrowing_census_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    /// `v1 = cast(v0: from -> to)`, then `body`, then `term`; blocks 1 and 2
+    /// are plain returns so a `CondBranch` terminator has real targets.
+    fn func(from: IrType, to: IrType, body: Vec<Instruction>, term: Terminator) -> IrFunction {
+        let mut f = IrFunction::new("f".into(), IrType::I32, vec![], false);
+        let mut instructions = vec![Instruction::Cast {
+            dest: Value(1),
+            src: Operand::Value(Value(0)),
+            from_ty: from,
+            to_ty: to,
+        }];
+        instructions.extend(body);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: term,
+            source_spans: Vec::new(),
+        });
+        for label in [1, 2] {
+            f.blocks.push(BasicBlock {
+                label: BlockId(label),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(label as i32)))),
+                source_spans: Vec::new(),
+            });
+        }
+        f.next_value_id = 64;
+        f
+    }
+
+    fn cmp(dest: u32, op: IrCmpOp, c: i64, ty: IrType) -> Instruction {
+        Instruction::Cmp {
+            dest: Value(dest),
+            op,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(c)),
+            ty,
+        }
+    }
+
+    /// `v40 = v10 | v11 | ...`: keeps every compare result read.
+    fn or_all(dests: &[u32]) -> Vec<Instruction> {
+        let mut acc = dests[0];
+        let mut out = Vec::new();
+        for (k, &d) in dests[1..].iter().enumerate() {
+            let dest = 40 + k as u32;
+            out.push(Instruction::BinOp {
+                dest: Value(dest),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(acc)),
+                rhs: Operand::Value(Value(d)),
+                ty: IrType::I8,
+            });
+            acc = dest;
+        }
+        out
+    }
+
+    fn ret(v: u32) -> Terminator {
+        Terminator::Return(Some(Operand::Value(Value(v))))
+    }
+
+    /// `(lhs, ty)` of every compare, in order.
+    fn compares(f: &IrFunction) -> Vec<(Operand, IrType)> {
+        f.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Cmp { lhs, ty, .. } => Some((*lhs, *ty)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn all_read(f: &IrFunction, v: u32, ty: IrType) -> bool {
+        let got = compares(f);
+        !got.is_empty()
+            && got
+                .iter()
+                .all(|(l, t)| *l == Operand::Value(Value(v)) && *t == ty)
+    }
+
+    #[test]
+    fn a_byte_classified_by_several_compares_is_compared_as_a_byte() {
+        // Expat's name scan: c < 0x80, c >= 0xc2, c <= 0xdf on one promoted byte.
+        let mut body = vec![
+            cmp(10, IrCmpOp::Ult, 0x80, IrType::U32),
+            cmp(11, IrCmpOp::Uge, 0xc2, IrType::U32),
+            cmp(12, IrCmpOp::Ule, 0xdf, IrType::U32),
+        ];
+        body.extend(or_all(&[10, 11, 12]));
+        let mut f = func(IrType::U8, IrType::U32, body, ret(41));
+        simplify_function(&mut f);
+        assert!(all_read(&f, 0, IrType::U8), "{:?}", compares(&f));
+    }
+
+    #[test]
+    fn sign_extended_compares_narrow_together() {
+        let mut body = vec![
+            cmp(10, IrCmpOp::Slt, 0, IrType::I32),
+            cmp(11, IrCmpOp::Sgt, -5, IrType::I32),
+        ];
+        body.extend(or_all(&[10, 11]));
+        let mut f = func(IrType::I8, IrType::I32, body, ret(40));
+        simplify_function(&mut f);
+        assert!(all_read(&f, 0, IrType::I8), "{:?}", compares(&f));
+    }
+
+    #[test]
+    fn one_non_compare_reader_keeps_every_compare_wide() {
+        // sqlite: `serial_type >= 128` beside a call reading serial_type.
+        let mut body = vec![
+            cmp(10, IrCmpOp::Uge, 128, IrType::U32),
+            cmp(11, IrCmpOp::Ult, 12, IrType::U32),
+            Instruction::BinOp {
+                dest: Value(20),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::U32,
+            },
+        ];
+        body.extend(or_all(&[10, 11, 20]));
+        let mut f = func(IrType::U8, IrType::U32, body, ret(41));
+        simplify_function(&mut f);
+        assert!(all_read(&f, 1, IrType::U32), "{:?}", compares(&f));
+    }
+
+    #[test]
+    fn one_compare_that_cannot_narrow_keeps_the_others_wide() {
+        for blocker in [
+            cmp(11, IrCmpOp::Ult, 300, IrType::U32), // 300 does not fit in u8
+            cmp(11, IrCmpOp::Slt, 5, IrType::U32),   // signed order on a zero-extension
+        ] {
+            let mut body = vec![cmp(10, IrCmpOp::Ult, 0x80, IrType::U32), blocker];
+            body.extend(or_all(&[10, 11]));
+            let mut f = func(IrType::U8, IrType::U32, body, ret(40));
+            simplify_function(&mut f);
+            let got = compares(&f);
+            assert_eq!(got[0], (Operand::Value(Value(1)), IrType::U32), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn a_branch_on_the_cast_narrows_with_its_compares() {
+        let body = vec![cmp(10, IrCmpOp::Ult, 0x80, IrType::U32)];
+        let term = Terminator::CondBranch {
+            cond: Operand::Value(Value(1)),
+            true_label: BlockId(1),
+            false_label: BlockId(2),
+        };
+        let mut f = func(IrType::U8, IrType::U32, body, term);
+        simplify_function(&mut f);
+        assert!(all_read(&f, 0, IrType::U8), "{:?}", compares(&f));
+        assert!(matches!(
+            f.blocks[0].terminator,
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                ..
+            }
+        ));
+    }
+
+    fn census(f: &IrFunction, widened_cond_live: bool) -> bool {
+        let mut cast_defs = vec![None; 64];
+        cast_defs[1] = Some(CastDef {
+            src: Operand::Value(Value(0)),
+            from_ty: IrType::U8,
+            to_ty: IrType::U32,
+        });
+        casts_dying_under_narrowing(f, &cast_defs, widened_cond_live)[1]
+    }
+
+    /// `cmp(v1 < 0x80)`, `v20 = copy v1`, `v21 = copy v20`; the function
+    /// returns `v21` when `copy_live`, else the compare.
+    fn with_copy_chain(copy_live: bool) -> IrFunction {
+        let body = vec![
+            cmp(10, IrCmpOp::Ult, 0x80, IrType::U32),
+            Instruction::Copy {
+                dest: Value(20),
+                src: Operand::Value(Value(1)),
+            },
+            Instruction::Copy {
+                dest: Value(21),
+                src: Operand::Value(Value(20)),
+            },
+        ];
+        func(
+            IrType::U8,
+            IrType::U32,
+            body,
+            ret(if copy_live { 21 } else { 10 }),
+        )
+    }
+
+    #[test]
+    fn an_unread_copy_chain_does_not_keep_the_cast_but_a_read_copy_does() {
+        // Inlining leaves unread copies of the promoted byte; DCE deletes the
+        // whole chain, so it must not veto the narrowing.
+        assert!(census(&with_copy_chain(false), true));
+        let mut f = with_copy_chain(false);
+        simplify_function(&mut f);
+        assert!(all_read(&f, 0, IrType::U8), "{:?}", compares(&f));
+        // Returned, the chain is a live non-compare reader.
+        assert!(!census(&with_copy_chain(true), true));
+        let mut f = with_copy_chain(true);
+        simplify_function(&mut f);
+        assert!(all_read(&f, 1, IrType::U32), "{:?}", compares(&f));
+    }
+
+    #[test]
+    fn dead_values_follow_dce() {
+        let f = with_copy_chain(false);
+        let dead = dead_pure_values(&f);
+        assert!(dead[20] && dead[21], "the unread copy chain dies whole");
+        assert!(
+            !dead[1] && !dead[10],
+            "the cast and the returned compare live"
+        );
+        let mut f = with_copy_chain(false);
+        f.blocks[0].instructions.push(Instruction::Store {
+            val: Operand::Value(Value(21)),
+            ptr: Value(0),
+            ty: IrType::U32,
+            seg_override: Default::default(),
+            volatile: false,
+        });
+        let dead = dead_pure_values(&f);
+        assert!(!dead[20] && !dead[21], "a store keeps its operand chain");
+    }
+
+    #[test]
+    fn the_census_counts_a_branch_only_when_its_rewrite_runs() {
+        let term = Terminator::CondBranch {
+            cond: Operand::Value(Value(1)),
+            true_label: BlockId(1),
+            false_label: BlockId(2),
+        };
+        let f = func(
+            IrType::U8,
+            IrType::U32,
+            vec![cmp(10, IrCmpOp::Ult, 0x80, IrType::U32)],
+            term,
+        );
+        assert!(census(&f, true));
+        assert!(!census(&f, false));
+    }
+
+    #[test]
+    fn the_census_refuses_a_compare_reading_the_cast_twice_and_an_unread_cast() {
+        let both_sides = Instruction::Cmp {
+            dest: Value(11),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::U32,
+        };
+        let mut body = vec![cmp(10, IrCmpOp::Ult, 0x80, IrType::U32), both_sides];
+        body.extend(or_all(&[10, 11]));
+        assert!(!census(&func(IrType::U8, IrType::U32, body, ret(40)), true));
+        // No reader at all: nothing to narrow, so nothing claims the cast dies.
+        let unread = func(IrType::U8, IrType::U32, Vec::new(), ret(0));
+        assert!(!census(&unread, true));
     }
 }

@@ -1,4 +1,5 @@
 pub(crate) mod phi_eliminate;
+pub(crate) mod phi_webs;
 pub(crate) mod promote;
 
 pub(crate) use phi_eliminate::eliminate_phis;

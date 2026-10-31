@@ -491,16 +491,9 @@ fn make_chain_plan(
     )?;
     let indices = collect_single_use_chain(func, source, root_idx, uses, def_count, def_sites)?;
 
-    // Source locations are a parallel array only in debug builds.  Never
-    // create a mismatched mapping merely to take an optimization.
-    let source_spans = &func.blocks[source].source_spans;
-    let target_spans = &func.blocks[target].source_spans;
-    let spans_compatible = (source_spans.is_empty() && target_spans.is_empty())
-        || (source_spans.len() == func.blocks[source].instructions.len()
-            && target_spans.len() == func.blocks[target].instructions.len());
-    if !spans_compatible {
-        return None;
-    }
+    // Span state never decides a sink: `move_chain` keeps each block's own
+    // pairing through the `BasicBlock` span primitives, so code is the same
+    // whether or not a block tracks locations (debug/non-debug parity).
 
     let mut chain_values = FxHashSet::default();
     for &idx in &indices {
@@ -632,18 +625,14 @@ fn chain_loads_can_move(func: &IrFunction, plan: &ChainPlan, region: &FxHashSet<
 fn move_chain(func: &mut IrFunction, plan: &ChainPlan) {
     debug_assert_ne!(plan.source, plan.target);
     debug_assert!(plan.indices.windows(2).all(|pair| pair[0] < pair[1]));
-    let track_spans = !func.blocks[plan.source].source_spans.is_empty();
+    // The two blocks may differ in tracking (a pass-created block has no
+    // spans): the span primitives keep each block's own pairing.
     let mut moved = Vec::with_capacity(plan.indices.len());
     {
         let source = &mut func.blocks[plan.source];
         for &idx in plan.indices.iter().rev() {
-            let inst = source.instructions.remove(idx);
-            let span = if track_spans {
-                Some(source.source_spans.remove(idx))
-            } else {
-                None
-            };
-            moved.push((inst, span));
+            let span = source.span_at(idx);
+            moved.push((source.remove_inst(idx), span));
         }
     }
     moved.reverse();
@@ -651,10 +640,7 @@ fn move_chain(func: &mut IrFunction, plan: &ChainPlan) {
     let target = &mut func.blocks[plan.target];
     let at = plan.insert_at.min(target.instructions.len());
     for (offset, (inst, span)) in moved.into_iter().enumerate() {
-        target.instructions.insert(at + offset, inst);
-        if let Some(span) = span {
-            target.source_spans.insert(at + offset, span);
-        }
+        target.insert_inst(at + offset, inst, span);
     }
 }
 
@@ -1159,18 +1145,10 @@ fn sink_round(func: &mut IrFunction) -> usize {
         if si >= func.blocks[sb].instructions.len() {
             continue;
         }
-        let inst = func.blocks[sb].instructions.remove(si);
-        let span = if si < func.blocks[sb].source_spans.len() {
-            Some(func.blocks[sb].source_spans.remove(si))
-        } else {
-            None
-        };
+        let span = func.blocks[sb].span_at(si);
+        let inst = func.blocks[sb].remove_inst(si);
         let at = at.min(func.blocks[db].instructions.len());
-        func.blocks[db].instructions.insert(at, inst);
-        if let Some(sp) = span {
-            let p = at.min(func.blocks[db].source_spans.len());
-            func.blocks[db].source_spans.insert(p, sp);
-        }
+        func.blocks[db].insert_inst(at, inst, span);
         touched.insert(sb);
         touched.insert(db);
         moved += 1;

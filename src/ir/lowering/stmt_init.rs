@@ -73,6 +73,7 @@ impl Lowerer {
             self.globals.insert(declarator.name.clone(), ginfo);
         }
         self.emit_extern_tls_global(decl, declarator);
+        self.record_extern_data_size(decl, declarator);
         if declarator.attrs.tls_model.is_some() || decl.is_thread_local() {
             let ir_name = self.global_object_ir_name(declarator);
             self.record_tls_model_attr(

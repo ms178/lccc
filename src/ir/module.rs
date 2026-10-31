@@ -34,6 +34,13 @@ pub struct IrModule {
     /// `R_X86_64_PLT32` call (measured 2026-10-30).
     pub noplt_symbols: crate::common::fx_hash::FxHashSet<String>,
     pub globals: Vec<IrGlobal>,
+    /// Declared byte size of every `extern` data object this unit declares
+    /// (file or block scope), the largest over its declarations (a later
+    /// complete declaration completes the composite type, C11 6.2.7p3).
+    /// Function types, thread-locals and incomplete types are absent.
+    /// Consumed by `licm::speculation_safe_globals`; weakness and aliasing
+    /// are judged there from `symbol_attrs` and `aliases`.
+    pub extern_data_sizes: crate::common::fx_hash::FxHashMap<String, usize>,
     pub string_literals: Vec<(String, String)>, // (label, value)
     /// Wide string literals (L"..."): (label, chars as u32 values including null terminator)
     pub wide_string_literals: Vec<(String, Vec<u32>)>,
@@ -556,6 +563,7 @@ impl IrModule {
             extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             noplt_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: Vec::new(),
+            extern_data_sizes: crate::common::fx_hash::FxHashMap::default(),
             string_literals: Vec::new(),
             wide_string_literals: Vec::new(),
             char16_string_literals: Vec::new(),

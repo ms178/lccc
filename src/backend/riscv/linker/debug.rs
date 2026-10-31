@@ -16,7 +16,7 @@
 //! symbol and every addend that names trimmed code (`align.rs`).
 
 use super::elf_read::{
-    ElfObject, SHF_ALLOC, SHN_ABS, SHN_COMMON, SHN_UNDEF, STB_LOCAL, STT_SECTION,
+    ElfObject, SHF_ALLOC, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF, STB_LOCAL, STT_SECTION,
 };
 use super::relocations::{
     GlobalSym, R_RISCV_32, R_RISCV_32_PCREL, R_RISCV_64, R_RISCV_ADD8, R_RISCV_ADD16,
@@ -24,10 +24,13 @@ use super::relocations::{
     R_RISCV_SET32, R_RISCV_SUB_ULEB128, R_RISCV_SUB6, R_RISCV_SUB8, R_RISCV_SUB16, R_RISCV_SUB32,
     R_RISCV_SUB64,
 };
+use crate::backend::elf::{SHF_MERGE, SHF_STRINGS};
 use crate::backend::linker_common::shdr::{ShdrSpec, SymtabEntry};
+use crate::backend::linker_common::strmerge_gnu::{self, MergeInput, OffsetMap, Placement};
 use crate::backend::linker_common::symtab::{SymtabBuilder, include_global, include_local};
 use crate::backend::linker_common::{self, OutputSection};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use std::rc::Rc;
 
 type SectionMap = FxHashMap<(usize, usize), (usize, u64)>;
 
@@ -36,35 +39,168 @@ type SectionMap = FxHashMap<(usize, usize), (usize, u64)>;
 pub(super) struct DebugSections {
     outputs: Vec<OutputSection>,
     map: SectionMap,
+    /// `SHF_MERGE` inputs GNU ld merged (`strmerge_gnu`): their offset map;
+    /// `map` places each at its group representative.
+    merged: FxHashMap<(usize, usize), Rc<OffsetMap>>,
+    /// The merged contents each group representative is laid out with.
+    pools: FxHashMap<(usize, usize), Vec<u8>>,
+    /// Each output's `sh_entsize`.
+    entsizes: Vec<u64>,
 }
 
 impl DebugSections {
-    /// The debug sections of `input_objs`; none under `-s`/`-S` (`keep`
-    /// false), which drop DWARF without a trace.
-    pub(super) fn collect(input_objs: &[(String, ElfObject)], keep: bool) -> Result<Self, String> {
+    /// The debug sections of `input_objs` (none under `-s`/`-S`, which drop
+    /// DWARF without a trace: `keep_debug` false) and `.comment`, which GNU
+    /// ld keeps even when stripping (`keep_comment`).
+    pub(super) fn collect(
+        input_objs: &[(String, ElfObject)],
+        keep_debug: bool,
+        keep_comment: bool,
+    ) -> Result<Self, String> {
         let mut outputs = Vec::new();
         let mut map = SectionMap::default();
-        if keep {
-            linker_common::merge_debug_sections_elf64(
-                input_objs.iter().map(|(_, o)| o),
-                &mut outputs,
-                &mut map,
-                &FxHashSet::default(),
-            )?;
+        linker_common::merge_nonalloc_sections_elf64(
+            input_objs.iter().map(|(_, o)| o),
+            &mut outputs,
+            &mut map,
+            &FxHashSet::default(),
+            |name| {
+                (keep_comment && name == ".comment")
+                    || (keep_debug && linker_common::is_debug_section_name(name))
+            },
+        )?;
+        let mut debug = DebugSections {
+            outputs,
+            map,
+            merged: FxHashMap::default(),
+            pools: FxHashMap::default(),
+            entsizes: Vec::new(),
+        };
+        for out_idx in 0..debug.outputs.len() {
+            debug.merge_strings(input_objs, out_idx);
         }
-        Ok(DebugSections { outputs, map })
+        debug.entsizes = debug
+            .outputs
+            .iter_mut()
+            .map(|osec| merged_output_flags(osec, input_objs))
+            .collect();
+        Ok(debug)
+    }
+
+    /// GNU ld's `SHF_MERGE` merging of one output section's inputs
+    /// (`.debug_str`, `.debug_line_str`, ...): merged groups live in their
+    /// first member, the other members are excluded from layout.
+    fn merge_strings(&mut self, input_objs: &[(String, ElfObject)], out_idx: usize) {
+        let osec = &self.outputs[out_idx];
+        let inputs: Vec<MergeInput> = osec
+            .inputs
+            .iter()
+            .map(|i| {
+                let obj = &input_objs[i.object_idx].1;
+                let sec = &obj.sections[i.section_idx];
+                MergeInput {
+                    data: obj.section_data[i.section_idx].as_slice(),
+                    merge: sec.flags & SHF_MERGE != 0,
+                    strings: sec.flags & SHF_STRINGS != 0,
+                    entsize: sec.entsize,
+                    addralign: sec.addralign,
+                    has_relocs: obj
+                        .relocations
+                        .get(i.section_idx)
+                        .is_some_and(|r| !r.is_empty()),
+                }
+            })
+            .collect();
+        let placements = strmerge_gnu::merge(&inputs);
+        if placements.iter().all(|p| matches!(p, Placement::Raw)) {
+            return;
+        }
+        let old = std::mem::take(&mut self.outputs[out_idx].inputs);
+        let mut placed = vec![0u64; old.len()];
+        let mut end = 0u64;
+        let mut kept = Vec::with_capacity(old.len());
+        for (k, (mut input, placement)) in old.into_iter().zip(placements).enumerate() {
+            let key = (input.object_idx, input.section_idx);
+            let align = input_objs[key.0].1.sections[key.1].addralign.max(1);
+            match placement {
+                Placement::Merged {
+                    repr,
+                    pool: None,
+                    map,
+                } => {
+                    self.map.insert(key, (out_idx, placed[repr]));
+                    self.merged.insert(key, map);
+                    continue;
+                }
+                Placement::Merged {
+                    pool: Some(pool),
+                    map,
+                    ..
+                } => {
+                    input.size = pool.len() as u64;
+                    self.pools.insert(key, pool);
+                    self.merged.insert(key, map);
+                }
+                Placement::Raw => {}
+            }
+            let at = end.div_ceil(align) * align;
+            placed[k] = at;
+            input.output_offset = at;
+            end = at + input.size;
+            self.map.insert(key, (out_idx, at));
+            kept.push(input);
+        }
+        let osec = &mut self.outputs[out_idx];
+        osec.inputs = kept;
+        osec.mem_size = end;
     }
 
     /// Section headers for the placed debug sections, in output order.
     pub(super) fn headers(&self) -> Vec<ShdrSpec> {
         self.outputs
             .iter()
-            .map(|s| ShdrSpec {
+            .zip(&self.entsizes)
+            .map(|(s, &entsize)| ShdrSpec {
                 align: s.alignment.max(1),
+                entsize,
                 ..ShdrSpec::new(&s.name, s.sh_type, s.flags, 0, s.file_offset, s.mem_size)
             })
             .collect()
     }
+}
+
+/// The output-section flags GNU ld's merge rule decides.
+pub(super) const MERGE_FLAGS: u64 = SHF_MERGE | SHF_STRINGS;
+
+/// GNU ld's rule for an output's `SHF_MERGE`/`SHF_STRINGS` (`ldlang.c`
+/// `lang_add_section`), over the inputs' `(sh_flags, sh_entsize)` in link
+/// order: kept only while every input agrees on both flags and, when merging,
+/// on the entry size; the header then states that entry size
+/// (`elf_fake_sections`). Returns the kept [`MERGE_FLAGS`] bits and the
+/// output's `sh_entsize`, `(0, 0)` on disagreement.
+pub(super) fn gnu_merge_flags(mut inputs: impl Iterator<Item = (u64, u64)>) -> (u64, u64) {
+    let Some((first_flags, entsize)) = inputs.next() else {
+        return (0, 0);
+    };
+    let flags = first_flags & MERGE_FLAGS;
+    let agree =
+        inputs.all(|(f, e)| f & MERGE_FLAGS == flags && (flags & SHF_MERGE == 0 || e == entsize));
+    if agree && flags & SHF_MERGE != 0 {
+        (flags, entsize)
+    } else {
+        (0, 0)
+    }
+}
+
+/// [`gnu_merge_flags`] applied to a debug output: sets its flags and returns
+/// its `sh_entsize`.
+fn merged_output_flags(osec: &mut OutputSection, input_objs: &[(String, ElfObject)]) -> u64 {
+    let (flags, entsize) = gnu_merge_flags(osec.inputs.iter().map(|i| {
+        let sec = &input_objs[i.object_idx].1.sections[i.section_idx];
+        (sec.flags, sec.entsize)
+    }));
+    osec.flags = (osec.flags & !MERGE_FLAGS) | flags;
+    entsize
 }
 
 /// Final symbol values of a link: what the writers resolve relocations with.
@@ -83,6 +219,32 @@ fn regular(shndx: u16) -> bool {
 }
 
 impl Symbols<'_> {
+    /// `S` and `A` of a debug relocation against `sym_idx` with `addend`:
+    /// [`Self::value`], except that a symbol in a merged `SHF_MERGE` input
+    /// resolves through the pool -- a section symbol to `map(addend)`, any
+    /// other to `map(value) + addend` (`_bfd_elf_rela_local_sym`).
+    fn resolve(
+        &self,
+        debug: &DebugSections,
+        obj_idx: usize,
+        sym_idx: usize,
+        addend: i64,
+    ) -> Option<(u64, i64)> {
+        let sym = &self.input_objs[obj_idx].1.symbols[sym_idx];
+        let key = (obj_idx, usize::from(sym.shndx));
+        if regular(sym.shndx)
+            && let (Some(map), Some(&(_, base))) = (debug.merged.get(&key), debug.map.get(&key))
+        {
+            return Some(if sym.sym_type() == STT_SECTION {
+                let at = sym.value.wrapping_add_signed(addend);
+                (base + map.map(at), 0)
+            } else {
+                (base + map.map(sym.value), addend)
+            });
+        }
+        self.value(debug, obj_idx, sym_idx).map(|s| (s, addend))
+    }
+
     /// The value a debug relocation in object `obj_idx` resolves symbol
     /// `sym_idx` to, or `None` when it is defined in a section the link
     /// dropped, which takes the tombstone instead (bfd's
@@ -204,8 +366,11 @@ pub(super) fn write_debug_sections(
     out.resize(end as usize, 0);
     for osec in &debug.outputs {
         for input in &osec.inputs {
-            let data =
-                syms.input_objs[input.object_idx].1.section_data[input.section_idx].as_slice();
+            let key = (input.object_idx, input.section_idx);
+            let data = match debug.pools.get(&key) {
+                Some(pool) => pool.as_slice(),
+                None => syms.input_objs[key.0].1.section_data[key.1].as_slice(),
+            };
             let at = (osec.file_offset + input.output_offset) as usize;
             out[at..at + data.len()].copy_from_slice(data);
         }
@@ -237,7 +402,7 @@ pub(super) fn write_debug_sections(
                 if r.rela_type == 0 {
                     continue;
                 }
-                let s = syms.value(debug, obj_idx, r.sym_idx as usize);
+                let s = syms.resolve(debug, obj_idx, r.sym_idx as usize, r.addend);
                 if r.rela_type == R_RISCV_SET_ULEB128 {
                     // `validate_input_relocations` guarantees the SUB half
                     // follows at the same offset and the field is a
@@ -248,9 +413,12 @@ pub(super) fn write_debug_sections(
                     let len = super::uleb128::field_len(&input_data[r.offset as usize..])?;
                     let at = field_at(r.offset, len)?;
                     let field = &mut out[at..at + len];
-                    match (s, syms.value(debug, obj_idx, sub.sym_idx as usize)) {
-                        (Some(set), Some(sub_s)) => {
-                            super::uleb128::apply_pair(field, set, r.addend, sub_s, sub.addend)
+                    match (
+                        s,
+                        syms.resolve(debug, obj_idx, sub.sym_idx as usize, sub.addend),
+                    ) {
+                        (Some((set, set_a)), Some((sub_s, sub_a))) => {
+                            super::uleb128::apply_pair(field, set, set_a, sub_s, sub_a)
                         }
                         _ => super::uleb128::apply_pair(field, tombstone, 0, 0, 0),
                     }
@@ -268,14 +436,9 @@ pub(super) fn write_debug_sections(
                 let mut bytes = [0u8; 8];
                 bytes[..width].copy_from_slice(&out[at..at + width]);
                 let value = match s {
-                    Some(s) => apply_op(
-                        op,
-                        width,
-                        u64::from_le_bytes(bytes),
-                        s,
-                        r.addend,
-                        base + r.offset,
-                    ),
+                    Some((s, a)) => {
+                        apply_op(op, width, u64::from_le_bytes(bytes), s, a, base + r.offset)
+                    }
                     None => tombstone,
                 };
                 out[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
@@ -340,27 +503,38 @@ pub(super) fn symtab(syms: &Symbols, headers: &[ShdrSpec]) -> Vec<SymtabEntry> {
 }
 
 /// Section headers for the allocated merged sections at their final
-/// places; `.riscv.attributes` is placed by each writer itself. The
-/// executable writer leaves `.note.*` inputs out of its image
-/// (`drop_notes`); the shared-object writer lays them out.
+/// places; `.riscv.attributes` is placed by each writer itself.
 pub(super) fn merged_headers(
     merged: &[super::relocations::MergedSection],
     vaddrs: &[u64],
     offsets: &[u64],
-    drop_notes: bool,
 ) -> Vec<ShdrSpec> {
     merged
         .iter()
         .enumerate()
-        .filter(|(_, ms)| {
-            ms.sh_flags & SHF_ALLOC != 0 && !(drop_notes && ms.name.starts_with(".note."))
+        .filter(|(_, ms)| ms.sh_flags & SHF_ALLOC != 0)
+        .map(|(i, ms)| {
+            (
+                i,
+                ms,
+                if ms.script_write {
+                    ms.sh_flags & !SHF_WRITE
+                } else {
+                    ms.sh_flags
+                },
+            )
         })
-        .map(|(i, ms)| ShdrSpec {
+        .map(|(i, ms, flags)| ShdrSpec {
             align: ms.align.max(1),
+            entsize: if ms.sh_flags & SHF_MERGE != 0 {
+                ms.entsize
+            } else {
+                ShdrSpec::new(&ms.name, ms.sh_type, flags, 0, 0, 0).entsize
+            },
             ..ShdrSpec::new(
                 &ms.name,
                 ms.sh_type,
-                ms.sh_flags,
+                flags,
                 vaddrs[i],
                 offsets[i],
                 ms.data.len() as u64,
@@ -372,6 +546,35 @@ pub(super) fn merged_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GNU ld's `lang_add_section` merge rule, for any output section.
+    #[test]
+    fn merge_flags_survive_only_full_agreement() {
+        const A: u64 = SHF_ALLOC;
+        let ams = A | SHF_MERGE | SHF_STRINGS;
+        // One string pool, or several with one entry size: kept with it.
+        assert_eq!(gnu_merge_flags([(ams, 1)].into_iter()), (MERGE_FLAGS, 1));
+        assert_eq!(
+            gnu_merge_flags([(ams, 1), (ams, 1)].into_iter()),
+            (MERGE_FLAGS, 1)
+        );
+        assert_eq!(
+            gnu_merge_flags([(A | SHF_MERGE, 8), (A | SHF_MERGE, 8)].into_iter()),
+            (SHF_MERGE, 8)
+        );
+        // Plain data beside a pool, differing entry sizes, or STRINGS vs
+        // constants: cleared.
+        assert_eq!(gnu_merge_flags([(A, 0), (ams, 1)].into_iter()), (0, 0));
+        assert_eq!(gnu_merge_flags([(ams, 1), (A, 0)].into_iter()), (0, 0));
+        assert_eq!(gnu_merge_flags([(ams, 1), (ams, 2)].into_iter()), (0, 0));
+        assert_eq!(
+            gnu_merge_flags([(ams, 1), (A | SHF_MERGE, 1)].into_iter()),
+            (0, 0)
+        );
+        // SHF_STRINGS without SHF_MERGE is not a merge section.
+        assert_eq!(gnu_merge_flags([(A | SHF_STRINGS, 1)].into_iter()), (0, 0));
+        assert_eq!(gnu_merge_flags(std::iter::empty()), (0, 0));
+    }
 
     #[test]
     fn field_operations_follow_the_psabi() {

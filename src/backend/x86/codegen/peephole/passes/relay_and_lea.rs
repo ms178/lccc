@@ -4783,6 +4783,7 @@ pub(super) fn fold_scaled_index_temp_into_mem(
             i += 1;
             continue;
         };
+        let bare_shift = !infos[i].trimmed(store.get(i)).starts_with("leaq ");
         let j = next_non_debug(store, infos, shl.unwrap_or(i) + 1, len);
         if j >= len || infos[j].is_barrier() || infos[j].pinned {
             i += 1;
@@ -4790,6 +4791,13 @@ pub(super) fn fold_scaled_index_temp_into_mem(
         }
         let dst_fam = register_family_fast(&dst);
         let consumer = infos[j].trimmed(store.get(j));
+        // A bare-shift producer pairs only with a `leaq` consumer: memory
+        // consumers of a shifted temporary are `fold_shift_into_sib`'s
+        // (its memory-operand arm), and one transform has one owner.
+        if bare_shift && !consumer.starts_with("leaq ") {
+            i += 1;
+            continue;
+        }
         if implicit_reg_refs(consumer.as_bytes()) & (1u16 << dst_fam) != 0 {
             i += 1;
             continue;
@@ -4826,6 +4834,9 @@ fn scaled_temp_producer(
     len: usize,
 ) -> Option<(SibAddr, String, Option<usize>)> {
     let t = infos[i].trimmed(store.get(i));
+    if let Some(found) = bare_shift_producer(store, infos, t, i) {
+        return Some(found);
+    }
     let (addr_text, dst) = t.strip_prefix("leaq ")?.rsplit_once(',')?;
     let (addr_text, dst) = (addr_text.trim(), dst.trim());
     let fam = register_family_fast(dst);
@@ -4871,6 +4882,46 @@ fn scaled_temp_producer(
         },
         dst.to_string(),
         Some(k),
+    ))
+}
+
+/// A lone `shlq/salq $s, %T` (s = 1..3) as the producer: `%T << s` is the
+/// index `%T` scaled by `2^s`, and with the shift deleted `%T` keeps its
+/// pre-shift value. The loop_memset start address `x << 2` then
+/// `leaq (%rdi,%T),%rdi` becomes `leaq (%rdi,%T,4),%rdi`, GCC's form. The
+/// deleted shift's flags must be dead. The caller pairs it with `leaq`
+/// consumers only (memory consumers belong to `fold_shift_into_sib`).
+fn bare_shift_producer(
+    store: &LineStore,
+    infos: &[LineInfo],
+    t: &str,
+    i: usize,
+) -> Option<(SibAddr, String, Option<usize>)> {
+    let (mnemonic, rest) = t.split_once(' ')?;
+    if !matches!(mnemonic, "shlq" | "salq") {
+        return None;
+    }
+    let (imm, reg) = split_two_operands(rest.trim_start())?;
+    let s: u32 = imm.strip_prefix('$')?.parse().ok()?;
+    if !(1..=3).contains(&s) {
+        return None;
+    }
+    let fam = register_family_fast(reg);
+    if fam == REG_NONE || fam > REG_GP_MAX || REG_NAMES[0][fam as usize] != reg {
+        return None;
+    }
+    if !super::flag_peepholes::flags_dead_after(store, infos, i + 1) {
+        return None;
+    }
+    Some((
+        SibAddr {
+            sym: None,
+            disp: 0,
+            base: None,
+            index: Some((reg.to_string(), 1u8 << s)),
+        },
+        reg.to_string(),
+        None,
     ))
 }
 
@@ -9290,6 +9341,46 @@ mod scaled_index_temp_tests {
         ]);
         assert!(c);
         assert_eq!(out, ["prefetchnta 64(%rdi, %r8, 8)", "ret"]);
+    }
+
+    #[test]
+    fn bare_shift_folds_into_a_lea_scaled_index() {
+        // loop_memset's `int` start address: `p + (a << 2)`.
+        let (c, out) = fold(&["    shlq $2, %r10", "    leaq (%rdi, %r10), %rdi"]);
+        assert!(c);
+        assert_eq!(out, ["leaq (%rdi, %r10, 4), %rdi", "ret"]);
+        let (c, out) = fold(&["    salq $3, %r9", "    leaq (%r9, %rsi), %rax"]);
+        assert!(c);
+        assert_eq!(out, ["leaq (%rsi, %r9, 8), %rax", "ret"]);
+    }
+
+    #[test]
+    fn bare_shift_declines_live_temp_flags_and_wide_shifts() {
+        for body in [
+            // %T read after the consumer.
+            &[
+                "    shlq $2, %r10",
+                "    leaq (%rdi, %r10), %rdi",
+                "    movq %r10, %rax",
+            ][..],
+            // The shift's flags are read.
+            &[
+                "    shlq $2, %r10",
+                "    leaq (%rdi, %r10), %rdi",
+                "    je .L1",
+            ][..],
+            // Not a SIB scale.
+            &["    shlq $4, %r10", "    leaq (%rdi, %r10), %rdi"][..],
+            // 32-bit shift zero-extends; lea scaling does not model it.
+            &["    shll $2, %r10d", "    leaq (%rdi, %r10), %rdi"][..],
+            // Already scaled.
+            &["    shlq $1, %r10", "    leaq (%rdi, %r10, 2), %rdi"][..],
+            // A memory consumer: `fold_shift_into_sib`'s, not this pass's.
+            &["    shlq $3, %r9", "    movq (%rsi, %r9), %rax"][..],
+        ] {
+            let (c, _) = fold(body);
+            assert!(!c, "{body:?}");
+        }
     }
 
     #[test]

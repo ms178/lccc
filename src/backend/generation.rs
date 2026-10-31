@@ -318,7 +318,7 @@ fn collect_asm_goto_cc_branch_values(
 /// elsewhere, a different value returned, a constant returned — is a
 /// miss, never a guess. The returned hint carries the instruction index;
 /// a result id is not a call-site identity (void calls all have `None`).
-fn sibcall_block_hint(
+pub(crate) fn sibcall_block_hint(
     block: &BasicBlock,
     use_counts: &FxHashMap<u32, u8>,
 ) -> Option<crate::backend::state::SibcallHint> {
@@ -357,6 +357,55 @@ fn sibcall_block_hint(
         (None, Terminator::Return(None)) => hint(),
         _ => None,
     }
+}
+
+/// Sibling-call site analysis, part 1 (see the call site in
+/// `generate_function`): the function-level guards and the whole-function
+/// use counts `sibcall_block_hint` needs, or `None` when no site of `func`
+/// may convert. Shared with the x86-64 frame planner
+/// (`calculate_stack_space_impl`), which must predict every conversion
+/// exactly: a predicted sibling call that is emitted as a real `call`
+/// would run on a frame without the call-alignment pad.
+pub(crate) fn sibcall_function_use_counts(
+    func: &IrFunction,
+    incoming_byval_slots: &FxHashMap<u32, crate::backend::state::StackSlot>,
+) -> Option<FxHashMap<u32, u8>> {
+    if !sibcall_enabled() {
+        return None;
+    }
+    let mut sibcall_use_counts: FxHashMap<u32, u8> = FxHashMap::default();
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            for id in inst.used_values() {
+                let entry = sibcall_use_counts.entry(id).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        }
+        for id in b.terminator.used_values() {
+            let entry = sibcall_use_counts.entry(id).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+    }
+    let refused = func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|inst| match inst {
+            // A live LOCAL alloca's address could reach the tail callee.
+            // Checked incoming MEMORY parameter homes are different:
+            // their storage belongs to the caller's argument area and
+            // remains above the tail callee's frame after our epilogue.
+            // Keep refusing every ordinary or dynamic local object.
+            Instruction::Alloca { dest, .. } => {
+                !incoming_byval_slots.contains_key(&dest.0)
+                    && sibcall_use_counts.get(&dest.0).copied().unwrap_or(0) > 0
+            }
+            // Dynamic stack allocation: memory below %rsp, and the
+            // epilogue would hand the tail callee unowned stack.
+            Instruction::DynAlloca { .. } => true,
+            // Inline asm: unbounded stack expectations.
+            Instruction::InlineAsm { .. } => true,
+            _ => false,
+        })
+    });
+    (!refused).then_some(sibcall_use_counts)
 }
 
 /// GEP/`Add`/`Sub` with a constant offset foldable into a Load/Store.
@@ -2036,6 +2085,17 @@ fn build_indexed_gep_map(
         // accumulated shift at the add's position (`const << shift`).
         // This allows `4(%base,%j,4)` instead of a separate
         // `leaq 0(,%rax,4),%r12` every iteration.
+        // A load whose only use is the cast is fused with it (`movzbl` writes
+        // the extended value) and never materialised on its own, so it never
+        // holds the register an indexed fold reads.  Peeling to it made every
+        // such fold fail at emission after the RA had already dropped the
+        // GEP's candidacy: the address was rebuilt with two `lea`s and stored
+        // to a dead stack home (glibc_strstr's `shift_table[hay[h + n - 1]]`).
+        // The cast result is the register-resident index; stop there.
+        let single_use_load = |v: u32| {
+            matches!(defs.get(&v).copied(), Some(Instruction::Load { .. }))
+                && use_counts.get(v as usize).copied() == Some(1)
+        };
         let mut id = off_id;
         let mut shift: u8 = 0;
         let mut disp: i64 = 0;
@@ -2094,7 +2154,8 @@ fn build_indexed_gep_map(
                         && !from_ty.is_float()
                         && !to_ty.is_float()))
                     && (from_ty.cast_preserves_integer_value(*to_ty)
-                        || (pointer_ring_peel && from_ty.cast_preserves_offset_value(*to_ty))) =>
+                        || (pointer_ring_peel && from_ty.cast_preserves_offset_value(*to_ty)))
+                    && !single_use_load(v.0) =>
                 {
                     id = v.0;
                 }
@@ -4916,18 +4977,24 @@ fn emit_extern_visibility_directives(
 /// all of it a *static count* of what a placement leaves taken. When the two
 /// orders tie on that count the model has no opinion, and the historical rule
 /// (`chain_count < orig_count`) handed the decision back to whichever order the
-/// middle-end passes happened to append. That is not a corner case: over the 49
-/// benchmark programs, 32 of the 44 functions that reach this comparison are
-/// exact ties (`CCC_DEBUG_CHAIN=1`), so the tie rule governs the layout of most
-/// functions the dual-layout machinery touches at all.
+/// middle-end passes happened to append. When the rule was introduced
+/// (8c4d1eac7) that was not a corner case: over the 49 benchmark programs then,
+/// 32 of the 44 functions reaching this comparison were exact ties
+/// (`CCC_DEBUG_CHAIN=1`). Later pipeline work decides most of them outright;
+/// exact ties are now rare (four sites over the 86 benchmark programs and the
+/// 1,220-file regression corpus), but where one sits on a hot path the rule
+/// still decides it (see `tests/regression/check_layout_tie_rule.sh`).
 ///
 /// On a tie the chain order is the better-founded default: its fall-throughs
 /// were chosen by a greedy walk over the *same* structural weights the metric
-/// sums, while the pre-chain order is an artefact of pass order. Measured, the
-/// tie rule is worth -7.4 % to -8.7 % on `expat_xml_scan` (31 interleaved
-/// paired rounds, two independent runs) and is inside the noise band on every
-/// other benchmark of the set -- the tie is the only case where the append
-/// order is demonstrably the wrong one.
+/// sums, while the pre-chain order is an artefact of pass order. Measured at its
+/// introduction, the tie rule was worth -7.4 % to -8.7 % wall-clock on
+/// `expat_xml_scan` (31 interleaved paired rounds, two independent runs) and
+/// inside the noise band on every other benchmark of the set. On the current
+/// pipeline the same tie (reached with `CCC_DISABLE_PASSES=jump_thread`)
+/// removes 0.59 % of the program's executed taken transfers (Callgrind,
+/// identical output): the tie is the case where the append order is
+/// demonstrably the wrong one.
 ///
 /// The stack term is what keeps a tie from being a free choice, and it is
 /// applied differently on each side of the tie:
@@ -6311,39 +6378,9 @@ fn generate_function_body(
     // is refused on sight (the design's "no live inline-asm barrier", made
     // function-wide: an IR-level analysis cannot bound the asm's stack
     // expectations).
-    let mut sibcall_use_counts: FxHashMap<u32, u8> = FxHashMap::default();
-    for b in &func.blocks {
-        for inst in &b.instructions {
-            for id in inst.used_values() {
-                let entry = sibcall_use_counts.entry(id).or_insert(0);
-                *entry = entry.saturating_add(1);
-            }
-        }
-        for id in b.terminator.used_values() {
-            let entry = sibcall_use_counts.entry(id).or_insert(0);
-            *entry = entry.saturating_add(1);
-        }
-    }
-    let sibcall_fn_ok = sibcall_enabled()
-        && !func.blocks.iter().any(|b| {
-            b.instructions.iter().any(|inst| match inst {
-                // A live LOCAL alloca's address could reach the tail callee.
-                // Checked incoming MEMORY parameter homes are different:
-                // their storage belongs to the caller's argument area and
-                // remains above the tail callee's frame after our epilogue.
-                // Keep refusing every ordinary or dynamic local object.
-                Instruction::Alloca { dest, .. } => {
-                    !cg.state().incoming_byval_slots.contains_key(&dest.0)
-                        && sibcall_use_counts.get(&dest.0).copied().unwrap_or(0) > 0
-                }
-                // Dynamic stack allocation: memory below %rsp, and the
-                // epilogue would hand the tail callee unowned stack.
-                Instruction::DynAlloca { .. } => true,
-                // Inline asm: unbounded stack expectations.
-                Instruction::InlineAsm { .. } => true,
-                _ => false,
-            })
-        });
+    let sibcall_use_counts = sibcall_function_use_counts(func, &cg.state().incoming_byval_slots);
+    let sibcall_fn_ok = sibcall_use_counts.is_some();
+    let sibcall_use_counts = sibcall_use_counts.unwrap_or_default();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         cg.begin_home_write_block(block.label);

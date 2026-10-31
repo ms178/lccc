@@ -1237,7 +1237,7 @@ fn materialise_constant_defs(block: &mut BasicBlock, state: &SccpState, stats: &
 
     let mut promoted: Vec<Instruction> = Vec::new();
     let mut idx = 0usize;
-    block.instructions.retain(|inst| {
+    block.retain_insts(|inst| {
         let i = idx;
         idx += 1;
         if i >= phi_prefix {
@@ -1261,7 +1261,7 @@ fn materialise_constant_defs(block: &mut BasicBlock, state: &SccpState, stats: &
         stats.defs_materialised += promoted.len();
         // The surviving phis now occupy exactly [0, phi_prefix - promoted.len()).
         let insert_at = phi_prefix - promoted.len();
-        block.instructions.splice(insert_at..insert_at, promoted);
+        block.insert_insts(insert_at, promoted, crate::common::source::Span::dummy());
     }
 }
 

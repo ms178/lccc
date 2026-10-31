@@ -1555,6 +1555,9 @@ pub struct RegAllocConfig {
     /// Hints never override `follow_value` and are honored only when the
     /// physical register belongs to the current allocation wave.
     pub reg_hints: FxHashMap<u32, PhysReg>,
+    /// Soft preferences (outgoing call-argument slots): steer a free-register
+    /// choice only; never the eviction/exchange protection `reg_hints` give.
+    pub reg_prefs: FxHashMap<u32, PhysReg>,
     /// Invocation-scoped policy captured by the driver before code generation.
     pub ra_config: Arc<RaConfig>,
     /// Leaf-function home policy (x86-64 only today).
@@ -3491,12 +3494,16 @@ fn bump_coalesce_group_priority(
 fn apply_physical_reg_hints(
     ranges: &mut [crate::backend::live_range::LiveRange],
     hints: &FxHashMap<u32, PhysReg>,
+    prefs: &FxHashMap<u32, PhysReg>,
 ) {
     for range in ranges {
         // Dataflow coalescing is stronger than an ABI preference: overwriting
         // `follow_value` would reintroduce producer/consumer copies.
         if range.follow_value.is_none() {
             range.reg_hint = hints.get(&range.value_id).copied();
+            if range.reg_hint.is_none() {
+                range.reg_pref = prefs.get(&range.value_id).copied();
+            }
         }
     }
 }
@@ -4854,11 +4861,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // (`lib/rbtree.c`) merged `parent` (`v200`, arg0 of `augment_rotate`) under
     // entry copy leader `v217`, which otherwise entered Wave 4 and received
     // `%r10`, clobbered by `emit_call_spill_fptr_impl` before `%rdi` staging.
-    propagate_member_restrictions(&mut later_arg_values, &coalesce_member_of);
+    propagate_member_depths(&mut later_arg_values, &coalesce_member_of);
     propagate_member_restrictions(&mut indirect_arg_values, &coalesce_member_of);
     for (leader, members) in &coalesce_groups {
-        if later_arg_values.contains(leader) {
-            later_arg_values.extend(members.iter().copied());
+        if let Some(&depth) = later_arg_values.get(leader) {
+            for &m in members {
+                let slot = later_arg_values.entry(m).or_insert(0);
+                *slot = (*slot).max(depth);
+            }
         }
         if indirect_arg_values.contains(leader) {
             indirect_arg_values.extend(members.iter().copied());
@@ -5008,7 +5018,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             &config.ra_config,
             Some(&fold_use_transfer),
         );
-        apply_physical_reg_hints(&mut ranges, &config.reg_hints);
+        apply_physical_reg_hints(&mut ranges, &config.reg_hints, &config.reg_prefs);
         bump_folded_index_priority(
             &mut ranges,
             &config.folded_index_uses,
@@ -5384,7 +5394,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .copied()
                     .filter(|iv| base_ok(&assignments, iv))
                     .filter(|iv| indirect_arg_values.contains(&iv.value_id))
-                    .filter(|iv| later_arg_values.contains(&iv.value_id))
+                    .filter(|iv| later_arg_values.contains_key(&iv.value_id))
                     .collect();
                 if !w1.is_empty() && !no_arg_no_indirect_pool.is_empty() {
                     let ranges = build_gpr_ranges(&w1);
@@ -5433,7 +5443,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .copied()
                     .filter(|iv| base_ok(&assignments, iv))
                     .filter(|iv| indirect_arg_values.contains(&iv.value_id))
-                    .filter(|iv| !later_arg_values.contains(&iv.value_id))
+                    .filter(|iv| !later_arg_values.contains_key(&iv.value_id))
                     .collect();
                 if !w2.is_empty() && !no_indirect_pool.is_empty() {
                     let ranges = build_gpr_ranges(&w2);
@@ -5466,35 +5476,103 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .collect();
                     eprintln!("[RA-W2] fn={} homes={:?}", func.name, ids);
                 }
-                // Wave 3: direct-call args at index ≥ 1 — avoid the arg
-                // registers; the indirect-target register is safe here.
+                // Wave 3: direct-call arguments with a staging hazard -- each
+                // avoids exactly the argument registers its hazard depth names
+                // (`arg_reg_hazard`); the indirect-target register is safe.
                 let w3: Vec<LiveInterval> = scan_ivs
                     .iter()
                     .copied()
                     .filter(|iv| base_ok(&assignments, iv))
-                    .filter(|iv| later_arg_values.contains(&iv.value_id))
+                    .filter(|iv| later_arg_values.contains_key(&iv.value_id))
                     .filter(|iv| !indirect_arg_values.contains(&iv.value_id))
                     .collect();
-                if !w3.is_empty() && !no_arg_pool.is_empty() {
-                    let ranges = build_gpr_ranges(&w3);
-                    let mut alloc = LinearScanAllocator::new_with_config(
-                        ranges,
-                        no_arg_pool,
-                        &config.ra_config,
-                    );
-                    alloc.run_with_seed(&seeded);
-                    for (vid, reg) in &alloc.assignments {
-                        assignments.insert(*vid, *reg);
-                        caller_used_regs_set.insert(reg.0);
-                        if let Some((start, end)) =
-                            allocation_owner_bounds(*vid, &merged_of, &iv_map)
+                if !w3.is_empty() {
+                    let depth_of = |v: u32| later_arg_values.get(&v).copied().unwrap_or(0);
+                    // 3a: a hinted argument-register home the value's own
+                    // depth admits (a parameter forwarded in its incoming
+                    // register, `y` of `g3(c, x, y)` in %rdx). One scan per
+                    // register so a hint is never displaced by a rotation
+                    // pick of a more constrained sibling in 3b.
+                    let mut by_hint: Vec<(PhysReg, Vec<LiveInterval>)> = Vec::new();
+                    for range in build_gpr_ranges(&w3) {
+                        let Some(hint) = range.reg_hint.or(range.reg_pref) else {
+                            continue;
+                        };
+                        if !config.call_arg_regs.contains(&hint)
+                            || !config.caller_saved_regs.contains(&hint)
+                            || arg_reg_hazard(
+                                &later_arg_values,
+                                range.value_id,
+                                hint,
+                                &config.call_arg_regs,
+                            )
                         {
-                            if end > start {
-                                // Half-open seed span (see the Wave 1 note).
-                                seeded
-                                    .entry(*reg)
-                                    .or_default()
-                                    .push((start, end.saturating_add(1)));
+                            continue;
+                        }
+                        let Some(iv) = w3.iter().find(|iv| iv.value_id == range.value_id) else {
+                            continue;
+                        };
+                        match by_hint.iter_mut().find(|(r, _)| *r == hint) {
+                            Some((_, ivs)) => ivs.push(*iv),
+                            None => by_hint.push((hint, vec![*iv])),
+                        }
+                    }
+                    by_hint.sort_unstable_by_key(|(r, _)| r.0);
+                    // 3b: the rest in the hazard-free pool first. Granting a
+                    // hazardous argument every register its depth admits up
+                    // front lets this wave take the caller-saved argument
+                    // registers the later, longer-lived values need, which
+                    // then fall back to callee-saved homes (glibc_memcmp's
+                    // `b0..b3` took %r8/%r9/%rdx and pushed `src1`/`a1` into
+                    // %rbx/%r12: two pushes per call of the hot word loop).
+                    // 3c: only what that leaves unassigned widens, most
+                    // constrained first (deepest hazard, smallest pool), each
+                    // depth with its exact pool.
+                    let mut depths: Vec<u8> = w3.iter().map(|iv| depth_of(iv.value_id)).collect();
+                    depths.sort_unstable_by(|x, y| y.cmp(x));
+                    depths.dedup();
+                    let mut sub_waves: Vec<(Vec<PhysReg>, Vec<LiveInterval>)> =
+                        by_hint.into_iter().map(|(r, ivs)| (vec![r], ivs)).collect();
+                    sub_waves.push((no_arg_pool.clone(), w3.clone()));
+                    for d in depths {
+                        let pool: Vec<PhysReg> = config
+                            .caller_saved_regs
+                            .iter()
+                            .copied()
+                            .filter(|&r| !arg_reg_hazard_at_depth(d, r, &config.call_arg_regs))
+                            .collect();
+                        let ivs: Vec<LiveInterval> = w3
+                            .iter()
+                            .copied()
+                            .filter(|iv| depth_of(iv.value_id) == d)
+                            .collect();
+                        sub_waves.push((pool, ivs));
+                    }
+                    for (pool, ivs) in sub_waves {
+                        let ivs: Vec<LiveInterval> = ivs
+                            .into_iter()
+                            .filter(|iv| !assignments.contains_key(&iv.value_id))
+                            .collect();
+                        if ivs.is_empty() || pool.is_empty() {
+                            continue;
+                        }
+                        let ranges = build_gpr_ranges(&ivs);
+                        let mut alloc =
+                            LinearScanAllocator::new_with_config(ranges, pool, &config.ra_config);
+                        alloc.run_with_seed(&seeded);
+                        for (vid, reg) in &alloc.assignments {
+                            assignments.insert(*vid, *reg);
+                            caller_used_regs_set.insert(reg.0);
+                            if let Some((start, end)) =
+                                allocation_owner_bounds(*vid, &merged_of, &iv_map)
+                            {
+                                if end > start {
+                                    // Half-open seed span (see the Wave 1 note).
+                                    seeded
+                                        .entry(*reg)
+                                        .or_default()
+                                        .push((start, end.saturating_add(1)));
+                                }
                             }
                         }
                     }
@@ -5522,7 +5600,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .iter()
                     .copied()
                     .filter(|iv| base_ok(&assignments, iv))
-                    .filter(|iv| !later_arg_values.contains(&iv.value_id))
+                    .filter(|iv| !later_arg_values.contains_key(&iv.value_id))
                     .filter(|iv| !indirect_arg_values.contains(&iv.value_id))
                     .collect();
                 if !w4.is_empty() {
@@ -5630,7 +5708,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         && !call_spanning.contains(&iv.value_id)
                         && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
                         && !riscv_entry_guard.contains(&iv.value_id)
-                        && !later_arg_values.contains(&iv.value_id)
+                        && !arg_reg_hazard(
+                            &later_arg_values,
+                            iv.value_id,
+                            PhysReg(16),
+                            &config.call_arg_regs,
+                        )
                         && !divrem_tail_dests.contains(&iv.value_id)
                         && !overlaps_inclusive_skip_birth_liveness(
                             &liveness,
@@ -5703,7 +5786,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     && !call_spanning.contains(&iv.value_id)
                     && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
                     && !riscv_entry_guard.contains(&iv.value_id)
-                    && !later_arg_values.contains(&iv.value_id)
+                    && !pool.iter().any(|&r| {
+                        arg_reg_hazard(&later_arg_values, iv.value_id, r, &config.call_arg_regs)
+                    })
                     && !divrem_tail_dests.contains(&iv.value_id)
                     && !overlaps_inclusive(iv, &hazards)
             })
@@ -7370,7 +7455,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 && !call_spanning.contains(&v)
                 && !restricted(v)
                 && !non_gpr_values.contains(&v)
-                && !(later_arg_values.contains(&v) && config.call_arg_regs.contains(&r))
+                && !arg_reg_hazard(&later_arg_values, v, r, &config.call_arg_regs)
                 && !(indirect_arg_values.contains(&v) && config.indirect_target_regs.contains(&r))
                 && (!fold_use_transfer.contains_key(&v) || config.fold_base_regs.contains(&r))
         };
@@ -7378,7 +7463,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         // without `reloc_ok`'s value-level clauses (call-spanning values are
         // precisely what IPA homing exists to place).
         let ipa_register_ok = |v: u32, r: PhysReg| {
-            !(later_arg_values.contains(&v) && config.call_arg_regs.contains(&r))
+            !arg_reg_hazard(&later_arg_values, v, r, &config.call_arg_regs)
                 && !(indirect_arg_values.contains(&v) && config.indirect_target_regs.contains(&r))
                 && (!fold_use_transfer.contains_key(&v) || config.fold_base_regs.contains(&r))
         };
@@ -9139,35 +9224,209 @@ fn propagate_copy_web(succs: &FxHashMap<u32, Vec<u32>>, seed: &mut FxHashSet<u32
     }
 }
 
-/// Values whose (last) use is as an operand of a `Call` / `CallIndirect`.
+/// Staging-hazard depth meaning "every argument register is clobbered before
+/// this value is read": the historical blanket rule, kept for indirect calls,
+/// non-x86-64 targets and every call shape whose staging the precise model
+/// below does not describe.
+pub(crate) const ARG_HAZARD_ALL: u8 = u8::MAX;
+
+/// SysV x86-64 GP argument slot of an allocatable home (`%rcx`, slot 3, is
+/// never an allocator home). Inverse of the slot mapping the emitter's
+/// staging-hazard pre-spill uses (`emit_call_reg_args_impl`).
+fn x86_64_sysv_arg_slot(r: PhysReg) -> Option<u8> {
+    match r.0 {
+        14 => Some(0),
+        15 => Some(1),
+        16 => Some(2),
+        12 => Some(4),
+        13 => Some(5),
+        _ => None,
+    }
+}
+
+/// Whether homing `v` in `r` would be clobbered by some call's argument
+/// staging before that staging reads `v`.
 ///
-/// The call's argument staging materialises each argument into the ABI arg
-/// registers in order; a value homed in one of those registers (x86-64:
-/// rdi/rsi/rdx/r8/r9) is read only AFTER an earlier argument's staging already
-/// wrote that register. Phase 2 therefore allocates these values from the
-/// arg-register-free subset of the caller-saved pool. The second set is the
-/// subset used as arguments to a `CallIndirect`, whose staging also writes the
-/// indirect-target register (r10) before reading them.
-/// Values whose (last) use is as an operand of a `Call` / `CallIndirect`.
+/// `depths[v] == d` (see [`collect_call_arg_values`]) says the SysV GP slots
+/// `0..d` may already be written when `v` is read, so exactly the argument
+/// registers in those slots are hazards; [`ARG_HAZARD_ALL`] keeps every
+/// register of `call_arg_regs` off limits. A value absent from `depths` is
+/// read before any argument register is written.
+fn arg_reg_hazard(
+    depths: &FxHashMap<u32, u8>,
+    v: u32,
+    r: PhysReg,
+    call_arg_regs: &[PhysReg],
+) -> bool {
+    let Some(&d) = depths.get(&v) else {
+        return false;
+    };
+    arg_reg_hazard_at_depth(d, r, call_arg_regs)
+}
+
+/// [`arg_reg_hazard`] for a value of known staging-hazard depth `d`
+/// (`0`: no hazard).
+fn arg_reg_hazard_at_depth(d: u8, r: PhysReg, call_arg_regs: &[PhysReg]) -> bool {
+    d != 0
+        && call_arg_regs.contains(&r)
+        && (d == ARG_HAZARD_ALL || x86_64_sysv_arg_slot(r).is_none_or(|slot| slot < d))
+}
+
+/// One past the highest SysV GP argument slot a call argument's staging
+/// writes (`None`: it writes no GP argument register). Mirrors the emitter's
+/// `gp_high` census and its `written_gpr` marking in `emit_call_reg_args_impl`.
+fn gp_slots_written_end(cls: &crate::backend::call_abi::CallArgClass) -> Option<usize> {
+    use crate::backend::call_abi::CallArgClass as C;
+    match *cls {
+        C::IntReg { reg_idx } => Some(reg_idx + 1),
+        C::I128RegPair { base_reg_idx } | C::I64RegPair { base_reg_idx } => Some(base_reg_idx + 2),
+        C::StructByValReg { base_reg_idx, size } => Some(base_reg_idx + size.div_ceil(8)),
+        C::StructMixedIntSseReg { int_reg_idx, .. }
+        | C::StructMixedSseIntReg { int_reg_idx, .. }
+        | C::StructSplitRegStack {
+            reg_idx: int_reg_idx,
+            ..
+        } => Some(int_reg_idx + 1),
+        _ => None,
+    }
+}
+
+/// Per-argument staging-hazard depth of one direct x86-64 SysV call, or
+/// `None` when the call's staging is outside the precise model.
+///
+/// The emitter stages a call in fixed phases (`emit_call` in `traits.rs`):
+/// the F128 pre-conversion (which may call helpers), the stack arguments
+/// (whose `rep movsb` copies save and restore `%rdi`/`%rsi`/`%rcx`), then the
+/// register arguments strictly in argument order, each writing only its own
+/// target registers (plus `%rax`/`%rcx`, which are never allocator homes).
+/// SysV hands out GP slots monotonically, so when argument `i` is read the
+/// written GP argument registers are exactly the slots below the highest slot
+/// an earlier argument consumed: a prefix. A stack-class argument is read by
+/// the stack phase, before any register is written: depth 0.
+///
+/// The classification is the emitter's own (`classify_call_args` with the
+/// hidden `%ymm0`/`%zmm0` return buffer skipped, as `emit_call` does). The
+/// variadic wide-vector demotion is not replayed: it turns a vector-register
+/// argument into a stack one, which leaves every GP slot unchanged and only
+/// lowers that argument's own depth -- the model's answer stays an upper
+/// bound. F128 arguments (helper-calling pre-conversion), fastcall and
+/// regparm keep the blanket rule.
+fn x86_64_call_staging_depths(info: &crate::ir::reexports::CallInfo) -> Option<Vec<u8>> {
+    use crate::backend::call_abi::CallArgClass as C;
+    let (skip, classes) = x86_64_sysv_call_classes(info)?;
+    let mut depths = Vec::with_capacity(info.args.len());
+    // The skipped buffer address is not staged into any register.
+    depths.extend(std::iter::repeat_n(0u8, skip));
+    let mut written = 0usize;
+    for cls in &classes {
+        let read_by_stack_phase = matches!(
+            cls,
+            C::Stack
+                | C::I128Stack
+                | C::StructByValStack { .. }
+                | C::LargeStructStack { .. }
+                | C::ZeroSizeSkip
+        );
+        let depth = if read_by_stack_phase {
+            0
+        } else {
+            written.min(6)
+        };
+        depths.push(u8::try_from(depth).unwrap_or(ARG_HAZARD_ALL));
+        if let Some(end) = gp_slots_written_end(cls) {
+            written = written.max(end);
+        }
+    }
+    Some(depths)
+}
+
+/// The SysV GP argument slot of each argument of one direct x86-64 call
+/// (`Some(slot)` for a scalar integer/pointer argument, `None` otherwise),
+/// or `None` when the call is outside the precise staging model. Shares
+/// [`x86_64_call_staging_depths`]'s classification.
+pub(crate) fn x86_64_call_int_slots(
+    info: &crate::ir::reexports::CallInfo,
+) -> Option<Vec<Option<usize>>> {
+    use crate::backend::call_abi::CallArgClass as C;
+    let (skip, classes) = x86_64_sysv_call_classes(info)?;
+    let mut slots: Vec<Option<usize>> = vec![None; skip];
+    slots.extend(classes.iter().map(|cls| match *cls {
+        C::IntReg { reg_idx } => Some(reg_idx),
+        _ => None,
+    }));
+    Some(slots)
+}
+
+/// `(skipped leading args, classes of the rest)` of a direct SysV x86-64
+/// call whose staging the precise model covers.
+fn x86_64_sysv_call_classes(
+    info: &crate::ir::reexports::CallInfo,
+) -> Option<(usize, Vec<crate::backend::call_abi::CallArgClass>)> {
+    use crate::backend::call_abi::{
+        CallAbiConfig, CallArgClass as C, classify_call_args, hidden_vector_return_bytes,
+    };
+    if info.is_fastcall || info.regparm.is_some() {
+        return None;
+    }
+    let skip = usize::from(
+        hidden_vector_return_bytes(info.is_sret, &info.ret_eightbyte_classes).is_some()
+            && !info.args.is_empty(),
+    );
+    let classes = classify_call_args(
+        &info.args[skip..],
+        info.arg_types.get(skip..).unwrap_or(&[]),
+        info.struct_arg_sizes.get(skip..).unwrap_or(&[]),
+        info.struct_arg_aligns.get(skip..).unwrap_or(&[]),
+        info.struct_arg_classes.get(skip..).unwrap_or(&[]),
+        info.struct_arg_riscv_float_classes
+            .get(skip..)
+            .unwrap_or(&[]),
+        info.struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
+        info.is_variadic,
+        &CallAbiConfig::sysv_x86_64(),
+    );
+    if classes.len() + skip != info.args.len()
+        || classes
+            .iter()
+            .any(|c| matches!(c, C::F128Reg { .. } | C::F128SseReg { .. } | C::F128Stack))
+    {
+        return None;
+    }
+    Some((skip, classes))
+}
+
+/// Values consumed as call arguments, with their argument-staging hazards.
 ///
 /// Returns `(later, indirect)`:
-/// * `later` — values used as a call argument at ABI index ≥ 1 (i.e. NOT the
-///   first argument). Their home is read only after the staging has written
-///   the argument register(s) that come before them in the ABI order, so those
-///   registers must not be their home.
+/// * `later` — value → staging-hazard depth, present only when the depth is
+///   non-zero. The call's argument staging writes the ABI argument registers
+///   in argument order, and a value is read only when its own argument is
+///   staged: a home in an argument register an EARLIER argument already wrote
+///   is clobbered (`printf("%d %d", add(3,4), mul(3,4))` read the mul result
+///   out of the format-string register). On x86-64 the hazard of a direct
+///   call is the prefix of SysV GP slots written before the value's argument
+///   ([`x86_64_call_staging_depths`]); a value used by several calls (or
+///   several arguments of one) takes the deepest prefix. Everywhere else the
+///   depth is [`ARG_HAZARD_ALL`] for argument index >= 1.
+///   [`arg_reg_hazard`] is the single query over this map.
 /// * `indirect` — values used as an argument of a `CallIndirect`, whose
 ///   staging additionally writes the indirect-target register (x86: `%r10`)
 ///   before reading any argument.
 ///
-/// A value used as argument 0 of a DIRECT call is deliberately absent from
-/// both: argument 0 is read first, so every argument register (and r10/r11)
-/// is still safe as its home.
-fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>) {
-    let mut later = FxHashSet::default();
+/// Argument 0 of a direct call has depth 0 under both models: it is read
+/// first, so every argument register (and r10/r11) is still safe as its home.
+/// The precise depth generalises exactly that rule: a value passed as the
+/// second argument after a `double` (GP slot 0 untouched), or in its own
+/// incoming register (`return g3(c, x, y)` with `x` in `%rsi`), keeps the
+/// register instead of paying a copy to `%r10`/`%r11` and back.
+fn collect_call_arg_values(func: &IrFunction) -> (FxHashMap<u32, u8>, FxHashSet<u32>) {
+    let mut later: FxHashMap<u32, u8> = FxHashMap::default();
     let mut indirect = FxHashSet::default();
+    let is_x86_64 = crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
+        && crate::common::types::target_ptr_size() == 8;
     for block in &func.blocks {
         for inst in &block.instructions {
-            let (args, is_indirect) = match inst {
+            let (info, is_indirect) = match inst {
                 // Inline-expanded memcpy/memset (x86-64) stage their operands
                 // hazard-free for any home: memset reads the fill value into
                 // %rax (never a home) before the destination; memcpy orders
@@ -9175,8 +9434,7 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
                 // Excluding their operands from the argument registers only
                 // spilled parameters and bought a frame.
                 Instruction::Call { func: name, info }
-                    if crate::common::types::target_elf_machine()
-                        == crate::backend::elf::EM_X86_64
+                    if is_x86_64
                         && (crate::backend::generation::inline_memcpy_len(name, info)
                             .is_some()
                             || crate::backend::generation::x86_inline_memset_len(name, info)
@@ -9184,14 +9442,25 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
                 {
                     continue;
                 }
-                Instruction::Call { info, .. } => (&info.args, false),
-                Instruction::CallIndirect { info, .. } => (&info.args, true),
+                Instruction::Call { info, .. } => (info, false),
+                Instruction::CallIndirect { info, .. } => (info, true),
                 _ => continue,
             };
-            for (idx, arg) in args.iter().enumerate() {
+            let precise = if is_x86_64 && !is_indirect {
+                x86_64_call_staging_depths(info)
+            } else {
+                None
+            };
+            for (idx, arg) in info.args.iter().enumerate() {
                 if let Operand::Value(v) = arg {
-                    if idx >= 1 {
-                        later.insert(v.0);
+                    let depth = match &precise {
+                        Some(d) => d.get(idx).copied().unwrap_or(ARG_HAZARD_ALL),
+                        None if idx >= 1 => ARG_HAZARD_ALL,
+                        None => 0,
+                    };
+                    if depth > 0 {
+                        let slot = later.entry(v.0).or_insert(0);
+                        *slot = (*slot).max(depth);
                     }
                     if is_indirect {
                         indirect.insert(v.0);
@@ -9201,6 +9470,19 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
         }
     }
     (later, indirect)
+}
+
+/// [`propagate_member_restrictions`] for staging-hazard depths: the owner of
+/// a merged allocation web takes the deepest hazard of any member.
+fn propagate_member_depths(depths: &mut FxHashMap<u32, u8>, member_of: &FxHashMap<u32, u32>) {
+    let owners: Vec<(u32, u8)> = member_of
+        .iter()
+        .filter_map(|(&member, &owner)| depths.get(&member).map(|&d| (owner, d)))
+        .collect();
+    for (owner, d) in owners {
+        let slot = depths.entry(owner).or_insert(0);
+        *slot = (*slot).max(d);
+    }
 }
 
 /// Values that do not fit in a single GPR (floats, i128, 32-bit i64/u64),
@@ -12922,7 +13204,7 @@ fn phi_home_blockers(
 
 #[derive(Clone, Copy)]
 struct PhiCallArgHazards<'a> {
-    later_arg_values: &'a FxHashSet<u32>,
+    later_arg_values: &'a FxHashMap<u32, u8>,
     indirect_arg_values: &'a FxHashSet<u32>,
     call_arg_regs: &'a [PhysReg],
     indirect_target_regs: &'a [PhysReg],
@@ -13042,7 +13324,7 @@ fn apply_phi_coalesce_assignments_with_config(
         // when `end == cp`), so inheriting an ABI argument register or `%r10`
         // from `phi_dest` would let earlier argument/callee staging clobber it.
         if let Some(haz) = call_arg_hazards {
-            if (haz.later_arg_values.contains(&backedge_src) && haz.call_arg_regs.contains(&reg))
+            if arg_reg_hazard(haz.later_arg_values, backedge_src, reg, haz.call_arg_regs)
                 || (haz.indirect_arg_values.contains(&backedge_src)
                     && haz.indirect_target_regs.contains(&reg))
             {
@@ -16197,6 +16479,7 @@ mod phi_coalesce_tests {
             fold_base_regs: Vec::new(),
             fold_readmit: FxHashSet::default(),
             reg_hints: FxHashMap::default(),
+            reg_prefs: FxHashMap::default(),
             ra_config: Arc::new(RaConfig::default()),
         };
         let result = allocate_registers(&func, &config);
@@ -16307,6 +16590,7 @@ mod phi_coalesce_tests {
             fold_base_regs: Vec::new(),
             fold_readmit: FxHashSet::default(),
             reg_hints: FxHashMap::default(),
+            reg_prefs: FxHashMap::default(),
             ra_config: Arc::new(RaConfig::default()),
         };
         let result = allocate_registers(&func, &config);
@@ -17106,6 +17390,7 @@ mod allocation_kernel_tests {
             fold_base_regs: Vec::new(),
             fold_readmit: FxHashSet::default(),
             reg_hints: FxHashMap::default(),
+            reg_prefs: FxHashMap::default(),
             ra_config: Arc::new(RaConfig::default()),
         };
         let result = allocate_registers(&func, &config);
@@ -19857,6 +20142,7 @@ mod call_sequence_policy_tests {
             fold_base_regs: Vec::new(),
             fold_readmit: FxHashSet::default(),
             reg_hints: FxHashMap::default(),
+            reg_prefs: FxHashMap::default(),
             ra_config: Arc::new(RaConfig::default()),
         }
     }
@@ -20035,6 +20321,7 @@ mod fold_defer_tests {
             fold_base_regs,
             fold_readmit: FxHashSet::default(),
             reg_hints: FxHashMap::default(),
+            reg_prefs: FxHashMap::default(),
             ra_config: Arc::new(RaConfig::default()),
         }
     }

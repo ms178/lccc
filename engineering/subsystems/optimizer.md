@@ -33,3 +33,8 @@ Splits canonical 2-block vector reductions into interleaved accumulator chains. 
 - Never fold `0.0 + x`, `fabs(x) >= 0`, or NaN/Inf float-to-int; volatile is gated in every load/store pass.
 - `movslq`-insertion heuristics in GCC do not justify widening the IV heuristic — verify with same-window A/B (see journal W1 iv-widen entry).
 - GlobalAddr CSE/GVN location classes: foldable / must-materialize / site-local variable-index bases. Placement: no movement for cold singleton values; loop-preheader for repeated execution; no eager merge of mutually-exclusive branches; intrinsic-bearing loops refuse new preheader homes.
+- Loop-header tail duplication (`jump_thread.rs`), measured Callgrind rules that were rejected -- do not retry: unrestricted (bitops +8.4%, mandelbrot +12%, find_bit +13%, percpu +33%); "two or more latches" (kills the list_sort merge copy); load-fed alone (fannkuch +4.4%); "both successors in the header's loop" (list_sort 1.0042); loop-nest rule without the private-arm check (strlen +2.3%). The final rule gives up rbtree 0.970 / dl_hash 0.990, which came from loop rotation that regresses elsewhere.
+- Accumulator recursion elimination runs after `rec2iter`; moved before it, it pre-empts the O(n) Fibonacci rewrite.
+- Self-inlining is frame-neutral by construction (no referenced `Alloca`); never relax that -- stack use per recursion level must not grow. Dead parameter-home allocas left by mem2reg do not count.
+- Never narrow a compare through an extension that has other readers (see the compare narrowing rule in `docs/optimization-passes.md`).
+- Never peel a cast into an indexed address when its source is a single-use load (strstr regression: the fused load-cast is cheaper).

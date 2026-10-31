@@ -261,6 +261,15 @@ gate "i128-atomic-reproducer" fast \
 gate "sibcall-shapes" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" \
     bash tests/regression/check_sibcall_shapes.sh
+# LICM load speculation of non-faulting objects (positives hoisted, refusals
+# kept, weak-undefined runtime); call-argument staging vs register homes
+# (pinned __int128 stack arguments + seeds 1-6 and 11/14/16/26/30, the
+# seeds that caught the staged-register scratch clobber).
+gate "licm-global-speculation" fast \
+    python3 tests/regression/check_licm_global_speculation.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
+gate "call-arg-staging-homes" fast \
+    python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
+    --seed-list 1,2,3,4,5,6,11,14,16,26,30
 gate "fno-builtin-fold-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
 gate "builtin-floor-float-narrowing" fast \
@@ -889,6 +898,8 @@ gate "c-digraphs" fast \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
 # GCC warning-group parity and DWARF line/link preservation are cheap focused
 # gates; keeping them in the local mirror prevents hosted-only drift.
+gate "warning-compatibility-selftest" fast \
+    python3 tests/regression/check_warning_compat.py --self-test
 gate "warning-compatibility" fast \
     python3 tests/regression/check_warning_compat.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
@@ -961,6 +972,12 @@ gate "qualifier-conversions" fast \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "qualifier-gate-selftest" fast \
     python3 tests/regression/test_qualifier_gate.py
+# -Wreturn-local-addr: GCC 16.2's front-end walk byte for byte at -O0/-O2,
+# option handling both ways, and GCC's null-return code generation (native
+# and i686 execution against gcc-16).
+gate "return-local-addr" fast \
+    python3 tests/regression/check_return_local_addr.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
 gate "qualifier-composition" fast \
     python3 tests/regression/check_qualifier_composition.py \
         --lccc "$LCCC" --lccc target/fastbuild/lccc-i686 \
@@ -1082,6 +1099,10 @@ gate "riscv-relocation-contract" fast \
 # object linked by lccc-ld, ld.lld and GNU ld must pass its run-time checks.
 gate "riscv-relax-layout" fast \
     env CCC_RISCV=target/fastbuild/lccc-riscv bash tests/regression/check_riscv_relax_layout.sh
+# Relaxation against the pinned bfd (scripts/ensure_riscv_ld_247.sh); SKIPs
+# without it locally, while CI passes --require.
+gate "riscv-relax-bfd" fast \
+    python3 tests/regression/check_riscv_relax_bfd.py --lccc target/fastbuild/lccc-riscv
 
 gate "pr824-boundaries" fast \
     python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross --json target/redteam/boundaries.json

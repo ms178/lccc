@@ -33,6 +33,17 @@ impl X86Codegen {
                 self.state.emit("    vzeroupper");
             }
             self.emit_epilogue_impl(frame_size);
+            let markers = std::mem::take(&mut self.state.sibcall_marker_lines);
+            // Every form is one `jmp` line except the inline retpoline
+            // (a `call`/`pause`/`lfence`/`ret` thunk), which stays unmarked:
+            // the liveness oracle then keeps treating the function as
+            // unanalysable, as it did for every tail call before.
+            let single_jump = match &target {
+                SibcallTarget::Direct(_) => true,
+                SibcallTarget::RipSlot(_) | SibcallTarget::Reg(_) => {
+                    !self.state.indirect_branch_thunk_inline
+                }
+            };
             match target {
                 SibcallTarget::Direct(name) => {
                     // Same formatting path as `emit_call` uses for call
@@ -55,6 +66,18 @@ impl X86Codegen {
                 }
                 SibcallTarget::Reg(reg) => {
                     self.emit_retpoline_jump(reg);
+                }
+            }
+            // `# LCCC_TAIL_CALL` + the call's own marker block: the tail
+            // `jmp` reads exactly what the suppressed `call` would have
+            // read (argument registers, static chain, ...) and, as a
+            // return, the callee-saved registers our caller expects. The
+            // peephole liveness oracle models it so (`liveness.rs`,
+            // `tail_call_marked`) instead of refusing the function.
+            if single_jump {
+                self.state.emit("    # LCCC_TAIL_CALL");
+                for line in &markers {
+                    self.state.emit(line);
                 }
             }
             return;

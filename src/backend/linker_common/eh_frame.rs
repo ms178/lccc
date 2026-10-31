@@ -1659,6 +1659,7 @@ mod tests {
             ],
             relocations: vec![Vec::new(), Vec::new(), Vec::new(), Vec::new(), relocs],
             source_name: "<test>".into(),
+            e_flags: 0,
         }];
 
         // Collect `.text.f2` (section 2 -> FDE index 1).
@@ -1743,6 +1744,7 @@ mod tests {
             section_data: vec![SectionData::owned(eh.clone())],
             relocations: vec![Vec::new()],
             source_name: "<test>".into(),
+            e_flags: 0,
         }];
         assert_eq!(prune_dead_fdes(&mut objects, &dead), 0);
         assert_eq!(count_eh_frame_fdes(&objects[0].section_data[0]), 2);
@@ -2158,6 +2160,7 @@ mod tests {
             ],
             relocations: vec![Vec::new(), relocs, Vec::new()],
             source_name: "t.o".into(),
+            e_flags: 0,
         }
     }
 

@@ -840,6 +840,182 @@ pub(crate) fn line_len_without_trailing_comment(b: &[u8]) -> usize {
     b.len()
 }
 
+/// What one assembler statement can tell about whether the section it leaves
+/// current holds executable code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SectionKind {
+    /// `.text`, `.text.*`, `.init`, `.fini`, or any section whose flag string
+    /// carries `x`.
+    Code,
+    /// A section GAS creates without `SHF_EXECINSTR`.
+    NonCode,
+    /// Not decidable from the text (an unparsable flag argument, a code-named
+    /// section given flags without `x`, an underflowed `.popsection`, or a
+    /// compound statement that may switch sections).
+    Unknown,
+}
+
+/// A section-changing statement, in GAS ELF semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SectionSwitch {
+    /// `.text`, `.data`, `.bss`, `.section`.
+    Enter(SectionKind),
+    /// `.pushsection`.
+    Push(SectionKind),
+    /// `.popsection`.
+    Pop,
+    /// `.previous`.
+    Previous,
+    /// A compound statement (`;`-separated, as inline asm can produce) that
+    /// mentions a section directive: the resulting section is unknowable.
+    Opaque,
+}
+
+/// Classify `text` as a section switch, or `None` when it cannot change the
+/// current section.
+///
+/// Fail-closed in both directions a caller can lean on: `Unknown` is never
+/// promoted to `Code` (a caller that only trusts code sections loses coverage,
+/// not soundness) nor to `NonCode` (a caller that ignores data in non-code
+/// sections keeps treating it as possibly executed). The compound-statement
+/// keyword test over-matches on purpose for the same reason.
+pub(crate) fn section_switch(text: &str) -> Option<SectionSwitch> {
+    let trimmed = text.trim();
+    let Some(stmt) = single_asm_statement(trimmed) else {
+        let mentions = ["section", ".text", ".data", ".bss", ".previous"]
+            .iter()
+            .any(|k| trimmed.contains(k));
+        return mentions.then_some(SectionSwitch::Opaque);
+    };
+    let rest = stmt.strip_prefix('.')?;
+    let name = rest
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()
+        .unwrap_or("");
+    let args = &rest[name.len()..];
+    match name {
+        // `.text N`/`.data N` pick a subsection of the same section.
+        "text" => Some(SectionSwitch::Enter(SectionKind::Code)),
+        "data" | "bss" => Some(SectionSwitch::Enter(SectionKind::NonCode)),
+        "section" => Some(SectionSwitch::Enter(section_kind_from_args(args))),
+        "pushsection" => Some(SectionSwitch::Push(section_kind_from_args(args))),
+        "popsection" => Some(SectionSwitch::Pop),
+        "previous" => Some(SectionSwitch::Previous),
+        _ => None,
+    }
+}
+
+/// `.section NAME[, "FLAGS"[, ...]]`: `x` in FLAGS decides; without FLAGS GAS
+/// applies the defaults of the special section names, and gives every other
+/// name no flags at all (so not executable).
+fn section_kind_from_args(args: &str) -> SectionKind {
+    let args = args.trim();
+    let (name, after) = if let Some(q) = args.strip_prefix('"') {
+        match q.find('"') {
+            Some(end) => (&q[..end], &q[end + 1..]),
+            None => return SectionKind::Unknown,
+        }
+    } else {
+        let end = args
+            .find(|c: char| c.is_whitespace() || c == ',')
+            .unwrap_or(args.len());
+        (&args[..end], &args[end..])
+    };
+    if name.is_empty() {
+        return SectionKind::Unknown;
+    }
+    let code_name = name == ".text"
+        || name.starts_with(".text.")
+        || name == ".init"
+        || name == ".fini"
+        || name.starts_with(".gnu.linkonce.t.");
+    let after = after.trim_start();
+    if after.is_empty() {
+        return if code_name {
+            SectionKind::Code
+        } else {
+            SectionKind::NonCode
+        };
+    }
+    let Some(flags) = after.strip_prefix(',').map(str::trim_start) else {
+        return SectionKind::Unknown;
+    };
+    // Only the quoted ELF flag string is understood; `#execinstr` (Solaris
+    // syntax, and stripped as a comment by `single_asm_statement`) and a bare
+    // numeric argument land here as Unknown.
+    let Some(q) = flags.strip_prefix('"') else {
+        return SectionKind::Unknown;
+    };
+    let Some(end) = q.find('"') else {
+        return SectionKind::Unknown;
+    };
+    if q[..end].contains('x') {
+        SectionKind::Code
+    } else if code_name {
+        // GAS warns and the outcome is version-dependent: decide nothing.
+        SectionKind::Unknown
+    } else {
+        SectionKind::NonCode
+    }
+}
+
+/// The current/previous section pair and the `.pushsection` stack, tracking
+/// only [`SectionKind`]. Starts in `.text` (GAS's initial section) with an
+/// unknown previous section.
+#[derive(Clone, Debug)]
+pub(crate) struct SectionTracker {
+    cur: SectionKind,
+    prev: SectionKind,
+    stack: Vec<(SectionKind, SectionKind)>,
+}
+
+impl Default for SectionTracker {
+    fn default() -> Self {
+        SectionTracker {
+            cur: SectionKind::Code,
+            prev: SectionKind::Unknown,
+            stack: Vec::new(),
+        }
+    }
+}
+
+impl SectionTracker {
+    pub(crate) fn current(&self) -> SectionKind {
+        self.cur
+    }
+
+    /// Apply one switch. `.pushsection` saves the current *and* previous
+    /// section and `.popsection` restores both, as GAS does; an unmatched
+    /// `.popsection` and an [`SectionSwitch::Opaque`] statement forget
+    /// everything, including the stack, so no later pop resurrects a state
+    /// the opaque statement may have replaced.
+    pub(crate) fn apply(&mut self, switch: SectionSwitch) {
+        match switch {
+            SectionSwitch::Enter(kind) => {
+                self.prev = self.cur;
+                self.cur = kind;
+            }
+            SectionSwitch::Push(kind) => {
+                self.stack.push((self.cur, self.prev));
+                self.prev = self.cur;
+                self.cur = kind;
+            }
+            SectionSwitch::Pop => {
+                (self.cur, self.prev) = self
+                    .stack
+                    .pop()
+                    .unwrap_or((SectionKind::Unknown, SectionKind::Unknown));
+            }
+            SectionSwitch::Previous => std::mem::swap(&mut self.cur, &mut self.prev),
+            SectionSwitch::Opaque => {
+                self.stack.clear();
+                self.cur = SectionKind::Unknown;
+                self.prev = SectionKind::Unknown;
+            }
+        }
+    }
+}
+
 /// Return one complete statement, without a trailing comment. Unknown quoting
 /// and statement separators fail closed. This is shared by both directive
 /// predicates so metadata cannot hide executable statements from either one.
@@ -1520,6 +1696,101 @@ mod tests {
         assert_eq!(s.get(1), "B2");
         assert_eq!(s.replacements.len(), 1, "second replace must not leak");
         assert_eq!(s.build_result(|i| i == 0), "B2\nc\n");
+    }
+
+    #[test]
+    fn section_switch_classifies_gas_elf_section_directives() {
+        use SectionKind::{Code, NonCode, Unknown};
+        use SectionSwitch::{Enter, Opaque, Pop, Previous, Push};
+        let cases: &[(&str, Option<SectionSwitch>)] = &[
+            (".text", Some(Enter(Code))),
+            ("    .text 1", Some(Enter(Code))),
+            (".data", Some(Enter(NonCode))),
+            (".bss", Some(Enter(NonCode))),
+            (".section .rodata", Some(Enter(NonCode))),
+            (
+                ".section .rodata.str1.1,\"aMS\",@progbits,1",
+                Some(Enter(NonCode)),
+            ),
+            (".section .text.startup,\"ax\",@progbits", Some(Enter(Code))),
+            (".section .text.hot", Some(Enter(Code))),
+            (".section .init", Some(Enter(Code))),
+            (".section .gnu.linkonce.t.f", Some(Enter(Code))),
+            (".section .textual", Some(Enter(NonCode))),
+            (".section mycode,\"ax\"", Some(Enter(Code))),
+            (".section \"my code\",\"awx\",@progbits", Some(Enter(Code))),
+            (
+                ".section .note.GNU-stack,\"\",@progbits",
+                Some(Enter(NonCode)),
+            ),
+            // A code-named section stripped of `x`: GAS warns; decide nothing.
+            (".section .text,\"a\"", Some(Enter(Unknown))),
+            // Arguments this parser does not understand.
+            (".section .foo,#alloc,#execinstr", Some(Enter(Unknown))),
+            (".section .foo,@progbits", Some(Enter(Unknown))),
+            // An unbalanced quote is not one statement: the line may hide a
+            // switch anywhere, so it is opaque rather than merely unknown.
+            (".section .foo,\"ax", Some(Opaque)),
+            (".section \"unterminated", Some(Opaque)),
+            (".section", Some(Enter(Unknown))),
+            (".pushsection __ex_table,\"a\"", Some(Push(NonCode))),
+            (".pushsection .text.unlikely", Some(Push(Code))),
+            (".popsection", Some(Pop)),
+            (".previous", Some(Previous)),
+            (".text # trailing comment", Some(Enter(Code))),
+            (
+                "    .pushsection .rodata; .long 1; .popsection",
+                Some(Opaque),
+            ),
+            ("nop; .text", Some(Opaque)),
+            // Not section switches.
+            (".textual 1", None),
+            (".datum", None),
+            (".long .Ltext0", None),
+            (".Ltext:", None),
+            ("movl %eax, %ebx", None),
+            (".cfi_startproc; .cfi_endproc", None),
+            (".subsection 1", None),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(section_switch(text), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn section_tracker_follows_push_pop_and_previous_like_gas() {
+        use SectionKind::{Code, NonCode, Unknown};
+        let mut t = SectionTracker::default();
+        let mut step = |text: &str| {
+            t.apply(section_switch(text).expect(text));
+            t.current()
+        };
+        assert_eq!(step(".section .rodata"), NonCode);
+        assert_eq!(step(".text"), Code);
+        // `.previous` swaps current and previous, twice is the identity.
+        assert_eq!(step(".previous"), NonCode);
+        assert_eq!(step(".previous"), Code);
+        // Push saves (current, previous); pop restores both.
+        assert_eq!(step(".pushsection __ex_table,\"a\""), NonCode);
+        assert_eq!(step(".pushsection .text.cold,\"ax\""), Code);
+        assert_eq!(step(".popsection"), NonCode);
+        assert_eq!(step(".popsection"), Code);
+        assert_eq!(
+            step(".previous"),
+            NonCode,
+            "pop restored the previous section too"
+        );
+        assert_eq!(step(".previous"), Code);
+        // An unmatched pop forgets everything.
+        assert_eq!(step(".popsection"), Unknown);
+        assert_eq!(step(".previous"), Unknown);
+        assert_eq!(step(".text"), Code);
+        // An opaque compound statement also drops the stack, so a later pop
+        // cannot resurrect a pre-opaque state.
+        assert_eq!(step(".pushsection .data"), NonCode);
+        assert_eq!(step(".text; .pushsection .rodata"), Unknown);
+        assert_eq!(step(".popsection"), Unknown);
+        assert_eq!(step(".previous"), Unknown);
     }
 }
 

@@ -83,6 +83,11 @@ pub struct LiveRange {
     /// Callers / later passes may populate this; [`build_live_ranges`] does
     /// not (it uses [`LiveRange::follow_value`] instead).
     pub reg_hint: Option<PhysReg>,
+    /// Soft register preference (an outgoing call-argument slot). Unlike
+    /// `reg_hint` it is no codegen contract: it only steers which FREE
+    /// register the range takes, and the range stays an ordinary eviction
+    /// and exchange candidate.
+    pub reg_pref: Option<PhysReg>,
     /// Producer to follow. Resolved at allocation time: the producer is
     /// defined earlier, so its assignment is already known. Sharing is
     /// accepted only when the producer's final *recorded* use is this
@@ -247,6 +252,7 @@ impl LiveRange {
             loop_depth,
             priority: loop_weight,
             reg_hint: None,
+            reg_pref: None,
             follow_value: None,
             spill_weight: loop_weight as f64 / live_span(interval.start, interval.end),
             cascade: 0,
@@ -1503,6 +1509,10 @@ impl LinearScanAllocator {
                 if self.is_allocatable_reg(hint) && self.register_compatible(hint, range) {
                     return Some(hint);
                 }
+            }
+        } else if let Some(pref) = range.reg_pref {
+            if self.is_allocatable_reg(pref) && self.register_compatible(pref, range) {
+                return Some(pref);
             }
         }
 
@@ -4663,6 +4673,7 @@ mod tests {
             loop_depth: 0,
             priority,
             reg_hint: None,
+            reg_pref: None,
             follow_value: None,
             spill_weight: priority as f64 / live_span(start, end),
             cascade: 0,
@@ -5365,6 +5376,36 @@ mod tests {
             None,
             "next use 80 lies inside [50,120]: reload thrash, refuse"
         );
+    }
+
+    /// A soft preference is no contract: the range takes its preferred
+    /// register when that is free, yet stays evictable (the guard that
+    /// protects ABI-hinted ParamRefs must not cover it -- lz4's hot loop
+    /// lost its end pointer to a call argument that could not be evicted).
+    #[test]
+    fn soft_register_preference_is_taken_but_stays_evictable() {
+        let regs = vec![PhysReg(0), PhysReg(1)];
+        let mut a = LinearScanAllocator::new(vec![], regs.clone());
+        a.init_registers();
+        let mut pref = lr_weighted(1, 0, 200, vec![(1, 100)]);
+        pref.reg_pref = Some(PhysReg(1));
+        assert_eq!(a.find_free_register(&pref), Some(PhysReg(1)));
+
+        let one = vec![PhysReg(0)];
+        let mut soft = lr_weighted(1, 0, 200, vec![(1, 100)]);
+        soft.reg_pref = Some(PhysReg(0));
+        let incoming = lr_weighted(2, 50, 120, vec![(60, 1000)]);
+        let mut b = LinearScanAllocator::new(vec![], one.clone());
+        b.init_registers();
+        b.allocate_range(soft);
+        assert_eq!(b.select_evict_victim(&incoming, 6), Some(0));
+
+        let mut hard = lr_weighted(1, 0, 200, vec![(1, 100)]);
+        hard.reg_hint = Some(PhysReg(0));
+        let mut c = LinearScanAllocator::new(vec![], one);
+        c.init_registers();
+        c.allocate_range(hard);
+        assert_eq!(c.select_evict_victim(&incoming, 6), None);
     }
 
     /// Cost-ratio escape (mode 3, K=CCC_EVICT_SHORT_K default 16): a victim

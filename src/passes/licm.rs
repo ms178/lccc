@@ -38,7 +38,11 @@ use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator
 
 /// Run LICM using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
-pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnalysis) -> usize {
+pub(crate) fn licm_with_analysis(
+    func: &mut IrFunction,
+    cfg: &analysis::CfgAnalysis,
+    safe_globals: &SpeculationSafeGlobals,
+) -> usize {
     if super::fp_environment_blocks_reordering(func) {
         return 0;
     }
@@ -66,8 +70,14 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
     sorted_loops.sort_by_key(|l| l.body.len());
 
     for natural_loop in &sorted_loops {
-        total_hoisted +=
-            hoist_loop_invariants(func, natural_loop, &cfg.preds, &cfg.idom, &alloca_info);
+        total_hoisted += hoist_loop_invariants_with(
+            func,
+            natural_loop,
+            &cfg.preds,
+            &cfg.idom,
+            &alloca_info,
+            safe_globals,
+        );
     }
 
     total_hoisted
@@ -1395,6 +1405,7 @@ fn preheader_always_enters_header(
 /// Hoist loop-invariant instructions from a natural loop to a preheader.
 ///
 /// Returns the number of instructions hoisted.
+#[cfg(test)]
 fn hoist_loop_invariants(
     func: &mut IrFunction,
     natural_loop: &NaturalLoop,
@@ -1402,6 +1413,146 @@ fn hoist_loop_invariants(
     idom: &[usize],
     alloca_info: &AllocaAnalysis,
 ) -> usize {
+    hoist_loop_invariants_with(
+        func,
+        natural_loop,
+        preds,
+        idom,
+        alloca_info,
+        &SpeculationSafeGlobals::default(),
+    )
+}
+
+/// Global objects a load may read speculatively: name -> bytes that are
+/// certainly mapped and readable at the symbol's address in every complete
+/// program this unit links into (see [`speculation_safe_globals`]).
+pub(crate) type SpeculationSafeGlobals = FxHashMap<String, usize>;
+
+/// The data symbols a speculative load cannot fault on, with their
+/// guaranteed size.
+///
+/// LICM's must-execute rule keeps a load in its loop when its block does
+/// not dominate every loop block (`for (...) if (p) x = *p;` must not
+/// dereference `p` before the test, gcc.c-torture 20051215-1), and before a
+/// loop is rotated even the body block of `for (i = 0; i < n; i++) c += G;`
+/// fails it, so LCCC re-read `G` on every iteration (GCC 16.2, Clang 23.1.4
+/// and ICX 2026.2 all load it once). The rule exists for pointers that can
+/// be invalid; a non-weak object symbol cannot be: once the program links,
+/// its address is that of a real object, at least as large as this unit
+/// declares it (C11 6.2.7p2 requires compatible declarations), in mapped,
+/// readable storage. Speculating such a load is the dereferenceability
+/// argument GCC's `tree_could_trap_p` and LLVM's `isDereferenceablePointer`
+/// make for the same symbols.
+///
+/// Excluded, because the argument fails for them: weak symbols (a weak
+/// declaration may resolve to address 0; `#pragma weak` included),
+/// alias/`redefine_extname` names (the size belongs to another object),
+/// thread-locals (a per-thread address, and the access is not a plain
+/// load), and objects of unknown or zero size (`extern int a[];`).
+///
+/// An object this unit only declares (`extern int E;`) qualifies under the
+/// same rules with its declared size ([`IrModule::extern_data_sizes`]), as
+/// it does for GCC 16.2, Clang 23.1.4 and ICX 2026.2, which all load `E`
+/// once ahead of `for (...) if (p[i]) c += E;`. A name this unit also
+/// defines is judged by its definition alone, so a weak or thread-local
+/// definition cannot be readmitted through a declaration.
+///
+/// [`IrModule::extern_data_sizes`]: crate::ir::module::IrModule::extern_data_sizes
+/// Whether the loop changes the object is a separate question, answered by
+/// the unchanged `is_load_hoistable` memory analysis.
+pub(crate) fn speculation_safe_globals(
+    module: &crate::ir::module::IrModule,
+) -> SpeculationSafeGlobals {
+    let redirected: FxHashSet<&str> = module
+        .aliases
+        .iter()
+        .flat_map(|(name, target, _)| [name.as_str(), target.as_str()])
+        .chain(
+            module
+                .symbol_attrs
+                .iter()
+                .filter(|(_, weak, _)| *weak)
+                .map(|(name, _, _)| name.as_str()),
+        )
+        .collect();
+    let defined: FxHashSet<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+    let declared_only = module
+        .extern_data_sizes
+        .iter()
+        .filter(|(name, _)| !defined.contains(name.as_str()) && !redirected.contains(name.as_str()))
+        .map(|(name, &size)| (name.clone(), size));
+    module
+        .globals
+        .iter()
+        .filter(|g| {
+            !g.is_weak && !g.is_thread_local && g.size > 0 && !redirected.contains(g.name.as_str())
+        })
+        .map(|g| (g.name.clone(), g.size))
+        .chain(declared_only)
+        .collect()
+}
+
+/// `value -> (symbol, constant byte offset)` for every `GlobalAddr` of a
+/// speculation-safe symbol and every constant-offset GEP chain from one.
+fn speculation_safe_addresses<'a>(
+    func: &IrFunction,
+    safe_globals: &'a SpeculationSafeGlobals,
+) -> FxHashMap<u32, (&'a str, usize, i64)> {
+    let mut map: FxHashMap<u32, (&'a str, usize, i64)> = FxHashMap::default();
+    if safe_globals.is_empty() {
+        return map;
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, name } = inst {
+                if let Some((key, &size)) = safe_globals.get_key_value(name) {
+                    map.insert(dest.0, (key.as_str(), size, 0));
+                }
+            }
+        }
+    }
+    // GEP chains may be listed before their base in block order; iterate to
+    // a fixpoint (each round adds at least one value or stops).
+    loop {
+        let mut grew = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } = inst
+                {
+                    if map.contains_key(&dest.0) {
+                        continue;
+                    }
+                    let (Some(&(name, size, off)), Some(delta)) = (map.get(&base.0), c.to_i64())
+                    else {
+                        continue;
+                    };
+                    if let Some(total) = off.checked_add(delta) {
+                        map.insert(dest.0, (name, size, total));
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            return map;
+        }
+    }
+}
+
+fn hoist_loop_invariants_with(
+    func: &mut IrFunction,
+    natural_loop: &NaturalLoop,
+    preds: &analysis::FlatAdj,
+    idom: &[usize],
+    alloca_info: &AllocaAnalysis,
+    safe_globals: &SpeculationSafeGlobals,
+) -> usize {
+    let safe_addresses = speculation_safe_addresses(func, safe_globals);
     let header = natural_loop.header;
 
     // Find the preheader: the single predecessor of the header outside the loop.
@@ -1683,6 +1834,13 @@ fn hoist_loop_invariants(
                         .body
                         .iter()
                         .all(|&b| dominates_block(idom, block_idx, b)))
+                        && !safe_addresses.get(&ptr.0).is_some_and(|&(_, size, off)| {
+                            // The whole access lies inside the object.
+                            off >= 0
+                                && off
+                                    .checked_add(ty.size() as i64)
+                                    .is_some_and(|end| end <= size as i64)
+                        })
                     {
                         licm_debug(|| {
                             eprintln!(
@@ -1977,6 +2135,52 @@ mod tests {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, IrConst};
+
+    #[test]
+    fn declared_externs_are_speculation_safe_under_the_definition_rules() {
+        use crate::ir::reexports::{GlobalInit, IrGlobal};
+        let global = |name: &str, weak: bool, tls: bool| IrGlobal {
+            name: name.to_string(),
+            ty: IrType::I32,
+            size: 4,
+            align: 4,
+            init: GlobalInit::Zero,
+            is_static: false,
+            is_extern: tls,
+            is_common: false,
+            section: None,
+            is_weak: weak,
+            visibility: None,
+            has_explicit_align: false,
+            is_const: false,
+            is_used: false,
+            is_retain: false,
+            is_nocommon: false,
+            is_thread_local: tls,
+        };
+        let mut module = crate::ir::module::IrModule::new();
+        // Defined: plain (safe), weak and thread-local (refused). The weak
+        // and TLS names are also declared `extern`, which must not readmit
+        // them.
+        module.globals = vec![
+            global("G", false, false),
+            global("DW", true, false),
+            global("T", false, true),
+        ];
+        for (name, size) in [("E", 4), ("A", 40), ("DW", 4), ("T", 4), ("W", 4), ("R", 4)] {
+            module.extern_data_sizes.insert(name.to_string(), size);
+        }
+        // `extern int W __attribute__((weak));` / `#pragma weak W`, and a
+        // `redefine_extname`/alias name.
+        module.symbol_attrs.push(("W".to_string(), true, None));
+        module
+            .aliases
+            .push(("R".to_string(), "R2".to_string(), false));
+        let safe = speculation_safe_globals(&module);
+        let mut names: Vec<_> = safe.iter().map(|(n, &s)| (n.as_str(), s)).collect();
+        names.sort_unstable();
+        assert_eq!(names, [("A", 40), ("E", 4), ("G", 4)]);
+    }
 
     /// Helper to create a simple loop: preheader -> header -> body -> header, header -> exit
     fn make_loop_func() -> IrFunction {

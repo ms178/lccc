@@ -30,6 +30,10 @@
 //!   requires their values to be intact.
 //! * A `call` reads the SysV argument registers, `%rax` (variadic vector count)
 //!   and `%r10` (static chain), and clobbers the caller-saved set.
+//! * A sibling call's `jmp`, published by the codegen with a
+//!   `# LCCC_TAIL_CALL` marker block, is a call plus a return: it has no
+//!   successor, reads what the call reads (same marker protocol) and the
+//!   callee-saved registers. An unmarked jump to a symbol stays unresolvable.
 
 use super::super::types::*;
 use super::helpers::{get_dest_reg, is_read_modify_write, src_mentions_family};
@@ -71,6 +75,19 @@ const RET_LIVE: u16 = RAX | RDX | RBX | RBP | RSP | (1 << 12) | (1 << 13) | (1 <
 /// `%rdx` artificially live there hides every dead `movq %rax, %rdx` the
 /// return-value materialisation leaves behind.
 const RET_LIVE_RAX_ONLY: u16 = RET_LIVE & !RDX;
+/// Live at a sibling call's `jmp`: the callee-saved registers (restored by
+/// the epilogue, owed to our caller, preserved by the tail callee).
+const TAIL_CALL_LIVE: u16 = RET_LIVE & !(RAX | RDX);
+
+/// Whether the `jmp` on line `n` is a codegen-published sibling call: its
+/// marker block opens with `# LCCC_TAIL_CALL` (`x86::codegen::returns`),
+/// followed by the suppressed call's own markers, which
+/// [`call_site_reads`] parses from the same position.
+pub(super) fn tail_call_marked(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
+    (n + 1..(n + 1 + CALL_MARKER_WINDOW).min(infos.len()))
+        .find(|&k| !infos[k].is_nop())
+        .is_some_and(|k| infos[k].trimmed(store.get(k)) == "# LCCC_TAIL_CALL")
+}
 
 /// How many lines after a `call` its marker protocol may occupy: every
 /// marker [`call_markers`] consults sits on lines `n+1..=n+CALL_MARKER_WINDOW`
@@ -1432,7 +1449,14 @@ impl FileLiveness {
                 for &s in &succ_flat[first..past] {
                     out |= live_in[s - start];
                 }
-                if first == past {
+                // No successor: a `ret` (or falling off the end) hands the
+                // return liveness to the caller. A sibling call's `jmp` --
+                // the only jump `classify` leaves without an edge -- does
+                // not: its effect already reads what the tail callee and
+                // our caller observe, and the return-value registers are
+                // the callee's to produce.
+                if first == past && !matches!(infos[n].kind, LineKind::Jmp | LineKind::JmpIndirect)
+                {
                     out |= ret_live; // fell off the end: be conservative
                 }
                 let inn = eff.reads | (out & !eff.writes);
@@ -1894,6 +1918,19 @@ impl FileLiveness {
     /// (none for `ret`, which the solver then treats as reading `ret_live`),
     /// or `None` when the control transfer cannot be resolved -- `edges` is
     /// then garbage, and the caller abandons the function.
+    /// The effect of a `jmp` that leaves the function: a sibling call when
+    /// the codegen marked it (`tail_call_marked`), modeled as a call plus a
+    /// return -- no successor in this function, reads what the call reads
+    /// (its marker block and its own operands) plus the callee-saved
+    /// registers a return owes the caller (the return-value registers are
+    /// the tail callee's to produce). `None` (unanalysable) otherwise.
+    fn tail_call_effect(store: &LineStore, infos: &[LineInfo], n: usize) -> Option<Effect> {
+        tail_call_marked(store, infos, n).then(|| Effect {
+            reads: call_site_reads(store, infos, n) | TAIL_CALL_LIVE,
+            writes: 0,
+        })
+    }
+
     fn classify(
         store: &LineStore,
         infos: &[LineInfo],
@@ -1975,7 +2012,7 @@ impl FileLiveness {
                 // registers are ordinary instructions classified on their
                 // own lines; this line only reads the target register.
                 let Some(Some(targets)) = jump_table_succs.get(n - jump_table_base) else {
-                    return None;
+                    return Self::tail_call_effect(store, infos, n);
                 };
                 edges.extend_from_slice(targets);
                 Some(Effect {
@@ -1986,9 +2023,14 @@ impl FileLiveness {
             LineKind::Jmp => {
                 let target = t.split_whitespace().nth(1)?;
                 if target.starts_with('*') {
-                    return None;
+                    return Self::tail_call_effect(store, infos, n);
                 }
-                let idx = resolve(target)?; // tail call / foreign label
+                // A label of this function is an ordinary edge, marker or
+                // not; anything else is a sibling call when the codegen
+                // marked it, and an unknown transfer otherwise.
+                let Some(idx) = resolve(target) else {
+                    return Self::tail_call_effect(store, infos, n);
+                };
                 edges.push(idx);
                 Some(Effect {
                     reads: mentioned,
@@ -1997,7 +2039,20 @@ impl FileLiveness {
             }
             LineKind::CondJmp => {
                 let target = t.split_whitespace().nth(1)?;
-                let idx = resolve(target)?;
+                let Some(idx) = resolve(target) else {
+                    // A conditional sibling call (`jne sym@PLT` carrying the
+                    // `# LCCC_TAIL_CALL` block, `jump_thread::
+                    // fold_conditional_tail_calls`): the taken edge leaves the
+                    // function reading what the tail call reads, the
+                    // fall-through continues here.  Unmarked foreign targets
+                    // stay unknown.
+                    let tail = Self::tail_call_effect(store, infos, n)?;
+                    edges.extend(next);
+                    return Some(Effect {
+                        reads: tail.reads | mentioned,
+                        writes: 0,
+                    });
+                };
                 edges.extend(next);
                 edges.push(idx);
                 Some(Effect {

@@ -255,7 +255,18 @@ pub(super) fn optimize_tail_calls(store: &mut LineStore, infos: &mut [LineInfo])
 /// - Pop with reg being rbp (popq %rbp)
 /// - Directive lines (.cfi_*)
 /// - Nop/Empty lines
-/// - NOTHING that writes to %rax (the return value must pass through)
+/// - NOTHING that writes to %rax or %rdx (the return value, scalar or the
+///   second half of a 16-byte aggregate, must pass through)
+///
+/// The loads move from after the call to before the jump. That is a
+/// restore's whole point, and a load into any other caller-saved register is
+/// dead after `ret`; but `%rdx` is the second return register, and a
+/// `disp(%rbp)` load is a frame slot only while `%rbp` is the frame pointer.
+/// In a frameless epilogue (`addq $N, %rsp`) it is a pointer dereference,
+/// which the move would hoist above the callee's stores -- or above a callee
+/// that never returns, onto an address the original never touched. So
+/// `%rbp`-based loads are accepted only when the scan also tears down an
+/// `%rbp` frame (`movq %rbp, %rsp`).
 fn is_tail_call_candidate(
     store: &LineStore,
     infos: &[LineInfo],
@@ -267,6 +278,8 @@ fn is_tail_call_candidate(
 
     let mut found_frame_teardown = false;
     let mut found_pop_rbp = false;
+    let mut rbp_frame_teardown = false;
+    let mut rbp_based_load = false;
     // Index and immediate of a frameless `addq $N, %rsp`, when that is the
     // teardown form. The caller must keep it BEFORE the jump.
     let mut j = call_idx + 1;
@@ -287,10 +300,12 @@ fn is_tail_call_candidate(
                 continue;
             }
             LineKind::LoadRbp { reg, .. } => {
-                // Callee-save restore from stack - OK, but must not restore to %rax (reg 0)
-                if reg == 0 {
-                    return None; // Writing to %rax would clobber the return value
+                // Callee-save restore from stack - OK, but never into a
+                // return register: %rax (0) or %rdx (2).
+                if reg == 0 || reg == 2 {
+                    return None;
                 }
+                rbp_based_load |= infos[j].trimmed(store.get(j)).contains("(%rbp)");
                 j += 1;
                 continue;
             }
@@ -298,6 +313,7 @@ fn is_tail_call_candidate(
                 let trimmed = infos[j].trimmed(store.get(j));
                 if trimmed == "movq %rbp, %rsp" {
                     found_frame_teardown = true;
+                    rbp_frame_teardown = true;
                     j += 1;
                     continue;
                 }
@@ -339,7 +355,8 @@ fn is_tail_call_candidate(
             }
             LineKind::Ret => {
                 // Found the ret! Make sure we saw the frame teardown
-                if found_frame_teardown && found_pop_rbp {
+                if found_frame_teardown && found_pop_rbp && (rbp_frame_teardown || !rbp_based_load)
+                {
                     return Some(j);
                 }
                 return None;
@@ -761,6 +778,94 @@ mod tests {
             result.contains("ret"),
             "should keep ret when lea of local exists: {}",
             result
+        );
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+
+    /// `is_tail_call_candidate` on `body` (the call is its first line).
+    fn candidate(body: &str) -> bool {
+        let text = format!("func:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let store = LineStore::new(text);
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let call = (0..store.len())
+            .find(|&i| infos[i].kind == LineKind::Call)
+            .expect("body has a call");
+        is_tail_call_candidate(&store, &infos, call, store.len()).is_some()
+    }
+
+    const FRAMED: &str =
+        "    call *%r10\n    movq -8(%rbp), %rbx\n    movq %rbp, %rsp\n    popq %rbp\n    ret";
+    const FRAMELESS: &str = "    call *%r10\n    movq 8(%rsp), %rbx\n    addq $24, %rsp\n    ret";
+
+    #[test]
+    fn restores_move_before_the_jump() {
+        assert!(candidate(FRAMED));
+        assert!(candidate(FRAMELESS));
+        // A frame-slot load into a dead caller-saved register is harmless.
+        assert!(candidate(&FRAMED.replace("%rbx", "%rcx")));
+    }
+
+    /// `%rdx` carries the second half of a 16-byte return value: loading it
+    /// before the jump would hand back the callee's `%rdx` instead.
+    #[test]
+    fn a_load_into_either_return_register_refuses() {
+        assert!(!candidate(&FRAMED.replace("%rbx", "%rdx")));
+        assert!(!candidate(&FRAMED.replace("%rbx", "%rax")));
+        assert!(!candidate(&FRAMELESS.replace("%rbx", "%rdx")));
+    }
+
+    /// Without `movq %rbp, %rsp` nothing makes `%rbp` the frame pointer, so
+    /// `disp(%rbp)` is a pointer dereference that must not be hoisted above
+    /// the call. The same load in a framed epilogue is a frame slot.
+    #[test]
+    fn an_rbp_dereference_in_a_frameless_epilogue_refuses() {
+        let deref = FRAMELESS.replace("8(%rsp), %rbx", "8(%rbp), %rbx");
+        assert!(!candidate(&deref), "{deref}");
+        assert!(candidate(&FRAMED.replace("-8(%rbp)", "8(%rbp)")));
+    }
+
+    /// End to end: the converting indirect-dispatch shape with an `%rdx`
+    /// return-half reload after the call keeps its `call`/`ret`; the same
+    /// shape reloading a dead caller-saved register still converts, so the
+    /// refusal is the `%rdx` rule, not the stack-window gate.
+    #[test]
+    fn rdx_return_half_survives_the_full_pipeline() {
+        let shape = |reg: &str| {
+            [
+                "func:",
+                ".cfi_startproc",
+                "    pushq %rbp",
+                "    .cfi_def_cfa_offset 16",
+                "    .cfi_offset %rbp, -16",
+                "    movq %rsp, %rbp",
+                "    .cfi_def_cfa_register %rbp",
+                "    subq $8, %rsp",
+                // The function's own return contract: a 16-byte aggregate.
+                "    # LCCC_RET_RDX 1",
+                "    # LCCC_RET_RAX 1",
+                "    movq %rdi, %r10",
+                "    call *%r10",
+                &format!("    movq -8(%rbp), {reg}"),
+                "    movq %rbp, %rsp",
+                "    popq %rbp",
+                "    ret",
+                ".size func, .-func",
+            ]
+            .join("\n")
+                + "\n"
+        };
+        let control = super::super::super::peephole_optimize(shape("%rcx"));
+        assert!(control.contains("jmp *%r10"), "{control}");
+        let rdx = super::super::super::peephole_optimize(shape("%rdx"));
+        assert!(
+            rdx.contains("call *%r10") && !rdx.contains("jmp *%r10"),
+            "{rdx}"
         );
     }
 }

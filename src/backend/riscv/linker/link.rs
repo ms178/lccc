@@ -48,6 +48,7 @@ pub fn link_builtin(
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
     let is_static = parsed_args.is_static;
     let (strip_all, strip_debug) = (parsed_args.strip_all, parsed_args.strip_debug);
+    let build_id = parsed_args.resolved_build_id_style()?;
     let defsym_defs = parsed_args.defsym_defs;
 
     // Collect all input files: CRT before + user objects + bare files from args + CRT after
@@ -177,14 +178,219 @@ pub fn link_builtin(
         &shared_lib_syms,
     )?;
     symbols::import_shared_commons(&mut input_objs, late_from, &shared_lib_syms);
+    let gnu_stack = gnu_stack_flags(
+        parsed_args.z_execstack,
+        parsed_args.warn_execstack,
+        parsed_args.error_execstack,
+        parsed_args.fatal_warnings,
+        &input_objs,
+    )?;
+    push_build_id_note(&mut input_objs, &build_id);
+    let eh_frame = edit_eh_frame(&mut input_objs, false)?;
+    let merge_aliases = sections::merge_alloc_sections(&mut input_objs);
+
+    // ── Relaxation ──────────────────────────────────────────────────────
+    //
+    // Each relaxation trip lays the objects out with the same Phase 2-4 code
+    // the final link runs (`link_objects` in probe mode), so every decision
+    // is taken against the layout this link will actually produce.
+    let link = ExecLink {
+        defsym_defs: &defsym_defs,
+        shared_lib_syms: &shared_lib_syms,
+        is_static,
+        actual_needed_libs: &actual_needed_libs,
+        rpath: rpath.as_ref(),
+        strip_all,
+        strip_debug,
+        output_path,
+        z_relro: parsed_args.z_relro,
+        eh_frame: &eh_frame,
+        merge_aliases: &merge_aliases,
+        build_id: &build_id,
+        gnu_stack,
+    };
+    relax_inputs(
+        &mut input_objs,
+        parsed_args.no_relax,
+        false,
+        parsed_args.z_relro,
+        &mut |objs, probe| link_objects(&link, objs, Some(probe)),
+    )?;
+    link_objects(&link, &input_objs, None)
+}
+
+/// GNU ld's editing of the `.eh_frame` inputs (`eh_frame_gnu`), in the order
+/// `merge_sections` concatenates them: link order (`.eh_frame` has a single
+/// input rank).  Runs once, before relaxation; relaxation only changes the
+/// values the `.eh_frame` relocations resolve to, never its layout.
+fn edit_eh_frame(
+    input_objs: &mut [(String, ElfObject)],
+    pic: bool,
+) -> Result<linker_common::eh_frame_gnu::EhFrameLayout, String> {
+    let inputs: Vec<(usize, usize)> = input_objs
+        .iter()
+        .enumerate()
+        .flat_map(|(o, (_, obj))| {
+            obj.sections.iter().enumerate().filter_map(move |(s, sec)| {
+                let out =
+                    super::relocations::output_section_name(&sec.name, sec.sh_type, sec.flags);
+                (sec.sh_type != SHT_GROUP && out.as_deref() == Some(".eh_frame")).then_some((o, s))
+            })
+        })
+        .collect();
+    let target = linker_common::eh_frame_gnu::EhTarget {
+        ptr_size: 8,
+        pic,
+        aarch64: false,
+    };
+    linker_common::eh_frame_gnu::edit(input_objs, &inputs, target)
+}
+
+/// Run the link's relaxation over the loaded inputs: GNU ld's full
+/// relaxation (`relax.rs`) by default, only the mandatory `R_RISCV_ALIGN`
+/// trimming under `--no-relax` (bfd forces that pass even then).  `layout`
+/// performs one layout of the current objects into the probe.
+pub(super) fn relax_inputs(
+    input_objs: &mut [(String, ElfObject)],
+    no_relax: bool,
+    pic: bool,
+    relro: bool,
+    layout: &mut dyn FnMut(
+        &[(String, ElfObject)],
+        &mut super::relax::LayoutProbe,
+    ) -> Result<(), String>,
+) -> Result<(), String> {
+    super::reloc::validate_input_relocations(input_objs)?;
+    super::relocations::merged_e_flags(input_objs)?;
+    if no_relax {
+        for (_, obj) in input_objs.iter_mut() {
+            super::align::relax_align(obj)?;
+        }
+        return Ok(());
+    }
+    if !super::relax::needs_relaxation(input_objs) {
+        return Ok(());
+    }
+    super::relax::relax(input_objs, &mut |objs| {
+        let mut probe = super::relax::LayoutProbe {
+            relro,
+            pic,
+            ..Default::default()
+        };
+        layout(objs, &mut probe)?;
+        Ok(probe)
+    })
+}
+
+/// `PT_GNU_STACK` as GNU ld decides it for RISC-V, whose ABI does not default
+/// to an executable stack (`elf_backend_default_execstack` 0): the command
+/// line, else the inputs' `.note.GNU-stack` markers (an executable one comes
+/// from a nested-function trampoline), else no header at all.
+///
+/// Also prints GNU ld's executable-stack warning (`--warn-execstack`), so a
+/// trampoline that silently widens the program's attack surface is reported
+/// exactly as with GNU ld.
+fn gnu_stack_flags(
+    z_execstack: Option<bool>,
+    warn: Option<bool>,
+    error: bool,
+    fatal_warnings: bool,
+    input_objs: &[(String, ElfObject)],
+) -> Result<Option<u32>, String> {
+    linker_common::stack_note::report_execstack(
+        linker_common::stack_note::ExecstackOptions {
+            z_execstack,
+            warn,
+            error,
+        },
+        fatal_warnings,
+        input_objs.iter().map(|(name, o)| (name.as_str(), o)),
+    )?;
+    Ok(linker_common::stack_note::gnu_stack_flags(
+        z_execstack,
+        false,
+        input_objs.iter().map(|(_, o)| o),
+    ))
+}
+
+/// The name of the synthetic object holding the `--build-id` note.
+pub(super) const BUILD_ID_OBJECT: &str = "<build-id>";
+
+/// `--build-id` (Debian's gcc passes it on every link): the note GNU ld
+/// creates, as a linker-made input object whose contents are hashed once the
+/// image is final.
+fn push_build_id_note(
+    input_objs: &mut Vec<(String, ElfObject)>,
+    style: &linker_common::build_id::BuildIdStyle,
+) {
+    if style.is_enabled() {
+        input_objs.push((
+            BUILD_ID_OBJECT.into(),
+            linker_common::build_id::synthetic_note_object_styled(style),
+        ));
+    }
+}
+
+/// What Phases 2-4 of an executable link read besides the objects: fixed for
+/// the whole link, so every relaxation trip and the final link agree.
+struct ExecLink<'a> {
+    defsym_defs: &'a [(String, String)],
+    shared_lib_syms: &'a input::SharedLibSyms,
+    is_static: bool,
+    actual_needed_libs: &'a [String],
+    rpath: Option<&'a (i64, String)>,
+    strip_all: bool,
+    strip_debug: bool,
+    output_path: &'a str,
+    z_relro: bool,
+    eh_frame: &'a linker_common::eh_frame_gnu::EhFrameLayout,
+    /// Merged `SHF_MERGE` members and their representatives
+    /// (`sections::merge_alloc_sections`).
+    merge_aliases: &'a sections::MergeAliases,
+    build_id: &'a linker_common::build_id::BuildIdStyle,
+    /// `PT_GNU_STACK`'s flags, if the output has one.
+    gnu_stack: Option<u32>,
+}
+
+/// Phases 2-4 of an executable link.  With `probe`, stop after layout and
+/// record it (no DWARF is collected, nothing is relocated or written).
+fn link_objects(
+    link: &ExecLink,
+    input_objs: &[(String, ElfObject)],
+    mut probe: Option<&mut super::relax::LayoutProbe>,
+) -> Result<(), String> {
+    let ExecLink {
+        defsym_defs,
+        shared_lib_syms,
+        is_static,
+        actual_needed_libs,
+        rpath,
+        strip_all,
+        strip_debug,
+        output_path,
+        z_relro,
+        eh_frame,
+        merge_aliases,
+        build_id,
+        gnu_stack,
+    } = *link;
 
     // ── Phase 2: Merge sections ─────────────────────────────────────────
 
-    super::reloc::validate_input_relocations(&input_objs)?;
     let (mut merged_sections, mut merged_map, input_sec_refs) =
-        sections::merge_sections(&input_objs);
-    let mut debug_sections =
-        super::debug::DebugSections::collect(&input_objs, !strip_all && !strip_debug)?;
+        sections::merge_sections(input_objs, merge_aliases);
+    let attr_warnings =
+        super::attributes::merge_into_output(input_objs, &mut merged_sections, &merged_map)?;
+    if probe.is_none() {
+        for warning in attr_warnings {
+            eprintln!("lccc-ld: warning: {warning}");
+        }
+    }
+    let mut debug_sections = super::debug::DebugSections::collect(
+        input_objs,
+        !strip_all && !strip_debug && probe.is_none(),
+        probe.is_none(),
+    )?;
 
     // ── Phase 3: Build global symbol table ──────────────────────────────
 
@@ -195,9 +401,15 @@ pub fn link_builtin(
             (r.merged_sec_idx, r.offset_in_merged),
         );
     }
+    eh_frame.verify(&sec_mapping)?;
+
+    if let Some(p) = probe.as_deref_mut() {
+        p.sec_mapping = sec_mapping.clone();
+        p.aliases = merge_aliases.clone();
+    }
 
     let mut global_syms = symbols::build_global_symbols(
-        &input_objs,
+        input_objs,
         &sec_mapping,
         &mut merged_sections,
         &mut merged_map,
@@ -209,28 +421,28 @@ pub fn link_builtin(
     // shared-library import (`--defsym=sqrt=test_sqrt` used to keep a
     // `sqrt@GLIBC` JUMP_SLOT -- a crash without -lm, the wrong function
     // with it).
-    for (alias, target) in &defsym_defs {
+    for (alias, target) in defsym_defs {
         if let Some(target_sym) = global_syms.get(target).filter(|s| s.defined).cloned() {
             global_syms.insert(alias.clone(), target_sym);
         }
     }
 
     let (plt_symbols, copy_symbols) = if !is_static {
-        symbols::mark_plt_and_copy_symbols(&mut global_syms, &shared_lib_syms)
+        symbols::mark_plt_and_copy_symbols(&mut global_syms, shared_lib_syms)
     } else {
         (Vec::new(), Vec::new())
     };
 
     // An alias of a shared-library symbol takes the classified import (its
     // PLT/copy slot), so it is applied after classification.
-    for (alias, target) in &defsym_defs {
+    for (alias, target) in defsym_defs {
         if let Some(target_sym) = global_syms.get(target).filter(|s| !s.defined).cloned() {
             global_syms.insert(alias.clone(), target_sym);
         }
     }
 
     if !is_static {
-        symbols::check_undefined_symbols(&global_syms, &shared_lib_syms)?;
+        symbols::check_undefined_symbols(&global_syms, shared_lib_syms)?;
     } else {
         symbols::check_undefined_symbols(&global_syms, &FxHashMap::default())?;
     }
@@ -238,7 +450,7 @@ pub fn link_builtin(
     // General-dynamic access to a variable the executable defines is
     // relaxed to local-exec (`reloc::collect_gd_tls_relax_info`) and needs
     // no `tls_index`; one to an import keeps it, filled by the loader.
-    let (wanted_got, local_got_sym_info) = symbols::collect_got_entries(&input_objs);
+    let (wanted_got, local_got_sym_info) = symbols::collect_got_entries(input_objs);
     let got = GotLayout::new(wanted_got.into_iter().filter(|(key, kind)| {
         *kind != GotKind::TlsGd
             || (!local_got_sym_info.contains_key(key)
@@ -270,7 +482,7 @@ pub fn link_builtin(
     // ── Phase 4+: Emit executable ───────────────────────────────────────
 
     super::emit_exec::emit_executable(
-        &input_objs,
+        input_objs,
         &mut merged_sections,
         &mut merged_map,
         &sec_mapping,
@@ -281,13 +493,18 @@ pub fn link_builtin(
         &plt_symbols,
         &copy_symbols,
         &sec_indices,
-        &actual_needed_libs,
-        &shared_lib_syms,
-        rpath.as_ref(),
+        actual_needed_libs,
+        shared_lib_syms,
+        rpath,
         is_static,
         &mut debug_sections,
         !strip_all,
         output_path,
+        z_relro,
+        eh_frame,
+        build_id,
+        gnu_stack,
+        probe,
     )
 }
 
@@ -321,6 +538,7 @@ pub fn link_shared(
     let parsed_args = linker_common::parse_linker_args(user_args);
     parsed_args.validate_common_options()?;
     parsed_args.warn_unimplemented_keyword_options(0x1000)?;
+    let build_id = parsed_args.resolved_build_id_style()?;
     let (strip_all, strip_debug) = (parsed_args.strip_all, parsed_args.strip_debug);
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
 
@@ -418,14 +636,89 @@ pub fn link_shared(
         &shared_lib_syms,
     )?;
     symbols::import_shared_commons(&mut input_objs, late_from, &shared_lib_syms);
+    let gnu_stack = gnu_stack_flags(
+        parsed_args.z_execstack,
+        parsed_args.warn_execstack,
+        parsed_args.error_execstack,
+        parsed_args.fatal_warnings,
+        &input_objs,
+    )?;
+    push_build_id_note(&mut input_objs, &build_id);
+    let eh_frame = edit_eh_frame(&mut input_objs, true)?;
+    let merge_aliases = sections::merge_alloc_sections(&mut input_objs);
 
+    let link = SharedLink {
+        needed_sonames: &needed_sonames,
+        shared_lib_syms: &shared_lib_syms,
+        soname: soname.as_deref(),
+        rpath: rpath.as_ref(),
+        strip_all,
+        strip_debug,
+        output_path,
+        eh_frame: &eh_frame,
+        merge_aliases: &merge_aliases,
+        build_id: &build_id,
+        gnu_stack,
+        symbolic: parsed_args.symbolic,
+        new_dtags: parsed_args.use_runpath,
+    };
+    // GNU ld relaxes a shared object too, minus the absolute and pc-relative
+    // data rewrites a position-independent image cannot use (`pic`).
+    relax_inputs(
+        &mut input_objs,
+        parsed_args.no_relax,
+        true,
+        parsed_args.z_relro,
+        &mut |objs, probe| link_shared_objects(&link, objs, Some(probe)),
+    )?;
+    link_shared_objects(&link, &input_objs, None)
+}
+
+/// What Phases 2-4 of a shared-library link read besides the objects.
+struct SharedLink<'a> {
+    needed_sonames: &'a [String],
+    shared_lib_syms: &'a input::SharedLibSyms,
+    soname: Option<&'a str>,
+    rpath: Option<&'a (i64, String)>,
+    strip_all: bool,
+    strip_debug: bool,
+    output_path: &'a str,
+    eh_frame: &'a linker_common::eh_frame_gnu::EhFrameLayout,
+    /// Merged `SHF_MERGE` members and their representatives
+    /// (`sections::merge_alloc_sections`).
+    merge_aliases: &'a sections::MergeAliases,
+    build_id: &'a linker_common::build_id::BuildIdStyle,
+    /// `PT_GNU_STACK`'s flags, if the output has one.
+    gnu_stack: Option<u32>,
+    /// `-Bsymbolic*`: which of the library's own definitions bind locally.
+    symbolic: linker_common::Symbolic,
+    /// `--enable-new-dtags` (lccc's default; `--disable-new-dtags` clears
+    /// it): DT_RUNPATH, and DT_FLAGS when a flag is set.
+    new_dtags: bool,
+}
+
+/// Phases 2-4 of a shared-library link; with `probe`, layout only.
+fn link_shared_objects(
+    link: &SharedLink,
+    input_objs: &[(String, ElfObject)],
+    mut probe: Option<&mut super::relax::LayoutProbe>,
+) -> Result<(), String> {
     // ── Phase 2: Merge sections ─────────────────────────────────────
 
-    super::reloc::validate_input_relocations(&input_objs)?;
     let (mut merged_sections, mut merged_map, input_sec_refs) =
-        sections::merge_sections(&input_objs);
-    let mut debug_sections =
-        super::debug::DebugSections::collect(&input_objs, !strip_all && !strip_debug)?;
+        sections::merge_sections(input_objs, link.merge_aliases);
+    let attr_warnings =
+        super::attributes::merge_into_output(input_objs, &mut merged_sections, &merged_map)?;
+    if probe.is_none() {
+        for warning in attr_warnings {
+            eprintln!("lccc-ld: warning: {warning}");
+        }
+    }
+    let mut debug_sections = super::debug::DebugSections::collect(
+        input_objs,
+        !link.strip_all && !link.strip_debug && probe.is_none(),
+        probe.is_none(),
+    )?;
 
     // ── Phase 3: Build global symbol table ───────────────────────────
 
@@ -436,35 +729,46 @@ pub fn link_shared(
             (r.merged_sec_idx, r.offset_in_merged),
         );
     }
+    link.eh_frame.verify(&sec_mapping)?;
+    if let Some(p) = probe.as_deref_mut() {
+        p.sec_mapping = sec_mapping.clone();
+        p.aliases = link.merge_aliases.clone();
+    }
 
     let mut global_syms = symbols::build_global_symbols(
-        &input_objs,
+        input_objs,
         &sec_mapping,
         &mut merged_sections,
         &mut merged_map,
     );
 
     // Identify GOT entries needed
-    let (wanted_got, local_got_sym_info) = symbols::collect_got_entries(&input_objs);
+    let (wanted_got, local_got_sym_info) = symbols::collect_got_entries(input_objs);
     let got = GotLayout::new(wanted_got);
 
     // ── Phase 4+: Emit shared library ───────────────────────────────
 
     super::emit_shared::emit_shared_library(
-        &input_objs,
+        input_objs,
         &mut merged_sections,
         &mut merged_map,
         &sec_mapping,
         &mut global_syms,
         &got,
         &local_got_sym_info,
-        &needed_sonames,
-        &shared_lib_syms,
-        soname,
-        rpath.as_ref(),
+        link.needed_sonames,
+        link.shared_lib_syms,
+        link.soname.map(str::to_string),
+        link.rpath,
         &mut debug_sections,
-        !strip_all,
-        output_path,
+        !link.strip_all,
+        link.output_path,
+        link.eh_frame,
+        link.build_id,
+        link.gnu_stack,
+        link.symbolic,
+        link.new_dtags,
+        probe,
     )
 }
 

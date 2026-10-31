@@ -417,18 +417,31 @@ fn rewrite_sum2_chain(
     }
 
     let block = &mut func.blocks[bi];
+    let old_spans = block.take_parallel_spans();
     let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len() + seq.len());
+    let mut new_spans = Vec::with_capacity(if old_spans.is_empty() {
+        0
+    } else {
+        new_insts.capacity()
+    });
     for (idx, inst) in block.instructions.drain(..).enumerate() {
+        let span = old_spans.get(idx).copied();
         if old_indices.contains(&idx) {
             if inst.dest().is_some_and(|d| d.0 == sum2_n.0) {
                 new_insts.extend(seq.iter().cloned());
+                new_spans.extend(
+                    span.map(|s| std::iter::repeat_n(s, seq.len()))
+                        .into_iter()
+                        .flatten(),
+                );
             }
             // else: an intermediate sum2 add — drop it (now dead).
         } else {
             new_insts.push(inst);
+            new_spans.extend(span);
         }
     }
-    block.instructions = new_insts;
+    block.replace_insts(new_insts, new_spans);
     func.next_value_id = next_id;
     true
 }

@@ -3939,7 +3939,7 @@ pub(crate) fn hoist_masked_guard_splats(func: &mut IrFunction) -> usize {
         }
     }
     for (pre, inst) in inserts {
-        func.blocks[pre].instructions.push(inst);
+        func.blocks[pre].push_inst(inst, crate::common::source::Span::dummy());
     }
     func.next_value_id = next;
     rewrites.len()
@@ -6314,7 +6314,7 @@ fn rewrite_reduction_body(
             dest_ptr: None,
             args: vec![],
         };
-        entry_block.instructions.push(zero_inst);
+        entry_block.push_inst(zero_inst, crate::common::source::Span::dummy());
     }
     changes += 1;
 
@@ -6369,9 +6369,7 @@ fn rewrite_reduction_body(
                 dest_ptr: None,
                 args: vec![Operand::Value(phi), Operand::Value(vec_load_a)],
             };
-            body_block.instructions.insert(add_idx, load_inst);
-            body_block.instructions.insert(add_idx + 1, add_inst);
-            body_block.instructions.remove(add_idx + 2);
+            body_block.splice_inst(add_idx, vec![load_inst, add_inst]);
             changes += 2;
         }
         ReductionKind::DotProduct => {
@@ -6382,8 +6380,7 @@ fn rewrite_reduction_body(
                     dest_ptr: None,
                     args: vec![Operand::Value(phi), a_base, a_off, b_base, b_off],
                 };
-                body_block.instructions.insert(add_idx, fma_inst);
-                body_block.instructions.remove(add_idx + 1);
+                body_block.splice_inst(add_idx, vec![fma_inst]);
                 changes += 1;
             } else {
                 let load_a_inst = Instruction::Intrinsic {
@@ -6410,11 +6407,7 @@ fn rewrite_reduction_body(
                     dest_ptr: None,
                     args: vec![Operand::Value(phi), Operand::Value(vec_mul)],
                 };
-                body_block.instructions.insert(add_idx, load_a_inst);
-                body_block.instructions.insert(add_idx + 1, load_b_inst);
-                body_block.instructions.insert(add_idx + 2, mul_inst);
-                body_block.instructions.insert(add_idx + 3, add_inst);
-                body_block.instructions.remove(add_idx + 4);
+                body_block.splice_inst(add_idx, vec![load_a_inst, load_b_inst, mul_inst, add_inst]);
                 changes += 4;
             }
         }
@@ -8870,20 +8863,20 @@ fn rewrite_conditional_store(
 
     // Commit: first chain block becomes the straight-line body.
     let first = &mut func.blocks[first_block];
-    first.instructions.extend(new_insts);
+    first.extend_insts(new_insts, crate::common::source::Span::dummy());
     first.terminator = Terminator::Branch(latch_label);
     // The remaining chain blocks and the store block become empty bypass
     // blocks (unreachable; later CFG cleanup removes them).
     for block_idx in &chain_blocks {
         if *block_idx != first_block {
             let b = &mut func.blocks[*block_idx];
-            b.instructions.clear();
+            b.clear_insts();
             b.terminator = Terminator::Branch(latch_label);
         }
     }
     {
         let b = &mut func.blocks[store_block];
-        b.instructions.clear();
+        b.clear_insts();
         b.terminator = Terminator::Branch(latch_label);
     }
     if debug {
@@ -9491,7 +9484,7 @@ fn rewrite_folded_cond_store(
     {
         let store_label = func.blocks[store_block].label;
         let b = &mut func.blocks[store_block];
-        b.instructions = new_insts;
+        b.replace_insts_synthesized(new_insts);
         b.terminator = Terminator::Branch(latch_label);
         let g = &mut func.blocks[guard_block];
         g.terminator = Terminator::Branch(store_label);
@@ -15306,83 +15299,90 @@ fn transform_adler_loop_inner(
     // vs1_init = [s1_init, 0, 0, 0] (broadcastq + lane-0 mask): the seed
     // that makes hsum(vs1) and the vs3 snapshots exact including the
     // initial value.  vs2/vs3 start at zero; zero64 is the SAD operand.
-    func.blocks[preheader_idx]
-        .instructions
-        .push(Instruction::Cast {
+    func.blocks[preheader_idx].push_inst(
+        Instruction::Cast {
             dest: zext_s1,
             src: p.s1_init.clone(),
             from_ty: IrType::U32,
             to_ty: IrType::U64,
-        });
-    func.blocks[preheader_idx]
-        .instructions
-        .push(Instruction::Intrinsic {
+        },
+        crate::common::source::Span::dummy(),
+    );
+    func.blocks[preheader_idx].push_inst(
+        Instruction::Intrinsic {
             dest: Some(bcast_s1),
             op: IntrinsicOp::VecBroadcastI64x4,
             dest_ptr: None,
             args: vec![Operand::Value(zext_s1)],
-        });
+        },
+        crate::common::source::Span::dummy(),
+    );
     let mut mask_bytes: [i64; 32] = [0; 32];
     for b in mask_bytes.iter_mut().take(8) {
         *b = -1; // 0xFF in every byte of qword lane 0
     }
-    func.blocks[preheader_idx]
-        .instructions
-        .push(Instruction::Intrinsic {
+    func.blocks[preheader_idx].push_inst(
+        Instruction::Intrinsic {
             dest: Some(mask_c),
             op: IntrinsicOp::VecConstI8x32,
             dest_ptr: None,
             args: mask_bytes
                 .map(|b| Operand::Const(IrConst::I8(b as i8)))
                 .to_vec(),
-        });
-    func.blocks[preheader_idx]
-        .instructions
-        .push(Instruction::Intrinsic {
+        },
+        crate::common::source::Span::dummy(),
+    );
+    func.blocks[preheader_idx].push_inst(
+        Instruction::Intrinsic {
             dest: Some(vs1_init),
             op: IntrinsicOp::VecAndI64x4,
             dest_ptr: None,
             args: vec![Operand::Value(bcast_s1), Operand::Value(mask_c)],
-        });
+        },
+        crate::common::source::Span::dummy(),
+    );
     for (dest, op) in [
         (vs2_init, IntrinsicOp::VecZeroI32x8),
         (vs3_init, IntrinsicOp::VecZeroI64x4),
         (zero64, IntrinsicOp::VecZeroI64x4),
     ] {
-        func.blocks[preheader_idx]
-            .instructions
-            .push(Instruction::Intrinsic {
+        func.blocks[preheader_idx].push_inst(
+            Instruction::Intrinsic {
                 dest: Some(dest),
                 op,
                 dest_ptr: None,
                 args: vec![],
-            });
+            },
+            crate::common::source::Span::dummy(),
+        );
     }
     // The Adler weight table [32, 31, ..., 1] (i8) and the i16 ones table
     // (byte pattern 01 00 repeated — the little-endian encoding of 16
     // word lanes of 1).
     let weight_bytes: [i64; 32] = std::array::from_fn(|i| (32 - i) as i64);
     let ones_bytes: [i64; 32] = std::array::from_fn(|i| if i % 2 == 0 { 1 } else { 0 });
-    func.blocks[preheader_idx]
-        .instructions
-        .push(Instruction::Intrinsic {
+    func.blocks[preheader_idx].push_inst(
+        Instruction::Intrinsic {
             dest: Some(weights),
             op: IntrinsicOp::VecConstI8x32,
             dest_ptr: None,
             args: weight_bytes
                 .map(|b| Operand::Const(IrConst::I8(b as i8)))
                 .to_vec(),
-        });
-    func.blocks[preheader_idx]
-        .instructions
-        .push(Instruction::Intrinsic {
+        },
+        crate::common::source::Span::dummy(),
+    );
+    func.blocks[preheader_idx].push_inst(
+        Instruction::Intrinsic {
             dest: Some(ones),
             op: IntrinsicOp::VecConstI8x32,
             dest_ptr: None,
             args: ones_bytes
                 .map(|b| Operand::Const(IrConst::I8(b as i8)))
                 .to_vec(),
-        });
+        },
+        crate::common::source::Span::dummy(),
+    );
     changes += 10;
 
     // ── Vector header: phis + `n >= 32` compare ────────────────────────
@@ -18562,15 +18562,16 @@ fn transform_stencil_vector(
             Operand::Const(int_const(n))
         }
         Operand::Value(limit_val) => {
-            func.blocks[preheader_idx]
-                .instructions
-                .push(Instruction::BinOp {
+            func.blocks[preheader_idx].push_inst(
+                Instruction::BinOp {
                     dest: trip_val,
                     op: IrBinOp::Sub,
                     lhs: Operand::Value(*limit_val),
                     rhs: Operand::Const(int_const(pattern.cmp_k + pattern.iv_start)),
                     ty: pattern.iv_ty,
-                });
+                },
+                crate::common::source::Span::dummy(),
+            );
             changes += 1;
             Operand::Value(trip_val)
         }
@@ -18623,33 +18624,35 @@ fn transform_stencil_vector(
                 ty: pattern.iv_ty,
             },
         ] {
-            func.blocks[preheader_idx].instructions.push(inst);
+            func.blocks[preheader_idx].push_inst(inst, crate::common::source::Span::dummy());
             changes += 1;
         }
     } else {
-        func.blocks[preheader_idx]
-            .instructions
-            .push(Instruction::BinOp {
+        func.blocks[preheader_idx].push_inst(
+            Instruction::BinOp {
                 dest: vec_trip,
                 op: IrBinOp::LShr,
                 lhs: trip_operand.clone(),
                 rhs: Operand::Const(int_const(shift)),
                 ty: pattern.iv_ty,
-            });
+            },
+            crate::common::source::Span::dummy(),
+        );
         changes += 1;
     }
     // bound = vec_trip + (cmp_k + iv_start)
     let bound = Value(next_val_id);
     next_val_id += 1;
-    func.blocks[preheader_idx]
-        .instructions
-        .push(Instruction::BinOp {
+    func.blocks[preheader_idx].push_inst(
+        Instruction::BinOp {
             dest: bound,
             op: IrBinOp::Add,
             lhs: Operand::Value(vec_trip),
             rhs: Operand::Const(int_const(pattern.cmp_k + pattern.iv_start)),
             ty: pattern.iv_ty,
-        });
+        },
+        crate::common::source::Span::dummy(),
+    );
     changes += 1;
 
     // Rewrite the header compare's limit operand. The compare's IV-derived
@@ -18708,7 +18711,7 @@ fn transform_stencil_vector(
         .iter()
         .position(|inst| !matches!(inst, Instruction::Phi { .. }))
         .unwrap_or(func.blocks[pattern.header_idx].instructions.len());
-    func.blocks[pattern.header_idx].instructions.insert(
+    func.blocks[pattern.header_idx].insert_inst(
         phi_pos,
         Instruction::Phi {
             dest: byte_iv,
@@ -18721,16 +18724,18 @@ fn transform_stencil_vector(
                 (Operand::Value(byte_iv_next), latch_label),
             ],
         },
+        crate::common::source::Span::dummy(),
     );
-    func.blocks[pattern.latch_idx]
-        .instructions
-        .push(Instruction::BinOp {
+    func.blocks[pattern.latch_idx].push_inst(
+        Instruction::BinOp {
             dest: byte_iv_next,
             op: IrBinOp::Add,
             lhs: Operand::Value(byte_iv),
             rhs: Operand::Const(IrConst::I64(elem_size * vec_width as i64)),
             ty: IrType::I64,
-        });
+        },
+        crate::common::source::Span::dummy(),
+    );
     changes += 2;
 
     // ── Vector body ────────────────────────────────────────────────────────
@@ -18824,11 +18829,10 @@ fn transform_stencil_vector(
             }
         }
         func.blocks[pattern.header_idx]
-            .instructions
-            .retain(|i| !matches!(i, Instruction::Phi { dest, .. } if *dest == byte_iv));
-        func.blocks[pattern.latch_idx]
-            .instructions
-            .retain(|i| !matches!(i, Instruction::BinOp { dest, .. } if *dest == byte_iv_next));
+            .retain_insts(|i| !matches!(i, Instruction::Phi { dest, .. } if *dest == byte_iv));
+        func.blocks[pattern.latch_idx].retain_insts(
+            |i| !matches!(i, Instruction::BinOp { dest, .. } if *dest == byte_iv_next),
+        );
         func.next_value_id = next_val_id;
         func.next_label = next_label;
         return changes;
@@ -18862,10 +18866,7 @@ fn transform_stencil_vector(
             return changes;
         };
         let inserted = vec_insts.len();
-        for (i, inst) in vec_insts.into_iter().enumerate() {
-            body.instructions.insert(store_pos + i, inst);
-        }
-        body.instructions.remove(store_pos + inserted);
+        body.splice_inst(store_pos, vec_insts);
         changes += inserted;
     }
 
@@ -18934,8 +18935,7 @@ fn transform_stencil_vector(
         // Clones first, guard code after: both append before the
         // preheader's terminator.
         func.blocks[preheader_idx]
-            .instructions
-            .append(&mut guard_prefix);
+            .extend_insts(guard_prefix.drain(..), crate::common::source::Span::dummy());
         changes += emit_alias_guards(
             func,
             preheader_idx,
@@ -19009,14 +19009,15 @@ fn emit_stencil_expr(
         }
         let dest = Value(*next_val_id);
         *next_val_id += 1;
-        func.blocks[preheader_idx]
-            .instructions
-            .push(Instruction::Intrinsic {
+        func.blocks[preheader_idx].push_inst(
+            Instruction::Intrinsic {
                 dest: Some(dest),
                 op: broadcast_op,
                 dest_ptr: None,
                 args: vec![op.clone()],
-            });
+            },
+            crate::common::source::Span::dummy(),
+        );
         *changes += 1;
         cache.insert(key, dest);
         Some(dest)
@@ -21882,20 +21883,19 @@ fn transform_strict_computed_recip_reduction(
     // borrowing an allocator-owned XMM register or dynamically moving %rsp.
     // Loop-invariant packed constants/broadcasts run once: the matcher proved
     // every external leaf dominates the preheader (strict_external_value_available).
-    func.blocks[pattern.preheader_idx]
-        .instructions
-        .extend(prefix);
+    func.blocks[pattern.preheader_idx].extend_insts(prefix, crate::common::source::Span::dummy());
     func.blocks[pattern.header_idx].instructions = rewritten_header_instructions;
-    func.blocks[pattern.preheader_idx]
-        .instructions
-        .push(Instruction::Alloca {
+    func.blocks[pattern.preheader_idx].push_inst(
+        Instruction::Alloca {
             dest: scratch,
             ty: IrType::F64,
             size: 32,
             align: 16,
             volatile: false,
             semantic_volatile: false,
-        });
+        },
+        crate::common::source::Span::dummy(),
+    );
     debug_assert!(matches!(
         func.blocks[pattern.preheader_idx].terminator,
         Terminator::Branch(label) if label == original_header_label
@@ -23228,13 +23228,16 @@ fn hoist_fma_a_broadcast(
             .expect("fma broadcast hoist lost its dominance plan");
         let mut hoist_prefix = Vec::new();
         let bc_ptr = materialize_remainder_reference(bc_plan, &mut hoist_prefix, next_val_id);
-        func.blocks[site].instructions.extend(hoist_prefix);
-        func.blocks[site].instructions.push(Instruction::Intrinsic {
-            dest: None,
-            op: IntrinsicOp::BroadcastLoadF64,
-            dest_ptr: None,
-            args: vec![Operand::Value(bc_ptr)],
-        });
+        func.blocks[site].extend_insts(hoist_prefix, crate::common::source::Span::dummy());
+        func.blocks[site].push_inst(
+            Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::BroadcastLoadF64,
+                dest_ptr: None,
+                args: vec![Operand::Value(bc_ptr)],
+            },
+            crate::common::source::Span::dummy(),
+        );
         if debug {
             eprintln!(
                 "[VEC]   Hoisted BroadcastLoadF64 for A ptr Value({}) into entry block {} ({})",
@@ -23962,9 +23965,11 @@ fn transform_to_fma_f64x2(
                     ty: limit_ty,
                 };
 
-                func.blocks[pattern.header_idx]
-                    .instructions
-                    .insert(pattern.exit_cmp_inst_idx, div_inst);
+                func.blocks[pattern.header_idx].insert_inst(
+                    pattern.exit_cmp_inst_idx,
+                    div_inst,
+                    crate::common::source::Span::dummy(),
+                );
 
                 if debug {
                     eprintln!(
@@ -24272,9 +24277,11 @@ fn transform_to_fma_f64x2(
                 };
 
                 // Insert mul before the GEP
-                func.blocks[block_idx]
-                    .instructions
-                    .insert(inst_idx, mul_inst);
+                func.blocks[block_idx].insert_inst(
+                    inst_idx,
+                    mul_inst,
+                    crate::common::source::Span::dummy(),
+                );
 
                 // Update the GEP's offset (now at inst_idx + 1 due to insertion)
                 if let Instruction::GetElementPtr { offset, .. } =
@@ -24345,10 +24352,9 @@ fn transform_to_fma_f64x2(
         );
 
         if let Some(pos) = store_pos {
-            body.instructions.insert(pos, intrinsic);
-            body.instructions.remove(pos + 1);
+            body.splice_inst(pos, vec![intrinsic]);
         } else {
-            body.instructions.push(intrinsic);
+            body.push_inst(intrinsic, crate::common::source::Span::dummy());
         }
         changes += 1;
         if debug {
@@ -24555,7 +24561,11 @@ fn normalize_iv_exit_comparison(
                 let Some(block) = func.blocks.get_mut(pattern.header_idx) else {
                     return false;
                 };
-                block.instructions.insert(pattern.exit_cmp_inst_idx, add);
+                block.insert_inst(
+                    pattern.exit_cmp_inst_idx,
+                    add,
+                    crate::common::source::Span::dummy(),
+                );
                 pattern.exit_cmp_inst_idx += 1; // the comparison moved one slot down
                 Operand::Value(dest)
             }
@@ -24963,7 +24973,11 @@ fn matmul_f64x4_byte_limit_operand(
                 return None;
             }
             for (offset, instruction) in emitted.into_iter().enumerate() {
-                block.instructions.insert(insertion + offset, instruction);
+                block.insert_inst(
+                    insertion + offset,
+                    instruction,
+                    crate::common::source::Span::dummy(),
+                );
             }
             if debug {
                 eprintln!(
@@ -25631,12 +25645,9 @@ fn transform_to_fma_f64x4(
         }
 
         if let Some(pos) = store_pos {
-            body.instructions.remove(pos);
-            for (k, inst) in prelude.into_iter().enumerate() {
-                body.instructions.insert(pos + k, inst);
-            }
+            body.splice_inst(pos, prelude);
         } else {
-            body.instructions.extend(prelude);
+            body.extend_insts(prelude, crate::common::source::Span::dummy());
         }
         changes += 4;
         if debug {
@@ -28224,12 +28235,16 @@ fn emit_invariant_vector_bound(
         });
         let added = chain.len();
         match preheader_idx {
-            Some(pre_idx) => func.blocks[pre_idx].instructions.extend(chain),
+            Some(pre_idx) => {
+                func.blocks[pre_idx].extend_insts(chain, crate::common::source::Span::dummy())
+            }
             None => {
                 let at = pattern.exit_cmp_inst_idx;
-                func.blocks[pattern.header_idx]
-                    .instructions
-                    .splice(at..at, chain);
+                func.blocks[pattern.header_idx].insert_insts(
+                    at,
+                    chain,
+                    crate::common::source::Span::dummy(),
+                );
             }
         }
         return Some((Operand::Value(bound), added));
@@ -28357,12 +28372,16 @@ fn emit_invariant_vector_bound(
 
     let added = chain.len();
     match preheader_idx {
-        Some(pre_idx) => func.blocks[pre_idx].instructions.extend(chain),
+        Some(pre_idx) => {
+            func.blocks[pre_idx].extend_insts(chain, crate::common::source::Span::dummy())
+        }
         None => {
             let at = pattern.exit_cmp_inst_idx;
-            func.blocks[pattern.header_idx]
-                .instructions
-                .splice(at..at, chain);
+            func.blocks[pattern.header_idx].insert_insts(
+                at,
+                chain,
+                crate::common::source::Span::dummy(),
+            );
         }
     }
 
@@ -29578,9 +29597,11 @@ fn transform_reduction_avx2(
                 ty: IrType::I64,
             };
 
-            func.blocks[block_idx]
-                .instructions
-                .insert(inst_idx, mul_inst);
+            func.blocks[block_idx].insert_inst(
+                inst_idx,
+                mul_inst,
+                crate::common::source::Span::dummy(),
+            );
             changes += 1;
 
             if let Instruction::GetElementPtr { offset, .. } =
@@ -29645,14 +29666,15 @@ fn transform_reduction_avx2(
 
                 // Broadcast the scalar init in the exact preheader that
                 // supplied the validated accumulator seed.
-                func.blocks[pre_idx]
-                    .instructions
-                    .push(Instruction::Intrinsic {
+                func.blocks[pre_idx].push_inst(
+                    Instruction::Intrinsic {
                         dest: Some(init_bcast),
                         op: IntrinsicOp::VecBroadcastI32x8,
                         dest_ptr: None,
                         args: vec![init_operand],
-                    });
+                    },
+                    crate::common::source::Span::dummy(),
+                );
                 changes += 1;
 
                 // Body: 8-wide load + lane-wise vpmaxsd, replacing the
@@ -29674,7 +29696,7 @@ fn transform_reduction_avx2(
                             Operand::Const(IrConst::I64(0)),
                         ),
                     };
-                    body_block.instructions.insert(
+                    body_block.insert_inst(
                         pattern.accumulator_add_idx,
                         Instruction::Intrinsic {
                             dest: Some(vec_load),
@@ -29682,8 +29704,9 @@ fn transform_reduction_avx2(
                             dest_ptr: None,
                             args: vec![base, off],
                         },
+                        crate::common::source::Span::dummy(),
                     );
-                    body_block.instructions.insert(
+                    body_block.insert_inst(
                         pattern.accumulator_add_idx + 1,
                         Instruction::Intrinsic {
                             dest: Some(vec_sum_value),
@@ -29698,11 +29721,10 @@ fn transform_reduction_avx2(
                                 Operand::Value(vec_load),
                             ],
                         },
+                        crate::common::source::Span::dummy(),
                     );
                     // Remove the old Select (now shifted to +2).
-                    body_block
-                        .instructions
-                        .remove(pattern.accumulator_add_idx + 2);
+                    body_block.remove_inst(pattern.accumulator_add_idx + 2);
                     changes += 2;
                     if let Some(cv) = sel_cmp_val {
                         if let Some(cp) = body_block
@@ -29710,7 +29732,7 @@ fn transform_reduction_avx2(
                             .iter()
                             .position(|i| matches!(i.dest(), Some(d) if d.0 == cv.0))
                         {
-                            body_block.instructions.remove(cp);
+                            body_block.remove_inst(cp);
                         }
                     }
                 }
@@ -29802,7 +29824,7 @@ fn transform_reduction_avx2(
                     dest_ptr: None,
                     args: vec![],
                 };
-                entry_block.instructions.push(zero_inst);
+                entry_block.push_inst(zero_inst, crate::common::source::Span::dummy());
                 changes += 1;
 
                 // Rewrite only the validated non-latch zero seed. A latch
@@ -29875,14 +29897,14 @@ fn transform_reduction_avx2(
                             }
                         }
                         if let Some(si) = select_idx {
-                            body_block.instructions.remove(si);
+                            body_block.remove_inst(si);
                         }
-                        body_block
-                            .instructions
-                            .insert(pattern.accumulator_add_idx, masked_inst);
-                        body_block
-                            .instructions
-                            .remove(pattern.accumulator_add_idx + 1);
+                        body_block.insert_inst(
+                            pattern.accumulator_add_idx,
+                            masked_inst,
+                            crate::common::source::Span::dummy(),
+                        );
+                        body_block.remove_inst(pattern.accumulator_add_idx + 1);
                         changes += 1;
                     } else if widening_i64 {
                         // One composite intrinsic: acc += sext(load4×I32).
@@ -29892,12 +29914,12 @@ fn transform_reduction_avx2(
                             dest_ptr: None,
                             args: vec![Operand::Value(pattern.accumulator_phi), base, off],
                         };
-                        body_block
-                            .instructions
-                            .insert(pattern.accumulator_add_idx, widen_inst);
-                        body_block
-                            .instructions
-                            .remove(pattern.accumulator_add_idx + 1);
+                        body_block.insert_inst(
+                            pattern.accumulator_add_idx,
+                            widen_inst,
+                            crate::common::source::Span::dummy(),
+                        );
+                        body_block.remove_inst(pattern.accumulator_add_idx + 1);
                         changes += 1;
                     } else if pattern.guard_cond.is_some() {
                         // CONDITIONAL (guarded) EQUAL-WIDTH sum: the old
@@ -29944,14 +29966,14 @@ fn transform_reduction_avx2(
                             }
                         }
                         if let Some(si) = select_idx {
-                            body_block.instructions.remove(si);
+                            body_block.remove_inst(si);
                         }
-                        body_block
-                            .instructions
-                            .insert(pattern.accumulator_add_idx, masked_inst);
-                        body_block
-                            .instructions
-                            .remove(pattern.accumulator_add_idx + 1);
+                        body_block.insert_inst(
+                            pattern.accumulator_add_idx,
+                            masked_inst,
+                            crate::common::source::Span::dummy(),
+                        );
+                        body_block.remove_inst(pattern.accumulator_add_idx + 1);
                         changes += 1;
                     } else {
                         // Vector load from array → SSA value
@@ -29974,15 +29996,17 @@ fn transform_reduction_avx2(
                         };
 
                         // Insert vector instructions and remove old scalar add
-                        body_block
-                            .instructions
-                            .insert(pattern.accumulator_add_idx, load_inst);
-                        body_block
-                            .instructions
-                            .insert(pattern.accumulator_add_idx + 1, add_inst);
-                        body_block
-                            .instructions
-                            .remove(pattern.accumulator_add_idx + 2);
+                        body_block.insert_inst(
+                            pattern.accumulator_add_idx,
+                            load_inst,
+                            crate::common::source::Span::dummy(),
+                        );
+                        body_block.insert_inst(
+                            pattern.accumulator_add_idx + 1,
+                            add_inst,
+                            crate::common::source::Span::dummy(),
+                        );
+                        body_block.remove_inst(pattern.accumulator_add_idx + 2);
                         changes += 2;
                     }
 
@@ -30087,7 +30111,7 @@ fn transform_reduction_avx2(
                     dest_ptr: None,
                     args: vec![],
                 };
-                entry_block.instructions.push(zero_inst);
+                entry_block.push_inst(zero_inst, crate::common::source::Span::dummy());
                 changes += 1;
 
                 // Rewrite only the validated non-latch zero seed. A latch
@@ -30134,12 +30158,12 @@ fn transform_reduction_avx2(
                             b_off,
                         ],
                     };
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx, fma_inst);
-                    body_block
-                        .instructions
-                        .remove(pattern.accumulator_add_idx + 1);
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx,
+                        fma_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.remove_inst(pattern.accumulator_add_idx + 1);
                     changes += 1;
                 } else {
                     let load_a_inst = Instruction::Intrinsic {
@@ -30169,21 +30193,27 @@ fn transform_reduction_avx2(
                             Operand::Value(vec_mul),
                         ],
                     };
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx, load_a_inst);
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx + 1, load_b_inst);
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx + 2, mul_inst);
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx + 3, add_inst);
-                    body_block
-                        .instructions
-                        .remove(pattern.accumulator_add_idx + 4);
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx,
+                        load_a_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx + 1,
+                        load_b_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx + 2,
+                        mul_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx + 3,
+                        add_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.remove_inst(pattern.accumulator_add_idx + 4);
                     changes += 4;
                 }
 
@@ -30943,9 +30973,11 @@ fn transform_reduction_sse2(
                 ty: IrType::I64,
             };
 
-            func.blocks[block_idx]
-                .instructions
-                .insert(inst_idx, mul_inst);
+            func.blocks[block_idx].insert_inst(
+                inst_idx,
+                mul_inst,
+                crate::common::source::Span::dummy(),
+            );
             changes += 1;
 
             if let Instruction::GetElementPtr { offset, .. } =
@@ -31019,14 +31051,15 @@ fn transform_reduction_sse2(
 
                 // Broadcast the scalar init in the exact preheader that
                 // supplied the validated accumulator seed.
-                func.blocks[pre_idx]
-                    .instructions
-                    .push(Instruction::Intrinsic {
+                func.blocks[pre_idx].push_inst(
+                    Instruction::Intrinsic {
                         dest: Some(init_bcast),
                         op: IntrinsicOp::VecBroadcastI32x4,
                         dest_ptr: None,
                         args: vec![init_operand],
-                    });
+                    },
+                    crate::common::source::Span::dummy(),
+                );
                 changes += 1;
 
                 // Body: 4-wide load + lane-wise smax, replacing the Select and
@@ -31049,7 +31082,7 @@ fn transform_reduction_sse2(
                             Operand::Const(IrConst::I64(0)),
                         ),
                     };
-                    body_block.instructions.insert(
+                    body_block.insert_inst(
                         pattern.accumulator_add_idx,
                         Instruction::Intrinsic {
                             dest: Some(vec_load),
@@ -31057,8 +31090,9 @@ fn transform_reduction_sse2(
                             dest_ptr: None,
                             args: vec![base, off],
                         },
+                        crate::common::source::Span::dummy(),
                     );
-                    body_block.instructions.insert(
+                    body_block.insert_inst(
                         pattern.accumulator_add_idx + 1,
                         Instruction::Intrinsic {
                             dest: Some(vec_sum_value),
@@ -31069,11 +31103,10 @@ fn transform_reduction_sse2(
                                 Operand::Value(vec_load),
                             ],
                         },
+                        crate::common::source::Span::dummy(),
                     );
                     // Remove the old Select (now shifted to +2).
-                    body_block
-                        .instructions
-                        .remove(pattern.accumulator_add_idx + 2);
+                    body_block.remove_inst(pattern.accumulator_add_idx + 2);
                     changes += 2;
                     if let Some(cv) = sel_cmp_val {
                         if let Some(cp) = body_block
@@ -31081,7 +31114,7 @@ fn transform_reduction_sse2(
                             .iter()
                             .position(|i| matches!(i.dest(), Some(d) if d.0 == cv.0))
                         {
-                            body_block.instructions.remove(cp);
+                            body_block.remove_inst(cp);
                         }
                     }
                 }
@@ -31185,7 +31218,7 @@ fn transform_reduction_sse2(
                     dest_ptr: None,
                     args: vec![],
                 };
-                entry_block.instructions.push(zero_inst);
+                entry_block.push_inst(zero_inst, crate::common::source::Span::dummy());
                 changes += 1;
 
                 if debug {
@@ -31272,18 +31305,20 @@ fn transform_reduction_sse2(
                         });
                         if let Some(si) = select_idx {
                             debug_assert!(si > pattern.accumulator_add_idx);
-                            body_block.instructions.remove(si);
+                            body_block.remove_inst(si);
                         }
                     }
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx, load_inst);
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx + 1, add_inst);
-                    body_block
-                        .instructions
-                        .remove(pattern.accumulator_add_idx + 2);
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx,
+                        load_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx + 1,
+                        add_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.remove_inst(pattern.accumulator_add_idx + 2);
                     changes += 2;
 
                     // Debug: Log vector accumulator flow
@@ -31352,12 +31387,15 @@ fn transform_reduction_sse2(
                 {
                     let entry_block = &mut func.blocks[0];
                     for init in [init_zero0, init_zero1] {
-                        entry_block.instructions.push(Instruction::Intrinsic {
-                            dest: Some(init),
-                            op: IntrinsicOp::VecZeroI64x2,
-                            dest_ptr: None,
-                            args: vec![],
-                        });
+                        entry_block.push_inst(
+                            Instruction::Intrinsic {
+                                dest: Some(init),
+                                op: IntrinsicOp::VecZeroI64x2,
+                                dest_ptr: None,
+                                args: vec![],
+                            },
+                            crate::common::source::Span::dummy(),
+                        );
                     }
                     changes += 2;
                 }
@@ -31402,7 +31440,7 @@ fn transform_reduction_sse2(
                         .rposition(|inst| matches!(inst, Instruction::Phi { .. }))
                         .map(|p| p + 1)
                         .unwrap_or(0);
-                    header_block.instructions.insert(
+                    header_block.insert_inst(
                         insert_pos,
                         Instruction::Phi {
                             dest: acc1_phi,
@@ -31412,6 +31450,7 @@ fn transform_reduction_sse2(
                                 (Operand::Value(acc1_next), latch_label),
                             ],
                         },
+                        crate::common::source::Span::dummy(),
                     );
                     changes += 1;
                 }
@@ -31419,7 +31458,7 @@ fn transform_reduction_sse2(
                 // Body: two 4-wide loads + smlal/smlal2, replacing the scalar add.
                 {
                     let body_block = &mut func.blocks[pattern.body_idx];
-                    body_block.instructions.insert(
+                    body_block.insert_inst(
                         pattern.accumulator_add_idx,
                         Instruction::Intrinsic {
                             dest: Some(vec_load_a),
@@ -31430,8 +31469,9 @@ fn transform_reduction_sse2(
                                 Operand::Const(IrConst::I64(0)),
                             ],
                         },
+                        crate::common::source::Span::dummy(),
                     );
-                    body_block.instructions.insert(
+                    body_block.insert_inst(
                         pattern.accumulator_add_idx + 1,
                         Instruction::Intrinsic {
                             dest: Some(vec_load_b),
@@ -31442,8 +31482,9 @@ fn transform_reduction_sse2(
                                 Operand::Const(IrConst::I64(0)),
                             ],
                         },
+                        crate::common::source::Span::dummy(),
                     );
-                    body_block.instructions.insert(
+                    body_block.insert_inst(
                         pattern.accumulator_add_idx + 2,
                         Instruction::Intrinsic {
                             dest: Some(acc0_next),
@@ -31455,8 +31496,9 @@ fn transform_reduction_sse2(
                                 Operand::Value(vec_load_b),
                             ],
                         },
+                        crate::common::source::Span::dummy(),
                     );
-                    body_block.instructions.insert(
+                    body_block.insert_inst(
                         pattern.accumulator_add_idx + 3,
                         Instruction::Intrinsic {
                             dest: Some(acc1_next),
@@ -31468,12 +31510,11 @@ fn transform_reduction_sse2(
                                 Operand::Value(vec_load_b),
                             ],
                         },
+                        crate::common::source::Span::dummy(),
                     );
                     // Remove the old scalar add; the scalar mul/casts/loads are now
                     // dead and cleaned up by DCE.
-                    body_block
-                        .instructions
-                        .remove(pattern.accumulator_add_idx + 4);
+                    body_block.remove_inst(pattern.accumulator_add_idx + 4);
                     changes += 4;
                 }
 
@@ -31549,7 +31590,7 @@ fn transform_reduction_sse2(
                     dest_ptr: None,
                     args: vec![],
                 };
-                entry_block.instructions.push(zero_inst);
+                entry_block.push_inst(zero_inst, crate::common::source::Span::dummy());
                 changes += 1;
 
                 if debug {
@@ -31629,18 +31670,26 @@ fn transform_reduction_sse2(
                 // Insert all instructions and remove old scalar operations
                 {
                     let body_block = &mut func.blocks[pattern.body_idx];
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx, load_a_inst);
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx + 1, load_b_inst);
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx + 2, mul_inst);
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx + 3, add_inst);
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx,
+                        load_a_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx + 1,
+                        load_b_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx + 2,
+                        mul_inst,
+                        crate::common::source::Span::dummy(),
+                    );
+                    body_block.insert_inst(
+                        pattern.accumulator_add_idx + 3,
+                        add_inst,
+                        crate::common::source::Span::dummy(),
+                    );
 
                     // Remove the dead scalar add (now after the 4 inserted vector
                     // ops). The dead scalar multiply that fed it becomes unreachable
@@ -31649,9 +31698,7 @@ fn transform_reduction_sse2(
                     // deleted the latch's induction-variable increment once the
                     // byte-offset IV stopped inserting per-GEP multiplies
                     // (infinite loop / undefined IV on dot products).
-                    body_block
-                        .instructions
-                        .remove(pattern.accumulator_add_idx + 4);
+                    body_block.remove_inst(pattern.accumulator_add_idx + 4);
                     changes += 4;
                 }
 
@@ -33102,8 +33149,7 @@ fn transform_map_vector(
             };
             changes += quotient_insts.len();
             func.blocks[preheader_idx]
-                .instructions
-                .extend(quotient_insts);
+                .extend_insts(quotient_insts, crate::common::source::Span::dummy());
             quotient
         }
     };
@@ -33150,7 +33196,7 @@ fn transform_map_vector(
         .iter()
         .position(|inst| !matches!(inst, Instruction::Phi { .. }))
         .unwrap_or(func.blocks[pattern.header_idx].instructions.len());
-    func.blocks[pattern.header_idx].instructions.insert(
+    func.blocks[pattern.header_idx].insert_inst(
         phi_pos,
         Instruction::Phi {
             dest: byte_iv,
@@ -33160,16 +33206,18 @@ fn transform_map_vector(
                 (Operand::Value(byte_iv_next), latch_label),
             ],
         },
+        crate::common::source::Span::dummy(),
     );
-    func.blocks[pattern.latch_idx]
-        .instructions
-        .push(Instruction::BinOp {
+    func.blocks[pattern.latch_idx].push_inst(
+        Instruction::BinOp {
             dest: byte_iv_next,
             op: IrBinOp::Add,
             lhs: Operand::Value(byte_iv),
             rhs: Operand::Const(IrConst::I64((elem_size as u64 * packed_width) as i64)),
             ty: IrType::I64,
-        });
+        },
+        crate::common::source::Span::dummy(),
+    );
     changes += 2;
 
     // ---- OP-06: fuse the two induction variables ------------------------
@@ -33258,29 +33306,31 @@ fn transform_map_vector(
                 let widened = if matches!(pattern.iv_ty, IrType::I32 | IrType::U32 | IrType::U64) {
                     let w = Value(next_val_id);
                     next_val_id += 1;
-                    func.blocks[preheader_idx]
-                        .instructions
-                        .push(Instruction::Cast {
+                    func.blocks[preheader_idx].push_inst(
+                        Instruction::Cast {
                             dest: w,
                             src: Operand::Value(*t),
                             from_ty: pattern.iv_ty,
                             to_ty: IrType::I64,
-                        });
+                        },
+                        crate::common::source::Span::dummy(),
+                    );
                     w
                 } else {
                     *t
                 };
                 let scaled = Value(next_val_id);
                 next_val_id += 1;
-                func.blocks[preheader_idx]
-                    .instructions
-                    .push(Instruction::BinOp {
+                func.blocks[preheader_idx].push_inst(
+                    Instruction::BinOp {
                         dest: scaled,
                         op: IrBinOp::Mul,
                         lhs: Operand::Value(widened),
                         rhs: Operand::Const(IrConst::I64(stride_bytes)),
                         ty: IrType::I64,
-                    });
+                    },
+                    crate::common::source::Span::dummy(),
+                );
                 Some(Operand::Value(scaled))
             }
         };
@@ -33353,8 +33403,7 @@ fn transform_map_vector(
     // index; no earlier edit removes/reorders the store, so account for that
     // one known insertion instead of performing a fallible post-mutation search.
     func.blocks[preheader_idx]
-        .instructions
-        .extend(map_preheader_insts);
+        .extend_insts(map_preheader_insts, crate::common::source::Span::dummy());
     let store_pos = if pattern.body_idx == pattern.header_idx && phi_pos <= preflighted_store_pos {
         preflighted_store_pos + 1
     } else {
@@ -33366,8 +33415,7 @@ fn transform_map_vector(
         Some(Instruction::Store { ptr, .. }) if *ptr == pattern.dst_gep
     ));
     let inserted = map_vec_insts.len();
-    body.instructions
-        .splice(store_pos..store_pos + 1, map_vec_insts);
+    body.splice_inst(store_pos, map_vec_insts);
     changes += inserted;
 
     // Snapshot the labels of every block OUTSIDE the loop before the
@@ -33495,9 +33543,7 @@ fn transform_map_vector(
                 }
                 replacement.push(resume);
                 let n_new = replacement.len();
-                func.blocks[vec_exit_idx]
-                    .instructions
-                    .splice(pos..pos + 1, replacement);
+                func.blocks[vec_exit_idx].splice_inst(pos, replacement);
                 changes += n_new;
             }
         }
@@ -33519,14 +33565,15 @@ fn transform_map_vector(
             let trip = constant_trip.expect("remainder_dead implies a constant trip count");
             let trip_val = Value(next_val_id);
             next_val_id += 1;
-            func.blocks[preheader_idx]
-                .instructions
-                .push(Instruction::Cast {
+            func.blocks[preheader_idx].push_inst(
+                Instruction::Cast {
                     dest: trip_val,
                     src: Operand::Const(IrConst::I64(trip)),
                     from_ty: IrType::I64,
                     to_ty: pattern.iv_ty,
-                });
+                },
+                crate::common::source::Span::dummy(),
+            );
             changes += 1;
             changes += rewire_escaping_iv_uses(
                 func,
@@ -33583,7 +33630,8 @@ fn transform_map_vector(
             })
             .collect();
         if !guard_prefix.is_empty() {
-            func.blocks[preheader_idx].instructions.extend(guard_prefix);
+            func.blocks[preheader_idx]
+                .extend_insts(guard_prefix, crate::common::source::Span::dummy());
         }
         let zero = match pattern.iv_ty {
             IrType::I32 | IrType::U32 => IrConst::I32(0),
@@ -33829,7 +33877,7 @@ fn emit_alias_guards(
             l
         };
         let cur = &mut func.blocks[cur_idx];
-        cur.instructions.append(&mut pending);
+        cur.extend_insts(pending.drain(..), crate::common::source::Span::dummy());
         cur.terminator = Terminator::CondBranch {
             cond: Operand::Value(unsafe_overlap),
             true_label: rem_header_label,
@@ -34678,12 +34726,15 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
     let scalar = Value(func.next_value_id);
     func.next_value_id += 1;
     let block = &mut func.blocks[0];
-    block.instructions.push(Instruction::Intrinsic {
-        dest: Some(scalar),
-        op,
-        dest_ptr: None,
-        args: vec![Operand::Value(a_base), Operand::Value(b_base)],
-    });
+    block.push_inst(
+        Instruction::Intrinsic {
+            dest: Some(scalar),
+            op,
+            dest_ptr: None,
+            args: vec![Operand::Value(a_base), Operand::Value(b_base)],
+        },
+        crate::common::source::Span::dummy(),
+    );
     block.terminator = Terminator::Return(Some(Operand::Value(scalar)));
     1
 }
@@ -34749,14 +34800,17 @@ pub(crate) fn vectorize_function_with_symbol_facts(
 struct CompanionPointerIvBackup {
     header_idx: usize,
     header_insts: Vec<Instruction>,
+    header_spans: Vec<crate::common::source::Span>,
     body_entry_idx: usize,
     body_entry_insts: Vec<Instruction>,
+    body_entry_spans: Vec<crate::common::source::Span>,
     next_value_id: u32,
 }
 
 fn restore_companion_pointer_ivs(func: &mut IrFunction, backup: CompanionPointerIvBackup) {
-    func.blocks[backup.header_idx].instructions = backup.header_insts;
-    func.blocks[backup.body_entry_idx].instructions = backup.body_entry_insts;
+    func.blocks[backup.header_idx].replace_insts(backup.header_insts, backup.header_spans);
+    func.blocks[backup.body_entry_idx]
+        .replace_insts(backup.body_entry_insts, backup.body_entry_spans);
     func.next_value_id = backup.next_value_id;
 }
 
@@ -35030,12 +35084,14 @@ fn try_canonicalize_companion_pointer_ivs(
     let backup = CompanionPointerIvBackup {
         header_idx,
         header_insts: func.blocks[header_idx].instructions.clone(),
+        header_spans: func.blocks[header_idx].source_spans.clone(),
         body_entry_idx,
         body_entry_insts: func.blocks[body_entry_idx].instructions.clone(),
+        body_entry_spans: func.blocks[body_entry_idx].source_spans.clone(),
         next_value_id: func.next_value_id,
     };
 
-    func.blocks[header_idx].instructions.retain(
+    func.blocks[header_idx].retain_insts(
         |inst| !matches!(inst, Instruction::Phi { dest, .. } if companion_phi_set.contains(dest)),
     );
 
@@ -35084,9 +35140,11 @@ fn try_canonicalize_companion_pointer_ivs(
         .iter()
         .take_while(|i| matches!(i, Instruction::Phi { .. }))
         .count();
-    func.blocks[body_entry_idx]
-        .instructions
-        .splice(insert_pos..insert_pos, injected);
+    func.blocks[body_entry_idx].insert_insts(
+        insert_pos,
+        injected,
+        crate::common::source::Span::dummy(),
+    );
     func.next_value_id = next_val;
 
     Some(backup)

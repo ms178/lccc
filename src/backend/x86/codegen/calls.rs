@@ -508,12 +508,25 @@ impl X86Codegen {
                     match &args[si] {
                         Operand::Value(v) => {
                             if let Some(slot) = self.state.get_slot(v.0) {
-                                let sr1 = self.slot_ref(slot.0 + 8);
-                                let sr0 = self.slot_ref(slot.0);
-                                self.state.emit_fmt(format_args!("    movq {}, %r11", sr1));
-                                self.state.emit_fmt(format_args!("    movq {}, %rax", sr0));
-                                self.state.emit("    pushq %r11");
-                                self.state.emit("    pushq %rax");
+                                // Push both halves straight from the slot.  No
+                                // scratch register may be used here: register
+                                // arguments are staged AFTER the stack
+                                // arguments, and the allocator may keep one of
+                                // them in %r11 -- `c(.., p0 ^ 3, .., i128)`
+                                // with every GP slot taken pushed the high
+                                // limb through %r11 and passed it as `p0 ^ 3`
+                                // (call-arg staging gate, five seeds of forty).
+                                // Under %rsp addressing the first push moves
+                                // the slot 8 bytes further away.
+                                self.state.out.emit_instr_rbp("    pushq", slot.0 + 8);
+                                let rsp_rel = self.state.out.use_rsp_addressing;
+                                if rsp_rel {
+                                    self.state.out.rsp_frame_size += 8;
+                                }
+                                self.state.out.emit_instr_rbp("    pushq", slot.0);
+                                if rsp_rel {
+                                    self.state.out.rsp_frame_size -= 8;
+                                }
                             } else {
                                 self.state.emit("    pushq $0");
                                 self.state.emit("    pushq $0");
@@ -521,12 +534,23 @@ impl X86Codegen {
                         }
                         Operand::Const(c) => {
                             if let IrConst::I128(v) = c {
-                                let low = *v as u64;
-                                let high = (*v >> 64) as u64;
-                                self.state
-                                    .emit_fmt(format_args!("    pushq ${}", high as i64));
-                                self.state
-                                    .emit_fmt(format_args!("    pushq ${}", low as i64));
+                                // High limb first.  `pushq $imm` takes a
+                                // sign-extended imm32 only; a wider limb goes
+                                // through %rax, the stack-argument scratch the
+                                // scalar path uses too (never allocated).
+                                for limb in [(*v >> 64) as i64, *v as i64] {
+                                    if i32::try_from(limb).is_ok() {
+                                        self.state.emit_fmt(format_args!("    pushq ${limb}"));
+                                    } else {
+                                        self.state.out.emit_instr_imm_reg(
+                                            "    movabsq",
+                                            limb,
+                                            "rax",
+                                        );
+                                        self.state.emit("    pushq %rax");
+                                    }
+                                }
+                                self.state.reg_cache.invalidate_all();
                             } else {
                                 // Smaller constant or zero
                                 if let Operand::Value(_) = &args[si] {} // can't happen
@@ -1661,6 +1685,15 @@ impl X86Codegen {
         };
         // A sibcall cleans at its `jmp` (returns.rs), not here.
         if preserve_upper_vector_lanes.is_none() {
+            // The frame planner dropped the call-alignment pad only after
+            // predicting that every call of this function converts; a real
+            // `call` here would run with %rsp misaligned. Fail closed.
+            assert!(
+                self.func_has_non_tail_calls || !self.func_has_calls,
+                "x86-64 frame planned without a call-alignment pad, but a call site of `{}` \
+                 did not become a sibling call",
+                self.state.current_func_name
+            );
             self.emit_vzeroupper_before_call();
         }
         if let Some(preserve_upper_vector_lanes) = preserve_upper_vector_lanes {
@@ -1817,7 +1850,7 @@ impl X86Codegen {
         // subsequent emission), and absent marker ⇒ non-variadic ⇒ %rax
         // unread.
         if self.state.call_is_variadic {
-            self.state.emit("    # LCCC_VA_CALL");
+            self.emit_call_marker("    # LCCC_VA_CALL".to_string());
         }
         // Call-argument count marker (the same authority contract as the
         // VA marker above): the GP liveness oracle reads this to model
@@ -1826,7 +1859,7 @@ impl X86Codegen {
         // call. 6 (or an absent marker — hand-written fragments, raw `call`
         // emissions like the i128 helpers) keeps the old conservative read
         // set: fail-closed.
-        self.state.emit_fmt(format_args!(
+        self.emit_call_marker(format!(
             "    # LCCC_CALL_ARGS {}",
             self.state.call_gp_arg_count.min(6)
         ));
@@ -1844,7 +1877,7 @@ impl X86Codegen {
         // [call][VA?][CALL_ARGS][CHAIN?] with CHAIN at n+1/n+2. The
         // LCCC_CALL_FP marker below is therefore emitted LAST.
         if self.state.chain_call {
-            self.state.emit("    # LCCC_CHAIN_CALL");
+            self.emit_call_marker("    # LCCC_CHAIN_CALL".to_string());
             self.state.chain_call = false;
         }
         // FP-argument count marker (the same authority contract as
@@ -1859,8 +1892,7 @@ impl X86Codegen {
         // every earlier marker's consumer scans a tight window measured
         // from the call text, and this one's parser skips sibling markers.
         if let Some(fp) = self.state.call_fp_arg_count {
-            self.state
-                .emit_fmt(format_args!("    # LCCC_CALL_FP {}", fp.min(8)));
+            self.emit_call_marker(format!("    # LCCC_CALL_FP {}", fp.min(8)));
         }
         // IPA-RA keep set (`ipa_ra`): the kept registers holding a value live
         // across THIS call (nonzero only when every call point of the
@@ -1870,12 +1902,25 @@ impl X86Codegen {
         // lines, inside its window).
         let keep = self.ipa_keep_at(self.state.current_program_point);
         if keep != 0 {
-            self.state
-                .emit_fmt(format_args!("    # LCCC_IPA_KEEP {:#06x}", keep));
+            self.emit_call_marker(format!("    # LCCC_IPA_KEEP {:#06x}", keep));
         }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
+    }
+
+    /// Publish one call-site marker line. At a sibling call (the call text
+    /// suppressed, `pending_sibcall` `Ready`) the line is also kept for
+    /// `emit_return_impl`, which repeats the marker block after the tail
+    /// `jmp` (see `BackendState::sibcall_marker_lines`).
+    fn emit_call_marker(&mut self, line: String) {
+        if matches!(
+            self.state.pending_sibcall,
+            Some(SibcallPending::Ready { .. })
+        ) {
+            self.state.sibcall_marker_lines.push(line.clone());
+        }
+        self.state.emit(&line);
     }
 
     pub(super) fn emit_call_cleanup_impl(
@@ -2069,6 +2114,20 @@ impl X86Codegen {
         if self.state.pending_sibcall.is_some() {
             return;
         }
+        if let Some(preserve_upper_vector_lanes) = self.sibcall_abi_admits(info) {
+            self.state.pending_sibcall = Some(SibcallPending::Armed {
+                preserve_upper_vector_lanes,
+            });
+        }
+    }
+
+    /// The sibling-call ABI refusals of a call site, as a pure predicate:
+    /// `Some(preserve_upper_vector_lanes)` when the site may become
+    /// `<epilogue>; jmp target`. The arming above and the frame planner's
+    /// prediction (`calculate_stack_space_impl`, which drops the 8-byte
+    /// call-alignment pad of a function whose every call converts) share it,
+    /// so the two can never disagree.
+    pub(super) fn sibcall_abi_admits(&self, info: &CallInfo) -> Option<bool> {
         // i686: cdecl stages every argument through the outgoing stack area
         // (see the `%esp`-relative staging in the probe for PR #255), so the
         // zero-stack-argument premise of §5b never holds there. Refused
@@ -2076,17 +2135,17 @@ impl X86Codegen {
         // (which classifies through the x86-64 SysV config) must not be
         // allowed to green-light a 32-bit target.
         if crate::common::types::target_is_32bit() {
-            return;
+            return None;
         }
         // The remaining ABI refusals from the §5b design: variadic callees
         // read `%al`, sret/fastcall take unaudited argument paths, and the
         // kernel return-thunk build replaces `ret` with a thunk the
         // conversion would bypass.
         if info.is_variadic || info.is_sret || info.is_fastcall || info.regparm.is_some() {
-            return;
+            return None;
         }
         if self.state.function_return_thunk {
-            return;
+            return None;
         }
         // Zero-stack-argument guard: classify exactly as the emission will
         // (same `CallAbiConfig`, same arrays) and refuse unless every
@@ -2110,18 +2169,15 @@ impl X86Codegen {
             .iter()
             .any(crate::backend::call_abi::CallArgClass::is_stack)
         {
-            return;
+            return None;
         }
-        let preserve_upper_vector_lanes = classes.iter().any(|class| {
+        Some(classes.iter().any(|class| {
             matches!(
                 class,
                 crate::backend::call_abi::CallArgClass::StructXmmReg { size, .. }
                     if *size > 16
             )
-        });
-        self.state.pending_sibcall = Some(SibcallPending::Armed {
-            preserve_upper_vector_lanes,
-        });
+        }))
     }
 
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {

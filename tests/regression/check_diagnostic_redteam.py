@@ -57,6 +57,10 @@ CASES = [
     ('top_space_array_argument', 'void g(__seg_gs int*);void f(void){int a[1];g(a);}', True, None),
     ('top_space_array_assignment', 'void f(void){int a[1];__seg_gs int*p;p=a;}', True, None),
     ('top_space_array_return', '__seg_gs int*f(void){int a[1];return a;}', True, None),
+    # GCC's c_finish_return: the conversion's diagnostic precedes the
+    # -Wreturn-local-addr walk, which a rejected conversion never reaches.
+    ('local_addr_after_incompatible_return', 'char*f(void){int a;return &a;}', False, 'incompatible-pointer-types'),
+    ('local_addr_after_int_conversion_return', 'int*f(void){int a;return (long)&a;}', False, 'int-conversion'),
     ('top_space_deref_array_init', 'long __seg_gs g[3][4];void f(void){long __seg_gs(*p)[4]=g;long*q=*p;(void)q;}', True, None),
     ('same_space_deref_array_init', 'long __seg_gs g[3][4];void f(void){long __seg_gs(*p)[4]=g;long __seg_gs*q=*p;(void)q;}', False, None),
     ('nested_space_init', 'void f(int**q){__seg_gs int**p=q;(void)p;}', False, 'incompatible-pointer-types'),

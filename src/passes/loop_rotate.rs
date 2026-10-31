@@ -780,9 +780,7 @@ fn try_rotate_loop(
     // Insert the new phis at the TOP of body_latch (phis must precede all
     // other instructions in a block).
     let latch_block = &mut func.blocks[latch_idx];
-    let mut new_body_insts: Vec<Instruction> = new_phi_insts;
-    new_body_insts.extend(latch_block.instructions.drain(..));
-    latch_block.instructions = new_body_insts;
+    latch_block.insert_insts(0, new_phi_insts, crate::common::source::Span::dummy());
 
     // v17 fix: rewrite the new self-loop phis' latch incomings to
     // reference the NEW self-loop phis (when the latch_op referenced a
@@ -893,7 +891,7 @@ fn try_rotate_loop(
             // content. The undo is safe here because Guard A is NOT
             // inside any `func.blocks.iter()` loop (no borrow conflict).
             let latch_block = &mut func.blocks[latch_idx];
-            latch_block.instructions.drain(..n_new_phis);
+            latch_block.remove_insts(0..n_new_phis);
             let latch_block = &mut func.blocks[latch_idx];
             for inst in latch_block.instructions.iter_mut() {
                 for (&old_phi, &new_phi) in &new_loop_phis {
@@ -1000,7 +998,7 @@ fn try_rotate_loop(
                 // `bi` is preserved for the debug eprintln above; we keep
                 // it in scope via the `if let Some(bi)` pattern.
                 let latch_block = &mut func.blocks[latch_idx];
-                latch_block.instructions.drain(..n_new_phis);
+                latch_block.remove_insts(0..n_new_phis);
                 let latch_block = &mut func.blocks[latch_idx];
                 for inst in latch_block.instructions.iter_mut() {
                     for (&old_phi, &new_phi) in &new_loop_phis {
@@ -1054,9 +1052,7 @@ fn try_rotate_loop(
         }
         if !exit_phi_insts.is_empty() {
             let exit_block = &mut func.blocks[exit_idx];
-            let mut new_exit_insts: Vec<Instruction> = exit_phi_insts;
-            new_exit_insts.extend(exit_block.instructions.drain(..));
-            exit_block.instructions = new_exit_insts;
+            exit_block.insert_insts(0, exit_phi_insts, crate::common::source::Span::dummy());
             // Rewrite external uses of the header phis to the merge phis.
             // We must skip the new merge phis themselves (they're at the top
             // of the exit block and reference v_pre / s_loop, NOT the header
@@ -1168,7 +1164,7 @@ fn try_rotate_loop(
     //    terminator, which we replace below). The latch's own instructions
     //    (e.g., the IV increment `i_next = i + 1`) must run BEFORE the test.
     let latch_block = &mut func.blocks[latch_idx];
-    latch_block.instructions.extend(cloned_insts);
+    latch_block.extend_insts(cloned_insts, crate::common::source::Span::dummy());
 
     // 9. Preserve the header's branch polarity. Classifying the targets as
     //    continue/exit does not negate the cloned condition: an exit-on-true
