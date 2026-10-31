@@ -725,7 +725,7 @@
     "codegen-a": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 404.51,
+      "predicted_gate_seconds": 404.9,
       "shards": 2,
       "steps": [
         {
@@ -851,6 +851,14 @@
         {
           "measured_s": 1.6,
           "name": "Pointer IV collapse and zero-guard count instruction selection"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "One-level self-recursion clone shape"
+        },
+        {
+          "measured_s": 0.06,
+          "name": "Compile-time fold refuses an unfinishable constant recursion"
         }
       ]
     },

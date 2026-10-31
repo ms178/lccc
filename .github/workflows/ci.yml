@@ -1339,6 +1339,10 @@ jobs:
       run: bash tests/regression/check_i386_call_staging_asm.sh
     - name: Pointer IV collapse and zero-guard count instruction selection
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ptr_iv_collapse_codegen.sh
+    - name: One-level self-recursion clone shape
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_self_recursion_clone.sh
+    - name: Compile-time fold refuses an unfinishable constant recursion
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ipcp_eval_depth.sh
     - name: Enum layout semantics (widening, packed, struct inheritance, static asserts)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_layout_semantics.sh
     - name: One-lane FP vector ABI (AUD-VABI-4)

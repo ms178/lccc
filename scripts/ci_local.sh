@@ -1288,6 +1288,19 @@ gate "i386-call-staging-asm" fast \
 gate "ptr-iv-collapse-codegen" fast \
     env CCC="$LCCC" bash tests/regression/check_ptr_iv_collapse_codegen.sh
 
+# GCC expands a directly self-recursive callee one level; the clone removes a
+# call/return, a prologue and an epilogue per level and halves the frame depth
+# of a full tree walk.  The gate is two-sided (the kill-switch build must show
+# the old call counts, and tail calls / oversized bodies must be untouched).
+gate "self-recursion-clone" fast \
+    env CCC="$LCCC" bash tests/regression/check_self_recursion_clone.sh
+
+# The compile-time constant evaluator is depth-bounded: a constant recursion
+# deeper than the bound must stay a call instead of recursing until the
+# compiler's own 64 MiB stack is gone (which aborted the whole compile).
+gate "ipcp-eval-depth" fast \
+    env CCC="$LCCC" bash tests/regression/check_ipcp_eval_depth.sh
+
 gate "loop-invert-census" fast \
     python3 scripts/loop_invert_census.py --lccc "$LCCC" --quiet
 
