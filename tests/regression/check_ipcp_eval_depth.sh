@@ -11,13 +11,23 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
 src="$repo/tests/regression/ipcp_eval_depth.c"
 
-if ! "$CCC" -O2 -S "$src" -o "$tmp/depth.s" 2>"$tmp/asm.err"; then
-  printf 'FAIL: assembly compilation failed: %s\n' "$(tail -3 "$tmp/asm.err")" >&2
+fail() {
+  local message=$1
+  printf 'FAIL: %s\n' "$message" >&2
+  # Publish the actionable failure in the GitHub check annotation as well as
+  # the step log, so red-team failures remain diagnosable from the check API.
+  message=${message//'%'/'%25'}
+  message=${message//$'\r'/'%0D'}
+  message=${message//$'\n'/'%0A'}
+  printf '::error title=IPCP evaluation-depth regression::%s\n' "$message"
   exit 1
+}
+
+if ! "$CCC" -O2 -S "$src" -o "$tmp/depth.s" 2>"$tmp/asm.err"; then
+  fail "assembly compilation failed: $(tail -3 "$tmp/asm.err")"
 fi
 if ! "$CCC" -O2 -o "$tmp/depth" "$src" 2>"$tmp/link.err"; then
-  printf 'FAIL: executable compilation failed: %s\n' "$(tail -3 "$tmp/link.err")" >&2
-  exit 1
+  fail "executable compilation failed: $(tail -3 "$tmp/link.err")"
 fi
 
 # Restrict inspection to main so the recursive call in chain itself is not
@@ -26,14 +36,12 @@ awk '/^main:/{in_main=1} in_main {print} /^\.size[[:space:]]+main,/{in_main=0}' 
   "$tmp/depth.s" > "$tmp/main.s"
 calls=$(grep -Ec '^[[:space:]]*callq?[[:space:]]+chain(@PLT)?([[:space:]]|$)' "$tmp/main.s" || true)
 if [ "$calls" -ne 1 ]; then
-  printf 'FAIL: expected exactly one runtime call to chain in main (the deep call); found %s\n' "$calls" >&2
   cat "$tmp/main.s" >&2
-  exit 1
+  fail "expected exactly one runtime call to chain in main (the deep call); found $calls"
 fi
 
 out=$("$tmp/depth")
 if [ "$out" != "16996" ]; then
-  printf 'FAIL: shallow constant recursion produced %s; expected 16996\n' "$out" >&2
-  exit 1
+  fail "shallow constant recursion produced $out; expected 16996"
 fi
 printf '%s\n' 'ipcp eval depth: shallow call folded; deep constant recursion safely remains a runtime call'
