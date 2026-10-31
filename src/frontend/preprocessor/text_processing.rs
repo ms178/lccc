@@ -179,6 +179,31 @@ impl SpliceState {
     }
 }
 
+/// Whether a block comment is still open at the end of `bytes`, entering in
+/// `state`.
+///
+/// This is the only lexical fact that crosses a newline: a literal cannot
+/// legally span one (an unterminated one is diagnosed later, and the joiner
+/// must not guess past it), and a `//` comment ends at it. [`join_continued_lines`]
+/// therefore carries this one answer and nothing else.
+///
+/// The full scan is needed only when the state enters inside a comment (to
+/// find out whether `*/` closes it) or when the bytes contain a `/` — the only
+/// way a new `/*` can start. Otherwise the end state cannot become
+/// `BlockComment`, so the scan — a pass over every physical line of the
+/// translation unit — is skipped. The spelling of that gate matters: std
+/// dispatches `[u8]::contains` to `core::slice::memchr` above 16 bytes (checked
+/// in the emitted assembly, where the iterator form stays a scalar byte loop).
+/// `SpliceState` can be entered in every state because a spliced line's last
+/// part inherits the state of the parts before it.
+///
+/// [`join_continued_lines`]: Preprocessor::join_continued_lines
+#[inline]
+fn comment_open_at_eol(state: SpliceState, bytes: &[u8]) -> bool {
+    (state == SpliceState::BlockComment || bytes.contains(&b'/'))
+        && state.scan(bytes) == SpliceState::BlockComment
+}
+
 /// First byte of `line` that is not a space or tab.
 fn first_non_blank(line: &[u8]) -> Option<u8> {
     line.iter().copied().find(|&b| b != b' ' && b != b'\t')
@@ -189,6 +214,77 @@ fn first_non_blank(line: &[u8]) -> Option<u8> {
 fn starts_directive(line: &[u8]) -> bool {
     let offset = line.iter().position(|&b| b != b' ' && b != b'\t');
     offset.is_some_and(|i| hash_token_len(&line[i..]) != 0)
+}
+
+/// Index just past the `*/` that closes a block comment whose body starts at
+/// `from`, or `None` when the comment is still open at the end of `line`.
+///
+/// `from` is the byte after a `/*`, or 0 for a line that enters inside a
+/// comment opened on an earlier physical line. The first `*/` wins: C
+/// comments do not nest. A `from` at or past the end of the line (a `/*` as
+/// the last two bytes) has no terminator.
+#[inline]
+fn block_comment_end(line: &[u8], from: usize) -> Option<usize> {
+    line.get(from..)?
+        .windows(2)
+        .position(|w| w == b"*/")
+        .map(|close| from + close + 2)
+}
+
+/// Whether the first *token* of `line` is a directive introducer, skipping
+/// horizontal white space AND block comments — including the tail of one that
+/// began on an earlier line.
+///
+/// This is the phase-4 question ("does this line begin a directive?"), which
+/// [`starts_directive`] cannot answer: that one reads raw text, before comment
+/// replacement. `/* x */ #define A 1 /*` opens a comment that bridges the next
+/// line AND is a directive; `*/ #define A 1` is one too when the comment it
+/// closes began on the previous line, which is what `starts_in_block_comment`
+/// says. Both spellings occur in real code: the first as
+/// `#define` after a file-header comment, the second as a `#define` that ends
+/// its last continuation after `*/` (fs/nfs/callback_xdr.c).
+///
+/// `starts_in_block_comment` is the lexical state at the line's first byte. A
+/// line that starts inside a comment has no tokens until the comment closes,
+/// and one whose comment never closes on this line has none at all; both
+/// `false` answers are the phase-4 truth (what follows is comment text, not a
+/// token) and both keep the joiner's directive-context carry honest, because
+/// answering `true` there would refuse a split the source is entitled to.
+///
+/// The answer is deliberately conservative in one direction. When the comment
+/// was opened after *code* on an earlier physical line (`int y; /* c` then
+/// `*/ #define A 1`), phase 4 merges the two lines through the comment, so the
+/// `#` is not the logical line's first token and that line is NOT a directive —
+/// while this function answers `true`. That costs nothing and risks nothing
+/// here, for two reasons. The only consumer of `true` is `splittable`, and a
+/// `false` there merely refuses to elide a physical break; elision is an
+/// optimization over the phase-3 text, so declining it always yields the
+/// faithful splice. And the directive reader does its own comment skipping on
+/// the joined text, so it still sees the `#` as mid-line and leaves it inert
+/// (both directions are pinned against GCC by the `comment_prefix_*` fixtures
+/// in `tests/regression/check_pp_directive_comment_bridge.sh`). Deciding it
+/// exactly would mean carrying "is the logical line blank so far?" across
+/// joins, which buys no behaviour.
+fn first_token_is_directive(line: &[u8], starts_in_block_comment: bool) -> bool {
+    let mut i = 0;
+    if starts_in_block_comment {
+        match block_comment_end(line, 0) {
+            Some(after) => i = after,
+            None => return false, // the whole line is comment text
+        }
+    }
+    loop {
+        match line.get(i) {
+            None => return false,
+            Some(b' ' | b'\t') => i += 1,
+            Some(b'/') if line.get(i + 1) == Some(&b'*') => match block_comment_end(line, i + 2) {
+                Some(after) => i = after,
+                None => return false, // comment still open at end of line
+            },
+            Some(b'/') if line.get(i + 1) == Some(&b'/') => return false,
+            Some(_) => return hash_token_len(&line[i..]) != 0,
+        }
+    }
 }
 
 /// Find a directive introducer at or after `from`, skipping horizontal space
@@ -537,6 +633,28 @@ impl Preprocessor {
         let mut splice_state = SpliceState::Code;
         // Whether the open joined line may be split at all (not a directive).
         let mut splittable = false;
+        // Carried across joined-line boundaries: a block comment open over the
+        // real newline that ended the previous joined line, and whether that
+        // joined line was in directive context. C11 5.1.1.2 runs phase 3
+        // (comment replacement, embedded newlines included) before phase 4
+        // reads the directive, so a comment opened on a directive line and
+        // still open at its end bridges the NEXT physical line into the same
+        // directive. Two things then follow, and forgetting either one
+        // miscompiles real code (fs/nfs/callback_xdr.c:
+        // `CB_OP_GETATTR_RES_MAXSZ` ends its last continuation after `*/`):
+        //   * the bridged line is directive context: keeping a physical break
+        //     instead of splicing would insert the newline that terminates the
+        //     `#define`, truncating the macro body; the keep-break elision
+        //     must not fire there (a newline on an ordinary line is white
+        //     space, inside a directive it is a terminator);
+        //   * its lexical state starts INSIDE the comment: rescanning comment
+        //     text from `Code` would read the quotes of `deleg_mtime`'s
+        //     neighbours and any `//` as literal or line-comment delimiters.
+        let mut carry_block = false;
+        let mut carry_dir = false;
+        // Whether the open joined line is in directive context (its own
+        // introducer, or inherited across a bridged comment).
+        let mut join_dir = false;
         let mut lines = source.lines().peekable();
         // Keeping the physical break (the elision above) is sound only when the
         // consumer is a C tokenizer, for which a newline is just white space.
@@ -560,9 +678,24 @@ impl Preprocessor {
             let bs_pos = Self::find_continuation_backslash(line);
             if let Some(pos) = bs_pos {
                 if !continuation {
-                    splice_state = SpliceState::Code;
-                    splittable = first_non_blank(line.as_bytes()) != Some(b'/')
-                        && !starts_directive(line.as_bytes());
+                    // New joined line: inherit an open block comment (and the
+                    // directive context it bridges) from the previous close.
+                    splice_state = if carry_block {
+                        SpliceState::BlockComment
+                    } else {
+                        SpliceState::Code
+                    };
+                    // Directive context is asked FIRST and is the authority on
+                    // splitting: this phase-4 line may begin *inside* a comment
+                    // opened on the previous physical line, so the predicate
+                    // gets that state instead of being asked about raw text.
+                    // `starts_directive` is subsumed — the predicate answers the
+                    // same question with comments skipped — and the leading-`/`
+                    // test stays because a line that opens a comment it never
+                    // closes is not a directive and must not be split either.
+                    join_dir = (carry_block && carry_dir)
+                        || first_token_is_directive(line.as_bytes(), carry_block);
+                    splittable = !join_dir && first_non_blank(line.as_bytes()) != Some(b'/');
                 }
                 splice_state = splice_state.scan(&line.as_bytes()[..pos]);
                 let next = lines.peek().map_or(&b""[..], |l| l.as_bytes());
@@ -576,11 +709,15 @@ impl Preprocessor {
                     && !starts_directive(next)
                 {
                     // Keep the line break: this part ends its joined line.
-                    // A block comment stays open across it (`splice_state`
-                    // is reset at the next joined line's start, which is
-                    // safe: see `SpliceState`). An earlier join on this
+                    // A block comment may stay open across it; the next
+                    // joined line inherits both the comment state and — only
+                    // when this joined line was a directive — its directive
+                    // context (the carry recorded below), so a break inside a
+                    // directive can never be kept. An earlier join on this
                     // joined line already set `any_spliced`; a split alone
                     // keeps the identity map.
+                    carry_block = matches!(splice_state, SpliceState::BlockComment);
+                    carry_dir = join_dir;
                     if continuation {
                         segs.push((result.len(), phys));
                         map.push(LineSegments::Mapped(segs.clone().into()));
@@ -603,6 +740,16 @@ impl Preprocessor {
                     result.push_str(&line[..pos]);
                     // Still continuing.
                 } else {
+                    // Closes the joined line at a real newline: the closing
+                    // line's content decides what carries (an open comment
+                    // continues through the newline). Only the comment state
+                    // can cross, so the full end state is not computed.
+                    carry_block = comment_open_at_eol(splice_state, line.as_bytes());
+                    splice_state = if carry_block {
+                        SpliceState::BlockComment
+                    } else {
+                        SpliceState::Code
+                    };
                     any_spliced = true;
                     segs.push((result.len(), phys));
                     map.push(LineSegments::Mapped(segs.clone().into()));
@@ -610,6 +757,7 @@ impl Preprocessor {
                     result.push_str(line);
                     result.push('\n');
                     continuation = false;
+                    carry_dir = join_dir;
                 }
             } else if let Some(pos) = bs_pos {
                 // Opens a new spliced joined line. The first physical part
@@ -623,10 +771,29 @@ impl Preprocessor {
                 result.push_str(&line[..pos]);
                 continuation = true;
             } else {
-                // Standalone joined line: closes immediately.
+                // Standalone joined line: opens and closes its own joined
+                // line in one step. The bridge carry still applies: an
+                // inherited open comment (with its directive context) runs
+                // through this line, and the line's own end state carries to
+                // the next one, so `#define A 1 /*\n */ 2;`-shaped sources
+                // and any later splice see the true lexical state.
+                let entry = if carry_block {
+                    SpliceState::BlockComment
+                } else {
+                    SpliceState::Code
+                };
+                join_dir = (carry_block && carry_dir)
+                    || first_token_is_directive(line.as_bytes(), carry_block);
+                carry_block = comment_open_at_eol(entry, line.as_bytes());
+                splice_state = if carry_block {
+                    SpliceState::BlockComment
+                } else {
+                    SpliceState::Code
+                };
                 result.push_str(line);
                 result.push('\n');
                 map.push(LineSegments::Flat(phys));
+                carry_dir = join_dir;
             }
             phys += 1;
         }
@@ -740,6 +907,110 @@ mod tests {
             "line start: stripped 7, joined 7, line 1"
         );
         assert_eq!(points[1].2, 2, "after `*/`: line 2");
+    }
+
+    /// The phase-4 predicate, branch by branch: both entry states, the
+    /// comment-skipping forms that make it different from `starts_directive`,
+    /// and the near-misses that must answer `false` (comment text is not a
+    /// token, and `%:%:` is not the `%:` introducer).
+    #[test]
+    fn first_token_is_directive_is_conservative_inside_a_bridged_comment() {
+        // `true` here where phase 4 says `false` (the comment was opened after
+        // code) is the documented conservative direction: it can only refuse a
+        // break elision. Pin it so a future "tightening" cannot quietly turn
+        // the refusal into an elision without re-deriving the argument.
+        assert!(first_token_is_directive(b"*/ #define A 1", true));
+        assert!(first_token_is_directive(b"*/\t#define A 1", true));
+        assert!(first_token_is_directive(b"  /* c */ #define A 1", false));
+        // Whitespace-only prefix: a real directive in both directions.
+        assert!(first_token_is_directive(b"#define A 1", false));
+        assert!(first_token_is_directive(b"%:define A 1", false));
+        // Comment text and line comments are not directive introducers.
+        assert!(!first_token_is_directive(b"/* c \\", false));
+        assert!(!first_token_is_directive(b"*/ int x;", true));
+        assert!(!first_token_is_directive(b"// x #define A 1", false));
+        assert!(!first_token_is_directive(b"", true));
+        assert!(!first_token_is_directive(b"", false));
+    }
+
+    #[test]
+    fn first_token_is_directive_answers_the_phase_four_question() {
+        // (line, starts inside a block comment, does the first token introduce
+        // a directive?)
+        const CASES: &[(&str, bool, bool)] = &[
+            ("#define A 1", false, true),
+            ("   \t# define A 1", false, true),
+            ("%:define A 1", false, true),
+            ("%:%: define A 1", false, false),
+            ("/* x */ #define A 1", false, true),
+            ("/* x *//* y */#define A 1", false, true),
+            ("/* x */ int a;", false, false),
+            ("/* x", false, false),
+            ("/*", false, false),
+            ("// #define A 1", false, false),
+            ("int a; /* #define A 1 */", false, false),
+            ("", false, false),
+            ("*/ #define A 1", true, true),
+            ("   */#define A 1", true, true),
+            ("   */\t%:define A 1", true, true),
+            ("*/ int a;", true, false),
+            ("still comment", true, false),
+            ("*/", true, false),
+            ("", true, false),
+            ("/*", true, false),
+        ];
+        for &(line, starts_in_comment, want) in CASES {
+            assert_eq!(
+                first_token_is_directive(line.as_bytes(), starts_in_comment),
+                want,
+                "{line:?} (starts_in_block_comment={starts_in_comment})"
+            );
+        }
+    }
+
+    /// The end-of-line fast path must agree with a full scan on every short
+    /// input over an alphabet holding one byte of each class `scan`
+    /// distinguishes: both comment openers, both quote kinds, an escape, a
+    /// digit (so `\'` can also be a C23 digit separator) and CR, which a CRLF
+    /// line leaves behind. Exhaustive to length 4 from every entry state, so
+    /// the `contains(b'/')` short-circuit is proved equivalent, not argued.
+    #[test]
+    fn eol_comment_fast_path_matches_a_full_scan() {
+        const ALPHABET: &[u8] = b"/*\"'\\1a\r";
+        let states = [
+            SpliceState::Code,
+            SpliceState::Literal(b'"'),
+            SpliceState::Literal(b'\''),
+            SpliceState::LineComment,
+            SpliceState::BlockComment,
+        ];
+        fn walk(
+            prefix: &mut Vec<u8>,
+            depth: usize,
+            states: &[SpliceState; 5],
+            checked: &mut usize,
+        ) {
+            for &state in states {
+                assert_eq!(
+                    comment_open_at_eol(state, prefix),
+                    state.scan(prefix) == SpliceState::BlockComment,
+                    "{state:?} over {prefix:?}"
+                );
+                *checked += 1;
+            }
+            if depth == 0 {
+                return;
+            }
+            for &b in ALPHABET {
+                prefix.push(b);
+                walk(prefix, depth - 1, states, checked);
+                prefix.pop();
+            }
+        }
+        let mut checked = 0usize;
+        walk(&mut Vec::with_capacity(4), 4, &states, &mut checked);
+        // 8^0 + 8^1 + 8^2 + 8^3 + 8^4 strings, five entry states each.
+        assert_eq!(checked, (1 + 8 + 64 + 512 + 4096) * states.len());
     }
 
     #[test]

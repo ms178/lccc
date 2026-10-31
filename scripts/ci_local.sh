@@ -871,6 +871,19 @@ gate "attribute-diagnostics" fast \
 # target modes; an untaken zero division must not become -Werror.
 gate "div-zero-constant-arms" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_divzero_constant_arms.sh
+# The kernel passes -fno-delete-null-pointer-checks unconditionally: the flag
+# is an off-request (silently accepted in both modes), LCCC must never infer
+# non-nullness from dereference UB (nine-shape guard ratchet at -O2/-O3), and
+# the GCC differential proves the fixture still detects deletion.
+gate "nullptr-check-policy" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_nullptr_check_policy.sh
+gate "pp-directive-comment-bridge" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_pp_directive_comment_bridge.sh
+# The kernel harness refuses to build a kernel the package does not ship; these
+# are the readers that decide it (value spellings, prefix anchoring, drift
+# direction, empty configs), pinned without a kernel tree.
+gate "kconfig-query" fast \
+    bash tests/regression/check_kconfig_query.sh
 # A statement expression's value comes from the last item that can produce
 # one; the kernel's `sizeof(struct { _Static_assert(...); })` idiom depends on
 # it, and a used void statement expression must be diagnosed rather than

@@ -33,7 +33,7 @@
 //! | *contract* flags — `-fstack-protector*`, `-ftrapv`, `-fsanitize=` | **hard error** + remediation hint (upstream's original rule) |
 //! | data-model / ABI requests — `-fshort-enums`, `-fpack-struct[=n]` | **hard error**, because ignoring one silently returns objects whose layout disagrees with the libraries they link against. `-funsigned-char` and `-fshort-wchar` are *not* here: both are implemented (`char_is_unsigned()` / `set_short_wchar`), and `-fsigned-char` names the x86-64 SysV default LCCC already emits |
 //! | `-g<selector>` that GNU rejects (`-g4`, `-ggdb9`, `-gdwarf-9`, `-gz=bogus`, `-gno-bogus`, `-gbogus`) | **hard error** — the selector grammar is closed and was measured exhaustively, so a name outside it is a typo, not a newer GNU (GCC 14.2/16.2, Clang 23.1 and ICX all reject these) |
-//! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured) |
+//! | *off-requests* — `-Wno-<unknown>`, `-gno-<feature>`, `-fno-delete-null-pointer-checks` | **accepted silently**: the thing asked to be switched off does not exist here, so the requested state is already the state (all four reference compilers accept `-Wno-<unknown>`, measured; for the `-f` spelling, nine measured null-guard shapes keep their checks with and without the flag, pinned by `tests/regression/check_nullptr_check_policy.sh`) |
 //! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`, `-fverbose-asm`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
 //!
 //! The open option namespace cannot distinguish typos from newer GCC flags.
@@ -1379,6 +1379,21 @@ impl Driver {
     /// Returns `Ok(true)` if early exit was handled (query flags like -dumpmachine),
     /// `Ok(false)` if normal compilation should proceed, or `Err` for invalid args.
     pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {
+        self.parse_cli_args_with_strict(args, strict_options_enabled())
+    }
+
+    /// `parse_cli_args` with the accepted-but-unimplemented policy supplied by
+    /// the caller instead of read from the environment.
+    ///
+    /// The policy is one process-wide answer (`LCCC_STRICT_OPTIONS`), and a
+    /// build that saw two values on one command line would be worse than
+    /// either; taking it as a parameter keeps that rule while making the
+    /// driver's own contract testable without mutating process state.
+    pub(crate) fn parse_cli_args_with_strict(
+        &mut self,
+        args: &[String],
+        strict_options: bool,
+    ) -> Result<bool, String> {
         // Detect target from binary name (argv[0])
         let binary_name = std::path::Path::new(&args[0])
             .file_name()
@@ -1420,7 +1435,7 @@ impl Driver {
             return Ok(true);
         }
 
-        self.parse_main_args(&expanded_args)?;
+        self.parse_main_args(&expanded_args, strict_options)?;
 
         // i386 has a real SSE-only state: unlike x86-64's existing backend,
         // `-mno-sse2` need not disable its baseline SSE XMM argument/return
@@ -1979,16 +1994,15 @@ impl Driver {
     }
 
     /// Parse the main argument list (everything after argv[0]).
-    fn parse_main_args(&mut self, args: &[String]) -> Result<(), String> {
+    fn parse_main_args(&mut self, args: &[String], strict_options: bool) -> Result<(), String> {
         let mut explicit_language: Option<String> = None;
         // Distinct unrecognized spellings already diagnosed, so a flag passed
         // to every translation unit of a build reports once (see the
         // unknown-option arm). Also the `LCCC_STRICT_OPTIONS` escalation point.
-        // `LCCC_STRICT_OPTIONS` escalates every accepted-but-unimplemented
-        // spelling to an error.  Read once: the policy is per process, and a
-        // build that cannot see one value for the whole command line is worse
-        // than either answer.
-        let strict_options = std::env::var_os("LCCC_STRICT_OPTIONS").is_some();
+        // `strict_options` escalates every accepted-but-unimplemented spelling
+        // to an error. The policy is supplied by `parse_cli_args` (one read of
+        // `LCCC_STRICT_OPTIONS` per driver entry), so this function never sees
+        // two answers for one command line.
         // With the optional gcc_m16 delegate, GCC—not LCCC—owns target-affecting
         // options. Preserve its full TLS-model surface instead of rejecting an
         // option that will never reach LCCC codegen. Detect this from the whole
@@ -3185,6 +3199,42 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     self.wrap_signed_overflow = false;
                 }
                 "-fno-trapv" => self.trapv = false,
+                // `-fno-delete-null-pointer-checks` asks that a pointer never
+                // be treated as non-null merely because it was dereferenced
+                // (GCC's `-fdelete-null-pointer-checks` fold would turn a
+                // later `p == 0` into `false` along a path that loaded
+                // through `p`). This compiler has no such transform in any
+                // direction: the optimizer never derives null-check facts
+                // from dereference UB, so the request is already satisfied
+                // in the only direction that can change an answer — the same
+                // "strictly more conservative than the flag allows" argument
+                // that lets normal mode accept `-fstrict-overflow` silently.
+                //
+                // The claim is measured, not assumed (kernel builds pass
+                // this flag unconditionally; a silent "tolerated" warning
+                // would tell every translation unit something false): nine
+                // canonical shapes — same-block, both-paths/phi-merged,
+                // loop-carried, store-through, field/base, then-arm-join,
+                // call-clobbered, GVN-merged and low-address range — keep
+                // their guards byte-identically with and without the flag at
+                // -O2 and -O3. tests/regression/check_nullptr_check_policy.sh
+                // pins that evidence in both compilers.
+                //
+                // Strict mode accepts it too: a probe passing this spelling
+                // asks "will null checks survive?", and "yes" is the true
+                // answer. (Contrast `-fstrict-overflow`, which strict mode
+                // refuses because its silent acceptance would affirm an
+                // optimisation that does not exist.)
+                //
+                // The positive `-fdelete-null-pointer-checks` spelling is
+                // deliberately NOT listed here: it asks to DELETE checks,
+                // which nothing here will do, so the generic tolerated
+                // path's "nothing will act on it" is the accurate answer
+                // for it. If a dereference-implies-nonnull fold is ever
+                // added, it must default OFF, be gated on this flag, extend
+                // scripts/check_no_ub_exploitation.py in the same change,
+                // and start setting a real policy bit from this arm.
+                "-fno-delete-null-pointer-checks" => {}
                 "-fno-plt" => self.no_plt = true,
                 "-fplt" => self.no_plt = false,
                 arg if self.apply_hardening_or_ipa_fflag(arg)? => {}
@@ -3922,6 +3972,17 @@ fn gnu_debug_feature_off_known(modifier: &str) -> bool {
             | "strict-dwarf"
             | "inline-points"
     )
+}
+
+/// The process-wide accepted-but-unimplemented policy: `LCCC_STRICT_OPTIONS`
+/// set (to anything, including the empty string) turns every tolerated
+/// spelling into an error, which is what lets a capability probe tell
+/// "implemented" from "quietly ignored" by exit status alone.
+///
+/// Read once per driver entry and threaded down as a value, so one command
+/// line can never be judged by two different policies.
+fn strict_options_enabled() -> bool {
+    std::env::var_os("LCCC_STRICT_OPTIONS").is_some()
 }
 
 /// The deliberately *tolerated* class of unrecognized spelling.
@@ -6097,6 +6158,7 @@ mod cli_tests {
             "-fno-builtin-memcpy",
             "-fwrapv",
             "-fno-strict-overflow",
+            "-fno-delete-null-pointer-checks",
             "-fno-common",
             "-fsigned-char",
             "-fno-asynchronous-unwind-tables",
@@ -6161,6 +6223,33 @@ mod cli_tests {
         for arg in ["-flto", "-flto=auto"] {
             assert!(try_flag(arg).is_err(), "{arg} must be refused, not ignored");
         }
+    }
+
+    /// The `-fno-delete-null-pointer-checks` contract, at the policy layer.
+    ///
+    /// The negative spelling asks for a guarantee LCCC already gives (no fold
+    /// derives non-nullness from a dereference), so silence is the only
+    /// truthful answer in *both* modes — a probe that reads a refusal there
+    /// would take a fallback it does not need. The positive spelling asks to
+    /// delete guards nothing here deletes, so the tolerated class and the
+    /// strict refusal are both correct for it.
+    #[test]
+    fn strict_mode_keeps_the_null_pointer_off_request_and_refuses_its_inverse() {
+        let parse = |flag: &str, strict: bool| {
+            let mut d = Driver::new();
+            let args = vec!["ccc".to_string(), flag.to_string(), "x.c".to_string()];
+            d.parse_cli_args_with_strict(&args, strict).map(|_| ())
+        };
+        parse("-fno-delete-null-pointer-checks", false)
+            .expect("normal mode must accept the off-request");
+        parse("-fno-delete-null-pointer-checks", true)
+            .expect("strict mode must accept it too: the request is already met");
+        parse("-fdelete-null-pointer-checks", false)
+            .expect("normal mode tolerates the positive spelling");
+        assert!(
+            parse("-fdelete-null-pointer-checks", true).is_err(),
+            "strict mode must refuse a request to delete guards that are never deleted"
+        );
     }
 
     /// Link-file switches are acted on after forwarding to the linker.

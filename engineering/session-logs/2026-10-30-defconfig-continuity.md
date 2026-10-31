@@ -251,3 +251,38 @@ ready, leaving an unstamped incomplete scratch tree; it was removed only after
 confirming the failed prepare log, and preparation was retried from the
 SHA256-verified archive. Full kernel build, actual setup-size measurement,
 QEMU boot and full fast CI remain pending. Snapshot S18 is **UNGATED**.
+
+## Continued: the kernel options this log asked to audit
+
+The open item above — "LCCC reports numerous accepted-but-unimplemented kernel
+options including `-fno-delete-null-pointer-checks` and `-fno-strict-overflow`;
+audit their actual code-generation semantics, not just whether the build
+finishes" — is answered for the null-pointer family:
+
+* `-fno-delete-null-pointer-checks` is an **off-request**, not a tolerated
+  unknown: silently accepted in normal *and* strict mode, with a
+  `option_table::CONTRACTS` row (`Class::Inert`, `probe-nullptr-checks-inert`)
+  so GP-22's ledger accounts for a flag every kernel translation unit passes.
+  The reason is semantic, not procedural: no dereference-implies-nonnull fold
+  exists here in either direction, so the state the flag asks for is the state
+  the compiler emits. The *positive* `-fdelete-null-pointer-checks` — delete
+  the guards — stays on the tolerated path by design and is refused under
+  `LCCC_STRICT_OPTIONS=1`.
+* The claim is measured. `tests/regression/check_nullptr_check_policy.sh` drives
+  nine canonical GCC-deletion shapes (same-block, phi-merged, loop-carried,
+  then-arm join, field/base, store-through, both-arm GVN, call-clobbered,
+  low-address range), floors the surviving `test`/`cmp` count per shape at
+  `-O2`/`-O3`, requires byte-identical assembly with and without the flag, and
+  keeps a GCC differential that proves the fixture still detects deletion
+  (GCC default 7 guards vs 14 under `-fno-delete` on this tree).
+* `-fno-strict-overflow` is unchanged: its signed half is implemented, its
+  pointer half is not, and strict mode still refuses the unimplemented half.
+* `scripts/build_kernel_full.sh` now compiles the package's own configuration
+  (`cp ../config .config`), reports both configs' sha256, and refuses to
+  continue when `olddefconfig` drops a feature the package enabled
+  (`scripts/kconfig_query.sh`, pinned by `check_kconfig_query.sh`). Real objtool
+  runs by default; `LCCC_NOOBJTOOL=1` is the explicit compile-sweep opt-in, and
+  the defconfig fallback says on stderr that it is not the package's config.
+* The preprocessor half of the same kernel run (comment-bridged directives) is
+  recorded in `engineering/journal/2026-10-31-comment-bridged-directives.md`;
+  it fixes two truncation shapes and names the residual gap it does not close.
