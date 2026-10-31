@@ -49,9 +49,14 @@ __attribute__((noinline)) static int absdiff_select(int a, int b) { return a > b
 __attribute__((noinline)) static int abs_control(int x, int y) { return x < 0 ? -y : x; }
 
 int main(void) {
+    /* Signed probes stay inside +-2^30 so every subtraction and negation in
+     * this file is free of signed overflow: `(a - b) > 0` on INT_MIN is UB, and
+     * a witness that evaluates UB cannot arbitrate a fold.  The boundary
+     * behaviour itself is covered by the unsigned probes and by the unit
+     * tests, which brute-force the rings. */
     static const int iprobes[] = {
         0, 1, 2, 3, 4, 5, 8, 9, 10, 11, -1, -2, -4, -5,
-        2147483647, -2147483647, -2147483647 - 1,
+        1073741823, -1073741823, -1073741824,
     };
     static const unsigned uprobes[] = {
         0u, 1u, 2u, 3u, 4u, 5u, 8u, 9u, 10u, 11u,
@@ -110,8 +115,9 @@ int main(void) {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        int a = (int)(uint32_t)s;
-        int b = (int)(uint32_t)(s >> 32);
+        /* 30-bit signed values: no subtraction or negation can overflow. */
+        int a = (int)((s & 0x3fffffffu)) - 0x20000000;
+        int b = (int)(((s >> 32) & 0x3fffffffu)) - 0x20000000;
         unsigned ua = (unsigned)a, ub = (unsigned)b;
         vi = a;
         vj = b;

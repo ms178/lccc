@@ -72,6 +72,7 @@ fn direct_op(op: IrCmpOp, signed: bool, may_wrap: bool) -> Option<IrCmpOp> {
 
 fn replacement(
     defs: &FxHashMap<u32, (usize, usize)>,
+    uses: &FxHashMap<u32, usize>,
     func: &IrFunction,
     inst: &Instruction,
     may_wrap: bool,
@@ -125,6 +126,14 @@ fn replacement(
     if *sub_ty != *ty {
         return None;
     }
+    // Only when the subtraction dies.  Its flags are free in the original
+    // shape (`subl` sets them, `setg` reads them), so folding a *shared*
+    // subtraction adds a comparison where the backend had none: measured as
+    // +13 instructions in div_mod_by_const_exhaustive.c and +5 in
+    // sign_test_cmov.c before this guard.
+    if uses.get(&v.0).copied().unwrap_or(0) != 1 {
+        return None;
+    }
     let signed = matches!(ty, IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64);
     let op = direct_op(op, signed, may_wrap)?;
     // `(0 - b) <op> 0` would rewrite to `0 <op> b`, which is not a difference
@@ -145,18 +154,23 @@ fn replacement(
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     let mut defs: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    let mut uses: FxHashMap<u32, usize> = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Some(Value(v)) = inst.dest() {
                 defs.insert(v, (bi, ii));
             }
+            inst.for_each_used_value(|v| *uses.entry(v).or_insert(0) += 1);
         }
+        block
+            .terminator
+            .for_each_used_value(|v| *uses.entry(v).or_insert(0) += 1);
     }
     let may_wrap = func.pass_policy.wrap_signed_overflow;
     let mut replacements = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Some(new_inst) = replacement(&defs, func, inst, may_wrap) {
+            if let Some(new_inst) = replacement(&defs, &uses, func, inst, may_wrap) {
                 replacements.push((bi, ii, new_inst));
             }
         }
@@ -172,6 +186,17 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 #[cfg(test)]
 fn zero(ty: IrType) -> Operand {
     Operand::Const(IrConst::from_i64(0, ty))
+}
+
+/// Apply to every function body of a module; returns the number of rewrites.
+pub(crate) fn run_on_module(module: &mut crate::ir::module::IrModule) -> usize {
+    let mut total = 0;
+    for func in module.functions.iter_mut() {
+        if !func.is_declaration {
+            total += run(func);
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -320,7 +345,9 @@ mod tests {
     }
 
     #[test]
-    fn shared_subtraction_keeps_a_reader() {
+    fn shared_subtraction_is_left_alone() {
+        // The subtraction's flags are free in the original shape, so folding a
+        // shared difference would ADD a comparison.  Neither node may move.
         let mut func = function(IrType::I32, IrCmpOp::Sgt, false, IrType::I32);
         func.blocks[0].instructions.push(Instruction::Cmp {
             dest: Value(4),
@@ -330,14 +357,6 @@ mod tests {
             ty: IrType::I32,
         });
         func.next_value_id = 5;
-        assert_eq!(run(&mut func), 2);
-        // Both comparisons now read the operands; the subtraction survives
-        // only until DCE proves it unreferenced.
-        for idx in [3, 4] {
-            let Instruction::Cmp { lhs, rhs, .. } = &func.blocks[0].instructions[idx] else {
-                panic!("comparison expected")
-            };
-            assert!(lhs != &Operand::Value(Value(2)) && rhs != &Operand::Value(Value(2)));
-        }
+        assert_eq!(run(&mut func), 0);
     }
 }

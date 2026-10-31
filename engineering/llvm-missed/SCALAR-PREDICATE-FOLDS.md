@@ -48,8 +48,11 @@ order-preserving:
   C default). A module built with wrapping signed arithmetic keeps the
   subtraction — the test suite pins both branches.
 
-A shared subtraction keeps its value: the pass replaces one comparison node and
-never deletes an instruction.
+The subtraction must have exactly one reader, the comparison. Its flags are
+free in the original shape (`subl` sets them, `setg` reads them), so folding a
+*shared* difference inserts a comparison where the backend had none. Measured
+before the guard: +13 instructions in `div_mod_by_const_exhaustive.c` and +5 in
+`sign_test_cmov.c`. With the guard both files are exactly as they were.
 
 ### 2. Interval and membership predicates — `interval`
 
@@ -74,10 +77,21 @@ that argument and is refused, as is an empty window, a mixed `==`/`!=` pair, a
 non-consecutive membership set (`{0, 2}` keeps both compares) and two predicates
 on different values.
 
-The pass runs twice: before `bit_idioms` for the bitwise `&`/`|` spelling, and
-again after if-conversion for the `&&`/`||` spelling, which only becomes a select
-once the CFG diamonds are gone. That second placement is what takes
-`x > 3 && x < 10` from seven instructions to five.
+Both this pass and `diffcmp` run **late** — after every vectorizer and after
+`range_check` — and that placement is a measurement, not a preference. Run
+early, the interval fold took apart exactly the shapes the passes downstream
+want: an `and` of two compares is what the vectorizers' mask-fusion matchers
+recognize. Over the 3,016-file test corpus the early placement cost **141
+instructions in `vec_range_mask_fusion.c`**, 19 in `range_fold_branch.c`, 6 in
+`expat_name_scan_kernel.c` and 5 in `range_check_fold.c`, while the late
+placement keeps every one of those files at its original size *and* keeps the
+scalar wins below.
+
+Two further details come straight out of that sweep. A window whose lower bound
+is zero emits no subtraction at all — the first version emitted `subl $0` and
+paid one instruction per folded test. And the if-converted `&&`/`||` spelling
+only exists after if-conversion, so the late placement is also the earliest
+point at which those shapes are visible at all.
 
 ### 3. Sign magnitude — `signmag`
 
@@ -163,7 +177,22 @@ shape at every level.
 | `check_predicate_differences_and_ranges.py` | PASS — values at `-O0`…`-O3`, per-fold mechanism, five controls, attribution, GCC 16.2 length oracle (1.5 s) |
 | `check_mask_and_interval_folds.py` | PASS (0.6 s) |
 | Exhaustive matcher tests | 8/16-bit rings brute-forced for interval and membership; 32/64-bit boundary sweeps; refusal tables |
-| Corpus A/B, 3,016 `tests/**/*.c` | per-pass instruction totals and every file that grew, recorded below |
+| Corpus A/B, 3,016 `tests/**/*.c` | **27 files shorter, 0 longer, net −147 instructions** with the three passes on versus off |
+
+## Corpus-wide result
+
+The final A/B compiles every one of the 3,016 test sources twice — once with
+`CCC_DISABLE_PASSES=diffcmp,interval,signmag` and once without — and counts the
+instructions in each output:
+
+| metric | value |
+|---|---|
+| files compiled both ways | 3,016 (765 skipped: they need headers this sandbox lacks) |
+| shorter with the passes | **27** |
+| longer with the passes | **0** |
+| net instruction change | **−147** |
+| largest single win | `predicate_differences_and_ranges.c` −60 |
+| largest vector win | `vec_range_mask_fusion.c` and its SSE2 twin −10 each |
 
 ## What is not done
 

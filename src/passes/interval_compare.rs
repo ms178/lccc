@@ -310,15 +310,26 @@ fn emit(
     } else {
         interval.value
     };
-    let difference = next;
-    next = Value(next.0.checked_add(1)?);
-    body.push(Instruction::BinOp {
-        dest: difference,
-        op: IrBinOp::Sub,
-        lhs: value,
-        rhs: Operand::Const(IrConst::from_i64(interval.lower_bound as i64, unsigned_ty)),
-        ty: unsigned_ty,
-    });
+    // A window that starts at zero needs no subtraction at all; emitting
+    // `x - 0` survived to the backend as a real `subl $0` and cost one
+    // instruction per folded test.
+    let difference = if interval.lower_bound == 0 {
+        match value {
+            Operand::Value(v) => v,
+            Operand::Const(_) => return None,
+        }
+    } else {
+        let dest = next;
+        next = Value(next.0.checked_add(1)?);
+        body.push(Instruction::BinOp {
+            dest,
+            op: IrBinOp::Sub,
+            lhs: value,
+            rhs: Operand::Const(IrConst::from_i64(interval.lower_bound as i64, unsigned_ty)),
+            ty: unsigned_ty,
+        });
+        dest
+    };
     let (op, bound) = if interval.inside {
         (IrCmpOp::Ult, width)
     } else {
@@ -494,6 +505,17 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         func.next_value_id = fresh;
     }
     changed
+}
+
+/// Apply to every function body of a module; returns the number of rewrites.
+pub(crate) fn run_on_module(module: &mut crate::ir::module::IrModule) -> usize {
+    let mut total = 0;
+    for func in module.functions.iter_mut() {
+        if !func.is_declaration {
+            total += run(func);
+        }
+    }
+    total
 }
 
 #[cfg(test)]

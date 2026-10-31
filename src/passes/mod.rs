@@ -2985,24 +2985,6 @@ pub(crate) fn run_passes(
             total_changes += n;
             total_changes_excl_dce += n;
 
-            // Interval predicates: `(x > 3) & (x < 10)` and its if-converted
-            // select spelling collapse into one unsigned compare against a
-            // wrapped difference, which is what GCC, Clang and ICX emit.
-            // Runs before bit_idioms so the surviving compare is available to
-            // its fact machinery.  Pass name for CCC_DISABLE_PASSES:
-            // "interval".
-            if !pass_disabled(&disabled, "interval") {
-                let n = timed_pass!(
-                    "interval",
-                    run_on_visited(module, &dirty, &mut changed, |func| {
-                        interval_compare::run(func)
-                    })
-                );
-                cur_pass_changes[3] += n;
-                total_changes += n;
-                total_changes_excl_dce += n;
-            }
-
             // Sign-magnitude lowering: `x < 0 ? -x : x` and
             // `a > b ? a - b : b - a` become the branch-free
             // mask/XOR/subtract identity, which needs no compare and no
@@ -3015,26 +2997,6 @@ pub(crate) fn run_passes(
                     "signmag",
                     run_on_visited(module, &dirty, &mut changed, |func| {
                         sign_magnitude::run(func)
-                    })
-                );
-                cur_pass_changes[3] += n;
-                total_changes += n;
-                total_changes_excl_dce += n;
-            }
-
-            // Difference-compare canonicalization: `(a - b) <op> 0` reads the
-            // subtrahends directly, so the subtraction becomes dead unless
-            // something else still reads it.  Placed after `simplify` (which
-            // produces the zero comparison) and before `bit_idioms`, whose
-            // interval matchers then see a direct `a <op> b` pair instead of
-            // two differences.  Signed order is admitted only for modules
-            // whose policy keeps signed overflow undefined.
-            // Pass name for CCC_DISABLE_PASSES: "diffcmp".
-            if !pass_disabled(&disabled, "diffcmp") {
-                let n = timed_pass!(
-                    "diffcmp",
-                    run_on_visited(module, &dirty, &mut changed, |func| {
-                        difference_compare::run(func)
                     })
                 );
                 cur_pass_changes[3] += n;
@@ -3340,23 +3302,6 @@ pub(crate) fn run_passes(
             cur_pass_changes[7] = n + forwarded;
             total_changes += n + forwarded;
             total_changes_excl_dce += n + forwarded;
-        }
-
-        // Interval predicates, second placement.  The `&&`/`||` spellings of a
-        // range test only exist as a select *after* if-conversion — before it
-        // they are two blocks and a phi — so the early run sees the bitwise
-        // `&`/`|` shapes and this one sees the if-converted ones.  Running
-        // before the post-if-conversion bit_idioms keeps the merged compare
-        // available to its fact machinery.  Pass name: "interval".
-        if !pass_disabled(&disabled, "interval") {
-            let n = timed_pass!(
-                "interval_post_ifconv",
-                run_on_visited(module, &dirty, &mut changed, |func| {
-                    interval_compare::run(func)
-                })
-            );
-            total_changes += n;
-            total_changes_excl_dce += n;
         }
 
         // Re-run bit-idiom recognition after if-conversion. Portable trees such
@@ -4320,6 +4265,30 @@ pub(crate) fn run_passes(
     // operation. Signed compares require the pass's nonnegative-domain proof;
     // shared compare/subtract nodes and all other widths stay unchanged.
     // Pass name for CCC_DISABLE_PASSES: "satsub".
+    // Late predicate canonicalization.  These two rewrites are profitable
+    // wherever they apply but *destructive* to shapes other passes still want:
+    // an interval test written as two compares is exactly what the
+    // vectorizers' mask-fusion matchers and `range_check`'s branch folds
+    // recognize, and a difference compare is a shape `div_by_const` and the
+    // conditional-move selector both prefer.  Measured on 3,016 test files,
+    // running them early cost 141 instructions in
+    // tests/regression/vec_range_mask_fusion.c and 19 in range_fold_branch.c
+    // while gaining nothing those passes did not already recover; run here,
+    // after every vectorizer and after range_check, scalar leftovers still
+    // fold and no optimized pattern is taken apart.  Both passes only replace
+    // a node and never insert a duplicate computation, so they are safe to run
+    // last.  Pass names: "interval" and "diffcmp".
+    if !pass_disabled(&disabled, "interval") {
+        let n = interval_compare::run_on_module(module);
+        verify::verify_after_pass(module, "interval");
+        let _ = n;
+    }
+    if !pass_disabled(&disabled, "diffcmp") {
+        let n = difference_compare::run_on_module(module);
+        verify::verify_after_pass(module, "diffcmp");
+        let _ = n;
+    }
+
     if matches!(
         target,
         crate::backend::Target::X86_64 | crate::backend::Target::I686
