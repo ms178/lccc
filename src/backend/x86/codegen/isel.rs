@@ -741,113 +741,88 @@ pub fn lower_binop(
     }
 
     // ── Division and remainder ───────────────────────────────────────
-    match op {
-        IrBinOp::SDiv | IrBinOp::SRem => {
-            // NARROW DIVIDES RUN AT 32-BIT WIDTH, for the same reason the
-            // mature path does (`emit_div_narrow`): both operands are exact in
-            // %eax/%edx, the 32-bit write leaves %rax/%rdx in the narrow
-            // canonical form, and the divide cannot trap -- the dividend is
-            // bounded by the narrow width, so INT32_MIN / -1 is unreachable.
-            // `div_size` widens staging, sign-extension, Cqto and the divide
-            // together; the result copy stays at `size` so the narrow home
-            // keeps the zero-extended narrow-copy convention.
-            let div_size = if matches!(size, OpSize::S8 | OpSize::S16) {
-                OpSize::S32
-            } else {
-                size
-            };
-            if div_size == size {
-                emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
-            } else {
-                emit_narrow_dividend(lhs, true, size, ra, out);
-            }
-            out.push(MachInst::Cqto { size: div_size });
-            let mut divisor_op = lower_operand_with_regs(rhs, ra);
-            // x86 div/idiv has no immediate form. Materialize constants in the
-            // dedicated rcx scratch register rather than emitting invalid
-            // `idivq $imm` text (SQLite amalgamation assembler failure).
-            if let MachOperand::Imm(value) = divisor_op {
-                out.push(MachInst::Mov {
-                    src: MachOperand::Imm(value),
-                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                    size: div_size,
-                });
-                divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
-            }
-            // Defense-in-depth: a Phys(RDX) divisor would be destroyed by
-            // the Cqto above before the Div reads it. The Phase-2x64 wave's
-            // inclusive hazard check refuses divisor values, and the
-            // phi-coalesce propagation guard keeps it that way — but any
-            // future home-propagation path must not turn into a silent
-            // miscompile here: stage through the rcx scratch like an
-            // immediate.
-            if let MachOperand::Reg(MachReg::Phys(RDX)) = divisor_op {
-                out.push(MachInst::Mov {
-                    src: divisor_op,
-                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                    size: div_size,
-                });
-                divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
-            }
-            out.push(MachInst::Div {
-                divisor: divisor_op,
-                signed: true,
-                size: div_size,
-            });
-            let result_phys = if op == IrBinOp::SDiv { RAX } else { RDX };
-            out.push(MachInst::Mov {
-                src: MachOperand::Reg(MachReg::Phys(result_phys)),
-                dst: MachOperand::Reg(dst),
-                size,
-            });
-            true
-        }
-        IrBinOp::UDiv | IrBinOp::URem => {
-            let div_size = if matches!(size, OpSize::S8 | OpSize::S16) {
-                OpSize::S32
-            } else {
-                size
-            };
-            if div_size == size {
-                emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
-            } else {
-                emit_narrow_dividend(lhs, false, size, ra, out);
-            }
-            out.push(MachInst::XorRdx);
-            let mut divisor_op = lower_operand_with_regs(rhs, ra);
-            if let MachOperand::Imm(value) = divisor_op {
-                out.push(MachInst::Mov {
-                    src: MachOperand::Imm(value),
-                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                    size: div_size,
-                });
-                divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
-            }
-            // Defense-in-depth: see the signed arm — the XorRdx above
-            // destroys a Phys(RDX) divisor before the Div reads it.
-            if let MachOperand::Reg(MachReg::Phys(RDX)) = divisor_op {
-                out.push(MachInst::Mov {
-                    src: divisor_op,
-                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                    size: div_size,
-                });
-                divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
-            }
-            out.push(MachInst::Div {
-                divisor: divisor_op,
-                signed: false,
-                size: div_size,
-            });
-            let result_phys = if op == IrBinOp::UDiv { RAX } else { RDX };
-            out.push(MachInst::Mov {
-                src: MachOperand::Reg(MachReg::Phys(result_phys)),
-                dst: MachOperand::Reg(dst),
-                size,
-            });
-            true
-        }
-        _ => unreachable!("unhandled binop: {:?}", op),
+    if matches!(
+        op,
+        IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+    ) {
+        return lower_divrem(dest, op, lhs, rhs, size, ra, out);
     }
+    unreachable!("unhandled binop: {:?}", op)
+}
+
+/// Division and remainder, split out of `lower_binop` so that function stays
+/// under the audit-census ceiling.
+///
+/// `size` is the IR type's width. A NARROW type (`S8`/`S16`) runs the whole
+/// sequence at 32-bit width, for the same reason the mature path does
+/// (`emit_div_narrow`): both operands are exact in `%eax`/`%edx`, a 32-bit write
+/// leaves `%rax`/`%rdx` in the narrow canonical form, and the divide cannot trap
+/// because the dividend is bounded by the narrow width. `div_size` widens
+/// staging, sign/zero extension, `Cqto` and the divide together; the result copy
+/// stays at `size` so the narrow home keeps the zero-extended narrow-copy
+/// convention `emit_mov_operand_r` defines.
+fn lower_divrem(
+    dest: &Value,
+    op: IrBinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    size: OpSize,
+    ra: &dyn HomeMap,
+    out: &mut Vec<MachInst>,
+) -> bool {
+    let dst = value_to_reg(dest, ra);
+    let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+    let is_rem = matches!(op, IrBinOp::SRem | IrBinOp::URem);
+    let div_size = if matches!(size, OpSize::S8 | OpSize::S16) {
+        OpSize::S32
+    } else {
+        size
+    };
+    if div_size == size {
+        emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
+    } else {
+        emit_narrow_dividend(lhs, signed, size, ra, out);
+    }
+    // Signed needs `Cqto` (sign-extend into %rdx:%rax); unsigned needs the
+    // explicit zeroing, because `xorl %edx, %edx` is the only way to say it.
+    if signed {
+        out.push(MachInst::Cqto { size: div_size });
+    } else {
+        out.push(MachInst::XorRdx);
+    }
+    let mut divisor_op = lower_operand_with_regs(rhs, ra);
+    // x86 div/idiv has no immediate form, so a constant is materialized in the
+    // dedicated %rcx scratch rather than emitted as an invalid `idivq $imm`
+    // (SQLite amalgamation assembler failure). A Phys(RDX) divisor is staged
+    // the same way and for the same reason: the sign/zero extension above has
+    // already destroyed %rdx before the divide reads it. The Phase-2x64 wave's
+    // inclusive hazard check refuses such divisors today -- this arm is what
+    // keeps a future home-propagation path from turning into a silent
+    // miscompile.
+    if matches!(
+        divisor_op,
+        MachOperand::Imm(_) | MachOperand::Reg(MachReg::Phys(RDX))
+    ) {
+        let src = divisor_op.clone();
+        out.push(MachInst::Mov {
+            src,
+            dst: MachOperand::Reg(MachReg::Phys(RCX)),
+            size: div_size,
+        });
+        divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
+    }
+    out.push(MachInst::Div {
+        divisor: divisor_op,
+        signed,
+        size: div_size,
+    });
+    let result_phys = if is_rem { RDX } else { RAX };
+    out.push(MachInst::Mov {
+        src: MachOperand::Reg(MachReg::Phys(result_phys)),
+        dst: MachOperand::Reg(dst),
+        size,
+    });
+    true
 }
 
 // ── Load / Store / Copy ──────────────────────────────────────────────────

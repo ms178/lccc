@@ -1971,6 +1971,64 @@ mod tests {
         );
     }
 
+    /// The emitter's marker is AUTHORITATIVE. This shape is deliberately one
+    /// the textual relation could not resolve (the constant is materialized
+    /// into a different register from the one the adjustment consumes), which
+    /// is what a future encoding change looks like; without the marker the
+    /// frame would lose its unwind information entirely.
+    #[test]
+    fn the_emitter_marker_supplies_a_delta_the_text_cannot_derive() {
+        let out = synth(
+            "    # LCCC_STACK_ADJUST 1099511627792\n    movq $1099511627792, %r11\n    subq %rax, %rsp\n    ret\n",
+        );
+        assert!(
+            out.contains("    subq %rax, %rsp\n    .cfi_def_cfa_offset 1099511627800\n"),
+            "{out}"
+        );
+        assert!(!out.contains(".cfi_undefined %rip"), "{out}");
+    }
+
+    /// The marker's sign repeats the direction of the instruction it
+    /// describes, and the two are cross-checked. When the marker is the ONLY
+    /// source (this shape's constant is materialized into a register the
+    /// adjustment does not consume) a contradiction is not resolved in favour
+    /// of either side -- the frame is declared unknown rather than described
+    /// wrongly.
+    #[test]
+    fn a_marker_contradicting_its_instruction_refuses_to_describe_the_frame() {
+        // `subq` allocates, so a negative delta cannot describe it.
+        let out = synth(
+            "    # LCCC_STACK_ADJUST -1099511627792\n    movq $1099511627792, %r11\n    subq %rax, %rsp\n    ret\n",
+        );
+        assert!(out.contains(".cfi_undefined %rip"), "{out}");
+        assert!(!out.contains(".cfi_def_cfa_offset 1099511627800"), "{out}");
+    }
+
+    /// With a contradiction AND a consistent textual relation, the textual
+    /// relation still describes the frame: it is independent evidence, and the
+    /// refusal above is about the absence of evidence, not about punishing a
+    /// stale comment.
+    #[test]
+    fn a_contradictory_marker_defers_to_a_consistent_textual_relation() {
+        let out = synth(
+            "    # LCCC_STACK_ADJUST -1099511627792\n    movq $1099511627792, %r11\n    subq %r11, %rsp\n    ret\n",
+        );
+        assert!(
+            out.contains("    subq %r11, %rsp\n    .cfi_def_cfa_offset 1099511627800\n"),
+            "{out}"
+        );
+    }
+
+    /// A marker that is not followed by the adjustment must not leak onto a
+    /// later, unrelated `%rsp` write.
+    #[test]
+    fn a_stale_marker_does_not_describe_a_later_adjustment() {
+        let out = synth(
+            "    # LCCC_STACK_ADJUST 1099511627792\n    movq $1099511627792, %r11\n    movq %rcx, %rdx\n    subq %r11, %rsp\n    ret\n",
+        );
+        assert!(out.contains(".cfi_undefined %rip"), "{out}");
+    }
+
     #[test]
     fn user_asm_cfi_is_kept() {
         let out = synth(

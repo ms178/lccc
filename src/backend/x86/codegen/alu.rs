@@ -831,6 +831,44 @@ impl X86Codegen {
     /// exactly the invariant every narrow consumer already re-extends from.
     /// No extra canonicalization instruction is therefore emitted, and the
     /// pre-existing width-consistency of slot reloads keeps it sufficient.
+    /// Divide `%rax` by `%rcx`, selecting the width the operand type needs and
+    /// leaving the quotient in `%rax` (remainder moved there when `op` is a
+    /// `rem`). Extracted from `emit_int_binop_impl` so that function stays
+    /// under the audit-census ceiling; the three arms are the three widths.
+    fn emit_divrem_reg(&mut self, op: IrBinOp, ty: IrType, use_32bit: bool) {
+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+        let is_rem = matches!(op, IrBinOp::SRem | IrBinOp::URem);
+        // Narrow integers are 32-bit canonical, so the 32-bit divide is exact
+        // for them (see `emit_div_narrow`). The staging the caller performs
+        // has already put the 64-bit canonical form in %rax/%rcx, whose low
+        // 32 bits ARE the canonical 32-bit operand.
+        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            self.emit_div_narrow(signed);
+            if is_rem {
+                self.state.emit("    movl %edx, %eax");
+            }
+        } else if use_32bit {
+            self.state.emit(if signed {
+                "    cltd"
+            } else {
+                "    xorl %edx, %edx"
+            });
+            self.state.emit(if signed {
+                "    idivl %ecx"
+            } else {
+                "    divl %ecx"
+            });
+            if is_rem {
+                self.state.emit("    movl %edx, %eax");
+            }
+        } else {
+            self.emit_div64(signed);
+            if is_rem {
+                self.state.emit("    movq %rdx, %rax");
+            }
+        }
+    }
+
     fn emit_div_narrow(&mut self, signed: bool) {
         if signed {
             self.state.emit("    cltd");
@@ -1886,37 +1924,7 @@ impl X86Codegen {
                 }
             }
             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
-                let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
-                let is_rem = matches!(op, IrBinOp::SRem | IrBinOp::URem);
-                // Narrow integers are 32-bit canonical, so the 32-bit divide
-                // is exact for them (see `emit_div_narrow`). The staging above
-                // already put the 64-bit canonical form in %rax/%rcx, whose low
-                // 32 bits ARE the canonical 32-bit operand.
-                if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
-                    self.emit_div_narrow(signed);
-                    if is_rem {
-                        self.state.emit("    movl %edx, %eax");
-                    }
-                } else if use_32bit {
-                    self.state.emit(if signed {
-                        "    cltd"
-                    } else {
-                        "    xorl %edx, %edx"
-                    });
-                    self.state.emit(if signed {
-                        "    idivl %ecx"
-                    } else {
-                        "    divl %ecx"
-                    });
-                    if is_rem {
-                        self.state.emit("    movl %edx, %eax");
-                    }
-                } else {
-                    self.emit_div64(signed);
-                    if is_rem {
-                        self.state.emit("    movq %rdx, %rax");
-                    }
-                }
+                self.emit_divrem_reg(op, ty, use_32bit)
             }
             IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
                 // Count already in %rcx, lhs in %rax: on Intel the VEX
