@@ -14,6 +14,7 @@ import os
 import re
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import tempfile
 
@@ -23,7 +24,8 @@ static float x[3*N+8], y[3*N+8], o[3*N+8];
 __attribute__((noinline)) void k(void){ for(int i=0;i<N;i++){ BODY } }
 int main(void){ for(int i=0;i<3*N;i++){x[i]=i*0.5f;y[i]=i*0.25f+1;} k();
 /* Compare every element, not a weighted sum that can hide compensating errors. */
-for(int i=0;i<3*N+8;i++) printf("%a\n",(double)o[i]); return 0; }
+for(int i=0;i<3*N+8;i++) { printf("%a\n",(double)o[i]); }
+return 0; }
 '''
 GUARDED = r'''#define _GNU_SOURCE
 #include <stdio.h>
@@ -92,13 +94,27 @@ class ProbeError(RuntimeError):
 
 def run(command: list[str], cwd: Path, timeout: float) -> str:
     try:
-        p = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
-                           timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        p = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+    except OSError as exc:
         raise ProbeError(f"{shlex.join(command)}: {exc}") from exc
+    try:
+        output, errors = p.communicate(timeout=timeout)
+    except BaseException as exc:
+        # A compiler may spawn an assembler/linker that inherits its pipes.
+        # Killing only the parent lets those children outlive the timeout and
+        # can leave communicate() waiting on their still-open stdout/stderr.
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.communicate()
+        if isinstance(exc, subprocess.TimeoutExpired):
+            raise ProbeError(f"{shlex.join(command)}: {exc}") from exc
+        raise
     if p.returncode:
-        raise ProbeError(f"{shlex.join(command)}: rc={p.returncode}\n{p.stderr}")
-    return p.stdout
+        raise ProbeError(f"{shlex.join(command)}: rc={p.returncode}\n{errors}")
+    return output
 
 
 def compiler(command: str) -> list[str]:
@@ -115,7 +131,8 @@ def evaluate(cc: list[str], flags: list[str], src: Path, exe: Path,
              timeout: float, expected_lines: int) -> str:
     # Never execute an artifact left by a previous successful compilation.
     exe.unlink(missing_ok=True)
-    run([*cc, *flags, '-ffp-contract=off', str(src), '-o', str(exe)], src.parent, timeout)
+    run([*cc, *flags, '-ffp-contract=off', '-Wall', '-Wextra', '-Werror',
+         str(src), '-o', str(exe)], src.parent, timeout)
     output = run([str(exe)], src.parent, timeout)
     if len(output.splitlines()) != expected_lines:
         raise ProbeError(f"{exe}: expected {expected_lines} output elements")

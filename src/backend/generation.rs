@@ -1491,7 +1491,7 @@ fn retain_used(map: &mut FxHashMap<u32, impl Sized>, use_counts: &[u32]) {
     });
 }
 
-/// Offset producers whose every IR use disappears in guaranteed load folds.
+/// Offset producers whose every IR use disappears in guaranteed memory folds.
 /// Machine-address index reads are not IR uses: protect ALL selected indices,
 /// not just the index of the chain currently being visited. One value can be
 /// peeled through in `a[2*(i+1)]` but remain the terminal index of
@@ -1501,42 +1501,75 @@ fn dead_indexed_offset_producers(
     func: &IrFunction,
     indexed: &FxHashMap<u32, IndexedGepInfo>,
     foldable: &FxHashSet<u32>,
-    stores: &FxHashSet<u32>,
+    fallback_stores: &FxHashSet<u32>,
     uses: &[u32],
     stab: &BaseStability,
 ) -> FxHashSet<u32> {
-    let live_indices: FxHashSet<u32> = indexed.values().map(|info| info.index.0).collect();
+    let mut required: FxHashSet<u32> = indexed.values().map(|info| info.index.0).collect();
+    // A store through an alias can rematerialize the ORIGINAL offset even
+    // when the original GEP itself only feeds loads. Protect that root across
+    // all chains, just as we protect implicit machine-index reads.
+    for ptr in fallback_stores {
+        if let Some(info) = indexed.get(ptr) {
+            required.insert(info.orig_offset.0);
+        }
+    }
     let defs = index_single_defs(func, stab);
     let mut attributed: FxHashMap<u32, u32> = FxHashMap::default();
     let mut work = Vec::new();
     for dest in foldable {
-        if stores.contains(dest) {
+        if fallback_stores.contains(dest) {
             continue;
         }
-        if let Some(info) = indexed.get(dest) {
-            *attributed.entry(info.orig_offset.0).or_insert(0) += 1;
-            work.push(info.orig_offset.0);
+        // Metadata aliases do NOT add IR offset uses. Credit exactly the
+        // offset edge of a unique, actually eliminated GEP instruction.
+        if let (
+            Some(info),
+            Some(Instruction::GetElementPtr {
+                offset: Operand::Value(off),
+                ..
+            }),
+        ) = (indexed.get(dest), defs.get(dest).copied())
+        {
+            if *off == info.orig_offset {
+                *attributed.entry(off.0).or_insert(0) += 1;
+                work.push(off.0);
+            }
         }
     }
     let mut dead = FxHashSet::default();
     while let Some(v) = work.pop() {
-        if live_indices.contains(&v) || dead.contains(&v) {
+        if required.contains(&v) || dead.contains(&v) {
             continue;
         }
-        let total = uses.get(v as usize).copied().unwrap_or(0);
-        if attributed.get(&v).copied().unwrap_or(0) < total {
+        let Some(&total) = uses.get(v as usize) else {
+            continue;
+        };
+        if total == 0 || attributed.get(&v).copied().unwrap_or(0) != total {
             continue;
         }
         let Some(inst) = defs.get(&v) else {
             continue;
         };
+        // Fail closed if fold-map construction ever grows a new producer
+        // class. A dead address value never licenses deleting its effects.
+        if !matches!(
+            inst,
+            Instruction::Copy { .. }
+                | Instruction::Cast { .. }
+                | Instruction::BinOp {
+                    op: IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Shl,
+                    ..
+                }
+        ) {
+            continue;
+        }
         dead.insert(v);
         for_each_operand_in_instruction(inst, |op| {
             if let Operand::Value(x) = op {
                 *attributed.entry(x.0).or_insert(0) += 1;
-                // Revisit shared operands when the final attributable use
-                // disappears; unlike a per-GEP DFS this reaches a fixed point
-                // independently of hash-map iteration order.
+                // Revisit only when an actual eliminated operand edge is
+                // credited. Every instruction/edge is processed at most once.
                 work.push(x.0);
             }
         });
@@ -6082,11 +6115,10 @@ fn generate_function_body(
     // 3-5 instruction offset materialisation inside the hot loop.  Skip those
     // single-use producers here.
     //
-    // SOUNDNESS GUARD: only GEPs consumed EXCLUSIVELY by LOADs qualify.  The
-    // indexed STORE hook can still refuse emission at the access site (the
-    // value-staging class: accumulator staging would clobber the base/index),
-    // in which case `rematerialize_skipped_indexed` re-emits the GEP from
-    // `base + orig_offset` — the offset producers must exist for that.
+    // SOUNDNESS GUARD: stores normally retain their offset for fallback.
+    // A target may opt into store offset elimination only when staging has
+    // the same guaranteed-fold contract as loads (x86-64's reserved staging
+    // registers); i686/AArch64 retain their independent refusal paths.
     //
     // Load→cmp-mem priority: an indexed GEP that feeds a load→cmp-mem
     // candidate must be kept OUT of both the skip set and the dead-producer
@@ -6221,7 +6253,9 @@ fn generate_function_body(
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Instruction::Store { ptr, .. } = inst {
-                    if foldable_folds.contains(&ptr.0) {
+                    if indexed_gep_map.contains_key(&ptr.0)
+                        && (!foldable_folds.contains(&ptr.0) || !cg.guarantees_indexed_store_fold())
+                    {
                         has_store_consumer.insert(ptr.0);
                     }
                 }
@@ -9908,6 +9942,155 @@ mod indexed_offset_dead_tests {
         });
         f.next_value_id = 10;
         assert!(dead(&f, &m, &[]).is_empty());
+    }
+
+    fn alias(f: &mut IrFunction, map: &mut FxHashMap<u32, IndexedGepInfo>) {
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(9),
+            src: Operand::Value(Value(7)),
+        });
+        f.next_value_id = 10;
+        map.insert(9, map[&7].clone());
+    }
+
+    #[test]
+    fn alias_metadata_must_not_double_credit_an_offset_use() {
+        let (mut f, mut m) = shared_offset();
+        alias(&mut f, &mut m);
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(10),
+            src: Operand::Value(Value(4)),
+        });
+        f.next_value_id = 11;
+        assert!(
+            dead(&f, &m, &[]).is_empty(),
+            "ordinary offset use survives alias folding"
+        );
+    }
+
+    #[test]
+    fn fallback_through_alias_keeps_original_offset() {
+        let (mut f, mut m) = shared_offset();
+        alias(&mut f, &mut m);
+        assert!(
+            dead(&f, &m, &[9]).is_empty(),
+            "alias rematerialization needs orig_offset"
+        );
+    }
+
+    #[test]
+    fn side_effecting_offset_definition_is_never_suppressed() {
+        let (mut f, m) = shared_offset();
+        f.blocks[0].instructions[4] = Instruction::Load {
+            dest: Value(4),
+            ptr: Value(0),
+            ty: IrType::I64,
+            volatile: true,
+            seg_override: crate::common::types::AddressSpace::Default,
+        };
+        assert!(dead(&f, &m, &[]).is_empty());
+    }
+
+    #[test]
+    fn incomplete_use_metadata_must_fail_closed() {
+        let (f, m) = shared_offset();
+        let d = dead_indexed_offset_producers(
+            &f,
+            &m,
+            &m.keys().copied().collect(),
+            &FxHashSet::default(),
+            &[],
+            &analyze_base_stability(&f),
+        );
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn exhaustive_fold_alias_fallback_inventory_matches_slow_edge_oracle() {
+        // Independent pull-style oracle: subtract actual removed GEP edges,
+        // then repeatedly scan the remaining IR, rather than using a worklist.
+        for alias_present in [false, true] {
+            for ordinary_use in [false, true] {
+                for fold_mask in 0..8 {
+                    for fallback_mask in 0..8 {
+                        let (mut f, mut m) = shared_offset();
+                        if alias_present {
+                            alias(&mut f, &mut m);
+                        }
+                        if ordinary_use {
+                            f.blocks[0].instructions.push(Instruction::Copy {
+                                dest: Value(10),
+                                src: Operand::Value(Value(4)),
+                            });
+                            f.next_value_id = 11;
+                        }
+                        let folds: FxHashSet<u32> = (7..=9)
+                            .filter(|id| m.contains_key(id) && fold_mask & (1 << (id - 7)) != 0)
+                            .collect();
+                        let fallback: FxHashSet<u32> = (7..=9)
+                            .filter(|id| m.contains_key(id) && fallback_mask & (1 << (id - 7)) != 0)
+                            .collect();
+                        let uses = count_value_uses(&f);
+                        let mut residual = uses.clone();
+                        let protected: FxHashSet<u32> = m
+                            .values()
+                            .map(|i| i.index.0)
+                            .chain(fallback.iter().map(|id| m[id].orig_offset.0))
+                            .collect();
+                        for inst in &f.blocks[0].instructions {
+                            if let Instruction::GetElementPtr {
+                                dest,
+                                offset: Operand::Value(v),
+                                ..
+                            } = inst
+                            {
+                                if folds.contains(&dest.0) && !fallback.contains(&dest.0) {
+                                    residual[v.0 as usize] -= 1;
+                                }
+                            }
+                        }
+                        let mut expected = FxHashSet::default();
+                        loop {
+                            let before = expected.len();
+                            for inst in &f.blocks[0].instructions {
+                                let Some(dest) = inst.dest() else {
+                                    continue;
+                                };
+                                // This fixture's only candidate producers are 2,3,4.
+                                if !(2..=4).contains(&dest.0)
+                                    || protected.contains(&dest.0)
+                                    || expected.contains(&dest.0)
+                                    || residual[dest.0 as usize] != 0
+                                {
+                                    continue;
+                                }
+                                expected.insert(dest.0);
+                                for_each_operand_in_instruction(inst, |op| {
+                                    if let Operand::Value(v) = op {
+                                        residual[v.0 as usize] -= 1;
+                                    }
+                                });
+                            }
+                            if before == expected.len() {
+                                break;
+                            }
+                        }
+                        let got = dead_indexed_offset_producers(
+                            &f,
+                            &m,
+                            &folds,
+                            &fallback,
+                            &uses,
+                            &analyze_base_stability(&f),
+                        );
+                        assert_eq!(
+                            got, expected,
+                            "alias={alias_present} ordinary={ordinary_use} folds={fold_mask} fallback={fallback_mask}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

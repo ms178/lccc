@@ -25,16 +25,46 @@ class RunnerTests(unittest.TestCase):
 
     def test_nonzero_and_signal_are_errors(self):
         for rc in (1, -11):
-            with self.subTest(rc=rc), patch.object(aos.subprocess, 'run', return_value=
-                                                  subprocess.CompletedProcess(['cc'], rc, '', 'bad')):
+            with self.subTest(rc=rc), patch.object(aos.subprocess, 'Popen') as popen:
+                popen.return_value.returncode = rc
+                popen.return_value.communicate.return_value = ('', 'bad')
                 with self.assertRaisesRegex(aos.ProbeError, f'rc={rc}'):
                     aos.run(['cc'], Path('.'), 1)
+                self.assertTrue(popen.call_args.kwargs['start_new_session'])
 
     def test_timeout_and_missing_command_are_errors(self):
-        for error in (subprocess.TimeoutExpired(['cc'], 1), FileNotFoundError('cc')):
-            with self.subTest(error=error), patch.object(aos.subprocess, 'run', side_effect=error):
-                with self.assertRaises(aos.ProbeError):
-                    aos.run(['cc'], Path('.'), 1)
+        with patch.object(aos.subprocess, 'Popen', side_effect=FileNotFoundError('cc')):
+            with self.assertRaises(aos.ProbeError):
+                aos.run(['cc'], Path('.'), 1)
+        with patch.object(aos.subprocess, 'Popen') as popen, patch.object(aos.os, 'killpg') as kill:
+            popen.return_value.pid = 12345
+            popen.return_value.communicate.side_effect = [
+                subprocess.TimeoutExpired(['cc'], 1), ('', '')]
+            with self.assertRaises(aos.ProbeError):
+                aos.run(['cc'], Path('.'), 1)
+            kill.assert_called_once_with(12345, aos.signal.SIGKILL)
+
+    def test_real_timeout_terminates_pipe_inheriting_descendant(self):
+        import sys
+        import time
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            code = ('import subprocess,sys,time; '
+                    'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"]); '
+                    'open("child.pid","w").write(str(p.pid)); time.sleep(60)')
+            start = time.monotonic()
+            with self.assertRaises(aos.ProbeError):
+                aos.run([sys.executable, '-c', code], root, 2)
+            self.assertLess(time.monotonic()-start, 10)
+            pid = int((root/'child.pid').read_text())
+            # A killed orphan may briefly be a zombie awaiting init's reap.
+            stat = Path(f'/proc/{pid}/stat')
+            try:
+                state = stat.read_text().rsplit(')', 1)[1].split()[0]
+            except FileNotFoundError:
+                pass
+            else:
+                self.assertEqual(state, 'Z')
 
     def test_empty_successful_output_is_not_an_oracle(self):
         with tempfile.TemporaryDirectory() as work, patch.object(aos, 'run', return_value=''):
