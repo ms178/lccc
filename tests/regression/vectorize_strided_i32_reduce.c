@@ -1,6 +1,9 @@
 /*
- * Shape fixture for the AVX2 strided-2 32-bit sum-reduction vectorizer
- * (src/passes/vectorize_strided_i32_reduce.rs).
+ * Shape fixture for the strided-2 32-bit sum-reduction vectorizer
+ * (src/passes/vectorize_strided_i32_reduce.rs), in both widths: AVX2 under
+ * -march=x86-64-v3 and XMM at the SSE2 baseline. Proven globals take the
+ * compact full-lane form there; pointer streams gather the same four lanes
+ * with exact dword loads.
  *
  * Pointer forms require exact-width reads of scalar elements; their
  * intervening bytes may be independently shared or device-mapped. Sized

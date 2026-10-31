@@ -361,6 +361,7 @@ mod tests {
             section_data,
             relocations: Vec::new(),
             source_name: format!("<{sig}>"),
+            e_flags: 0,
         }
     }
 
@@ -464,6 +465,7 @@ mod tests {
             section_data,
             relocations: Vec::new(),
             source_name: "<multi>".to_string(),
+            e_flags: 0,
         }
     }
 

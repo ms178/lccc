@@ -11,22 +11,28 @@
 //! `.p2align 4` in a GAS object lands at `start + 14`, not on the boundary
 //! (measured: `lui; .p2align 4; f2:` put `f2` at an address ≡ 2 mod 16).
 //!
-//! This linker performs no other size-changing relaxation, so the only
+//! This module is the whole of relaxation under `--no-relax` (GNU ld runs
+//! its ALIGN pass even then); a relaxing link handles ALIGN inside the full
+//! relaxation instead (`relax.rs`).  With no other size change, the only
 //! movement inside an input section comes from these deletions, and the
 //! section itself is placed at a multiple of its `sh_addralign`.  Raising
 //! that to the largest alignment the section's `R_RISCV_ALIGN`s request (GNU
 //! as records it anyway) makes every directive's final residue a function of
 //! its offset in the section alone, so the trimming is done once per object,
-//! straight after parsing, and everything downstream sees an ordinary object
-//! whose code simply has fewer NOPs.
+//! before layout, and everything downstream sees an ordinary object whose
+//! code simply has fewer NOPs.
 //!
 //! What moves with the bytes (all through one monotone old-to-new offset map):
 //!   * the section's bytes and size;
 //!   * the offsets of the relocations applied to the section;
 //!   * symbols defined in it (value; size by mapping both ends);
-//!   * the addend of every relocation, in ANY section, against a symbol
-//!     defined in it: the target `value + addend` is mapped, so `.text+0x40`
-//!     section-symbol references (and `sym+off`) keep naming the same byte.
+//!   * the addend of every relocation, in ANY section, against the SECTION
+//!     symbol of it: the target `value + addend` is mapped, so `.text+0x40`
+//!     keeps naming the same byte.  An addend against any other symbol is
+//!     left alone, as GNU ld (`riscv_relax_delete_bytes`) leaves every
+//!     addend: `.LVL5-1` (GCC's DWARF location-list idiom) means "one byte
+//!     before `.LVL5`" wherever `.LVL5` lands, and mapping it instead would
+//!     clamp a target inside a deleted run onto `.LVL5` itself.
 //!
 //! Anything PC-relative inside relaxable code already carries a relocation
 //! (that is the relaxation ABI: assemblers emit branch/jal/`%pcrel` relocs
@@ -168,6 +174,9 @@ pub fn relax_align(obj: &mut ElfObject) -> Result<(), String> {
             let Some(sym) = obj.symbols.get(r.sym_idx as usize) else {
                 continue;
             };
+            if sym.info & 0xf != STT_SECTION {
+                continue;
+            }
             let Some(cuts) = home(sym.shndx) else {
                 continue;
             };
@@ -276,6 +285,7 @@ mod tests {
                 vec![rela(0, 1, 2, 18)],
             ],
             source_name: "a.o".into(),
+            e_flags: 0,
         }
     }
 
@@ -351,6 +361,18 @@ mod tests {
         assert_eq!(o.section_data[1].len(), 20);
         assert_eq!(o.symbols[3].value, 16);
         assert_eq!(o.relocations[2][0].addend, 16);
+    }
+
+    #[test]
+    fn symbol_addends_are_kept_as_gnu_ld_keeps_them() {
+        // `.8byte f2-1` (the `.LVL-1` idiom): f2 follows the deleted run
+        // [16, 18), so its target byte 17 lies inside it.  The symbol moves
+        // to 16 and the reference must still mean f2-1, i.e. byte 15.
+        let mut o = gas_object();
+        o.relocations[2] = vec![rela(0, 3, 2, -1)];
+        relax_align(&mut o).unwrap();
+        assert_eq!(o.symbols[3].value, 16);
+        assert_eq!(o.relocations[2][0].addend, -1);
     }
 
     #[test]

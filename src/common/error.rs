@@ -180,6 +180,12 @@ pub enum WarningKind {
     /// `ISO C90 forbids variable length array '<name>'`).
     /// GCC flag: -Wvla
     Vla,
+    /// `return` of the address of an automatic object, a parameter or a
+    /// label (measured against GCC 16.2: default-on in every dialect, never
+    /// a dialect default error, front-end walk identical at -O0..-O3; see
+    /// `sema::analysis::return_local_addr`).
+    /// GCC flag: -Wreturn-local-addr
+    ReturnLocalAddr,
 }
 
 /// Supported warning groups. `-Wall` and `-Wextra` are broad groups;
@@ -411,6 +417,14 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "variable length array at block scope"
+    ),
+    warning!(
+        ReturnLocalAddr,
+        "return-local-addr",
+        true,
+        [],
+        false,
+        "return of the address of a local variable, parameter or label"
     ),
 ];
 
@@ -1755,6 +1769,7 @@ mod dialect_severity_redteam_tests {
             WarningKind::Vla,
             WarningKind::DivByZero,
             WarningKind::StrictPrototypes,
+            WarningKind::ReturnLocalAddr,
         ];
         let expected: HashSet<_> = kinds.into_iter().collect();
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
@@ -1855,6 +1870,7 @@ mod dialect_severity_redteam_tests {
             "discarded-qualifiers",
             "discarded-array-qualifiers",
             "div-by-zero",
+            "return-local-addr",
             "undeclared",
         ];
         expected_defaults.sort_unstable();

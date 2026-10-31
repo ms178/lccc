@@ -1316,3 +1316,81 @@ fn loop_latch_saturating_initializer_keeps_the_extension() {
     ));
     assert!(out.contains("movslq %r10d, %r10"), "{out}");
 }
+
+/// The canonical counted loop of `loop_latch_sign_extension_is_eliminated`,
+/// with `pre` placed between the initializer and the guard block, `body`
+/// inside the loop and `post` after the function's `ret`.
+fn latch_loop(pre: &str, body: &str, post: &str) -> String {
+    format!(
+        "f:\n.cfi_startproc\n    subq $8, %rsp\n    xorl %r10d, %r10d\n    movl $5, %r15d\n{pre}\
+         .LBB11:\n    cmpl %r15d, %r10d\njge .LBB13\n.LBB12:\n    movl (%r8, %r10, 4), %ebp\n\
+         {body}    addl $1, %r10d\n    movslq %r10d, %r10\n    cmpl %r15d, %r10d\njl .LBB12\n\
+         .LBB13:\n    movl (%r8, %r10, 4), %eax\n    addq $8, %rsp\n    ret\n{post}.cfi_endproc\n"
+    )
+}
+
+/// The extension is deleted in the canonical shape and in fannkuch's real
+/// one, where unreferenced labels and a `.p2align` sit between the
+/// initializer and the head: neither is an entry, so the hardened proof must
+/// still accept it.
+#[test]
+fn loop_latch_proof_steps_over_fallthrough_only_labels() {
+    let out = run(&latch_loop("", "", ""));
+    assert!(!out.contains("movslq %r10d, %r10"), "{out}");
+    let out = run(&latch_loop(
+        ".LBB10:\n    leal 1(%rsi), %r9d\n.p2align 4,,10\n",
+        "",
+        "",
+    ));
+    assert!(!out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// A block laid out after the latch that writes the counter and jumps back
+/// into the body: the write is outside the head..latch text, and a negative
+/// counter makes the extension real. The body label it enters is referenced
+/// from outside the loop text, so the proof must refuse.
+#[test]
+fn loop_latch_out_of_line_write_keeps_the_extension() {
+    let body = "    testl %ebp, %ebp\n    js .LBB20\n.LBB14:\n";
+    let post = ".LBB20:\n    movl $-6, %r10d\n    jmp .LBB14\n";
+    let out = run(&latch_loop("", body, post));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// A conditional branch into the head from elsewhere skips the latch test as
+/// surely as a `jmp` does.
+#[test]
+fn loop_latch_conditional_entry_keeps_the_extension() {
+    let post = ".LBB21:\n    movl $-6, %r10d\n    testl %eax, %eax\n    jne .LBB12\n    ret\n";
+    let out = run(&latch_loop("", "", post));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// A jump-table entry naming the head is an entry with an arbitrary counter.
+#[test]
+fn loop_latch_address_taken_head_keeps_the_extension() {
+    let post = ".section .rodata\n.LJT0:\n    .quad .LBB12\n.text\n";
+    let out = run(&latch_loop("", "", post));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// A referenced label between the initializer and the head is a join point:
+/// the other predecessor brings its own counter value.
+#[test]
+fn loop_latch_join_above_the_head_keeps_the_extension() {
+    let pre = ".LBB10:\n";
+    let post = ".LBB22:\n    movl $-6, %r10d\n    jmp .LBB10\n";
+    let out = run(&latch_loop(pre, "", post));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}
+
+/// A data directive in the loop may encode a write to the counter.
+#[test]
+fn loop_latch_data_in_the_loop_keeps_the_extension() {
+    let out = run(&latch_loop(
+        "",
+        "    .byte 0x41, 0xba, 0xfa, 0xff, 0xff, 0xff\n",
+        "",
+    ));
+    assert!(out.contains("movslq %r10d, %r10"), "{out}");
+}

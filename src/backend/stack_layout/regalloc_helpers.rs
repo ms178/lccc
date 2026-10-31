@@ -147,6 +147,87 @@ fn collect_abi_reg_hints(
     hints
 }
 
+/// SysV x86-64: prefer, for each value passed to direct calls in one
+/// consistent GP argument slot `k`, that slot's register, so it is computed
+/// where the call reads it instead of in a scratch register copied at the
+/// call (`leaq (%rdi,%rsi),%r9; ...; movq %r9,%rdi`).
+///
+/// These are soft preferences (`RegAllocConfig::reg_prefs`), not hints: a
+/// `reg_hints` entry is the ParamRef ordered-copy contract and makes its
+/// range immune to eviction, exchange and hot-web stealing, which an
+/// outgoing argument must not be (lz4's hash-table base took %r15 and
+/// pushed the hot loop's end pointer to the stack). A preference only picks
+/// among free registers; the allocator's interference, pool and staging
+/// hazard (`arg_reg_hazard`) checks still apply. A value that already holds
+/// a contract hint gets none: its entry copy is elided, and the call's
+/// staging copy out of the incoming register costs the same one move
+/// (`fill(d, n)`: `movq %rsi,%rdx; movl $7,%esi; jmp memset`, GCC's code).
+/// Calls the backend expands inline (fixed-size memcpy/memset) stage
+/// nothing and give no preference.
+fn collect_outgoing_arg_prefs(
+    func: &IrFunction,
+    available_regs: &[PhysReg],
+    caller_saved_regs: &[PhysReg],
+    ra_config: &RaConfig,
+    hints: &FxHashMap<u32, PhysReg>,
+) -> FxHashMap<u32, PhysReg> {
+    let mut prefs = FxHashMap::default();
+    if ra_config.no_abi_reg_hints
+        || crate::common::types::target_is_32bit()
+        || !available_regs.iter().any(|r| r.0 == 1)
+        || !caller_saved_regs.iter().any(|r| r.0 == 10)
+    {
+        return prefs;
+    }
+    // SysV AMD64 integer argument slots; rcx is unavailable to the allocator.
+    let mapping = [
+        Some(PhysReg(14)),
+        Some(PhysReg(15)),
+        Some(PhysReg(16)),
+        None,
+        Some(PhysReg(12)),
+        Some(PhysReg(13)),
+    ];
+    // value -> Some(slot) when every direct-call use agrees, None on conflict.
+    let mut slot_of: FxHashMap<u32, Option<usize>> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::Call { func: name, info } = inst else {
+                continue;
+            };
+            if crate::backend::generation::inline_memcpy_len(name, info).is_some()
+                || crate::backend::generation::x86_inline_memset_len(name, info).is_some()
+            {
+                continue;
+            }
+            let Some(slots) = super::super::regalloc::x86_64_call_int_slots(info) else {
+                continue;
+            };
+            for (arg, slot) in info.args.iter().zip(slots) {
+                let Operand::Value(v) = arg else {
+                    continue;
+                };
+                let entry = slot_of.entry(v.0).or_insert(slot);
+                if *entry != slot {
+                    *entry = None;
+                }
+            }
+        }
+    }
+    for (v, slot) in slot_of {
+        if hints.contains_key(&v) {
+            continue;
+        }
+        let Some(Some(reg)) = slot.and_then(|k| mapping.get(k)) else {
+            continue;
+        };
+        if available_regs.contains(reg) || caller_saved_regs.contains(reg) {
+            prefs.insert(v, *reg);
+        }
+    }
+    prefs
+}
+
 /// Result tuple of [`run_regalloc_and_merge_clobbers_ex`]: final homes, the
 /// liveness the allocator computed, caller-save spans, accumulator
 /// assignments and the allocation-eligible value set.
@@ -417,6 +498,13 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
         Vec::new()
     };
     let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs, ra_config);
+    let reg_prefs = collect_outgoing_arg_prefs(
+        func,
+        &available_regs,
+        &caller_saved_regs,
+        ra_config,
+        &reg_hints,
+    );
 
     // ── Static-chain register reservation (GNU C nested functions) ───────
     //
@@ -492,6 +580,7 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
         fold_base_regs,
         fold_readmit: FxHashSet::default(),
         reg_hints,
+        reg_prefs,
         ra_config: Arc::clone(ra_config),
     };
     // Debug: CCC_NO_REGALLOC forces pure slot-based codegen (A/B experiments).

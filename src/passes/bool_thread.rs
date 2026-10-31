@@ -556,13 +556,16 @@ fn thread_round(func: &mut IrFunction) -> usize {
                                 }
                                 _ => (*op, arm.clone(), rhs.clone()),
                             };
-                            func.blocks[pi].instructions.push(Instruction::Cmp {
-                                dest: fresh,
-                                op: op_e,
-                                lhs: lhs_e,
-                                rhs: rhs_e,
-                                ty: *ty,
-                            });
+                            func.blocks[pi].push_inst(
+                                Instruction::Cmp {
+                                    dest: fresh,
+                                    op: op_e,
+                                    lhs: lhs_e,
+                                    rhs: rhs_e,
+                                    ty: *ty,
+                                },
+                                crate::common::source::Span::dummy(),
+                            );
                             Terminator::CondBranch {
                                 cond: Operand::Value(fresh),
                                 true_label: bt,

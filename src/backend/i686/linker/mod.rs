@@ -183,6 +183,7 @@ pub fn load_inputs_for_script(
                 section_data,
                 relocations,
                 source_name: filename,
+                e_flags: 0,
             }
         })
         .collect())

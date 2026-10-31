@@ -30,6 +30,39 @@ The `-O` flags still set `__OPTIMIZE__` / `__OPTIMIZE_SIZE__` for kernel-style `
 passes; the backend peepholes are documented per backend
 (`src/backend/<arch>/codegen/`). Landed since this page was written:
 
+- **Path-duplicating jump threading** (`jump_thread.rs`, IR pass, `>= -O2`
+  except `-Os`/`-Oz`, after the main loop) -- duplicates a path of at most 4
+  blocks / 8 instructions for a predecessor that decides a later branch
+  (constant phi arm, dominating test, implied integer compare); at most 16
+  threads per function. Loop-header tail duplication is limited to
+  load-fed header branches that choose within the iteration, 1-2 latches,
+  private arms; measured rejections are listed in
+  `engineering/subsystems/optimizer.md`. Disable: `CCC_DISABLE_PASSES=jump_thread`
+  (not the x86 peephole of the same name, `CCC_PEEPHOLE_SKIP=jump_thread`).
+- **Join store forwarding** (`join_store_forward.rs`) -- a reload after a
+  join whose predecessors all store to the same pointer becomes a phi of the
+  stored values (list_sort's `tail->next`). `join_store_forward`.
+- **Phi relay folding** (`phi_relay_fold.rs`, `>= -O2`, right before phi
+  elimination) -- phi-only latch relays fold into the header so each edge
+  gets one parallel copy. `phi_relay_fold`.
+- **Phi webs** (`ir/mem2reg/phi_webs.rs`) -- acyclic phi webs inside one
+  innermost loop share one name (class cap 32, pass-through pairs first);
+  cross-loop unions are refused because they spill. `CCC_NO_PHI_WEB_COALESCE`.
+- **Accumulator recursion elimination** (`tail_call_elim.rs`,
+  `accumulator_calls_to_loops`, after `rec2iter`) -- `return x OP f(...)`
+  with an integer (<= 64-bit) Add/Mul/And/Or/Xor becomes a loop with an
+  accumulator; one operator per function. It must run after `rec2iter`,
+  which owns the O(n) Fibonacci rewrite. `tce_acc`.
+- **Bounded recursive self-inlining** (`inline/self_recursion.rs`, off at
+  `-Os`/`-Oz`) -- a frame-neutral, directly self-recursive body of at most
+  32 instructions and 2 self-calls is inlined into itself (at most 8 copies,
+  3 rounds, 160 instructions; no setjmp/`__builtin_setjmp`/non-local goto),
+  so each level owns its base-case branch. binary_trees: Callgrind
+  mispredicts 198,691 -> 89,642, Ir -4.7%. `self_inline`.
+- **Compare narrowing rule** (`simplify.rs`) -- `cmp (ext x), C` narrows to
+  the source width only when the extension's sole reader is the compare;
+  otherwise the wide value stays live anyway, and the narrow compare plus
+  the wide use cost an extra register (sqlite_vdbe_serial spill).
 - **Aggregate-copy forwarding** (`sret_copy_elision.rs`) — forwards eligible
   same-block, dominated aggregate copies into their loads, retaining copies
   with escaping, ambiguous, volatile, or otherwise unowned uses. Set
@@ -79,29 +112,49 @@ passes; the backend peepholes are documented per backend
   iteration with a scalar tail. Kill switch `CCC_NO_GENERATOR_MAP`; the
   `[VEC-GEN]` trace under `LCCC_DEBUG_VECTORIZE`. Gate:
   `tests/regression/check_generator_map.sh`.
-- **Strided-2 i32 sum reductions** (`vectorize_strided_i32_reduce.rs`) —
-  counted loops whose byte IV steps by 8 and whose accumulator adds a pure
-  32-bit modular expression of the loaded dwords. One 256-bit load puts the
-  four real dwords in the *even* lanes and the intervening ones in the odd
-  lanes, so the whole per-element DAG evaluates with **zero in-loop shuffles**;
-  the epilogue masks the odd lanes and does one horizontal add. AVX2 only, and
-  the loop bound is the scalar loop's own dereferenced footprint
-  (`32v + 31 <= 8(T-1) + 3`) unless every base is a proven object of `>= 8T`
-  bytes, so the vector prefix can never cross a guard page. 4x unrolled with
-  two accumulator chains at `>= 8` safe vectors; scalar tail otherwise. Kill
-  switch `CCC_NO_STRIDED_REDUCE`. The arithmetic that can be wrong — the trip
-  count, the wrap-free admission and the resume constant — is factored into
-  pure functions exercised by exhaustive unit tests in the pass
-  (`cargo test -p lccc vectorize_strided_i32_reduce`). `LCCC_VEC_STRIDED_TRACE`
-  names the analysis line that declined a candidate loop: the transform fails
-  closed at forty-odd preconditions, and a silent decline is indistinguishable
-  from "no candidate here" without it. A load base qualifies for the full
-  wide load (instead of the gap-skipping strided form) under one of two
-  proofs: a current-frame alloca of sufficient extent, or — through
+- **Strided-2 i32 sum reductions** (`vectorize_strided_i32_reduce.rs`,
+  pass `vectorize_strided_reduce_pre_unroll`) — counted loops whose byte IV
+  steps by 8 and whose accumulator adds a pure 32-bit modular expression of
+  the loaded dwords. Every vector covers four elements (32 bytes of the IV).
+  **AVX2:** the elements sit in the even YMM lanes — four exact `vmovd` /
+  `vpinsrd` reads, or one full `vmovdqu` when the window is proven — so the
+  per-element DAG needs no in-loop shuffle; the epilogue masks the odd lanes;
+  4x unrolled with two accumulator chains at `>= 8` safe vectors. **SSE2
+  baseline:** the elements fill all four XMM lanes — a proven window is
+  compacted from two `movdqu` with one `shufps $0x88`, an unproven pointer is
+  gathered with four exact `movd` reads joined by `punpckldq`/`punpcklqdq` —
+  so streams of either kind mix and no lane mask exists; unrolled twice with
+  two accumulators and two in-place IV vectors. The loop bound is the scalar
+  loop's own dereferenced footprint (`32v + 31 <= 8(T-1) + 3`), so the
+  vector prefix never reads past the last scalar element. A stream qualifies
+  for a gap-reading wide load only under a proof that its whole window lies
+  in one object: a current-frame alloca of sufficient extent, or — through
   `ModuleSymbolFacts` — a strong, locally binding global whose defined size
   covers the window (interposable, weak, common, alias- and
   asm-label-redirected names are excluded, so a link-time replacement can
-  never shrink the proof).
+  never shrink the proof). Unproven pointers read only their elements:
+  intervening bytes may belong to another, independently shared or
+  device-mapped object. The untouched scalar loop runs the tail. Kill switch
+  `CCC_NO_STRIDED_REDUCE`; i686 and AArch64 fail closed. The trip count, the
+  wrap-free admission and the resume constant are pure functions with
+  exhaustive unit tests (`cargo test -p lccc vectorize_strided_i32_reduce`);
+  `tests/regression/check_vector_remainder_codegen.sh` pins both widths,
+  checks exact access with hardware watchpoints on the gaps
+  (`fixtures/strided_exact/`) and runs a boundary stress
+  (`tests/regression/lib/strided_reduce_stress.py`) against GCC.
+- **Vector fill** (`vector_fill.rs`, late, x86-64 SSE2+, `-O2`/`-O3`) —
+  `for (i = 0; i < n; i++) p[i] = v` whose element is 16/32/64-bit (or a
+  float constant) and whose value is not one repeated byte (those are
+  `loop_memset`'s `memset`): a 32-byte-per-iteration pre-loop of two
+  `movdqu` stores of the splatted value runs up to `n & -L`, then the
+  untouched scalar loop finishes the tail and still defines every exit
+  value. A constant trip count that is a multiple of the step exits straight
+  past the (then dead) scalar loop. Exactness argument and admission rules
+  (64-bit affine address chain, `sext` only under a signed exit test,
+  negative signed bounds clamp to zero) in the module doc; obeys
+  `-fno-tree-vectorize`; pass name `vector_fill`. Gate:
+  `tests/regression/check_vector_remainder_codegen.sh`
+  (`tests/regression/lib/vector_fill_stress.py`).
 - **Widening + masked conditional-sum reductions** — I32->I64 `paddq`
   pipelines, VEX-only bodies (9x AVX-SSE transition penalty avoided).
 - **Loop rotation** (`loop_rotate.rs`, IR) — **opt-in** at the IR level
@@ -289,7 +342,7 @@ CCC_DISABLE_PASSES="gvn,licm" ./target/fastbuild/lccc input.c -o output
 CCC_DISABLE_PASSES="all"      ./target/fastbuild/lccc input.c -o output
 ```
 
-Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `sccp`.
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `sccp`, `jump_thread`, `join_store_forward`, `phi_relay_fold`, `ret_dup`, `loop_memset`, `vector_fill`, `tce`, `tce_acc`, `rec2iter`, `self_inline`, `boolthread`.
 
 Timing data is available via:
 

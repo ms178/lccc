@@ -2363,6 +2363,22 @@ pub(super) fn eliminate_dead_sign_extensions(
                             }
                             break;
                         }
+                        // A full-width store keeps the extended upper half in
+                        // memory, so the extension is dead only if no reader
+                        // of the slot observes it -- slot reasoning, valid for
+                        // a frame slot. `disp(%rbp)` is one only while %rbp is
+                        // the frame pointer; otherwise the store writes an
+                        // object that later code or the caller may read in
+                        // full, and the scan below cannot see those readers.
+                        if infos[j].trimmed(store.get(j)).contains("(%rbp)")
+                            && !super::relay_and_lea::function_range(store, infos, j).is_some_and(
+                                |(fs, fe)| {
+                                    super::load_op_fuse::rbp_is_frame_pointer(store, infos, fs, fe)
+                                },
+                            )
+                        {
+                            break;
+                        }
                         let mut k = j + 1;
                         let mut safe = true;
                         let mut saw_load = false;
@@ -10028,7 +10044,8 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
         let add_new = format!("    {} {}, {}", add_op, mem_text, b_name);
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, add_new);
-        replace_line(store, &mut infos[k], k, use_new);
+        // `use_new` was spliced from the trimmed use: restore the indent.
+        replace_line(store, &mut infos[k], k, format!("    {use_new}"));
         // The fold edited exactly i, j and k; every line between them is a
         // nop (j and k are the next real lines), so the edit is confined to
         // `i..=k` as `refresh_span` requires.
@@ -15773,5 +15790,43 @@ mod fp_loop_header_index_tests {
         let before = FP_LOOP_HEADER_BUILDS.with(std::cell::Cell::get);
         assert!(!promote_loop_invariant_fp_load(&mut store, &mut infos));
         assert_eq!(FP_LOOP_HEADER_BUILDS.with(std::cell::Cell::get) - before, 0);
+    }
+}
+
+#[cfg(test)]
+mod dead_sign_extension_frame_tests {
+    use super::*;
+
+    fn run(body: &str) -> String {
+        let text = format!("f:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        eliminate_dead_sign_extensions(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    const BODY: &str = "    cltq\n    movq %rax, -8(%rbp)\n    movl -8(%rbp), %ecx";
+
+    /// Under a frame pointer the slot's only reader is 32-bit, so the
+    /// extension is dead (the control proving the full-width-store path
+    /// fires at all).
+    #[test]
+    fn framed_slot_read_narrowly_drops_the_extension() {
+        let out = run(&format!("    pushq %rbp\n    movq %rsp, %rbp\n{BODY}"));
+        assert!(!out.contains("cltq"), "{out}");
+    }
+
+    /// The same text without a frame: `-8(%rbp)` is an object reached through
+    /// a data register, whose upper half anyone may read later.
+    #[test]
+    fn frameless_rbp_store_keeps_the_extension() {
+        let out = run(&format!("    pushq %rbx\n{BODY}"));
+        assert!(out.contains("cltq"), "{out}");
     }
 }

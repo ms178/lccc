@@ -37,6 +37,17 @@ callgrind on the same binary: 246,951,674 → 246,705,917 executed instructions
 (−245,757) with byte-identical output. Static size is the wrong metric for an
 unroll; the gate keeps the new number as its floor.
 
+Baseline notes (2026-10-31): the instruction pattern used to require leading
+whitespace and trailing whitespace, so it skipped every column-0 instruction
+(the `emit_jcc_block` jumps, before the emitter indented them) and every
+operand-less one (`ret`, `cltq`, `leave`); `YMM_RE` likewise stopped at the
+first digit (`vfmadd231pd`). The counts now follow the instructions, not the
+layout. Re-measured with the fixed parser, ms178/lccc main (219f74aeb) and this
+tree differ only where this tree emits less: glibc_memcmp 185→159 insns and
+32→18 moves, sqlite_varint 278→262 and 9→7 stack operands, expat_xml_scan
+206→195 and 8→3, portable_bit_counts 247→241, chacha20_block 200→199; the
+other six workloads are identical.
+
 Usage:
     python3 ci-codegen-gate.py --lccc target/fastbuild/lccc
     python3 ci-codegen-gate.py --lccc ... --update-baseline
@@ -91,7 +102,11 @@ TOLERANCES = {
     "moves": 0.05,
 }
 
-INSN_RE = re.compile(r"^\s+([a-z0-9]+)[\s]")
+# One instruction per line, at any indentation: the metric must not depend on
+# the emitter's formatting (column-0 jumps went uncounted until the emitter
+# indented them), and operand-less instructions (`ret`, `cltq`, `leave`) are
+# instructions too. A label (`name:`) never matches: `:` follows the word.
+INSN_RE = re.compile(r"^\s*([a-z][a-z0-9]*)(?:\s|$)")
 MEM_RE = re.compile(r"[-0-9(]*\((?:%rbp|%rsp)\)")
 # A `N(%rbp)` operand is stack traffic only when rbp is the frame pointer.
 # In FPO functions rbp is an ordinary callee-saved GPR (and a *good* one for
@@ -105,15 +120,15 @@ MEM_RE = re.compile(r"[-0-9(]*\((?:%rbp|%rsp)\)")
 # exclusion can therefore never mask a real spill. `movq %rsp,%rbp` is the
 # frame-pointer setup itself and is excluded from the proof.
 RBP_GPR_WRITE_RE = re.compile(
-    r"^\s+(?:movq|movl|movabsq|movsbq|movswq|movslq|movzbq|movzwq|leaq)"
+    r"^\s*(?:movq|movl|movabsq|movsbq|movswq|movslq|movzbq|movzwq|leaq)"
     r"\s+[^,]+,\s*%[re]?bp\b"
-    r"|^\s+(?:xorl|xorq)\s+%[re]?bp,\s*%[re]?bp\b"
+    r"|^\s*(?:xorl|xorq)\s+%[re]?bp,\s*%[re]?bp\b"
 )
-RBP_SETUP_RE = re.compile(r"^\s+movq\s+%rsp,\s*%rbp\b")
+RBP_SETUP_RE = re.compile(r"^\s*movq\s+%rsp,\s*%rbp\b")
 RBP_REF_RE = re.compile(r"\(%[re]?bp\)")
 RSP_REF_RE = re.compile(r"\(%rsp\)")
-YMM_RE = re.compile(r"^\s+(?:v[a-z]+)\s+[^#]*%ymm")
-FMA_RE = re.compile(r"^\s+(?:vfmadd|vfnmadd|vfmsub|vfnmsub)[a-z0-9]*\s")
+YMM_RE = re.compile(r"^\s*(?:v[a-z][a-z0-9]*)\s+[^#]*%ymm")
+FMA_RE = re.compile(r"^\s*(?:vfmadd|vfnmadd|vfmsub|vfnmsub)[a-z0-9]*\s")
 
 
 def score_chunk(lines: list, m: dict) -> None:

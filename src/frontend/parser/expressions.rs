@@ -126,16 +126,20 @@ impl Parser {
         }
     }
 
+    /// `expression: expression , assignment-expression` (C23 6.5.18): the
+    /// comma operator is left-associative, so `a, b, c` is `(a, b), c` and
+    /// the outermost node's span is the LAST comma -- GCC's location for the
+    /// whole expression (measured: `return (g, i, &x);` carets the second
+    /// comma).
     pub(super) fn parse_expr(&mut self) -> Expr {
-        let lhs = self.parse_assignment_expr();
-        if matches!(self.peek(), TokenKind::Comma) {
+        let mut lhs = self.parse_assignment_expr();
+        while matches!(self.peek(), TokenKind::Comma) {
             let span = self.peek_span();
             self.advance();
-            let rhs = self.parse_expr();
-            Expr::Comma(Box::new(lhs), Box::new(rhs), span)
-        } else {
-            lhs
+            let rhs = self.parse_assignment_expr();
+            lhs = Expr::Comma(Box::new(lhs), Box::new(rhs), span);
         }
+        lhs
     }
 
     pub(super) fn parse_assignment_expr(&mut self) -> Expr {

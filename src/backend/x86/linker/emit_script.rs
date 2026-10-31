@@ -733,6 +733,7 @@ fn make_script_dynamic_object(
         section_data,
         relocations: vec![Vec::new(); section_count],
         source_name: "<script-dynamic>".into(),
+        e_flags: 0,
     };
     let plan = ScriptDynamic {
         object_index,

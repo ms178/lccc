@@ -118,12 +118,18 @@
 //! the block's other outgoing edges. So instead of splitting unconditionally,
 //! the backedge copies are buffered and then validated as a parallel copy
 //! (`self_loop_copies_can_hoist`). If every destination is invisible outside
-//! the block and the copies commute, they are appended to the block itself and
-//! the latch disappears. If any destination escapes, the trampoline is built
+//! the block and the copies commute, they are moved into the block itself
+//! (ahead of the compare feeding its branch, see `place_pred_copies`) and the
+//! latch disappears. If any destination escapes, the trampoline is built
 //! exactly as before, so the transform is strictly a refinement of the old
 //! behaviour. Rotation makes this fire in practice: rotating lifts the exit
 //! value into a distinct SSA value, so the accumulator the exit phi reads is
 //! no longer a phi destination. Set `CCC_NO_PHI_SELFLOOP_HOIST=1` to disable.
+//!
+//! Phi-web coalescing:
+//! Before lowering, non-interfering phi webs are renamed to one variable
+//! (`phi_webs`), so the copies between them vanish. `CCC_NO_PHI_WEB_COALESCE=1`
+//! disables it.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{
@@ -650,6 +656,15 @@ fn eliminate_phis_with_policy(
     next_block_id: &mut u32,
     policy: CopyOrderPolicy,
 ) {
+    // Phi-web coalescing (see `phi_webs`) on the targets that run the
+    // cycle-accurate resolver; narrow-GPR targets keep separate webs for the
+    // same register-economy reason they keep the legacy resolver.
+    // `CCC_NO_PHI_WEB_COALESCE=1` disables it.
+    if policy == CopyOrderPolicy::Acyclic
+        && std::env::var("CCC_NO_PHI_WEB_COALESCE").as_deref() != Ok("1")
+    {
+        super::phi_webs::coalesce_phi_webs(func);
+    }
     let mut ctx = PhiElimCtx {
         label_to_idx: func
             .blocks
@@ -692,6 +707,7 @@ fn eliminate_phis_with_policy(
     }
 
     resolve_self_loop_copies(func, &mut ctx);
+    hoist_uniform_edge_copies(func, &mut ctx);
     apply_phi_transformations(func, &mut ctx);
     if ctx.copy_order == CopyOrderPolicy::Acyclic {
         fold_computed_phi_incomings(func);
@@ -1197,15 +1213,15 @@ impl BlockUses {
 /// shift chain) changes its meaning, and the existing temporary machinery in
 /// `emit_multi_phi_copies` is what handles those.
 ///
-/// A fourth condition is about *profit*, not correctness. Absorbing appends the
-/// copies immediately before the terminator. If the block's branch condition is
-/// a `Cmp` in this block and one of the copies redefines an operand of it, the
-/// copy lands between that `Cmp` and its consumer, so the x86 emitter's
-/// compare-replay must decline (see the redefinition guard in
-/// `x86/codegen/comparison.rs`) and emit the compare at its own position rather
-/// than fusing it into the branch. That costs an operand reload on every
-/// iteration -- more than the removed branch is worth -- so the absorption is
-/// skipped in exactly that shape and kept wherever removing the latch pays.
+/// A fourth condition is about *profit*, not correctness. Absorbed copies are
+/// placed ahead of the compare feeding the branch (`place_pred_copies`), which
+/// keeps the compare fusable on every backend. That is impossible when the
+/// compare reads a copy destination (it must see the old value), and placing
+/// the copies after it separates the compare from its branch: the compare is
+/// then materialized and re-tested (x86-64's compare replay declines on the
+/// redefined operand, see `x86/codegen/comparison.rs`). That costs more per
+/// iteration than the removed latch branch, so the absorption is skipped in
+/// exactly that shape and kept wherever removing the latch pays.
 fn self_loop_copies_can_hoist(
     block: &BasicBlock,
     copies: &[Instruction],
@@ -1346,6 +1362,101 @@ fn resolve_self_loop_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
 
 /// Apply all phi elimination transformations to the function:
 /// remove phis, insert copies, retarget terminators, add trampolines.
+/// Uniform edge copies: when every outgoing edge of a branching block was
+/// split for the *same* copy sequence, run that sequence once before the
+/// branch instead.
+///
+/// A tail-duplicated merge loop's compare block ends `t = a; a = next` on both
+/// the edge back to its own arm and the edge into the other arm; splitting
+/// both edges costs two trampolines and an unconditional jump per iteration
+/// (GCC emits `mov; mov; cmp; jnb .L7`).  Executing an identical parallel copy
+/// on every outgoing edge equals executing it at the end of the block, as long
+/// as the terminator does not read a destination.  Refused when the block
+/// already carries copies of its own, ends in an indirect branch, has
+/// `asm goto` edges, or any edge is not split for the identical sequence.
+fn hoist_uniform_edge_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
+    let mut by_pred: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for (ti, t) in ctx.trampolines.iter().enumerate() {
+        by_pred.entry(t.pred_idx).or_default().push(ti);
+    }
+    let mut dropped: FxHashSet<usize> = FxHashSet::default();
+    for (pred, tramps) in by_pred {
+        let block = &func.blocks[pred];
+        if tramps.len() < 2
+            || ctx.is_indirect_branch[pred]
+            || ctx.pred_copies.contains_key(&pred)
+            || block
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::InlineAsm { .. }))
+        {
+            continue;
+        }
+        let mut succs: Vec<BlockId> = Vec::new();
+        match &block.terminator {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => succs.extend([*true_label, *false_label]),
+            Terminator::Switch { cases, default, .. } => {
+                succs.push(*default);
+                succs.extend(cases.iter().map(|&(_, l)| l));
+            }
+            _ => continue,
+        }
+        succs.sort_by_key(|b| b.0);
+        succs.dedup();
+        let mut targets: Vec<BlockId> = tramps
+            .iter()
+            .map(|&t| ctx.trampolines[t].old_target)
+            .collect();
+        targets.sort_by_key(|b| b.0);
+        targets.dedup();
+        let first = &ctx.trampolines[tramps[0]].copies;
+        let uniform = targets == succs
+            && first.iter().all(|c| matches!(c, Instruction::Copy { .. }))
+            && tramps
+                .iter()
+                .all(|&t| copies_equal(&ctx.trampolines[t].copies, first));
+        if !uniform {
+            continue;
+        }
+        let mut read_by_term = false;
+        block.terminator.for_each_used_value(|v| {
+            read_by_term |= first.iter().any(|c| c.dest().is_some_and(|d| d.0 == v));
+        });
+        if read_by_term {
+            continue;
+        }
+        ctx.pred_copies.insert(pred, first.clone());
+        dropped.extend(tramps);
+    }
+    if dropped.is_empty() {
+        return;
+    }
+    let mut index = 0usize;
+    ctx.trampolines.retain(|_| {
+        let keep = !dropped.contains(&index);
+        index += 1;
+        keep
+    });
+    // `trampoline_map` indices are stale after the retain and the map is not
+    // read past this point; clear it rather than renumber.
+    ctx.trampoline_map.clear();
+}
+
+/// Two copy sequences are the same parallel assignment, element by element.
+fn copies_equal(a: &[Instruction], b: &[Instruction]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| match (x, y) {
+            (Instruction::Copy { dest: d1, src: s1 }, Instruction::Copy { dest: d2, src: s2 }) => {
+                d1 == d2 && s1 == s2
+            }
+            _ => false,
+        })
+}
+
 fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
         // Remove phi instructions (and their spans)
@@ -1377,16 +1488,10 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
             }
         }
 
-        // Insert predecessor copies before terminator
+        // Insert predecessor copies before the terminator, ahead of the
+        // compare that feeds it (`place_pred_copies`).
         if let Some(copies) = ctx.pred_copies.remove(&block_idx) {
-            let num_copies = copies.len();
-            block.instructions.extend(copies);
-            if !block.source_spans.is_empty() {
-                block.source_spans.extend(std::iter::repeat_n(
-                    crate::common::source::Span::dummy(),
-                    num_copies,
-                ));
-            }
+            place_pred_copies(block, copies);
         }
     }
 
@@ -1414,6 +1519,212 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
             terminator: Terminator::Branch(trampoline.branch_target),
         });
     }
+}
+
+/// Insert a block's predecessor copies (its outgoing phi copies: absorbed
+/// self-loop backedges, uniform edge copies, single-successor edges) before
+/// its terminator -- and, when the terminator is a `CondBranch` fed by a
+/// compare, sink that compare's chain below them.
+///
+/// Every backend fuses `Cmp` -> `CondBranch` (`cmp; jcc`, `cmp; b.cond`,
+/// `bcc`) only when the compare is adjacent to the branch
+/// (`detect_cmp_branch_fusion`). Copies appended after the compare break the
+/// adjacency, and so does an instruction scheduled between them (a pointer
+/// induction step `p += 4` after the exit test): the compare is then
+/// materialized as a boolean and re-tested -- on i686, where phi webs are not
+/// coalesced (see `eliminate_phis`), `setcc; movzbl; test` in every rotated
+/// loop latch, and `cset`/`slt` plus a register branch on AArch64 and RISC-V.
+/// x86-64 recovered most of these with its compare replay, which re-reads the
+/// operands at the branch.
+///
+/// The block becomes `[other instructions] [copies] [compare chain]` when
+/// `flag_tail` proves that order equivalent; otherwise the copies are appended
+/// as before. Chain reads of a copy source are rewritten to that copy's
+/// destination (same value after the copy), so the source still dies at the
+/// copy and the two remain coalescable: the move adds no interference.
+/// Source spans are permuted with their instructions; a block whose spans are
+/// not index-aligned keeps the append order (its spans cannot be permuted).
+fn place_pred_copies(block: &mut BasicBlock, copies: Vec<Instruction>) {
+    use crate::common::source::Span;
+    let num_copies = copies.len();
+    // The chain is only moved when every instruction's span moves with it.
+    let spans_aligned = block.source_spans.is_empty() || block.spans_parallel();
+    let chain = if spans_aligned {
+        flag_tail(block, &copies)
+    } else {
+        None
+    };
+    let Some(chain) = chain else {
+        block.extend_insts(copies, Span::dummy());
+        return;
+    };
+    // value -> the destination of the (unique) copy reading it.
+    let mut carried: FxHashMap<u32, Value> = FxHashMap::default();
+    for copy in &copies {
+        if let Instruction::Copy {
+            dest,
+            src: Operand::Value(v),
+        } = copy
+        {
+            carried.entry(v.0).or_insert(*dest);
+        }
+    }
+    let in_chain = |i: usize| chain.binary_search(&i).is_ok();
+    let spans = block.take_parallel_spans();
+    let tracked = !spans.is_empty();
+    let old = std::mem::take(&mut block.instructions);
+    let mut insts = Vec::with_capacity(old.len() + num_copies);
+    let mut new_spans = Vec::with_capacity(if tracked { insts.capacity() } else { 0 });
+    let mut tail = Vec::with_capacity(chain.len());
+    let mut tail_spans = Vec::with_capacity(if tracked { chain.len() } else { 0 });
+    for (i, mut inst) in old.into_iter().enumerate() {
+        let span = spans.get(i).copied();
+        if !in_chain(i) {
+            insts.push(inst);
+            new_spans.extend(span);
+            continue;
+        }
+        inst.for_each_operand_mut(|op| {
+            if let Operand::Value(v) = op
+                && let Some(d) = carried.get(&v.0)
+            {
+                *v = *d;
+            }
+        });
+        inst.for_each_value_use_mut(|v| {
+            if let Some(d) = carried.get(&v.0) {
+                *v = *d;
+            }
+        });
+        tail.push(inst);
+        tail_spans.extend(span);
+    }
+    insts.extend(copies);
+    if tracked {
+        new_spans.extend(std::iter::repeat_n(Span::dummy(), num_copies));
+    }
+    insts.extend(tail);
+    new_spans.extend(tail_spans);
+    block.replace_insts(insts, new_spans);
+}
+
+/// Ascending indices of the compare chain feeding `block`'s `CondBranch` when
+/// `[others] [copies] [chain]` is equivalent to `[block] [copies]`, else
+/// `None` (the copies go last, as before).
+///
+/// The chain is the `Cmp` (or `BitTest`) defining the condition plus the
+/// `Copy`/integer-`Cast` links from it to the condition -- exactly what the
+/// backends fuse into the branch. Found walking back from the end of the
+/// block; an instruction defining the value being traced that is not such a
+/// link means the condition is not a compare chain.
+///
+/// Members may be interleaved with other instructions; sinking a member `c`
+/// past a later non-member `x` (copies included) is sound when
+/// * `x` does not read `c`'s result (no use before its new definition),
+/// * `x` defines neither `c`'s result nor a value `c` reads -- explicit even
+///   though SSA implies it, because this IR already carries phi copies --,
+/// * `x` is not a call or inline asm: the chain is pure, so it may pass any
+///   memory operation, but moving a compare below a call would stretch its
+///   operands across the call for no fusion the call does not already break.
+///
+/// For the copies this amounts to the group conditions: no chain instruction
+/// reads or defines a copy destination (the chain keeps seeing the values it
+/// saw before the copies ran) or defines a copy source (the copies keep
+/// reading the values they read at the end of the block). Each destination is
+/// written once (checked), so after the group every destination equals its
+/// source whenever that source is not itself a destination; chain reads of
+/// such a source may use the destination instead. That holds for sequential
+/// groups with cycle temporaries too: a value that is a destination is never
+/// rewritten, because a chain reading it refuses.
+fn flag_tail(block: &BasicBlock, copies: &[Instruction]) -> Option<Vec<usize>> {
+    let Terminator::CondBranch {
+        cond: Operand::Value(cond),
+        ..
+    } = &block.terminator
+    else {
+        return None;
+    };
+    let insts = &block.instructions;
+    let mut wanted = cond.0;
+    let mut chain = Vec::new();
+    let mut at = insts.len();
+    loop {
+        at = at.checked_sub(1)?;
+        let inst = &insts[at];
+        match inst {
+            Instruction::Cmp { dest, .. }
+            | Instruction::BinOp {
+                dest,
+                op: IrBinOp::BitTest,
+                ..
+            } if dest.0 == wanted => {
+                chain.push(at);
+                break;
+            }
+            Instruction::Copy {
+                dest,
+                src: Operand::Value(src),
+            } if dest.0 == wanted => {
+                chain.push(at);
+                wanted = src.0;
+            }
+            Instruction::Cast {
+                dest,
+                src: Operand::Value(src),
+                from_ty,
+                to_ty,
+            } if dest.0 == wanted && from_ty.is_integer() && to_ty.is_integer() => {
+                chain.push(at);
+                wanted = src.0;
+            }
+            _ if inst.dest().is_some_and(|d| d.0 == wanted) => return None,
+            Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
+            | Instruction::InlineAsm { .. } => return None,
+            _ => {}
+        }
+    }
+    chain.reverse();
+    let mut dests: FxHashSet<u32> = FxHashSet::default();
+    let mut srcs: FxHashSet<u32> = FxHashSet::default();
+    for copy in copies {
+        let Instruction::Copy { dest, src } = copy else {
+            return None;
+        };
+        if !dests.insert(dest.0) {
+            return None;
+        }
+        if let Operand::Value(v) = src {
+            srcs.insert(v.0);
+        }
+    }
+    for &c in &chain {
+        let member = &insts[c];
+        let result = member.dest()?.0;
+        let reads = member.used_values();
+        // The copies, which end up between every member's old and new place.
+        if dests.contains(&result) || srcs.contains(&result) {
+            return None;
+        }
+        if reads.iter().any(|v| dests.contains(v)) {
+            return None;
+        }
+        // Later non-members this member sinks past.
+        for (j, x) in insts.iter().enumerate().skip(c + 1) {
+            if chain.binary_search(&j).is_ok() {
+                continue;
+            }
+            if x.used_values().contains(&result) {
+                return None;
+            }
+            if x.dest()
+                .is_some_and(|d| d.0 == result || reads.contains(&d.0))
+            {
+                return None;
+            }
+        }
+    }
+    Some(chain)
 }
 
 fn fold_computed_phi_incomings(func: &mut IrFunction) {
@@ -2355,6 +2666,373 @@ mod tests {
             vec![(22, 21), (21, 20), (20, 19)],
             "rotation copies are missing or misordered"
         );
+    }
+
+    // ── predecessor-copy placement ahead of the branch compare chain ──────
+
+    fn add(d: u32, a: u32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(a)),
+            rhs: Operand::Const(crate::ir::reexports::IrConst::I64(1)),
+            ty: crate::common::types::IrType::I64,
+        }
+    }
+
+    fn widen(d: u32, s: u32) -> Instruction {
+        Instruction::Cast {
+            dest: Value(d),
+            src: Operand::Value(Value(s)),
+            from_ty: crate::common::types::IrType::I32,
+            to_ty: crate::common::types::IrType::I64,
+        }
+    }
+
+    /// `Instruction` has no `PartialEq`; its `Debug` form is structural.
+    fn same(a: &[Instruction], b: &[Instruction]) -> bool {
+        format!("{a:?}") == format!("{b:?}")
+    }
+
+    #[track_caller]
+    fn assert_same(got: &[Instruction], want: &[Instruction]) {
+        assert!(same(got, want), "got {got:?}\nwant {want:?}");
+    }
+
+    fn placed(
+        insts: Vec<Instruction>,
+        term: Terminator,
+        copies: Vec<Instruction>,
+    ) -> Vec<Instruction> {
+        let mut b = blk(1, insts, term);
+        place_pred_copies(&mut b, copies);
+        b.instructions
+    }
+
+    /// The rotated-latch shape: `i' = i + 1; c = i' != 0; br c` with the
+    /// backedge copy `i = i'`. The copy goes ahead of the compare, which
+    /// then reads the copy's destination, so `i'` still dies at the copy.
+    #[test]
+    fn latch_copies_precede_the_compare_and_carry_its_operand() {
+        let got = placed(vec![add(13, 10), cmp9(13)], cond(9, 1, 2), vec![cp(10, 13)]);
+        assert_same(&got, &[add(13, 10), cp(10, 13), cmp9(10)]);
+    }
+
+    /// `Copy`/integer `Cast` links between the compare and the branch stay
+    /// with the compare (the backends fuse through them).
+    #[test]
+    fn the_condition_chain_moves_with_its_compare() {
+        let got = placed(
+            vec![add(13, 10), cmp9(13), widen(20, 9), cp(21, 20)],
+            cond(21, 1, 2),
+            vec![cp(10, 13)],
+        );
+        assert_same(
+            &got,
+            &[add(13, 10), cp(10, 13), cmp9(10), widen(20, 9), cp(21, 20)],
+        );
+    }
+
+    /// A compare that reads a copy destination must see the old value: the
+    /// copies stay last.
+    #[test]
+    fn a_compare_reading_a_destination_keeps_the_copies_last() {
+        let got = placed(vec![add(13, 10), cmp9(10)], cond(9, 1, 2), vec![cp(10, 13)]);
+        assert_same(&got, &[add(13, 10), cmp9(10), cp(10, 13)]);
+    }
+
+    /// A copy reading a value the tail defines (a carried boolean, or a
+    /// chain link) cannot run before that definition.
+    #[test]
+    fn a_copy_of_a_tail_value_keeps_the_copies_last() {
+        let got = placed(vec![cmp9(13)], cond(9, 1, 2), vec![cp(10, 9)]);
+        assert_same(&got, &[cmp9(13), cp(10, 9)]);
+        let got = placed(
+            vec![cmp9(13), widen(20, 9)],
+            cond(20, 1, 2),
+            vec![cp(10, 20)],
+        );
+        assert_same(&got, &[cmp9(13), widen(20, 9), cp(10, 20)]);
+    }
+
+    /// The pointer-induction latch: `i' = i + 1; c = i' < n; p' = p + 4; br c`.
+    /// The compare sinks past the step and below the copies, reading the
+    /// copy destination of `i'`.
+    #[test]
+    fn the_chain_sinks_past_an_independent_instruction() {
+        let got = placed(
+            vec![add(13, 10), cmp9(13), add(14, 11)],
+            cond(9, 1, 2),
+            vec![cp(10, 13), cp(11, 14)],
+        );
+        assert_same(
+            &got,
+            &[add(13, 10), add(14, 11), cp(10, 13), cp(11, 14), cmp9(10)],
+        );
+        // Members interleaved with other instructions keep their order.
+        let got = placed(
+            vec![cmp9(13), add(14, 11), widen(20, 9), add(15, 12)],
+            cond(20, 1, 2),
+            vec![cp(11, 14)],
+        );
+        assert_same(
+            &got,
+            &[add(14, 11), add(15, 12), cp(11, 14), cmp9(13), widen(20, 9)],
+        );
+    }
+
+    /// Each sinking condition refuses on its own: a later instruction reading
+    /// the compare's result, one redefining a value the compare reads, a call
+    /// in between, a condition defined by something that is not a chain
+    /// link, a terminator that is not a conditional branch, no copies.
+    #[test]
+    fn a_chain_that_cannot_sink_keeps_the_copies_last() {
+        let got = placed(vec![cmp9(13), add(14, 9)], cond(9, 1, 2), vec![cp(10, 14)]);
+        assert_same(&got, &[cmp9(13), add(14, 9), cp(10, 14)]);
+        let got = placed(vec![cmp9(13), add(13, 12)], cond(9, 1, 2), vec![cp(10, 12)]);
+        assert_same(&got, &[cmp9(13), add(13, 12), cp(10, 12)]);
+        let call = Instruction::Call {
+            func: "f".to_string(),
+            info: crate::ir::reexports::CallInfo::default(),
+        };
+        let got = placed(
+            vec![cmp9(13), call.clone()],
+            cond(9, 1, 2),
+            vec![cp(10, 12)],
+        );
+        assert_same(&got, &[cmp9(13), call, cp(10, 12)]);
+        let got = placed(vec![cmp9(13), add(20, 9)], cond(20, 1, 2), vec![cp(10, 12)]);
+        assert_same(&got, &[cmp9(13), add(20, 9), cp(10, 12)]);
+        let got = placed(vec![cmp9(13)], cond(13, 1, 2), vec![cp(10, 12)]);
+        assert_same(&got, &[cmp9(13), cp(10, 12)]);
+        let got = placed(
+            vec![cmp9(13)],
+            Terminator::Branch(BlockId(1)),
+            vec![cp(10, 13)],
+        );
+        assert_same(&got, &[cmp9(13), cp(10, 13)]);
+        let got = placed(vec![cp(10, 13)], cond(9, 1, 2), Vec::new());
+        assert_same(&got, &[cp(10, 13)]);
+    }
+
+    /// Source spans stay index-parallel with the instructions.
+    #[test]
+    fn spans_are_inserted_at_the_copy_position() {
+        let mut b = blk(1, vec![add(13, 10), cmp9(13)], cond(9, 1, 2));
+        let real = crate::common::source::Span::new(4, 9, 0);
+        b.source_spans = vec![real, real];
+        place_pred_copies(&mut b, vec![cp(10, 13), cp(11, 12)]);
+        assert_eq!(b.instructions.len(), b.source_spans.len());
+        let dummy = crate::common::source::Span::dummy();
+        assert_eq!(b.source_spans, vec![real, dummy, dummy, real]);
+
+        // A sunk chain takes its spans along.
+        let (s1, s2, s3) = (
+            crate::common::source::Span::new(1, 2, 0),
+            crate::common::source::Span::new(3, 4, 0),
+            crate::common::source::Span::new(5, 6, 0),
+        );
+        let mut b = blk(1, vec![add(13, 10), cmp9(13), add(14, 11)], cond(9, 1, 2));
+        b.source_spans = vec![s1, s2, s3];
+        place_pred_copies(&mut b, vec![cp(10, 13)]);
+        assert_eq!(b.source_spans, vec![s1, s3, dummy, s2]);
+
+        // Spans that are not index-aligned (a drift some earlier pass left,
+        // reported by the verifier against that pass) cannot be permuted:
+        // the copies are appended, nothing is spliced out of range, and the
+        // drifted list is left exactly as found -- the `BasicBlock` span
+        // primitives' contract (`span_edit_tests`).
+        let mut b = blk(1, vec![add(13, 10), cmp9(13)], cond(9, 1, 2));
+        b.source_spans = vec![real];
+        place_pred_copies(&mut b, vec![cp(10, 13)]);
+        assert_same(&b.instructions, &[add(13, 10), cmp9(13), cp(10, 13)]);
+        assert_eq!(b.source_spans, vec![real]);
+    }
+
+    /// Exhaustive-by-sampling equivalence: for random blocks (compare chains
+    /// interleaved with foreign instructions, some reading the chain, some
+    /// redefining its operands) and random copy groups (parallel ones and
+    /// sequential ones with cycle temporaries), running the block as placed by
+    /// `place_pred_copies` must leave every value exactly as the reference
+    /// placement (copies last) does.
+    #[test]
+    fn placement_preserves_the_branch_and_every_copy_destination() {
+        use crate::ir::reexports::{IrCmpOp, IrConst};
+        fn run(insts: &[Instruction], init: &FxHashMap<u32, i64>) -> FxHashMap<u32, i64> {
+            let mut env = init.clone();
+            let val = |env: &FxHashMap<u32, i64>, op: &Operand| match op {
+                Operand::Value(v) => env[&v.0],
+                Operand::Const(IrConst::I64(c)) => *c,
+                Operand::Const(_) => unreachable!(),
+            };
+            for inst in insts {
+                let (d, x) = match inst {
+                    Instruction::Copy { dest, src } => (dest.0, val(&env, src)),
+                    Instruction::Cast { dest, src, .. } => (dest.0, val(&env, src)),
+                    Instruction::BinOp { dest, lhs, rhs, .. } => {
+                        (dest.0, val(&env, lhs).wrapping_add(val(&env, rhs)))
+                    }
+                    Instruction::Cmp { dest, lhs, rhs, .. } => {
+                        (dest.0, i64::from(val(&env, lhs) < val(&env, rhs)))
+                    }
+                    _ => unreachable!(),
+                };
+                env.insert(d, x);
+            }
+            env
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        // Values 1..=6 are live-in, 7 and 8 are computed in the block, 9 is
+        // the compare, 20/21 are condition links, 30.. are temporaries.
+        let mut moved = 0;
+        for _ in 0..20_000 {
+            let mut insts = vec![add(7, 1 + next(6)), add(8, 1 + next(7))];
+            let pick = |r: u32| if r < 8 { 1 + r } else { 9 };
+            insts.push(Instruction::Cmp {
+                dest: Value(9),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(1 + next(8))),
+                rhs: Operand::Value(Value(1 + next(8))),
+                ty: crate::common::types::IrType::I64,
+            });
+            let mut cond_v = 9;
+            if next(2) == 0 {
+                insts.push(widen(20, 9));
+                cond_v = 20;
+                if next(2) == 0 {
+                    insts.push(cp(21, 20));
+                    cond_v = 21;
+                }
+            }
+            // Foreign instructions anywhere after the compare: fresh values
+            // (40..) read from anywhere -- the chain included -- and, now and
+            // then, a redefinition of a live-in the compare may read.
+            for k in 0..next(3) {
+                let at = 3 + next(insts.len() as u32 - 2) as usize;
+                let src = match next(6) {
+                    0 => [9, 20, 21][next(3) as usize],
+                    _ => 1 + next(8),
+                };
+                let dest = if next(8) == 0 { 1 + next(8) } else { 40 + k };
+                insts.insert(at, add(dest, src));
+            }
+            // A copy group: distinct destinations among 1..=8 / 30..,
+            // sources anywhere (including the compare and its links).
+            let mut copies = Vec::new();
+            let mut used = FxHashSet::default();
+            for k in 0..(1 + next(3)) {
+                let d = if next(4) == 0 { 30 + k } else { 1 + next(8) };
+                if !used.insert(d) {
+                    continue;
+                }
+                let s = match next(5) {
+                    0 => cond_v,
+                    1 if d != 30 + k => 30 + next(3),
+                    _ => pick(next(9)),
+                };
+                copies.push(cp(d, s));
+            }
+            let term = cond(cond_v, 1, 2);
+            let mut reference = insts.clone();
+            reference.extend(copies.iter().cloned());
+            let got = placed(insts.clone(), term, copies.clone());
+            if !same(&got, &reference) {
+                moved += 1;
+            }
+            let mut init: FxHashMap<u32, i64> = FxHashMap::default();
+            for v in (1..=9).chain(20..=21).chain(30..=33).chain(40..=42) {
+                init.insert(v, i64::from(next(5)) - 2);
+            }
+            // Every value -- the branch condition, each copy destination,
+            // each chain link and foreign result -- ends up identical.
+            let a = run(&reference, &init);
+            let b = run(&got, &init);
+            assert_eq!(a, b, "state differs: {reference:?} vs {got:?}");
+        }
+        // The property must have been exercised on moved placements, not
+        // only on refusals.
+        assert!(moved > 1000, "only {moved} placements moved");
+    }
+
+    // ── uniform edge copies ────────────────────────────────────────────────
+
+    /// Block 1 branches to 2 and 3; each target's phi (already sharing the
+    /// name `dest`, as after phi-web coalescing) takes `src` from block 1.
+    fn uniform_edges(dest: u32, src2: u32, src3: u32) -> IrFunction {
+        let phi = |d: u32, s: u32| Instruction::Phi {
+            dest: Value(d),
+            ty: crate::common::types::IrType::I64,
+            incoming: vec![(Operand::Value(Value(s)), BlockId(1))],
+        };
+        let mut func = IrFunction::new(
+            "u".to_string(),
+            crate::common::types::IrType::I64,
+            Vec::new(),
+            false,
+        );
+        func.blocks = vec![
+            blk(0, Vec::new(), Terminator::Branch(BlockId(1))),
+            blk(1, vec![cmp9(5)], cond(9, 2, 3)),
+            blk(
+                2,
+                vec![phi(dest, src2)],
+                Terminator::Return(Some(Operand::Value(Value(dest)))),
+            ),
+            blk(
+                3,
+                vec![phi(dest, src3)],
+                Terminator::Return(Some(Operand::Value(Value(dest)))),
+            ),
+        ];
+        func.next_value_id = 64;
+        func.next_label = 4;
+        func
+    }
+
+    fn lower(mut func: IrFunction) -> IrFunction {
+        let mut next_block_id = 4;
+        eliminate_phis_with_policy(&mut func, &mut next_block_id, CopyOrderPolicy::Acyclic);
+        func
+    }
+
+    #[test]
+    fn identical_copies_on_every_edge_run_once_before_the_branch() {
+        let func = lower(uniform_edges(30, 5, 5));
+        assert_eq!(func.blocks.len(), 4, "no trampoline is needed");
+        let b1: Vec<_> = func.blocks[1]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(Value(s)),
+                } => Some((dest.0, *s)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(b1, vec![(30, 5)]);
+        assert!(matches!(
+            func.blocks[1].terminator,
+            Terminator::CondBranch {
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn differing_edges_or_a_destination_the_branch_reads_keep_trampolines() {
+        // Different sources per edge.
+        assert_eq!(lower(uniform_edges(30, 5, 6)).blocks.len(), 6);
+        // The copy writes the branch condition itself.
+        assert_eq!(lower(uniform_edges(9, 5, 5)).blocks.len(), 6);
     }
 
     // ── guard deferral + computed-incoming folding ─────────────────────────

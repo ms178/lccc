@@ -570,6 +570,7 @@ fn synthetic_property_object(note: &[u8], is_32: bool) -> Elf64Object {
         section_data,
         relocations: vec![Vec::new(); 2],
         source_name: "<property>".into(),
+        e_flags: 0,
     }
 }
 

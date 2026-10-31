@@ -69,7 +69,7 @@ use crate::ir::analysis::{
     build_cfg, build_dom_tree_children, build_label_map, compute_dominators,
 };
 use crate::ir::reexports::{
-    BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+    BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
 };
 
 /// A sorted, disjoint, non-adjacent list of closed intervals in `[0, max]`.
@@ -863,6 +863,183 @@ fn decided_select_arm(
     None
 }
 
+/// The constant `op` is known to equal under the active facts, spelled for a
+/// consumer that reads it as `ty`; `None` unless the facts pin `op` to one
+/// value of exactly `ty`'s width.
+///
+/// Facts are `bits`-wide unsigned interval sets, so the singleton is
+/// re-signed for `IrConst::from_i64` (which owns the per-type constant
+/// spelling, e.g. `U32` in a zero-extended `I64` payload). A 64-bit constant
+/// outside the sign-extended imm32 range is refused: materialising it costs a
+/// `movabsq` at every use, while the register it replaces is already there.
+fn singleton_const(stack: &[Fact], op: &Operand, ty: IrType) -> Option<Operand> {
+    let Operand::Value(v) = op else {
+        return None;
+    };
+    let bits = bits_of(ty)?;
+    // A direct `CondBranch(v)` edge only records "zero or not" on a 64-bit
+    // carrier. Zero is zero at every width, so a `{0}` boolean fact pins a
+    // narrower use too (`if (a) ...; else g(a)` → `g(0)`); a nonzero one does
+    // not, because the carrier's extension of `v` is unknown.
+    let zero_edge = bits < BOOL_BITS
+        && known_set(stack, *v, BOOL_BITS).is_some_and(|s| s.as_slice() == [(0, 0)]);
+    let lo = if zero_edge {
+        0
+    } else {
+        let known = known_set(stack, *v, bits)?;
+        let &[(lo, hi)] = known.as_slice() else {
+            return None;
+        };
+        if lo != hi {
+            return None;
+        }
+        lo
+    };
+    let signed = if lo >= 1i128 << (bits - 1) {
+        lo - (1i128 << bits)
+    } else {
+        lo
+    };
+    let value = i64::try_from(signed).ok()?;
+    if bits == 64 && i32::try_from(value).is_err() {
+        return None;
+    }
+    Some(Operand::Const(IrConst::from_i64(value, ty)))
+}
+
+/// Integer-register slot of each argument under the 64-bit register
+/// conventions, for the scalar integer/pointer arguments among the first six
+/// (the smallest register-argument count of SysV x86-64, AAPCS64 and the
+/// RISC-V LP64 ABI). Floats take no integer slot; the first aggregate or
+/// wide scalar ends the mapping, since its slot use is ABI-specific.
+/// Empty on 32-bit targets, whose arguments live on the stack.
+fn gp_arg_slots(args: impl Iterator<Item = (IrType, bool)>) -> Vec<Option<usize>> {
+    let mut out = Vec::new();
+    if crate::common::types::target_is_32bit() {
+        return out;
+    }
+    let mut next = 0usize;
+    let mut open = true;
+    for (ty, aggregate) in args {
+        let scalar_int = !aggregate && (ty.is_integer() || ty == IrType::Ptr) && ty.size() <= 8;
+        if aggregate || (!scalar_int && !ty.is_float()) {
+            open = false;
+        }
+        out.push((open && scalar_int && next < 6).then_some(next));
+        if scalar_int {
+            next += 1;
+        }
+    }
+    out
+}
+
+/// Parameters that arrive in an integer argument register, by slot
+/// (see [`gp_arg_slots`]).
+fn in_place_params(func: &IrFunction) -> FxHashMap<Value, usize> {
+    let slots = gp_arg_slots(func.params.iter().map(|p| (p.ty, p.struct_size.is_some())));
+    let mut out = FxHashMap::default();
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            if let Instruction::ParamRef {
+                dest, param_idx, ..
+            } = inst
+            {
+                if let Some(Some(s)) = slots.get(*param_idx) {
+                    out.insert(*dest, *s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Replace uses the active facts pin to a single constant (`x == 7` on this
+/// path: `g(x)` → `g(7)`), at operand positions that accept an immediate.
+///
+/// The win is the register, not the arithmetic: on the `a == 0` arm of
+/// `if (a) return g3(a, b, c); return g3(b, a, c);` the second argument
+/// becomes `xorl %esi, %esi`, so `a` is no longer live into that arm and the
+/// copy that kept it there disappears (GCC's DOM / LLVM's GVN equality
+/// propagation; GCC 16.2, Clang 23.1.4 and ICX 2026.2 all emit the `xorl`).
+///
+/// Positions: scalar call arguments (typed by `arg_types`; aggregates and
+/// the indirect callee stay), both operands of add/sub/mul/and/or/xor, the
+/// LEFT operand of division, remainder and shifts (a known-zero divisor or
+/// out-of-range count must never reach the constant folder as a literal),
+/// compare operands, stored values, select arms and the returned value.
+/// Never phis (edge-flavored), never `IsConstant` (`__builtin_constant_p`
+/// keeps its unoptimized answer), never pointers, asm operands or intrinsic
+/// arguments.
+fn substitute_singletons(
+    inst: &mut Instruction,
+    stack: &[Fact],
+    in_place: &FxHashMap<Value, usize>,
+) -> usize {
+    let mut n = 0usize;
+    let mut sub = |op: &mut Operand, ty: IrType| {
+        if let Some(c) = singleton_const(stack, op, ty) {
+            *op = c;
+            n += 1;
+        }
+    };
+    match inst {
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+            let slots = gp_arg_slots(info.arg_types.iter().enumerate().map(|(k, ty)| {
+                (
+                    *ty,
+                    info.struct_arg_sizes.get(k).is_some_and(Option::is_some),
+                )
+            }));
+            for (k, arg) in info.args.iter_mut().enumerate() {
+                let aggregate = info.struct_arg_sizes.get(k).is_some_and(Option::is_some);
+                // A parameter forwarded in its own integer slot is already in
+                // the argument register: the constant would cost a `xorl`/
+                // `movl` the register makes free (`else v2(c, y)` with
+                // `c == 0`).
+                let forwarded = matches!(arg, Operand::Value(v)
+                    if slots.get(k).copied().flatten().is_some_and(|s| in_place.get(v) == Some(&s)));
+                if let (false, false, Some(&ty)) = (aggregate, forwarded, info.arg_types.get(k)) {
+                    sub(arg, ty);
+                }
+            }
+        }
+        Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        } => {
+            use IrBinOp as B;
+            let ty = *ty;
+            match op {
+                B::Add | B::Sub | B::Mul | B::And | B::Or | B::Xor => {
+                    sub(lhs, ty);
+                    sub(rhs, ty);
+                }
+                B::SDiv | B::UDiv | B::SRem | B::URem | B::Shl | B::AShr | B::LShr => {
+                    sub(lhs, ty);
+                }
+                _ => {}
+            }
+        }
+        Instruction::Cmp { lhs, rhs, ty, .. } => {
+            let ty = *ty;
+            sub(lhs, ty);
+            sub(rhs, ty);
+        }
+        Instruction::Store { val, ty, .. } => sub(val, *ty),
+        Instruction::Select {
+            true_val,
+            false_val,
+            ty,
+            ..
+        } => {
+            let ty = *ty;
+            sub(true_val, ty);
+            sub(false_val, ty);
+        }
+        _ => {}
+    }
+    n
+}
+
 /// Remove `pred_label` from the phi incomings of block `target`.
 fn remove_phi_incoming(func: &mut IrFunction, target: usize, pred_label: BlockId) {
     for inst in &mut func.blocks[target].instructions {
@@ -991,6 +1168,7 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
     let label_to_idx = build_label_map(func);
     let (preds, succs) = build_cfg(func, &label_to_idx);
     let idom = compute_dominators(n, &preds, &succs);
+    let in_place = in_place_params(func);
     let children = build_dom_tree_children(n, &idom);
 
     // Value → definition maps used by predicate and zero-equivalence queries.
@@ -1239,6 +1417,22 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
                 func.blocks[blk].terminator = Terminator::Branch(keep);
                 changes += 1;
             }
+            // Singleton substitution (see `substitute_singletons`) runs LAST:
+            // the folds above decide compares, selects and branches from
+            // `Value` operands, and a compare whose operand had already been
+            // replaced by its constant (`cmp eq v, 1` -> `cmp eq 1, 1`) would
+            // escape them for the rest of this visit.
+            let return_type = func.return_type;
+            let block = &mut func.blocks[blk];
+            for inst in &mut block.instructions {
+                changes += substitute_singletons(inst, &stack, &in_place);
+            }
+            if let Terminator::Return(Some(op)) = &mut block.terminator {
+                if let Some(c) = singleton_const(&stack, op, return_type) {
+                    *op = c;
+                    changes += 1;
+                }
+            }
         }
         if *next < children[blk].len() {
             let child = children[blk][*next];
@@ -1260,7 +1454,7 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::reexports::{BasicBlock, IrBinOp, IrUnaryOp};
+    use crate::ir::reexports::{BasicBlock, CallInfo, IrBinOp, IrUnaryOp};
 
     #[test]
     fn constant_cast_resolution_respects_source_width_and_signedness() {
@@ -2279,7 +2473,18 @@ mod tests {
         ];
         f.next_value_id = 8;
         let n = run_function_with_symbols(&mut f, &bench_syms());
-        assert_eq!(n, 3, "S2 arm, b3 use, b4 use");
+        // Plus singleton substitution of d2's operands: b1 lies on b0's
+        // `v0 == 0` edge, so `cmp ne v0, v0` reads `cmp ne 0, 0` (the select
+        // rewrites are the subject; d2 stays a Cmp, so no def-fold interferes).
+        assert_eq!(n, 5, "S2 arm, b3 use, b4 use, d2 lhs, d2 rhs");
+        assert!(matches!(
+            f.blocks[1].instructions[0],
+            Instruction::Cmp {
+                lhs: Operand::Const(IrConst::I64(0)),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ..
+            }
+        ));
         assert!(matches!(
             f.blocks[1].instructions[1],
             Instruction::Select {
@@ -2299,6 +2504,310 @@ mod tests {
             run_function_with_symbols(&mut f, &bench_syms()),
             0,
             "idempotent"
+        );
+    }
+
+    /// `b0: c = cmp ne v, 0; br c, b1, b2` with `b2` (the `v == 0` arm)
+    /// holding `insts` and returning `ret`.
+    fn zero_arm(insts: Vec<Instruction>, ret: Operand) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![cmp0(1, IrCmpOp::Ne)],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(0)))),
+            ),
+            mk(2, insts, Terminator::Return(Some(ret))),
+        ];
+        f.next_value_id = 20;
+        f
+    }
+
+    fn call_g(dest: u32, args: Vec<Operand>, arg_types: Vec<IrType>) -> Instruction {
+        let n = args.len();
+        Instruction::Call {
+            func: "g".to_string(),
+            info: CallInfo {
+                dest: Some(Value(dest)),
+                args,
+                arg_types,
+                return_type: IrType::U64,
+                struct_arg_sizes: vec![None; n],
+                ..CallInfo::default()
+            },
+        }
+    }
+
+    #[test]
+    fn singleton_fact_substitutes_call_args_compares_and_return() {
+        let v = Operand::Value(Value(0));
+        let mut f = zero_arm(
+            vec![
+                call_g(
+                    5,
+                    vec![Operand::Value(Value(9)), v],
+                    vec![IrType::U64, IrType::U64],
+                ),
+                Instruction::Cmp {
+                    dest: Value(6),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(9)),
+                    rhs: v,
+                    ty: IrType::U64,
+                },
+            ],
+            v,
+        );
+        let n = run_function_with_symbols(&mut f, &bench_syms());
+        let Instruction::Call { info, .. } = &f.blocks[2].instructions[0] else {
+            panic!("call moved");
+        };
+        assert!(matches!(info.args[1], Operand::Const(IrConst::I64(0))));
+        assert!(matches!(info.args[0], Operand::Value(Value(9))));
+        assert!(matches!(
+            f.blocks[2].terminator,
+            Terminator::Return(Some(Operand::Const(IrConst::I64(0))))
+        ));
+        // The v != 0 arm learns nothing singleton: its `ret v` stays.
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::Return(Some(Operand::Value(Value(0))))
+        ));
+        assert!(n >= 3, "call arg, compare operand and return: {n}");
+    }
+
+    #[test]
+    fn direct_branch_zero_edge_pins_a_narrow_use() {
+        // `int w6(int a, ..) { if (a) return g3(a, ..); return g3(b, a, ..); }`
+        // branches on `a` itself: the false edge knows `a == 0` at any width;
+        // the true edge (nonzero on a 64-bit carrier) pins nothing.
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        let arm = |id: u32| {
+            mk(
+                id,
+                vec![call_g(
+                    5 + id,
+                    vec![Operand::Value(Value(0))],
+                    vec![IrType::I32],
+                )],
+                Terminator::Return(Some(Operand::Value(Value(5 + id)))),
+            )
+        };
+        f.blocks = vec![
+            mk(
+                0,
+                vec![],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(0)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            arm(1),
+            arm(2),
+        ];
+        f.next_value_id = 20;
+        run_function_with_symbols(&mut f, &bench_syms());
+        let arg = |b: usize| match &f.blocks[b].instructions[0] {
+            Instruction::Call { info, .. } => info.args[0],
+            other => panic!("call moved: {other:?}"),
+        };
+        assert!(
+            matches!(arg(2), Operand::Const(IrConst::I32(0))),
+            "{:?}",
+            arg(2)
+        );
+        assert!(matches!(arg(1), Operand::Value(Value(0))), "{:?}", arg(1));
+    }
+
+    #[test]
+    fn forwarded_parameter_keeps_its_register() {
+        // `void w4(int c, int x, int y) { if (c) v2(x, y); else v2(c, y); }`:
+        // on the `c == 0` arm `c` is parameter 0 passed as argument 0, already
+        // in the argument register, so the constant would cost an `xorl`. The
+        // same value passed in ANOTHER slot is substituted.
+        let param = |ty| crate::ir::reexports::IrParam {
+            ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+            is_f128_sse: false,
+        };
+        let mut f = IrFunction::new(
+            "w4".to_string(),
+            IrType::I32,
+            vec![param(IrType::I32), param(IrType::F64), param(IrType::I32)],
+            false,
+        );
+        let c = || Operand::Value(Value(0));
+        let y = || Operand::Value(Value(2));
+        f.blocks = vec![
+            mk(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I32,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(2),
+                        param_idx: 2,
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: c(),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(1, vec![], Terminator::Return(Some(y()))),
+            mk(
+                2,
+                vec![
+                    // A double ahead of `c` takes no integer slot: `c` is
+                    // still integer argument 0.
+                    call_g(
+                        5,
+                        vec![Operand::Const(IrConst::F64(1.0)), c(), y()],
+                        vec![IrType::F64, IrType::I32, IrType::I32],
+                    ),
+                    call_g(6, vec![y(), c()], vec![IrType::I32, IrType::I32]),
+                ],
+                Terminator::Return(Some(y())),
+            ),
+        ];
+        f.next_value_id = 20;
+        run_function_with_symbols(&mut f, &bench_syms());
+        let args = |i: usize| match &f.blocks[2].instructions[i] {
+            Instruction::Call { info, .. } => info.args.clone(),
+            other => panic!("call moved: {other:?}"),
+        };
+        assert!(
+            matches!(args(0)[1], Operand::Value(Value(0))),
+            "{:?}",
+            args(0)
+        );
+        assert!(
+            matches!(args(1)[1], Operand::Const(IrConst::I32(0))),
+            "{:?}",
+            args(1)
+        );
+    }
+
+    #[test]
+    fn singleton_never_reaches_divisors_shift_counts_aggregates_or_phis() {
+        let v = Operand::Value(Value(0));
+        let x = Operand::Value(Value(9));
+        let bin = |d: u32, op: IrBinOp, lhs: Operand, rhs: Operand| Instruction::BinOp {
+            dest: Value(d),
+            op,
+            lhs,
+            rhs,
+            ty: IrType::U64,
+        };
+        let mut agg = call_g(8, vec![v], vec![IrType::U64]);
+        if let Instruction::Call { info, .. } = &mut agg {
+            info.struct_arg_sizes = vec![Some(8)];
+        }
+        let mut f = zero_arm(
+            vec![
+                bin(5, IrBinOp::UDiv, x, v),
+                bin(6, IrBinOp::Shl, x, v),
+                bin(7, IrBinOp::SRem, v, x),
+                agg,
+            ],
+            x,
+        );
+        run_function_with_symbols(&mut f, &bench_syms());
+        let insts = &f.blocks[2].instructions;
+        assert!(matches!(
+            insts[0],
+            Instruction::BinOp {
+                rhs: Operand::Value(Value(0)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            insts[1],
+            Instruction::BinOp {
+                rhs: Operand::Value(Value(0)),
+                ..
+            }
+        ));
+        // The dividend is ordinary data: substituted.
+        assert!(matches!(
+            insts[2],
+            Instruction::BinOp {
+                lhs: Operand::Const(IrConst::I64(0)),
+                ..
+            }
+        ));
+        let Instruction::Call { info, .. } = &insts[3] else {
+            panic!("call moved");
+        };
+        assert!(matches!(info.args[0], Operand::Value(Value(0))));
+    }
+
+    #[test]
+    fn singleton_respects_width_and_the_imm32_budget() {
+        // A 32-bit fact says nothing about a 64-bit use of the same value.
+        let mut f = zero_arm(
+            vec![call_g(5, vec![Operand::Value(Value(0))], vec![IrType::U64])],
+            Operand::Const(IrConst::I64(1)),
+        );
+        if let Instruction::Cmp { ty, rhs, .. } = &mut f.blocks[0].instructions[0] {
+            *ty = IrType::U32;
+            *rhs = Operand::Const(IrConst::I32(0));
+        }
+        run_function_with_symbols(&mut f, &bench_syms());
+        let Instruction::Call { info, .. } = &f.blocks[2].instructions[0] else {
+            panic!("call moved");
+        };
+        assert!(matches!(info.args[0], Operand::Value(Value(0))));
+        // `v == 2^40` pins v, but a movabs per use costs more than the register.
+        let mut f = zero_arm(
+            vec![call_g(5, vec![Operand::Value(Value(0))], vec![IrType::U64])],
+            Operand::Const(IrConst::I64(1)),
+        );
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[0].instructions[0] {
+            *rhs = Operand::Const(IrConst::I64(1 << 40));
+        }
+        run_function_with_symbols(&mut f, &bench_syms());
+        let Instruction::Call { info, .. } = &f.blocks[2].instructions[0] else {
+            panic!("call moved");
+        };
+        assert!(matches!(info.args[0], Operand::Value(Value(0))));
+        // A negative 32-bit singleton is re-signed into the type's spelling.
+        let mut f = zero_arm(
+            vec![call_g(5, vec![Operand::Value(Value(0))], vec![IrType::I32])],
+            Operand::Const(IrConst::I64(1)),
+        );
+        if let Instruction::Cmp { ty, rhs, .. } = &mut f.blocks[0].instructions[0] {
+            *ty = IrType::I32;
+            *rhs = Operand::Const(IrConst::I32(-5));
+        }
+        run_function_with_symbols(&mut f, &bench_syms());
+        let Instruction::Call { info, .. } = &f.blocks[2].instructions[0] else {
+            panic!("call moved");
+        };
+        assert!(
+            matches!(info.args[0], Operand::Const(IrConst::I32(-5))),
+            "{:?}",
+            info.args[0]
         );
     }
 
@@ -2353,9 +2862,17 @@ mod tests {
         ];
         f.next_value_id = 5;
         let n = run_function_with_symbols(&mut f, &bench_syms());
-        // guard cmp, select, second cmp, branch, plus the correlated-select
-        // use rewrite of `ret s` in b3 (the guard is false there, so s is v).
-        assert_eq!(n, 5, "guard cmp, select, second cmp, branch, ret use");
+        // guard cmp, select, second cmp, branch, the correlated-select use
+        // rewrite of `ret s` in b3 (the guard is false there, so s is v), and
+        // the singleton substitution of `ret v` in b1 (`v == 0` there).
+        assert_eq!(
+            n, 6,
+            "guard cmp, select, second cmp, branch, ret use, singleton ret"
+        );
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::Return(Some(Operand::Const(IrConst::I64(0))))
+        ));
         assert!(matches!(
             f.blocks[2].instructions[0],
             Instruction::Copy {
@@ -2526,7 +3043,7 @@ mod tests {
 #[cfg(test)]
 mod safe_clz_review_tests {
     use super::*;
-    use crate::ir::reexports::{BasicBlock, IrBinOp, IrUnaryOp};
+    use crate::ir::reexports::{BasicBlock, IrUnaryOp};
     #[test]
     fn nonzero_or_bypass_is_dominance_and_width_scoped() {
         for (op, bit) in [
@@ -2583,7 +3100,20 @@ mod safe_clz_review_tests {
                     block(1, body(2), Terminator::Return(Some(v(3)))),
                     block(2, body(4), Terminator::Return(Some(v(5)))),
                 ];
-                assert_eq!(run_function(&mut f), usize::from(!truncate));
+                // Branching on the U32 value itself, the false edge pins it to
+                // zero: b2's `or v1, bit` becomes `or 0, bit` (singleton
+                // substitution) alongside b1's bypass rewrite.  Branching on
+                // the U64 source pins nothing about the truncation's width.
+                assert_eq!(run_function(&mut f), 2 * usize::from(!truncate));
+                let b2_lhs = match &f.blocks[2].instructions[0] {
+                    Instruction::BinOp { lhs, .. } => *lhs,
+                    other => panic!("or moved: {other:?}"),
+                };
+                if truncate {
+                    assert_eq!(b2_lhs, v(1));
+                } else {
+                    assert!(matches!(b2_lhs, Operand::Const(c) if c.to_i64() == Some(0)));
+                }
                 let expected = if truncate { v(2) } else { v(1) };
                 assert!(
                     matches!(f.blocks[1].instructions[1],Instruction::UnaryOp {src,..} if src==expected)

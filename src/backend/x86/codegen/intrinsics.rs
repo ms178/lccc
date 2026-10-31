@@ -5032,10 +5032,10 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecLoadStrided2I32x4 => {
-                // Two exact-width reads, never the gap at +4. `movd` zeroes
-                // the rest of its destination, so no separate zeroing op is
-                // needed. SSE2 has no pinsrd; shift the second dword to lane
-                // 2 in the reserved xmm1 scratch and merge it.
+                // Four exact-width reads at +0/+8/+16/+24, never a gap.
+                // SSE2 has no pinsrd: `movd` zeroes the rest of its
+                // destination, `punpckldq` pairs [e0, e8] and [e16, e24], and
+                // `punpcklqdq` joins the pairs into lanes 0..3.
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
@@ -5047,9 +5047,25 @@ impl X86Codegen {
                 self.state
                     .emit_fmt(format_args!("    movd (%rax), %{}", work));
                 self.state.emit("    movd 8(%rax), %xmm1");
-                self.state.emit("    pslldq $8, %xmm1");
                 self.state
-                    .emit_fmt(format_args!("    por %xmm1, %{}", work));
+                    .emit_fmt(format_args!("    punpckldq %xmm1, %{}", work));
+                if work == "xmm0" {
+                    // xmm1 is the only scratch: shift each upper element into
+                    // its lane and merge (two more ops than the form below).
+                    self.state.emit("    movd 16(%rax), %xmm1");
+                    self.state.emit("    pslldq $8, %xmm1");
+                    self.state.emit("    por %xmm1, %xmm0");
+                    self.state.emit("    movd 24(%rax), %xmm1");
+                    self.state.emit("    pslldq $12, %xmm1");
+                    self.state.emit("    por %xmm1, %xmm0");
+                } else {
+                    // xmm0 and xmm1 are both scratch here.
+                    self.state.emit("    movd 16(%rax), %xmm0");
+                    self.state.emit("    movd 24(%rax), %xmm1");
+                    self.state.emit("    punpckldq %xmm1, %xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    punpcklqdq %xmm0, %{}", work));
+                }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
                     if let Some(home) = dst_home {
@@ -11170,6 +11186,28 @@ impl X86Codegen {
             }
             return;
         }
+        // Splats (the vector-fill pass's run-time values): one broadcast
+        // instead of the general four-lane assembly.  Same scratch registers
+        // (%rax/%rcx, %xmm0/%xmm1) as the general path below.
+        if args[1..].iter().all(|a| *a == args[0]) {
+            self.operand_to_reg(&args[0], "rax");
+            self.state.emit("    movd %eax, %xmm0");
+            self.state.emit("    pshufd $0, %xmm0, %xmm0"); // [x0, x0, x0, x0]
+            self.state.sse_last_store_reg = false;
+            self.sse_store_dest(dest, "xmm0");
+            return;
+        }
+        if args[2] == args[0] && args[3] == args[1] {
+            self.operand_to_reg(&args[0], "rax");
+            self.state.emit("    movd %eax, %xmm0");
+            self.operand_to_reg(&args[1], "rcx");
+            self.state.emit("    movd %ecx, %xmm1");
+            self.state.emit("    punpckldq %xmm1, %xmm0"); // [x0, x1, 0, 0]
+            self.state.emit("    punpcklqdq %xmm0, %xmm0"); // [x0, x1, x0, x1]
+            self.state.sse_last_store_reg = false;
+            self.sse_store_dest(dest, "xmm0");
+            return;
+        }
         self.operand_to_reg(&args[0], "rax");
         self.state.emit("    movd %eax, %xmm0");
         self.operand_to_reg(&args[1], "rcx");
@@ -12099,14 +12137,16 @@ mod vector_address_contract_tests {
         assert!(!out.contains("vmovdqu"), "{out}");
     }
 
-    #[test]
-    fn strided_load_sse2_reads_only_two_dwords() {
+    /// The emitted instruction lines, without comments or directives.
+    fn strided_gather_lines(dest: Option<Value>, home: Option<PhysReg>) -> Vec<String> {
         let mut cg = X86Codegen::new();
         cg.reg_assignments.insert(0, super::super::machinst::R12);
         cg.reg_assignments.insert(1, super::super::machinst::R13);
-        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6
+        if let Some(home) = home {
+            cg.reg_assignments.insert(2, home);
+        }
         cg.emit_intrinsic_impl(
-            &Some(Value(2)),
+            &dest,
             &IntrinsicOp::VecLoadStrided2I32x4,
             &None,
             &[
@@ -12115,18 +12155,78 @@ mod vector_address_contract_tests {
                 Operand::Const(IrConst::I64(16)),
             ],
         );
-        let out = &cg.state.out.buf;
-        for inst in [
-            "leaq 16(%r12,%r13), %rax",
-            "movd (%rax), %xmm6",
-            "movd 8(%rax), %xmm1",
-            "pslldq $8, %xmm1",
-            "por %xmm1, %xmm6",
-        ] {
-            assert!(out.contains(inst), "missing {inst}: {out}");
-        }
-        assert!(!out.contains("movdqu"), "{out}");
-        assert!(!out.contains("movdqa %xmm0, %xmm6"), "{out}");
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('.'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every memory operand is one of the four scalar elements' own dwords.
+    fn assert_only_exact_element_reads(lines: &[String]) {
+        let reads: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains("(%rax)"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            reads
+                .iter()
+                .map(|l| l.split(',').next().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            [
+                "movd (%rax)",
+                "movd 8(%rax)",
+                "movd 16(%rax)",
+                "movd 24(%rax)"
+            ],
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn strided_load_sse2_gathers_four_exact_dwords() {
+        let lines = strided_gather_lines(Some(Value(2)), Some(PhysReg(24))); // xmm6
+        assert_eq!(
+            lines,
+            [
+                "leaq 16(%r12,%r13), %rax",
+                "movd (%rax), %xmm6",
+                "movd 8(%rax), %xmm1",
+                "punpckldq %xmm1, %xmm6",
+                "movd 16(%rax), %xmm0",
+                "movd 24(%rax), %xmm1",
+                "punpckldq %xmm1, %xmm0",
+                "punpcklqdq %xmm0, %xmm6",
+            ]
+        );
+        assert_only_exact_element_reads(&lines);
+    }
+
+    /// Without an XMM home the result is built in xmm0 with xmm1 as the only
+    /// scratch; the lane placement must still be `[e0, e8, e16, e24]`.
+    #[test]
+    fn strided_load_sse2_gather_without_home_uses_one_scratch() {
+        let lines = strided_gather_lines(None, None);
+        assert_eq!(
+            lines,
+            [
+                "leaq 16(%r12,%r13), %rax",
+                "movd (%rax), %xmm0",
+                "movd 8(%rax), %xmm1",
+                "punpckldq %xmm1, %xmm0",
+                "movd 16(%rax), %xmm1",
+                "pslldq $8, %xmm1",
+                "por %xmm1, %xmm0",
+                "movd 24(%rax), %xmm1",
+                "pslldq $12, %xmm1",
+                "por %xmm1, %xmm0",
+            ]
+        );
+        assert_only_exact_element_reads(&lines);
     }
 
     #[test]

@@ -1086,14 +1086,10 @@ impl I686Codegen {
         let Some(SlotAddr::Direct(slot)) = self.state.resolve_slot_addr(base.0) else {
             return None;
         };
-        let (frame, off) = if self.omit_frame_pointer {
-            (
-                "esp",
-                slot.0 + self.frame_base_offset + self.esp_adjust + disp,
-            )
-        } else {
-            ("ebp", slot.0 + disp)
-        };
+        // Same translation as every plain frame operand (direct parameter
+        // homes included), so an indexed access can never address a
+        // different location than `slot_ref` would.
+        let (frame, off) = self.slot_base_disp(slot, disp);
         // Frame slots and PF-06 displacements are i32 by construction; keep
         // the guard so a pathological frame cannot emit an unencodable
         // disp32 operand (silently wrong would be worse than refusing).
@@ -1702,5 +1698,37 @@ impl I686Codegen {
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
         emit!(self.state, "    movl ${}, %ecx", size);
         self.state.emit("    rep movsb");
+    }
+}
+
+#[cfg(test)]
+mod frame_operand_tests {
+    use super::*;
+
+    /// The indexed (SIB) frame operand goes through the same translation as
+    /// a plain one: a register-indexed byte of a directly-homed parameter
+    /// addresses the caller's argument slot, not the never-written frame
+    /// slot (`h(unsigned a, int i) { return ((unsigned char *)&a)[i]; }`).
+    #[test]
+    fn indexed_frame_operand_honours_direct_parameter_homes() {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.omit_frame_pointer = false;
+        cg.state.value_locations.insert(30, StackSlot(-8));
+        cg.state.alloca_values.insert(30);
+        cg.reg_assignments.insert(31, PhysReg(0));
+        let plain = cg.frame_sib_for_alloca_base(&Value(30), &Value(31), 0, 1);
+        assert_eq!(plain.as_deref(), Some("-7(%ebp, %ebx)"));
+        cg.param_direct_homes.insert(-8, (12, 4));
+        let homed = cg.frame_sib_for_alloca_base(&Value(30), &Value(31), 2, 1);
+        assert_eq!(homed.as_deref(), Some("13(%ebp, %ebx, 4)"));
+        // Agreement with the plain operand for every byte of the extent.
+        for k in 0..4 {
+            let sib = cg
+                .frame_sib_for_alloca_base(&Value(30), &Value(31), 0, k)
+                .unwrap();
+            let plain = cg.slot_ref_offset(StackSlot(-8), k);
+            assert_eq!(sib.split('(').next(), plain.split('(').next(), "byte {k}");
+        }
     }
 }

@@ -772,6 +772,45 @@ hot path.
 | `passes/callee_saves.rs` | ~160 | Phase 6: unused callee-saved register save/restore elimination |
 | `passes/frame_compact.rs` | ~320 | Phase 7: stack frame compaction after dead store/callee-save elimination |
 
+### Late passes and their bisection names
+
+Each pass below is described in its module documentation; the names are
+the `CCC_PEEPHOLE_SKIP` values that disable it.
+
+| Phase | Skip name | Pass | Rewrite |
+|---|---|---|---|
+| 3 | `load_mask_test` | `load_mask_test.rs` | `movslq G,%r; andl $m,%r; jcc` -> `testb $m,G; jcc` |
+| 4e | `ebb_reuse` | `ebb_reuse.rs` | delete copies/compares a single-predecessor path already established |
+| 4e | `copy_sink` | `ebb_reuse.rs` | move a copy only the fall-through arm reads past its `jcc` |
+| 4e | `dead_flag_writes` | `mod.rs` | retire flag-only writes the deletions left dead |
+| 8d' | `sign_test` | `sign_test.rs` | sign test as copy/load + shift (below) |
+| 8e | `arm_head_hoist` | `jump_thread.rs` | hoist identical arm heads above their `jcc` |
+| 8e | `cond_tail_call` | `jump_thread.rs` | `je .L; ... .L: jmp f` -> `je f` |
+
+### Sign tests as shifts (`sign_test.rs`)
+
+Phase 8d' rewrites a materialized sign test into a copy (or load) and one
+logical shift of the sign bit (or, for `test $1`, one `andl $1`), the form GCC 16.2, Clang 23.1.4 and ICX 2026.2
+emit:
+
+| Before | After |
+|---|---|
+| `xorl %eax,%eax; testl %edi,%edi; setl %al` | `movl %edi,%eax; shrl $31,%eax` |
+| `cmpb $0,(%rdi); setl %dl; movzbl %dl,%eax` | `movsbl (%rdi),%eax; shrl $31,%eax` |
+| `testb $128,(%rdi); setne %sil; movzbl %sil,%eax` | `movzbl (%rdi),%eax; shrl $7,%eax` |
+| `testb $1,4(%rdi); setne %sil; movzbl %sil,%eax` | `movzbl 4(%rdi),%eax; andl $1,%eax` |
+
+It runs unconditionally and late: the setcc pre-zeroing and the
+mask-to-memory test folds produce its inputs, and Phase 3 is skipped when no
+global pass changed anything. It runs before Phase 8e, whose same-line marker
+blocks the liveness oracle cannot read. Legality: consecutive live lines (a
+label is a join and blocks), flags dead afterwards, the `setcc` byte register
+dead after the `movzbl` (FileLiveness) unless it is the destination, nothing
+pinned. `CCC_PEEPHOLE_SKIP=sign_test` disables it. The IR-level counterpart,
+`(sext(x) & C) != 0` with `C` confined to the sign-replicated bits, is
+`fold_sign_region_mask_test` in `src/passes/simplify.rs`
+(`CCC_SIMPLIFY_SKIP=sign_mask`).
+
 ### Empty jump threading
 
 `jump_thread` runs after `identical_blocks` and before `epilogue_merge`.

@@ -546,6 +546,7 @@
     "LCCC_STRICT_MFLAGS",
     "LCCC_STRICT_OPTIONS",
     "LCCC_SYSROOT",
+    "LCCC_TAIL_CALL",
     "LCCC_VA_CALL",
     "LCCC_VEC_STRIDED_TRACE",
     "LCCC_VOLATILE_BEGIN",
@@ -553,8 +554,8 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 265,
-  "panic_sites": 881,
+  "knobs_undocumented": 263,
+  "panic_sites": 873,
   "panic_sites_hot": 101,
   "unsafe_sites": 25
 }

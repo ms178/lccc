@@ -1305,6 +1305,12 @@ impl Driver {
             let mut sema = SemanticAnalyzer::new();
             sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_pre_c99_dialect(self.pre_c99_dialect());
+            sema.set_weak_pragma_names(
+                preprocessor
+                    .weak_pragmas
+                    .iter()
+                    .map(|(name, _)| name.as_str()),
+            );
             sema.set_diagnostics(diagnostics);
             if let Err(error_count) = sema.analyze(&ast) {
                 return Err(format!("{} error(s) during semantic analysis", error_count));
@@ -2339,6 +2345,12 @@ impl Driver {
         let mut sema = SemanticAnalyzer::new();
         sema.set_builtin_policy(self.builtin_policy.clone());
         sema.set_pre_c99_dialect(self.pre_c99_dialect());
+        sema.set_weak_pragma_names(
+            preprocessor
+                .weak_pragmas
+                .iter()
+                .map(|(name, _)| name.as_str()),
+        );
         sema.set_diagnostics(diagnostics);
         if let Err(error_count) = sema.analyze(&ast) {
             // Errors already emitted through diagnostic engine with source spans
@@ -2463,7 +2475,8 @@ impl Driver {
         .with_trivial_auto_var_init(self.trivial_auto_var_init)
         .with_default_visibility(self.default_visibility.clone())
         .with_builtin_policy(self.builtin_policy.clone())
-        .with_enumerator_refs(sema_result.enumerator_refs);
+        .with_enumerator_refs(sema_result.enumerator_refs)
+        .with_local_address_returns(sema_result.local_address_returns);
         let (mut module, mut diagnostics) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one
@@ -2748,6 +2761,9 @@ impl Driver {
             self.target,
             crate::passes::loop_idiom::Capabilities {
                 native_popcount: self.resolved_fast_popcount(),
+                i686_sse: self.target == Target::I686
+                    && !self.codegen_no_sse()
+                    && !self.general_regs_only,
             },
             self.code16gcc,
             self.effective_wrap_signed_overflow(),
@@ -2863,6 +2879,31 @@ impl Driver {
             }
         }
 
+        // x86-64 sibling calls in branch arms: give each call block that
+        // ends in `Branch(R)` the shared return block's `Return`, so the
+        // backend's per-block sibling-call shape matches (see
+        // backend::x86::ret_dup). Last CFG change before the splitters;
+        // after the PGO post-pass fingerprint, so generate and use builds
+        // hash the same CFG. `CCC_NO_SIBCALL` turns the conversion off, and
+        // with it this rewrite (a duplicated epilogue would be its only
+        // effect); `CCC_DISABLE_PASSES=ret_dup` turns off only the rewrite.
+        if self.target == Target::X86_64
+            && self.opt_level >= 1
+            && std::env::var_os("CCC_NO_SIBCALL").is_none()
+            && !crate::passes::pass_disabled(
+                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                "ret_dup",
+            )
+        {
+            let mut changed = 0;
+            for func in &mut module.functions {
+                changed += crate::backend::x86::ret_dup::run(func);
+            }
+            if changed != 0 {
+                crate::passes::verify::verify_after_pass(&module, "ret_dup");
+            }
+        }
+
         // Dynamic-TLS addresses that are calls on this target (AArch64
         // descriptors) must be call points to the splitters' liveness too;
         // same policy as the backend's (`CodegenOptions::pic`, floor).
@@ -2874,6 +2915,26 @@ impl Driver {
             },
         ));
         (module, pgo_unit)
+    }
+
+    /// Fold phi-only latch relays into their headers so each incoming edge
+    /// gets one parallel copy (see `passes::phi_relay_fold`).  Runs right
+    /// before phi elimination, which is what turns each relay into copies.
+    fn fold_phi_relays(&self, module: &mut crate::ir::module::IrModule) {
+        if self.opt_level < 2
+            || crate::passes::pass_disabled(
+                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                "phi_relay_fold",
+            )
+        {
+            return;
+        }
+        for func in module.functions.iter_mut() {
+            if !func.is_declaration && !func.blocks.is_empty() {
+                crate::passes::phi_relay_fold::run(func);
+            }
+        }
+        crate::passes::verify::verify_after_pass(module, "phi_relay_fold");
     }
 
     fn split_and_layout_blocks(
@@ -3000,6 +3061,8 @@ impl Driver {
                 }
             }
         }
+
+        self.fold_phi_relays(&mut module);
 
         // Lower SSA phi nodes to copies before codegen
         if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
@@ -3744,12 +3807,7 @@ impl Driver {
                 }
             },
             skip_rax_setup: self.skip_rax_setup,
-            // Legacy bulk-memory/vararg helpers use SSE2 integer moves.
-            // Keep those paths off after an SSE2 denial, independently of
-            // the SSE1 scalar operations permitted by the driver flags.
-            no_sse: self.no_sse
-                || self.no_sse2
-                || (self.target == Target::I686 && !self.resolved_i686_sse()),
+            no_sse: self.codegen_no_sse(),
             i686_no_sse2: self.target == Target::I686
                 && (self.general_regs_only || !self.resolved_i686_sse2()),
             i686_no_sse3: self.target == Target::I686
@@ -3979,6 +4037,16 @@ impl Driver {
         matches!(self.target, Target::X86_64 | Target::I686)
             && self.enable_prfchw
             && !self.prfchw_explicitly_disabled
+    }
+
+    /// `CodegenOptions::no_sse`: the backend may not use SSE moves. Legacy
+    /// bulk-memory/vararg helpers use SSE2 integer moves, so an SSE2 denial
+    /// turns them off too, independently of the SSE1 scalar operations the
+    /// driver flags permit. The middle end reads the same answer
+    /// (`loop_idiom::Capabilities::i686_sse`) wherever its decisions must
+    /// match the emitter's.
+    pub(crate) fn codegen_no_sse(&self) -> bool {
+        self.no_sse || self.no_sse2 || (self.target == Target::I686 && !self.resolved_i686_sse())
     }
 
     /// Whether this i686 invocation enables the SSE register file.

@@ -204,12 +204,23 @@ asm_of() { # <cfile> <flags...>  -> stdout asm (fails the gate on compiler error
 # instead -- on CI (stdin /dev/null) every count came back 0 and every
 # refusal row passed vacuously, while on a host with an open stdin the gate
 # hung.  The count is real now, so the refusal rows genuinely bind.
+# A transfer to a function: `call`, or a direct tail jump -- `jmp` or a
+# conditional `jcc` -- to a symbol.  The x86 sibling-call and
+# conditional-tail-call peepholes turn a synthesised libcall into
+# `jne memcpy@PLT`; counting only `call` would call that "optimisation lost"
+# and, worse, let a self tail call inside a TU-defined memcpy pass as
+# refused.  Jumps to local labels and indirect jumps are not transfers.
+XFER_AWK='function xfer(line,   f, i) {
+    split(line, f, /[ \t]+/); i = (f[1] == "") ? 2 : 1
+    if (f[i] ~ /^call/) return 1
+    return f[i] ~ /^j[a-z]+$/ && f[i + 1] != "" && f[i + 1] !~ /^(\.L|\*|[0-9])/
+}'
 calls_in() { # <fn> ; asm on stdin
     local fn=$1
-    awk -v fn="$fn" '
+    awk -v fn="$fn" "$XFER_AWK"'
         index($0, fn ":") == 1 { in_fn = 1; next }
         in_fn && /^\.size/ { in_fn = 0 }
-        in_fn && /call/ { n++ }
+        in_fn && xfer($0) { n++ }
         END { print n + 0 }'
 }
 has_fn() { grep -q "^$2:" <<<"$1"; }
@@ -233,10 +244,10 @@ expect_no_call_to() { # <cfile> <fn> <sym> <flags...>
     local src=$1 fn=$2 sym=$3; shift 3
     local asm; asm=$(asm_of "$src" "$@")
     if ! has_fn "$asm" "$fn"; then bad "$(basename "$src") $*: $fn not emitted"; return; fi
-    if awk -v fn="$fn" -v sym="$sym" '
+    if awk -v fn="$fn" -v sym="$sym" "$XFER_AWK"'
             index($0, fn ":") == 1 { in_fn = 1; next }
             in_fn && /^\.size/ { in_fn = 0 }
-            in_fn && /call/ && index($0, sym) { found = 1 }
+            in_fn && xfer($0) && index($0, sym) { found = 1 }
             END { exit found ? 1 : 0 }' <<<"$asm"; then
         note "refused   $(basename "$src") $*  ($fn: no call to $sym)"
     else
@@ -247,10 +258,10 @@ expect_call() { # <cfile> <fn> <expected-symbol> <flags...>
     local src=$1 fn=$2 sym=$3; shift 3
     local asm; asm=$(asm_of "$src" "$@")
     if ! has_fn "$asm" "$fn"; then bad "$(basename "$src") $*: $fn not emitted"; return; fi
-    if awk -v fn="$fn" -v sym="$sym" '
+    if awk -v fn="$fn" -v sym="$sym" "$XFER_AWK"'
             index($0, fn ":") == 1 { in_fn = 1; next }
             in_fn && /^\.size/ { in_fn = 0 }
-            in_fn && /call/ && index($0, sym) { found = 1 }
+            in_fn && xfer($0) && index($0, sym) { found = 1 }
             END { exit found ? 0 : 1 }' <<<"$asm"; then
         note "synthesis $(basename "$src") $*  ($fn calls $sym)"
     else
@@ -265,10 +276,10 @@ expect_call() { # <cfile> <fn> <expected-symbol> <flags...>
 expect_no_library_fill() { # <cfile> <fn> <sym> <flags...>
     local src=$1 fn=$2 sym=$3; shift 3
     local asm; asm=$(asm_of "$src" "$@")
-    if awk -v fn="$fn" -v sym="$sym" '
+    if awk -v fn="$fn" -v sym="$sym" "$XFER_AWK"'
             index($0, fn ":") == 1 { in_fn = 1; next }
             in_fn && /^\.size/ { in_fn = 0 }
-            in_fn && /call/ && index($0, sym) { found = 1 }
+            in_fn && xfer($0) && index($0, sym) { found = 1 }
             END { exit found ? 0 : 1 }' <<<"$asm"; then
         note "semantics $(basename "$src") $*  ($fn keeps the call to $sym)"
         return

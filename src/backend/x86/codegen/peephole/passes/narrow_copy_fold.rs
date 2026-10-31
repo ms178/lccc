@@ -495,38 +495,78 @@ fn loop_latch_increment_bounds_identity(
         return false;
     }
     // 3. The target must be a backward edge to the loop head, and no other
-    //    edge may enter the loop.
+    //    edge may enter the loop. "Edge" is any reference to a label as a
+    //    symbol -- a conditional jump (`jge .Lloop`), a jump-table entry
+    //    (`.quad .Lloop`) or a taken address (`leaq .Lloop(%rip)`) -- not only
+    //    the `jmp`/`, target` spellings: each of those is an entry that skips
+    //    the latch test this proof leans on.
     let label = format!("{target}:");
-    let Some(head) = (0..at).find(|&k| infos[k].trimmed(store.get(k)) == label) else {
+    let Some(head) =
+        (0..at).find(|&k| !infos[k].is_nop() && infos[k].trimmed(store.get(k)) == label)
+    else {
         return false;
     };
-    for k in 0..infos.len() {
-        if infos[k].is_nop() || k == next + 1 {
-            continue;
-        }
-        let text = infos[k].trimmed(store.get(k));
-        if text.ends_with(&format!(", {target}"))
-            || text == format!("jmp {target}")
-            || text == format!("jmp {target} ")
-        {
-            return false;
-        }
-    }
+    let latch = next + 1;
     // 4. Inside the loop the family is written only by that increment.
-    for k in head..=next + 1 {
-        if k == prev || k == at {
-            continue;
-        }
+    //
+    //    "Inside" must be the whole loop, not only the text between the head
+    //    and the latch: block layout puts out-of-line blocks after the latch
+    //    (`.LBBn: movq %rsi, %r15; jmp .LBBm` back into the body), and a write
+    //    there -- a negative value, say -- is exactly what the lower half of
+    //    the bound cannot survive (the latch test only bounds from above). So
+    //    the text range is made the whole loop: no label inside it may be
+    //    entered from outside, which leaves fallthrough into the head as the
+    //    only way in and makes the write scan below complete. A data
+    //    directive in the range may encode any write and is refused too.
+    let mut inner_labels: Vec<&str> = Vec::new();
+    for k in head..=latch {
         if infos[k].is_nop() {
             continue;
         }
         let text = infos[k].trimmed(store.get(k));
+        if k > head && infos[k].kind == LineKind::Label {
+            if let Some(name) = text.strip_suffix(':') {
+                inner_labels.push(name);
+            }
+            continue;
+        }
+        if k == prev || k == at {
+            continue;
+        }
+        if infos[k].kind == LineKind::Directive
+            && crate::backend::peephole_common::directive_emits_data(text)
+        {
+            return false;
+        }
         if writes_family(&infos[k], text, fam) {
+            return false;
+        }
+    }
+    for k in 0..infos.len() {
+        if infos[k].is_nop() || k == latch {
+            continue;
+        }
+        let text = infos[k].trimmed(store.get(k));
+        if k != head && references_symbol(text, target) {
+            return false;
+        }
+        if !(head..=latch).contains(&k)
+            && inner_labels
+                .iter()
+                .any(|&name| references_symbol(text, name))
+        {
             return false;
         }
     }
     // 5. The value entering the loop is a non-negative constant that cannot
     //    overflow on the first increment.
+    //
+    //    By 3 the head is entered only by falling into it, so walk the
+    //    fallthrough path backward. A label is a join point unless nothing
+    //    references it (then it is fallthrough-only and transparent); a
+    //    conditional jump is transparent (its fallthrough is this path); an
+    //    unconditional transfer means the line above is not a predecessor at
+    //    all; a call or inline asm may leave anything in the family.
     for k in (0..head).rev() {
         if infos[k].is_nop() {
             continue;
@@ -534,6 +574,33 @@ fn loop_latch_increment_bounds_identity(
         let text = infos[k].trimmed(store.get(k));
         if text.starts_with(".cfi_startproc") {
             return false;
+        }
+        match infos[k].kind {
+            LineKind::Label => {
+                let name = text.strip_suffix(':').unwrap_or(text);
+                let referenced = (0..infos.len()).any(|j| {
+                    j != k
+                        && !infos[j].is_nop()
+                        && references_symbol(infos[j].trimmed(store.get(j)), name)
+                });
+                if referenced {
+                    return false;
+                }
+                continue;
+            }
+            LineKind::CondJmp | LineKind::Empty => continue,
+            LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::Ret
+            | LineKind::Call
+            | LineKind::InlineAsm => return false,
+            LineKind::Directive => {
+                if crate::backend::peephole_common::directive_emits_data(text) {
+                    return false;
+                }
+                continue;
+            }
+            _ => {}
         }
         if !writes_family(&infos[k], text, fam) {
             continue;
@@ -555,6 +622,28 @@ fn loop_latch_increment_bounds_identity(
             .parse::<i64>()
             .ok()
             .is_some_and(|value| (0..i32::MAX as i64).contains(&value));
+    }
+    false
+}
+
+/// Whether `text` names `symbol` as a whole assembler symbol token (symbol
+/// characters are alphanumerics, `_`, `.` and `$`), anywhere on the line.
+fn references_symbol(text: &str, symbol: &str) -> bool {
+    if symbol.is_empty() {
+        return false;
+    }
+    let is_sym = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$');
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(off) = text[from..].find(symbol) {
+        let start = from + off;
+        let end = start + symbol.len();
+        let before_ok = start == 0 || !is_sym(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_sym(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
     }
     false
 }

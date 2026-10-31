@@ -65,6 +65,205 @@ pub struct BasicBlock {
     pub source_spans: Vec<Span>,
 }
 
+/// Span-preserving edits.
+///
+/// `source_spans` is either empty (no debug tracking for the block) or exactly
+/// parallel to `instructions`; the IR verifier checks this after every pass
+/// (`CCC_VERIFY_IR`), because `.loc` emission indexes spans by instruction
+/// position and every consumer clamps, so drift is otherwise silent until a
+/// pass splices at an index past the shorter list. These primitives keep the
+/// pairing when it holds and touch only `instructions` when it does not:
+/// already-drifted spans are the verifier's to attribute to the pass that
+/// broke them, and an editor must neither panic on them nor paper over them.
+/// Instructions a pass synthesizes take [`Span::dummy`] (no `.loc`: they
+/// inherit the previous line, like phi copies) or the span of the instruction
+/// they replace.
+impl BasicBlock {
+    /// `source_spans` is tracked and parallel to `instructions`.
+    #[inline]
+    pub fn spans_parallel(&self) -> bool {
+        !self.source_spans.is_empty() && self.source_spans.len() == self.instructions.len()
+    }
+
+    /// Whether an insertion carrying `span` keeps (or starts) the pairing: the
+    /// spans are parallel, or the block is empty and `span` is a real
+    /// location -- an instruction moved into a fresh block brings its line
+    /// along instead of leaving the block untracked.
+    #[inline]
+    fn tracks_insertion(&self, span: Span) -> bool {
+        self.spans_parallel()
+            || (self.instructions.is_empty()
+                && self.source_spans.is_empty()
+                && span != Span::dummy())
+    }
+
+    /// The span of instruction `at`, or [`Span::dummy`] when untracked.
+    #[inline]
+    pub fn span_at(&self, at: usize) -> Span {
+        if self.spans_parallel() {
+            self.source_spans[at]
+        } else {
+            Span::dummy()
+        }
+    }
+
+    /// Insert `inst` before position `at` (`at == len` appends).
+    pub fn insert_inst(&mut self, at: usize, inst: Instruction, span: Span) {
+        let tracked = self.tracks_insertion(span);
+        self.instructions.insert(at, inst);
+        if tracked {
+            self.source_spans.insert(at, span);
+        }
+    }
+
+    /// Insert every instruction of `insts` before position `at`, in order,
+    /// each with `span` (one splice: O(len), not O(len * count)).
+    pub fn insert_insts(
+        &mut self,
+        at: usize,
+        insts: impl IntoIterator<Item = Instruction>,
+        span: Span,
+    ) {
+        let tracked = self.tracks_insertion(span);
+        let before = self.instructions.len();
+        self.instructions.splice(at..at, insts);
+        if tracked {
+            let added = self.instructions.len() - before;
+            self.source_spans
+                .splice(at..at, std::iter::repeat_n(span, added));
+        }
+    }
+
+    /// Append `inst`.
+    pub fn push_inst(&mut self, inst: Instruction, span: Span) {
+        let at = self.instructions.len();
+        self.insert_inst(at, inst, span);
+    }
+
+    /// Append every instruction of `insts`, each with `span`.
+    pub fn extend_insts(&mut self, insts: impl IntoIterator<Item = Instruction>, span: Span) {
+        let tracked = self.tracks_insertion(span);
+        let before = self.instructions.len();
+        self.instructions.extend(insts);
+        if tracked {
+            let added = self.instructions.len() - before;
+            self.source_spans.extend(std::iter::repeat_n(span, added));
+        }
+    }
+
+    /// Remove and return instruction `at` (and its span).
+    pub fn remove_inst(&mut self, at: usize) -> Instruction {
+        if self.spans_parallel() {
+            self.source_spans.remove(at);
+        }
+        self.instructions.remove(at)
+    }
+
+    /// Replace instruction `at` by `insts`; each replacement inherits the
+    /// replaced instruction's span (they implement the same source construct).
+    pub fn splice_inst(&mut self, at: usize, insts: Vec<Instruction>) {
+        let tracked = self.spans_parallel();
+        let span = self.span_at(at);
+        let n = insts.len();
+        self.instructions.splice(at..=at, insts);
+        if tracked {
+            self.source_spans
+                .splice(at..=at, std::iter::repeat_n(span, n));
+        }
+    }
+
+    /// Replace the whole body with synthesized instructions.  A tracked
+    /// block stays tracked (every new instruction gets `Span::dummy()`, so
+    /// it emits no `.loc` of its own); an untracked block stays untracked.
+    pub fn replace_insts_synthesized(&mut self, insts: Vec<Instruction>) {
+        let tracked = !self.source_spans.is_empty();
+        self.source_spans.clear();
+        if tracked {
+            self.source_spans.resize(insts.len(), Span::dummy());
+        }
+        self.instructions = insts;
+    }
+
+    /// Remove the instructions in `range` (and their spans, when parallel).
+    pub fn remove_insts(&mut self, range: std::ops::Range<usize>) {
+        if self.spans_parallel() {
+            self.source_spans.drain(range.clone());
+        }
+        self.instructions.drain(range);
+    }
+
+    /// Append another block body (`insts` with its own `spans`, parallel or
+    /// empty), e.g. when merging blocks.  Locations survive whenever both
+    /// sides track; an untracked side contributes dummy spans to a tracked
+    /// one, and an untracked non-empty `self` stays untracked.
+    pub fn append_spanned(&mut self, insts: Vec<Instruction>, spans: Vec<Span>) {
+        let incoming_tracked = !spans.is_empty() && spans.len() == insts.len();
+        let self_empty = self.instructions.is_empty() && self.source_spans.is_empty();
+        if self.spans_parallel() || (self_empty && incoming_tracked) {
+            if incoming_tracked {
+                self.source_spans.extend(spans);
+            } else {
+                self.source_spans
+                    .extend(std::iter::repeat_n(Span::dummy(), insts.len()));
+            }
+        }
+        self.instructions.extend(insts);
+    }
+
+    /// Remove every instruction (and span).
+    pub fn clear_insts(&mut self) {
+        self.instructions.clear();
+        self.source_spans.clear();
+    }
+
+    /// Keep the instructions for which `keep` holds, with their spans.
+    pub fn retain_insts(&mut self, mut keep: impl FnMut(&Instruction) -> bool) {
+        if !self.spans_parallel() {
+            self.instructions.retain(keep);
+            return;
+        }
+        let mut flags = Vec::with_capacity(self.instructions.len());
+        self.instructions.retain(|inst| {
+            let k = keep(inst);
+            flags.push(k);
+            k
+        });
+        let mut it = flags.into_iter();
+        self.source_spans.retain(|_| it.next().unwrap_or(false));
+    }
+
+    /// Replace the whole instruction list by `insts` with `spans` computed in
+    /// parallel (empty when the block is untracked). Rebuilding passes take
+    /// the old spans with [`BasicBlock::take_parallel_spans`], map them along
+    /// with the instructions, and hand both back here.
+    pub fn replace_insts(&mut self, insts: Vec<Instruction>, spans: Vec<Span>) {
+        let paired = spans.is_empty() || spans.len() == insts.len();
+        debug_assert!(
+            paired,
+            "replace_insts: {} spans for {} instructions",
+            spans.len(),
+            insts.len()
+        );
+        self.instructions = insts;
+        // A caller bug must not become an ICE over line-table metadata: an
+        // unpaired list degrades to untracked, which the verifier accepts.
+        self.source_spans = if paired { spans } else { Vec::new() };
+    }
+
+    /// Take the spans for a rebuild: the parallel list, or empty when the
+    /// block is untracked or already drifted (a rebuild cannot know which
+    /// instruction a drifted span belonged to; the drift was reported after
+    /// the pass that caused it).
+    pub fn take_parallel_spans(&mut self) -> Vec<Span> {
+        if self.spans_parallel() {
+            std::mem::take(&mut self.source_spans)
+        } else {
+            self.source_spans.clear();
+            Vec::new()
+        }
+    }
+}
+
 /// Shared call metadata for both direct and indirect function calls.
 ///
 /// This struct consolidates the fields that are common to `Instruction::Call` and
@@ -1596,5 +1795,299 @@ mod direct_value_mutation_tests {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod span_edit_tests {
+    //! The `BasicBlock` span primitives against a reference model: after every
+    //! edit, instruction order and each instruction's span must match exactly
+    //! (not merely the lengths), so a moved or surviving instruction keeps its
+    //! source line through arbitrary edit sequences.
+    use super::*;
+
+    fn inst(id: u32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(id),
+            src: Operand::Const(IrConst::I32(0)),
+        }
+    }
+    fn sp(id: u32) -> Span {
+        Span::new(id, id + 1, 1)
+    }
+    fn ids(b: &BasicBlock) -> Vec<u32> {
+        b.instructions.iter().map(|i| i.dest().unwrap().0).collect()
+    }
+    fn block(ids: &[u32], tracked: bool) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(0),
+            instructions: ids.iter().map(|&i| inst(i)).collect(),
+            source_spans: if tracked {
+                ids.iter().map(|&i| sp(i)).collect()
+            } else {
+                Vec::new()
+            },
+            terminator: Terminator::Return(None),
+        }
+    }
+
+    #[test]
+    fn real_span_starts_tracking_only_in_an_empty_block() {
+        let mut b = block(&[], false);
+        b.push_inst(inst(1), sp(1));
+        assert_eq!(b.source_spans, vec![sp(1)]);
+        // A non-empty untracked block stays untracked: the existing
+        // instructions have no spans to pair with.
+        let mut b = block(&[1], false);
+        b.push_inst(inst(2), sp(2));
+        assert!(b.source_spans.is_empty());
+        let mut b = block(&[1], false);
+        b.insert_insts(0, [inst(2), inst(3)], sp(2));
+        assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn dummy_span_never_starts_tracking() {
+        let mut b = block(&[], false);
+        b.push_inst(inst(1), Span::dummy());
+        b.extend_insts([inst(2)], Span::dummy());
+        b.insert_insts(0, [inst(3)], Span::dummy());
+        assert_eq!(ids(&b), vec![3, 1, 2]);
+        assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn empty_insertion_into_an_empty_block_stays_untracked() {
+        let mut b = block(&[], false);
+        b.insert_insts(0, std::iter::empty(), sp(9));
+        b.extend_insts(std::iter::empty(), sp(9));
+        assert!(b.instructions.is_empty() && b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn drifted_block_is_neither_panicked_on_nor_repaired_by_local_edits() {
+        // 2 spans for 3 instructions: what a broken pass leaves behind.  Local
+        // edits must not index the short list (no panic) and must not touch
+        // it (the verifier reports the drift against the pass that caused it).
+        let mut b = block(&[1, 2, 3], true);
+        b.source_spans.pop();
+        let drift = b.source_spans.clone();
+        b.insert_inst(3, inst(4), sp(4));
+        b.push_inst(inst(5), sp(5));
+        b.insert_insts(0, [inst(6)], sp(6));
+        b.extend_insts([inst(7)], sp(7));
+        assert_eq!(b.remove_inst(5).dest(), Some(Value(5)));
+        b.splice_inst(4, vec![inst(8), inst(9)]);
+        b.retain_insts(|i| i.dest() != Some(Value(2)));
+        b.remove_insts(0..1);
+        assert_eq!(b.span_at(2), Span::dummy());
+        assert_eq!(ids(&b), vec![1, 3, 8, 9, 7]);
+        assert_eq!(b.source_spans, drift);
+        // A rebuild cannot map drifted spans; it gets none and the block
+        // becomes untracked.
+        assert!(b.take_parallel_spans().is_empty());
+        assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn splice_replacements_inherit_the_replaced_span() {
+        let mut b = block(&[1, 2, 3], true);
+        b.splice_inst(1, vec![inst(7), inst(8), inst(9)]);
+        assert_eq!(ids(&b), vec![1, 7, 8, 9, 3]);
+        assert_eq!(b.source_spans, vec![sp(1), sp(2), sp(2), sp(2), sp(3)]);
+        // Splicing in nothing is a removal.
+        b.splice_inst(0, Vec::new());
+        assert_eq!(b.source_spans, vec![sp(2), sp(2), sp(2), sp(3)]);
+    }
+
+    #[test]
+    fn append_spanned_covers_all_four_tracking_combinations() {
+        let mut both = block(&[1], true);
+        both.append_spanned(vec![inst(2)], vec![sp(2)]);
+        assert_eq!(both.source_spans, vec![sp(1), sp(2)]);
+        let mut only_self = block(&[1], true);
+        only_self.append_spanned(vec![inst(2)], Vec::new());
+        assert_eq!(only_self.source_spans, vec![sp(1), Span::dummy()]);
+        let mut only_incoming = block(&[1], false);
+        only_incoming.append_spanned(vec![inst(2)], vec![sp(2)]);
+        assert!(only_incoming.source_spans.is_empty());
+        let mut empty_self = block(&[], false);
+        empty_self.append_spanned(vec![inst(2)], vec![sp(2)]);
+        assert_eq!(empty_self.source_spans, vec![sp(2)]);
+        // A drifted incoming list is not trusted.
+        let mut drifted_incoming = block(&[1], true);
+        drifted_incoming.append_spanned(vec![inst(2), inst(3)], vec![sp(2)]);
+        assert_eq!(
+            drifted_incoming.source_spans,
+            vec![sp(1), Span::dummy(), Span::dummy()]
+        );
+    }
+
+    #[test]
+    fn synthesized_replacement_keeps_tracking_state() {
+        let mut t = block(&[1, 2], true);
+        t.replace_insts_synthesized(vec![inst(5), inst(6), inst(7)]);
+        assert_eq!(t.source_spans, vec![Span::dummy(); 3]);
+        let mut u = block(&[1, 2], false);
+        u.replace_insts_synthesized(vec![inst(5)]);
+        assert!(u.source_spans.is_empty());
+    }
+
+    #[test]
+    fn replace_insts_accepts_paired_or_untracked_lists() {
+        let mut b = block(&[1, 2], true);
+        let spans = b.take_parallel_spans();
+        assert_eq!(spans, vec![sp(1), sp(2)]);
+        assert!(b.source_spans.is_empty());
+        b.replace_insts(vec![inst(2), inst(1)], vec![sp(2), sp(1)]);
+        assert_eq!(b.source_spans, vec![sp(2), sp(1)]);
+        b.replace_insts(vec![inst(3)], Vec::new());
+        assert!(b.source_spans.is_empty());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "replace_insts: 1 spans for 2 instructions")]
+    fn replace_insts_rejects_unpaired_lists_in_debug_builds() {
+        block(&[], false).replace_insts(vec![inst(1), inst(2)], vec![sp(1)]);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn replace_insts_degrades_unpaired_lists_to_untracked_in_release() {
+        let mut b = block(&[], false);
+        b.replace_insts(vec![inst(1), inst(2)], vec![sp(1)]);
+        assert_eq!(ids(&b), vec![1, 2]);
+        assert!(b.source_spans.is_empty());
+    }
+
+    /// Seeded random edit sequences, checked after every step against a model
+    /// that applies the documented rules: a block is tracked iff its spans
+    /// are parallel; an emptied block is untracked; only a real span inserted
+    /// into an empty untracked block starts tracking.
+    #[test]
+    fn random_edit_sequences_match_the_reference_model() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let mut restarted = 0usize;
+        for case in 0..400 {
+            let start_tracked = case % 4 != 0;
+            let mut b = block(&[1, 2, 3], start_tracked);
+            let mut model: Vec<(u32, Span)> = (1..=3).map(|i| (i, sp(i))).collect();
+            let mut tracked = start_tracked;
+            let mut next = 100u32;
+            for _step in 0..40 {
+                let len = model.len();
+                // Tracking state an insertion of `added` instructions with `s` leaves.
+                let starts = |tracked: bool, empty: bool, s: Span, added: usize| {
+                    tracked || (empty && s != Span::dummy() && added > 0)
+                };
+                let mut fresh = |n: usize| -> Vec<u32> {
+                    (0..n)
+                        .map(|_| {
+                            next += 1;
+                            next
+                        })
+                        .collect()
+                };
+                match rnd(10) {
+                    0 => {
+                        let at = rnd(len + 1);
+                        let id = fresh(1)[0];
+                        let s = if rnd(2) == 0 { Span::dummy() } else { sp(id) };
+                        if !tracked && starts(false, len == 0, s, 1) {
+                            restarted += 1;
+                        }
+                        tracked = starts(tracked, len == 0, s, 1);
+                        b.insert_inst(at, inst(id), s);
+                        model.insert(at, (id, s));
+                    }
+                    1 => {
+                        let at = rnd(len + 1);
+                        let new = fresh(rnd(4));
+                        let s = if rnd(3) == 0 { Span::dummy() } else { sp(7) };
+                        tracked = starts(tracked, len == 0, s, new.len());
+                        b.insert_insts(at, new.iter().map(|&i| inst(i)), s);
+                        model.splice(at..at, new.iter().map(|&i| (i, s)));
+                    }
+                    2 => {
+                        let id = fresh(1)[0];
+                        b.push_inst(inst(id), Span::dummy());
+                        model.push((id, Span::dummy()));
+                    }
+                    3 => {
+                        let new = fresh(rnd(3));
+                        tracked = starts(tracked, len == 0, sp(9), new.len());
+                        b.extend_insts(new.iter().map(|&i| inst(i)), sp(9));
+                        model.extend(new.iter().map(|&i| (i, sp(9))));
+                    }
+                    4 if len > 0 => {
+                        let at = rnd(len);
+                        assert_eq!(b.remove_inst(at).dest(), Some(Value(model.remove(at).0)));
+                    }
+                    5 if len > 0 => {
+                        let at = rnd(len);
+                        let inherited = if tracked { model[at].1 } else { Span::dummy() };
+                        let new = fresh(rnd(3));
+                        b.splice_inst(at, new.iter().map(|&i| inst(i)).collect());
+                        model.splice(at..=at, new.iter().map(|&i| (i, inherited)));
+                    }
+                    6 => {
+                        let m = 2 + rnd(3) as u32;
+                        b.retain_insts(|i| i.dest().unwrap().0 % m != 0);
+                        model.retain(|&(id, _)| id % m != 0);
+                    }
+                    7 => {
+                        let lo = rnd(len + 1);
+                        let hi = lo + rnd(len - lo + 1);
+                        b.remove_insts(lo..hi);
+                        model.drain(lo..hi);
+                    }
+                    8 => {
+                        let new = fresh(rnd(3));
+                        let tracked_in = rnd(2) == 0 && !new.is_empty();
+                        let spans: Vec<Span> = if tracked_in {
+                            new.iter().map(|&i| sp(i)).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        tracked = tracked || (len == 0 && tracked_in);
+                        b.append_spanned(new.iter().map(|&i| inst(i)).collect(), spans);
+                        model.extend(
+                            new.iter()
+                                .map(|&i| (i, if tracked_in { sp(i) } else { Span::dummy() })),
+                        );
+                    }
+                    _ => {
+                        // Rebuild round trip: reverse the body with its spans.
+                        let mut spans = b.take_parallel_spans();
+                        let mut insts = std::mem::take(&mut b.instructions);
+                        insts.reverse();
+                        spans.reverse();
+                        b.replace_insts(insts, spans);
+                        model.reverse();
+                    }
+                }
+                if model.is_empty() {
+                    tracked = false;
+                }
+                assert_eq!(ids(&b), model.iter().map(|m| m.0).collect::<Vec<_>>());
+                if tracked {
+                    assert_eq!(
+                        b.source_spans,
+                        model.iter().map(|m| m.1).collect::<Vec<_>>()
+                    );
+                } else {
+                    assert!(b.source_spans.is_empty(), "untracked block grew spans");
+                }
+            }
+        }
+        // The empty-block restart rule must actually be exercised.
+        assert!(restarted > 0);
     }
 }

@@ -884,7 +884,7 @@ fn apply_one(func: &mut IrFunction, a: u32, global_name: &str) {
     // Delete the initialization stores and the alloca while the alloca id is
     // still meaningful.
     for block in &mut func.blocks {
-        block.instructions.retain(|inst| match inst {
+        block.retain_insts(|inst| match inst {
             Instruction::Store { ptr, .. } => addr_of(ptr.0, a, &geps).is_none(),
             Instruction::Alloca { dest, .. } => dest.0 != a,
             _ => true,
@@ -960,12 +960,13 @@ fn apply_one(func: &mut IrFunction, a: u32, global_name: &str) {
     }
     // Emit the GlobalAddr at the head of the entry block.
     if let Some(entry) = func.blocks.first_mut() {
-        entry.instructions.insert(
+        entry.insert_inst(
             0,
             Instruction::GlobalAddr {
                 dest: addr,
                 name: global_name.to_string(),
             },
+            crate::common::source::Span::dummy(),
         );
     }
 }

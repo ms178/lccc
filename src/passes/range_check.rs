@@ -1164,7 +1164,8 @@ fn fold_phi_diamonds(
         } = a;
         {
             let bcond = &mut func.blocks[bcond_idx];
-            bcond.instructions.extend(new_insts);
+            let span = last_span(bcond);
+            bcond.extend_insts(new_insts, span);
             bcond.terminator = Terminator::Branch(crate::ir::reexports::BlockId(merge_label));
         }
         if partial {
@@ -1208,7 +1209,7 @@ fn fold_phi_diamonds(
                     // duplicate Bcheck arm (proven equal above).
                     {
                         let merge = &mut func.blocks[jm];
-                        merge.instructions.remove(pi);
+                        merge.remove_inst(pi);
                         for inst in &mut merge.instructions {
                             let Instruction::Phi { incoming, .. } = inst else {
                                 break;
@@ -1224,7 +1225,8 @@ fn fold_phi_diamonds(
                     // Operand or bare-Value — keeps its reference; no rewrite
                     // walk, no dangling position.
                     let merge = &mut func.blocks[jm];
-                    merge.instructions.remove(pi);
+                    let phi_span = merge.span_at(pi);
+                    merge.remove_inst(pi);
                     let mut insert_at = 0;
                     for (i, inst) in merge.instructions.iter().enumerate() {
                         if matches!(inst, Instruction::Phi { .. }) {
@@ -1233,12 +1235,13 @@ fn fold_phi_diamonds(
                             break;
                         }
                     }
-                    merge.instructions.insert(
+                    merge.insert_inst(
                         insert_at,
                         Instruction::Copy {
                             dest: phi_dest,
                             src: Operand::Const(c),
                         },
+                        phi_span,
                     );
                     for inst in &mut merge.instructions {
                         let Instruction::Phi { incoming, .. } = inst else {
@@ -1854,7 +1857,8 @@ fn try_fold_one_branch_chain(
     // dead-block drops run last, by label.
     {
         let bcond = &mut func.blocks[bcond_idx];
-        bcond.instructions.extend(new_insts);
+        let span = last_span(bcond);
+        bcond.extend_insts(new_insts, span);
         bcond.terminator = new_term;
     }
     // Bbody phis: EVERY form gains the bcond→bbody edge, so Bcheck arms
@@ -2110,8 +2114,13 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     let maps = build_def_maps(func);
     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
         let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
+        // Replacements inherit the span of the instruction they fold.
+        let spans = block.take_parallel_spans();
+        let mut new_spans = Vec::with_capacity(spans.len());
         let known_pos = block_known_pos_i32[block_idx];
-        for inst in block.instructions.drain(..) {
+        for (i, inst) in block.instructions.drain(..).enumerate() {
+            let span = spans.get(i).copied();
+            let before = new_insts.len();
             let path_fold = if let (
                 Some(x),
                 Instruction::Cmp {
@@ -2178,11 +2187,24 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
             } else {
                 new_insts.push(inst);
             }
+            if let Some(span) = span {
+                new_spans.extend(std::iter::repeat_n(span, new_insts.len() - before));
+            }
         }
-        block.instructions = new_insts;
+        block.replace_insts(new_insts, new_spans);
     }
     func.next_value_id = next_id;
     total
+}
+
+/// The span of `block`'s last instruction: a rewrite appended to a block
+/// implements the condition that instruction computed.
+fn last_span(block: &crate::ir::instruction::BasicBlock) -> crate::common::source::Span {
+    block
+        .instructions
+        .len()
+        .checked_sub(1)
+        .map_or_else(crate::common::source::Span::dummy, |i| block.span_at(i))
 }
 
 #[cfg(test)]

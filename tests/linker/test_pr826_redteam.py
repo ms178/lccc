@@ -150,7 +150,9 @@ class RedTeam(unittest.TestCase):
         dispatcher = source.split("fn apply_one_reloc", 1)[1].split("/// Find the hi20", 1)[0]
         kinds = lambda text: set(re.findall(r"R_RISCV_[A-Z0-9_]+", text))
         self.assertEqual(kinds(table), kinds(dispatcher))
-        self.assertEqual(len(kinds(table)), 38)  # Plus numeric NONE, checked separately.
+        # Plus numeric NONE, checked separately. 38 static kinds plus the six
+        # relaxation produces or consumes: CALL, GPREL_I/S, TPREL_I/S, RVC_LUI.
+        self.assertEqual(len(kinds(table)), 44)
 
     def test_generated_c_has_independent_output_at_all_opts(self):
         with tempfile.TemporaryDirectory() as tmp:

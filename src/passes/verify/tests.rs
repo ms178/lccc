@@ -147,6 +147,20 @@ fn an_empty_function_is_clean() {
 
 // ── each invariant, pinned individually ─────────────────────────────────────
 
+/// Spans are optional, but when present they pair with instructions 1:1.
+#[test]
+fn source_spans_must_be_absent_or_parallel_to_the_instructions() {
+    let span = crate::common::source::Span::new(1, 2, 0);
+    let mut f = func_of(vec![blk(0, vec![def(1), def(2)], ret())]);
+    assert_clean(&f);
+    f.blocks[0].source_spans = vec![span, span];
+    assert_clean(&f);
+    f.blocks[0].source_spans = vec![span];
+    assert_reports(&f, "1 source spans for 2 instructions");
+    f.blocks[0].source_spans = vec![span; 3];
+    assert_reports(&f, "3 source spans for 2 instructions");
+}
+
 #[test]
 fn a_duplicate_block_label_is_reported() {
     let f = func_of(vec![

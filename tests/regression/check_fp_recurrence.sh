@@ -70,15 +70,18 @@ printf '%s\n' 'double twice(double x) { return 2.0*x; }' > "$work/i686.c"
 CCC_DISABLE_PASSES=loop_square,fp_double "$CCC" -m32 -O2 -S "$work/i686.c" -o "$work/i686-off.s"
 cmp "$work/i686-on.s" "$work/i686-off.s"
 # Use a shipped workload to pin the post-allocation opportunity. In the
-# current fastbuild corpus, lz4_compress has one conditional edge into an empty
-# branch-only trampoline when jump_thread is disabled and zero when enabled.
-# Measure both sides at the assembly level below; if later CFG work removes
-# this shape, the negative control fails rather than silently going vacuous.
+# current fastbuild corpus, gzip_longest_match has nine conditional edges into
+# empty branch-only trampolines when jump_thread is disabled and zero when
+# enabled (linux_list_sort has two; four more programs one each). The earlier
+# pin, lz4_compress, no longer has the shape: its assembly is identical with
+# and without the peephole, and with the IR jump_thread pass off. Measure both sides at the assembly
+# level below; if later CFG work removes this shape, the negative control
+# fails rather than silently going vacuous.
 for mode in on off; do
     skip=""
     [[ $mode != off ]] || skip=jump_thread
     CCC_PEEPHOLE_SKIP="$skip" "$CCC" -O2 -march=x86-64-v3 -S \
-        "$root/tests/benchmark/programs/lz4_compress.c" -o "$work/jump-$mode.s"
+        "$root/tests/benchmark/programs/gzip_longest_match.c" -o "$work/jump-$mode.s"
 done
 python3 - "$work" <<'PY'
 import re, sys
