@@ -3,7 +3,7 @@
   "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 544,
+  "knob_literals": 545,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -312,6 +312,7 @@
     "CCC_NO_PHI_WEB_COALESCE",
     "CCC_NO_PREFETCH",
     "CCC_NO_PROMOTED_FP_TAIL",
+    "CCC_NO_PTR_IV_COLLAPSE",
     "CCC_NO_PUSHF_ELIM",
     "CCC_NO_PUSH_ARG_STAGING",
     "CCC_NO_QUAD_SR",
