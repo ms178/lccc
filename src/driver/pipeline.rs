@@ -654,11 +654,19 @@ impl Driver {
             nostartfiles: false,
             nodefaultlibs: false,
             relocatable: false,
-            // Debian x86-64 defaults to PIE, not full PIC. Keeping these modes
-            // distinct lets executable data use direct RIP-relative accesses
-            // while explicit -fPIC/-shared remains interposition-safe.
+            // `pic` and `pie` describe the *codegen* mode; the link mode is
+            // decided separately by the `-pie`/`-no-pie` scan over the linker
+            // arguments (`linker_pie_effective`), and the default link is a
+            // position-fixed ET_EXEC. Codegen follows the link, so the default
+            // is non-PIC too: emitting PIE codegen into a fixed-base image
+            // pays for position independence that no part of the output can
+            // use (`leaq sym(%rip), %rcx` scratch per indexed global access
+            // where the absolute `disp32` operand is legal and free). `-pie`,
+            // `-fpie`/`-fPIE` opt back in, and they set the link mode as well,
+            // so the two halves can never disagree. Full `-fPIC`/`-shared`
+            // stays interposition-safe through `pic`.
             pic: false,
-            pie: true,
+            pie: false,
             tls_model_floor: None,
             tls_dialect: None,
             force_includes: Vec::new(),
