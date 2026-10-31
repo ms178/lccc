@@ -6982,7 +6982,7 @@
     }
   ],
   "latest_batch": 5,
-  "latest_cohort": "batch5-scalar-sets",
+  "latest_cohort": "scalar-mask-interval",
   "latest_cohort_reviews": 151,
   "latest_cohort_covered": 0
 }

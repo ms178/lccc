@@ -37,9 +37,9 @@
     "csv_sha256": "b6fb081ba74e6377a6d51ac31368cddb1b11458ec257e1446cf951deb32a852f",
     "comments_sha256": "262905b041716939cd5840620904b62ad8ef5af44e277fcf767297be01530f73"
   },
-  "refresh_note": "Membership refresh only (no --comments): two identical state=all enumerations of the label, 64 requests, 3,169 posts. Batch 5's 151 review verdicts live in batch5-sources.json.",
+  "refresh_note": "Membership refresh only (no --comments): two identical state=all enumerations of the label, 64 requests, 3,169 posts. The 2026-10-31 audit's 151 review verdicts live in audit-2026-10-31-sources.json.",
   "completed_at": "2026-10-31T17:44:30.361255+00:00",
   "requests_this_invocation": 64,
   "csv_sha256": "c554633573e8c3cb50d51198f353dc7311bc928a21e930ba511fc6a99e5ad912",
-  "ledger_sha256": "19edad454ee898476b59204ecc591f0af4abf52e665946bbdfe892855abbdd67"
+  "ledger_sha256": "3a37c00c2f8626b6f02b2a9f208c9f01e1141df5e1f80c60dabe9b897341f172"
 }

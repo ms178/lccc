@@ -34,6 +34,7 @@ pub(crate) mod copy_prop;
 pub(crate) mod cvp;
 pub(crate) mod dce;
 mod dead_statics;
+pub(crate) mod difference_compare;
 pub(crate) mod div_by_const;
 pub(crate) mod dse;
 pub(crate) mod expr_sink;
@@ -48,6 +49,7 @@ pub(crate) mod inline;
 pub(crate) mod instrument;
 pub(crate) mod int_const_hoist;
 pub(crate) mod integer_bounds;
+pub(crate) mod interval_compare;
 pub(crate) mod ip_purity;
 pub(crate) mod ipa_pta;
 pub(crate) mod ipcp;
@@ -85,6 +87,7 @@ pub(crate) mod round_cap;
 pub(crate) mod saturating_sub;
 pub(crate) mod sccp;
 pub(crate) mod set_membership;
+pub(crate) mod sign_magnitude;
 pub(crate) mod simplify;
 pub(crate) mod slp_vectorizer;
 pub(crate) mod sret_copy_elision;
@@ -2982,6 +2985,63 @@ pub(crate) fn run_passes(
             total_changes += n;
             total_changes_excl_dce += n;
 
+            // Interval predicates: `(x > 3) & (x < 10)` and its if-converted
+            // select spelling collapse into one unsigned compare against a
+            // wrapped difference, which is what GCC, Clang and ICX emit.
+            // Runs before bit_idioms so the surviving compare is available to
+            // its fact machinery.  Pass name for CCC_DISABLE_PASSES:
+            // "interval".
+            if !pass_disabled(&disabled, "interval") {
+                let n = timed_pass!(
+                    "interval",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        interval_compare::run(func)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            // Sign-magnitude lowering: `x < 0 ? -x : x` and
+            // `a > b ? a - b : b - a` become the branch-free
+            // mask/XOR/subtract identity, which needs no compare and no
+            // conditional move.  Runs before if-conversion, so the frontend's
+            // own select is still visible, and after `simplify`, which may
+            // already have folded the arms.  Pass name for
+            // CCC_DISABLE_PASSES: "signmag".
+            if !pass_disabled(&disabled, "signmag") {
+                let n = timed_pass!(
+                    "signmag",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        sign_magnitude::run(func)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            // Difference-compare canonicalization: `(a - b) <op> 0` reads the
+            // subtrahends directly, so the subtraction becomes dead unless
+            // something else still reads it.  Placed after `simplify` (which
+            // produces the zero comparison) and before `bit_idioms`, whose
+            // interval matchers then see a direct `a <op> b` pair instead of
+            // two differences.  Signed order is admitted only for modules
+            // whose policy keeps signed overflow undefined.
+            // Pass name for CCC_DISABLE_PASSES: "diffcmp".
+            if !pass_disabled(&disabled, "diffcmp") {
+                let n = timed_pass!(
+                    "diffcmp",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        difference_compare::run(func)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
@@ -3280,6 +3340,23 @@ pub(crate) fn run_passes(
             cur_pass_changes[7] = n + forwarded;
             total_changes += n + forwarded;
             total_changes_excl_dce += n + forwarded;
+        }
+
+        // Interval predicates, second placement.  The `&&`/`||` spellings of a
+        // range test only exist as a select *after* if-conversion — before it
+        // they are two blocks and a phi — so the early run sees the bitwise
+        // `&`/`|` shapes and this one sees the if-converted ones.  Running
+        // before the post-if-conversion bit_idioms keeps the merged compare
+        // available to its fact machinery.  Pass name: "interval".
+        if !pass_disabled(&disabled, "interval") {
+            let n = timed_pass!(
+                "interval_post_ifconv",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    interval_compare::run(func)
+                })
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
         }
 
         // Re-run bit-idiom recognition after if-conversion. Portable trees such

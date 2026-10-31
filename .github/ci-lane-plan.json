@@ -336,7 +336,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 423.86,
+      "predicted_gate_seconds": 425.35,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -490,7 +490,11 @@
         },
         {
           "measured_s": 0.36,
-          "name": "python3 tests/regression/check_llvm_batch5_scalar_sets.py"
+          "name": "python3 tests/regression/check_mask_and_interval_folds.py"
+        },
+        {
+          "measured_s": 1.49,
+          "name": "python3 tests/regression/check_predicate_differences_and_ranges.py"
         },
         {
           "measured_s": 0.96,

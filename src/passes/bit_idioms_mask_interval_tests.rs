@@ -1,9 +1,9 @@
-//! Production-matcher tests for the batch-5 scalar folds:
+//! Production-matcher tests for two scalar identities:
 //!
-//! * [`super::fold_shl_lshr_mask`] — `(x << k) >>u k` becomes `x & (2^(W-k) - 1)`
+//! * [`super::fold_shift_pair_into_mask`] — `(x << k) >>u k` becomes `x & (2^(W-k) - 1)`
 //!   (LLVM's `InstCombine` "shift pair to mask"; the audit's `#233830` cohort
 //!   kept hitting it in byte/nibble extraction).
-//! * [`super::fold_zero_one_membership`] — `(x == 0) | (x == 1)` becomes
+//! * [`super::fold_unit_interval_test`] — `(x == 0) | (x == 1)` becomes
 //!   `x <=u 1`, and `(x != 0) & (x != 1)` becomes `x >u 1` (the comparator form
 //!   of the implied-false disjunct in LLVM #234703 and the guarded-OR fold in
 //!   #237533).
@@ -88,7 +88,7 @@ fn shl_lshr_mask_matches_the_pair_exhaustively() {
     for (ty, bits) in [(IrType::U8, 8u32), (IrType::U16, 16)] {
         for amount in 1..bits {
             let (defs, inst) = shl_lshr_fixture(ty, amount as u64, None);
-            let replacement = fold_shl_lshr_mask(&inst, &defs).expect("pair folds");
+            let replacement = fold_shift_pair_into_mask(&inst, &defs).expect("pair folds");
             assert!(
                 expect_and_mask(&replacement, ty, bits, amount),
                 "{ty:?} k={amount}: mask must be 2^(W-k)-1"
@@ -145,7 +145,7 @@ fn shl_lshr_mask_matches_boundaries_at_32_and_64() {
         };
         for &amount in amounts {
             let (defs, inst) = shl_lshr_fixture(ty, amount as u64, None);
-            let replacement = fold_shl_lshr_mask(&inst, &defs).expect("pair folds");
+            let replacement = fold_shift_pair_into_mask(&inst, &defs).expect("pair folds");
             assert!(
                 expect_and_mask(&replacement, ty, bits, amount),
                 "{ty:?} k={amount}"
@@ -187,30 +187,30 @@ fn shl_lshr_mask_refuses_every_non_member() {
         rhs: Operand::Const(IrConst::from_i64(3, IrType::I32)),
         ty: IrType::I32,
     };
-    assert!(fold_shl_lshr_mask(&ashr, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&ashr, &defs).is_none());
 
     // k == 0 is already the identity.
     let (defs, inst) = shl_lshr_fixture(IrType::U32, 0, None);
-    assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&inst, &defs).is_none());
 
     // k >= W is undefined in C and is refused rather than folded.
     let (defs, inst) = shl_lshr_fixture(IrType::U32, 32, None);
-    assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&inst, &defs).is_none());
     let (defs, inst) = shl_lshr_fixture(IrType::U32, 40, None);
-    assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&inst, &defs).is_none());
 
     // A mask wider than 32 bits needs a materialized constant on every
     // supported target, which costs more than the pair it would replace.
     let (defs, inst) = shl_lshr_fixture(IrType::U64, 1, None);
-    assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&inst, &defs).is_none());
     let (defs, inst) = shl_lshr_fixture(IrType::U64, 31, None);
-    assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&inst, &defs).is_none());
     let (defs, inst) = shl_lshr_fixture(IrType::U64, 32, None);
-    assert!(fold_shl_lshr_mask(&inst, &defs).is_some());
+    assert!(fold_shift_pair_into_mask(&inst, &defs).is_some());
 
     // Mismatched amounts and mismatched widths are different operations.
     let (defs, inst) = shl_lshr_fixture(IrType::U32, 3, Some(4));
-    assert!(fold_shl_lshr_mask(&inst, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&inst, &defs).is_none());
     let mut defs = vec![None; 4];
     defs[1] = Some(Instruction::BinOp {
         dest: Value(1),
@@ -226,7 +226,7 @@ fn shl_lshr_mask_refuses_every_non_member() {
         rhs: Operand::Const(IrConst::from_i64(3, IrType::U32)),
         ty: IrType::U32,
     };
-    assert!(fold_shl_lshr_mask(&mixed, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&mixed, &defs).is_none());
 
     // A non-constant amount is a different value for each call.
     let mut defs = vec![None; 4];
@@ -244,7 +244,7 @@ fn shl_lshr_mask_refuses_every_non_member() {
         rhs: v(3),
         ty: IrType::U32,
     };
-    assert!(fold_shl_lshr_mask(&variable, &defs).is_none());
+    assert!(fold_shift_pair_into_mask(&variable, &defs).is_none());
 }
 
 fn cmp_of(value: u32, op: IrCmpOp, constant: i64, ty: IrType, dest: u32) -> Instruction {
@@ -306,7 +306,7 @@ fn zero_one_membership_matches_the_pair_exhaustively() {
         ] {
             for (left, right) in [((0u32, 0i64), (0u32, 1i64)), ((0, 1), (0, 0))] {
                 let (defs, inst) = membership_fixture(logic, cmp_op, left, right, ty);
-                let replacement = fold_zero_one_membership(&inst, &defs).expect("membership folds");
+                let replacement = fold_unit_interval_test(&inst, &defs).expect("membership folds");
                 let Instruction::Cmp {
                     dest,
                     op,
@@ -368,7 +368,7 @@ fn zero_one_membership_refuses_non_member_shapes() {
     for (l, r) in [(0i64, 2i64), (1, 2), (0, 3)] {
         let (defs, inst) = membership_fixture(IrBinOp::Or, IrCmpOp::Eq, (0, l), (0, r), ty);
         assert!(
-            fold_zero_one_membership(&inst, &defs).is_none(),
+            fold_unit_interval_test(&inst, &defs).is_none(),
             "{{{l}, {r}}} is not the {{0, 1}} set"
         );
     }
@@ -383,16 +383,16 @@ fn zero_one_membership_refuses_non_member_shapes() {
         rhs: v(2),
         ty: IrType::I8,
     };
-    assert!(fold_zero_one_membership(&mixed, &defs).is_none());
+    assert!(fold_unit_interval_test(&mixed, &defs).is_none());
     // Different compared values.
     let (defs, inst) = membership_fixture(IrBinOp::Or, IrCmpOp::Eq, (0, 0), (1, 1), ty);
-    assert!(fold_zero_one_membership(&inst, &defs).is_none());
+    assert!(fold_unit_interval_test(&inst, &defs).is_none());
     // `x != 0 | x != 1` is the tautology, not the threshold; and
     // `x == 0 & x == 1` is the empty set.  Neither is this fold.
     let (defs, inst) = membership_fixture(IrBinOp::Or, IrCmpOp::Ne, (0, 0), (0, 1), ty);
-    assert!(fold_zero_one_membership(&inst, &defs).is_none());
+    assert!(fold_unit_interval_test(&inst, &defs).is_none());
     let (defs, inst) = membership_fixture(IrBinOp::And, IrCmpOp::Eq, (0, 0), (0, 1), ty);
-    assert!(fold_zero_one_membership(&inst, &defs).is_none());
+    assert!(fold_unit_interval_test(&inst, &defs).is_none());
     // A non-comparison operand is not a membership test.
     let mut defs = vec![None; 6];
     defs[1] = Some(cmp_of(0, IrCmpOp::Eq, 0, ty, 1));
@@ -403,5 +403,5 @@ fn zero_one_membership_refuses_non_member_shapes() {
         rhs: v(0),
         ty: IrType::I8,
     };
-    assert!(fold_zero_one_membership(&not_a_cmp, &defs).is_none());
+    assert!(fold_unit_interval_test(&not_a_cmp, &defs).is_none());
 }

@@ -1478,7 +1478,10 @@ fn fold_sign_choice_zero(inst: &Instruction, defs: &[Option<Instruction>]) -> Op
 /// Only the consumer is rewritten; the shifts become dead and the ordinary
 /// dead-code pass removes them, so a live user of the left shift keeps its
 /// value.
-fn fold_shl_lshr_mask(inst: &Instruction, defs: &[Option<Instruction>]) -> Option<Instruction> {
+fn fold_shift_pair_into_mask(
+    inst: &Instruction,
+    defs: &[Option<Instruction>],
+) -> Option<Instruction> {
     let Instruction::BinOp {
         dest,
         op: IrBinOp::LShr,
@@ -1584,7 +1587,7 @@ fn cmp_against_constant(
 /// is a different function and is refused, as is any constant other than
 /// `{0, 1}`.  Only the consumer is rewritten, so shared comparisons keep
 /// their values.
-fn fold_zero_one_membership(
+fn fold_unit_interval_test(
     inst: &Instruction,
     defs: &[Option<Instruction>],
 ) -> Option<Instruction> {
@@ -3132,8 +3135,8 @@ pub(crate) fn recognize_function(
 
             if let Some(new) = fold_same_condition_select(&block.instructions[index], &defs)
                 .or_else(|| fold_sign_choice_zero(&block.instructions[index], &defs))
-                .or_else(|| fold_shl_lshr_mask(&block.instructions[index], &defs))
-                .or_else(|| fold_zero_one_membership(&block.instructions[index], &defs))
+                .or_else(|| fold_shift_pair_into_mask(&block.instructions[index], &defs))
+                .or_else(|| fold_unit_interval_test(&block.instructions[index], &defs))
             {
                 // New direct arm uses must be counted BEFORE a later boolean
                 // matcher can repurpose a supposedly single-use producer.
@@ -6323,8 +6326,8 @@ mod range_tests;
 mod zero_choice_tests;
 
 #[cfg(test)]
-#[path = "bit_idioms_batch5_tests.rs"]
-mod batch5_tests;
+#[path = "bit_idioms_mask_interval_tests.rs"]
+mod mask_interval_tests;
 
 #[path = "bit_idioms_observe.rs"]
 mod observe;

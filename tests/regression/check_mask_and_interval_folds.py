@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch-5 scalar sets: shift-pair masks and {0,1} membership.
+"""Mask and interval folds: shift-pair masks and {0,1} membership.
 
 What this pins, and how:
 
@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = Path(__file__).resolve().parent / "llvm_batch5_scalar_sets.c"
+SOURCE = Path(__file__).resolve().parent / "mask_and_interval_folds.c"
 
 
 def run(command, env=None):
@@ -71,10 +71,10 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         # ---- values, every optimization level ------------------------------
         for level in ("0", "1", "2", "3"):
-            binary = Path(td) / f"batch5-O{level}"
+            binary = Path(td) / f"maskfold-O{level}"
             run([lccc, f"-O{level}", "-o", str(binary), str(SOURCE)])
             out = run([str(binary)]).decode()
-            if "batch5: ok" not in out:
+            if "maskfold: ok" not in out:
                 problems.append(f"-O{level}: witness did not report ok: {out!r}")
 
         # ---- mechanism at -O2 ---------------------------------------------
@@ -97,15 +97,18 @@ def main():
             if len(lines) > 3:
                 problems.append(f"{name}: {len(lines)} instructions after the fold: {lines}")
 
-        for name, want in (("memb_or", "setbe"), ("memb_or_rev", "setbe")):
-            joined = "\n".join(body(text, name))
-            if want not in joined:
-                problems.append(f"{name}: expected a single unsigned threshold ({want}): {joined}")
+        # One unsigned threshold, whichever canonical spelling the interval
+        # pass picks: `cmp $1; setbe` (x <=u 1) or `cmp $2; setb` (x <u 2).
+        for name in ("memb_or", "memb_or_rev", "memb_and"):
+            lines = body(text, name)
+            joined = "\n".join(lines)
+            compares = [line for line in lines if re.match(r"^cmp", line)]
+            if len(compares) != 1:
+                problems.append(f"{name}: {len(compares)} compares, want 1: {lines}")
             if "cmov" in joined:
                 problems.append(f"{name}: conditional move survived the fold: {joined}")
-        joined = "\n".join(body(text, "memb_and"))
-        if "seta" not in joined or "cmov" in joined:
-            problems.append(f"memb_and: expected one threshold test: {joined}")
+            if not re.search(r"set(be|b|a|ae)\b", joined):
+                problems.append(f"{name}: no unsigned threshold test: {joined}")
 
         # Negative control: the {0, 2} set is NOT the {0, 1} set.
         control = "\n".join(body(text, "memb_control"))
@@ -115,10 +118,20 @@ def main():
             problems.append(f"memb_control lost its second comparison: {control}")
 
         # ---- attribution: the pass owns the win ---------------------------
+        # The membership shapes are shared with the `interval` pass, which also
+        # turns `(x == 0) | (x == 1)` into one unsigned compare, so both are
+        # disabled for that half of the leg; the shift-pair masks are
+        # bit_idioms-only.
         disabled = asm(lccc, SOURCE, env=os.environ | {"CCC_DISABLE_PASSES": "bit_idioms"})
+        disabled_both = asm(
+            lccc,
+            SOURCE,
+            env=os.environ | {"CCC_DISABLE_PASSES": "bit_idioms,interval"},
+        )
         for name in list(folded) + ["memb_or", "memb_and"]:
             on = len(body(text, name))
-            off = len(body(disabled, name))
+            source = disabled_both if name.startswith("memb") else disabled
+            off = len(body(source, name))
             if off <= on:
                 problems.append(f"{name}: disabling bit_idioms did not lengthen it ({on} vs {off})")
 
@@ -155,10 +168,10 @@ def main():
 
     if problems:
         for problem in problems:
-            print(f"FAIL batch5: {problem}")
+            print(f"FAIL mask/interv: {problem}")
         raise SystemExit(1)
     print(
-        "PASS batch5 scalar sets: shift-pair masks, {0,1} membership, "
+        "PASS mask and interval folds: shift-pair masks, unit-interval membership, "
         "negative control, disabled-pass attribution"
     )
 

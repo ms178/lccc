@@ -1,4 +1,4 @@
-/* Batch-5 scalar sets: shift-pair masks and {0,1} membership.
+/* Mask and interval folds: shift-pair masks and {0,1} membership.
  *
  * Every function is self-checking: `main` compares the optimized result with a
  * reference computed from volatile inputs, so a wrong fold shows up as a
@@ -72,9 +72,9 @@ int main(void) {
         if (memb_control(vx) != ((x == 0u) | (x == 2u))) bad++;
     }
     if (bad) {
-        printf("batch5: %llu mismatches\n", (unsigned long long)bad);
+        printf("maskfold: %llu mismatches\n", (unsigned long long)bad);
         return 1;
     }
-    printf("batch5: ok\n");
+    printf("maskfold: ok\n");
     return 0;
 }

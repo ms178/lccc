@@ -1,6 +1,6 @@
 {
  "method": "Original GitHub REST issue bodies for every reviewed post, fetched 2026-10-31 through the authenticated API; labels, state, comment counters and updated_at as reported at fetch time. Conversation comments were NOT re-collected in this round; their archive remains the 2026-10-20 conversation snapshot. Linked external pages, review threads and removed history are not included. Each record's archive_sha256 is the canonical sorted-key UTF-8 JSON of the fields fetched plus a newline. Collection is not semantic review; the verdicts are this batch's work.",
- "cohort": "batch5-scalar-sets",
+ "cohort": "scalar-mask-interval",
  "snapshot_delta": {
   "prior_snapshot": "2026-10-20",
   "posts_before": 3111,
@@ -88,24 +88,24 @@
  "folds": [
   {
    "name": "shl_lshr_mask",
-   "implementation": "src/passes/bit_idioms.rs:fold_shl_lshr_mask",
+   "implementation": "src/passes/bit_idioms.rs:fold_shift_pair_into_mask",
    "rewrite": "(x << k) >>u k  ->  x & (2^(W-k) - 1)",
    "evidence": [
-    "src/passes/bit_idioms_batch5_tests.rs",
-    "tests/regression/llvm_batch5_scalar_sets.c",
-    "tests/regression/check_llvm_batch5_scalar_sets.py"
+    "src/passes/bit_idioms_mask_interval_tests.rs",
+    "tests/regression/mask_and_interval_folds.c",
+    "tests/regression/check_mask_and_interval_folds.py"
    ],
    "measured": "4 -> 3 instructions on x86-64 at -O2, matching GCC 16.2 (was one move longer)",
    "history": "The first draft masked with 2^k - 1 and was wrong for every x with a bit at or above k; the GCC/Clang value differential caught it, and the exhaustive 8/16-bit test now compares against the pair's own evaluation."
   },
   {
    "name": "zero_one_membership",
-   "implementation": "src/passes/bit_idioms.rs:fold_zero_one_membership",
+   "implementation": "src/passes/bit_idioms.rs:fold_unit_interval_test",
    "rewrite": "(x == 0) | (x == 1)  ->  x <=u 1;   (x != 0) & (x != 1)  ->  x >u 1",
    "evidence": [
-    "src/passes/bit_idioms_batch5_tests.rs",
-    "tests/regression/llvm_batch5_scalar_sets.c",
-    "tests/regression/check_llvm_batch5_scalar_sets.py"
+    "src/passes/bit_idioms_mask_interval_tests.rs",
+    "tests/regression/mask_and_interval_folds.c",
+    "tests/regression/check_mask_and_interval_folds.py"
    ],
    "measured": "9 -> 4 instructions on the bitwise spelling, matching GCC 16.2; the short-circuit spelling is unchanged because if-conversion has already turned it into a select tree before this pass, which is recorded as remaining work",
    "history": "`memb_control` (x == 0 | x == 2) is the negative control: it is one constant away and must keep both comparisons."
@@ -330,7 +330,7 @@
    "archive_sha256": "707376651867a585152bcf2a06b612f71a3c71669c7696ff14e8b9c1bdb6e67a",
    "cohort": "new",
    "role": "new-review",
-   "review_note": "Dead disjunct implied false by a later conjunct: boolean implication across conjuncts. Batch 5 added the neighbouring {0,1} comparator set; this implication rule remains deferred.",
+   "review_note": "Dead disjunct implied false by a later conjunct: boolean implication across conjuncts. The 2026-10-31 audit added the neighbouring {0,1} comparator set; this implication rule remains deferred.",
    "review_status": "reviewed-deferred"
   },
   {
@@ -824,7 +824,7 @@
    "archive_sha256": "7214d0b9aa88aca9e3a6bb1f9e69b4ed684a36077dcfe537f5a4351dcd3252e3",
    "cohort": "new",
    "role": "new-review",
-   "review_note": "Guarded OR/XOR comparisons: batch 5 folds the {0,1} comparator instance only. The report's `(x | C) == D` guard forms need mask-set reasoning, still deferred.",
+   "review_note": "Guarded OR/XOR comparisons: the mask/interval work folds the {0,1} comparator instance only. The report's `(x | C) == D` guard forms need mask-set reasoning, still deferred.",
    "review_status": "reviewed-deferred"
   },
   {
@@ -1955,7 +1955,7 @@
    "archive_sha256": "b39327dea4cdee8e4bac7a222d069d407d04b7fa7fa03d719cd7e3f98e1351c2",
    "cohort": "backlog",
    "role": "backlog-review",
-   "review_note": "`(type)(a == CST)` when a is in {CST, CST+1}: a value-producing use of a boolean. Batch 5's threshold fold goes the other way (booleans to one compare); the value form is deferred.",
+   "review_note": "`(type)(a == CST)` when a is in {CST, CST+1}: a value-producing use of a boolean. The mask/interval fold goes the other way (booleans to one compare); the value form is deferred.",
    "review_status": "reviewed-deferred"
   },
   {
@@ -2072,7 +2072,7 @@
    "archive_sha256": "e2655573ccb7cbef1eb881fcbf14e1f3ac4ab8228fb09dc62cab8a28f71b0a4f",
    "cohort": "addendum",
    "role": "new-review",
-   "review_note": "Shift-then-mask with a truncated compare: batch 5 folds the opposite direction (a shift PAIR to a mask), and this report's shifted-field compare needs the add-with-offset reassociation; deferred.",
+   "review_note": "Shift-then-mask with a truncated compare: the mask/interval work folds the opposite direction (a shift pair to a mask), and this report's shifted-field compare needs the add-with-offset reassociation; deferred.",
    "review_status": "reviewed-deferred"
   }
  ]
