@@ -7,8 +7,11 @@ infrastructure. It did **not** change allocation, spilling, register policy,
 wide-integer lowering, or emitted machine code. Do not describe these changes as
 an allocator optimization or a performance win.
 
-Working-tree base: `935f243273329e168aa80a29f57e54bbbd0b64cf` (the checked-out
-`origin/main` at session start). Current container has GCC 12.2.0 and Python
+Final working-tree base: `474d326955c6d1bb2637d37adf0b5b1263acc6ec`
+(`origin/main` after the latest fetch/rebase). The branch initially started at
+`935f243273329e168aa80a29f57e54bbbd0b64cf`; upstream advanced before PR
+publication, so both session commits were rebased onto the new main. Current
+container has GCC 12.2.0 and Python
 3.11.2. `clang`, `rustc`, and `cargo` are not installed in `PATH`. The
 repository's `scripts/ensure_swap.sh` successfully activated an 8 GiB `/swapfile`
 for this container; current swap usage was zero. `scripts/build_lccc_fast.sh`
@@ -17,8 +20,7 @@ was attempted as required and failed before compilation because `rustc` and
 possible and `ci_local.sh --fast` could not pass its build gate. There is no Intel
 14700KF or usable PMU evidence in this VM.
 
-The latest-main fetch returned the same commit as the session base; no rebase
-was necessary. No benchmark timing or allocator-quality result is claimed.
+No benchmark timing or allocator-quality result is claimed.
 
 ## Accomplished
 
