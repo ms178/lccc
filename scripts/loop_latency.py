@@ -16,7 +16,8 @@ integer SIMD/GPR ops those loops use; an unknown mnemonic is a hard error,
 so a new instruction can never silently count as free.
 
 Latencies are 1 cycle for every simple vector/GPR integer op (add, xor, or,
-and, shifts, pshufb, pshufd, vprold, rol/ror/rorx) and 0 for reg-reg moves
+and, shifts, pshufb, pshufd, pshuflw, pshufhw, vprold, rol/ror/rorx) and 0
+for reg-reg moves
 (eliminated at rename).  These values hold on Zen 3/4/5, Golden Cove,
 Raptor Cove and Skylake-SP alike (Agner Fog's tables, uops.info), so the
 bound is microarchitecture-neutral for the ops it accepts.
@@ -49,9 +50,10 @@ import sys
 LAT1 = {
     # SSE/AVX integer
     "paddd", "psubd", "pxor", "por", "pand", "pandn", "pslld", "psrld",
-    "psllq", "psrlq", "pshufb", "pshufd", "paddq", "psubq",
+    "psllq", "psrlq", "pshufb", "pshufd", "pshuflw", "pshufhw", "paddq", "psubq",
     "vpaddd", "vpsubd", "vpxor", "vpor", "vpand", "vpandn", "vpslld",
-    "vpsrld", "vpsllq", "vpsrlq", "vpshufb", "vpshufd", "vpaddq", "vpsubq",
+    "vpsrld", "vpsllq", "vpsrlq", "vpshufb", "vpshufd", "vpshuflw", "vpshufhw",
+    "vpaddq", "vpsubq",
     "vprold", "vprord", "vpternlogd",
     # GPR integer
     "addl", "addq", "subl", "subq", "xorl", "xorq", "orl", "orq", "andl",

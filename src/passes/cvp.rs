@@ -184,6 +184,102 @@ fn proves_nonzero(
     })
 }
 
+/// Resolve an operand to the integer constant it must hold, looking through
+/// copies and constant casts, together with the bit width it is seen at.
+/// Frontends routinely materialise small literals as `Cast(Const)` pairs, so a
+/// literal-only test would miss the `x | 1` guard entirely.
+fn resolved_constant(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    mut operand: Operand,
+) -> Option<(u64, u32)> {
+    for _ in 0..8 {
+        match operand {
+            Operand::Const(c) => return c.to_u64().map(|n| (n, 64)),
+            Operand::Value(v) => {
+                let &(bi, ii) = defs.get(&v)?;
+                match &func.blocks[bi].instructions[ii] {
+                    Instruction::Cast { src, to_ty: to, .. } if to.is_integer() => {
+                        let bits = (to.size() * 8) as u32;
+                        let (n, _) = resolved_constant(func, defs, *src)?;
+                        let mask = if bits >= 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << bits) - 1
+                        };
+                        return Some((n & mask, bits));
+                    }
+                    Instruction::Copy { src, .. } => operand = *src,
+                    _ => return None,
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether `value`'s own defining operation returns a nonzero result on every
+/// path, with no help from a dominating predicate. The canonical source form is
+/// the portable zero guard `x | C` with `C != 0` (`__builtin_clz(x | 1)`,
+/// `__builtin_ctz(x | 0x80000000)`): the OR forces a bit on, so the result is
+/// nonzero for every `x`, including the `x == 0` case the guard exists for.
+/// Count intrinsics consume this fact to pick their branch-free lowering, so it
+/// is worth deriving from the definition instead of only from predicates.
+///
+/// Copies and zero-preserving casts are transparent; nothing else is. In
+/// particular `And(x, C)` is not admitted: a bitwise AND can still clear every
+/// bit, so it proves nothing about zero.
+fn def_proves_nonzero(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    casts: &FxHashMap<Value, (Operand, IrType, IrType)>,
+    value: Value,
+) -> bool {
+    let mut value = zero_equivalent_root(value, casts);
+    for _ in 0..32 {
+        let Some(&(bi, ii)) = defs.get(&value) else {
+            return false;
+        };
+        match &func.blocks[bi].instructions[ii] {
+            Instruction::Copy {
+                src: Operand::Value(next),
+                ..
+            } => value = zero_equivalent_root(*next, casts),
+            Instruction::BinOp {
+                op: crate::ir::reexports::IrBinOp::Or,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if ty.is_integer() => {
+                // The OR sets every bit of a nonzero constant operand, so its
+                // result cannot be zero regardless of the other operand.
+                let constant_nonzero = |o: &Operand| {
+                    resolved_constant(func, defs, *o).is_some_and(|(n, w)| {
+                        let bits = (w as usize).min(ty.size() * 8).min(127);
+                        (n as u128) & ((1u128 << bits) - 1) != 0
+                    })
+                };
+                if constant_nonzero(lhs) || constant_nonzero(rhs) {
+                    return true;
+                }
+                // Otherwise recurse into whichever operand might be the proof.
+                let next = match (lhs, rhs) {
+                    (Operand::Value(v), _) => *v,
+                    (_, Operand::Value(v)) => *v,
+                    _ => return false,
+                };
+                if def_proves_nonzero(func, defs, casts, next) {
+                    return true;
+                }
+                return false;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Portable count recognizers preserve zero -> W-1 by setting an extremal
 /// bit: bit 0 for CLZ, bit W-1 for CTZ. Under a dominating nonzero fact about
 /// x that bit cannot change its count, so the OR can go. Its arithmetic
@@ -792,11 +888,78 @@ pub fn run_function(func: &mut IrFunction) -> usize {
 
 /// Run correlated value propagation on one function with the module's
 /// defined-nonweak symbol set (see [`defined_nonweak_symbols`]).
+/// Promote `Clz`/`Ctz` to their nonzero-contract forms when the operand's own
+/// definition proves it nonzero, with no predicate and no CFG involved.
+///
+/// This is the portable zero-guard shape (`__builtin_clz(x | 1)`,
+/// `__builtin_ctz(x | 0x80000000)`): setting any constant bit makes the operand
+/// nonzero for every input, including the zero input the guard exists for. The
+/// count then feeds the branch-free BSR/BSF lowering instead of a
+/// test/jump diamond, so it matters even in a straight-line leaf function that
+/// the predicate-driven body of CVP never looks at (it requires two blocks).
+///
+/// Only the opcode changes; the guard instruction stays and keeps its value.
+/// Running twice is a no-op because the promoted ops no longer match.
+fn promote_guarded_counts(func: &mut IrFunction) -> usize {
+    let mut defs: FxHashMap<Value, (usize, usize)> = FxHashMap::default();
+    let mut casts: FxHashMap<Value, (Operand, IrType, IrType)> = FxHashMap::default();
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for (ii, inst) in b.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                defs.insert(dest, (bi, ii));
+            }
+            if let Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } = inst
+            {
+                casts.insert(*dest, (*src, *from_ty, *to_ty));
+            }
+        }
+    }
+    let promoted: Vec<(Value, usize, usize)> = {
+        let mut v = Vec::new();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                let Instruction::UnaryOp {
+                    dest,
+                    op: crate::ir::reexports::IrUnaryOp::Clz | crate::ir::reexports::IrUnaryOp::Ctz,
+                    src: Operand::Value(src),
+                    ..
+                } = inst
+                else {
+                    continue;
+                };
+                if def_proves_nonzero(func, &defs, &casts, *src) {
+                    v.push((*dest, bi, ii));
+                }
+            }
+        }
+        v
+    };
+    for (_, bi, ii) in &promoted {
+        let Instruction::UnaryOp { op, .. } = &mut func.blocks[*bi].instructions[*ii] else {
+            continue;
+        };
+        *op = match *op {
+            crate::ir::reexports::IrUnaryOp::Clz => crate::ir::reexports::IrUnaryOp::ClzNonZero,
+            _ => crate::ir::reexports::IrUnaryOp::CtzNonZero,
+        };
+    }
+    promoted.len()
+}
+
 pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet<String>) -> usize {
     let defined_syms = defined_syms;
+    // Straight-line functions have no predicates to propagate, but the
+    // definition-based zero-guard proof below needs no CFG at all: run it first
+    // so single-block leaves get the branch-free count lowering too.
+    let mut changes = promote_guarded_counts(func);
     let n = func.blocks.len();
     if n < 2 {
-        return 0;
+        return changes;
     }
     let label_to_idx = build_label_map(func);
     let (preds, succs) = build_cfg(func, &label_to_idx);
@@ -851,7 +1014,6 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
         .map(|b| block_entry_facts(func, &defs, &copies, preds.row(b), b))
         .collect();
 
-    let mut changes = 0usize;
     let mut stack: Vec<Fact> = entry_facts[0].clone();
     // Explicit DFS over the dominator tree: (block, next child index).
     let mut work: Vec<(usize, usize)> = vec![(0, 0)];
@@ -997,17 +1159,21 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
                             | crate::ir::reexports::IrUnaryOp::Ctz),
                         src: Operand::Value(src),
                         ty,
-                    } if proves_nonzero(&stack, *src, &casts) => Some(Instruction::UnaryOp {
-                        dest: *dest,
-                        op: match op {
-                            crate::ir::reexports::IrUnaryOp::Clz => {
-                                crate::ir::reexports::IrUnaryOp::ClzNonZero
-                            }
-                            _ => crate::ir::reexports::IrUnaryOp::CtzNonZero,
-                        },
-                        src: Operand::Value(*src),
-                        ty: *ty,
-                    }),
+                    } if proves_nonzero(&stack, *src, &casts)
+                        || def_proves_nonzero(func, &defs, &casts, *src) =>
+                    {
+                        Some(Instruction::UnaryOp {
+                            dest: *dest,
+                            op: match op {
+                                crate::ir::reexports::IrUnaryOp::Clz => {
+                                    crate::ir::reexports::IrUnaryOp::ClzNonZero
+                                }
+                                _ => crate::ir::reexports::IrUnaryOp::CtzNonZero,
+                            },
+                            src: Operand::Value(*src),
+                            ty: *ty,
+                        })
+                    }
                     _ => None,
                 };
                 if let Some(r) = repl {
@@ -1067,7 +1233,7 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::reexports::BasicBlock;
+    use crate::ir::reexports::{BasicBlock, IrBinOp, IrUnaryOp};
 
     #[test]
     fn truth_sets_signed_and_unsigned() {
@@ -1436,6 +1602,245 @@ mod tests {
             terminator: term,
             source_spans: Vec::new(),
         }
+    }
+
+    /// Build `return clz/ctz(<guard>)` as a ONE-block leaf, the shape the
+    /// frontend emits for `__builtin_clz(x | 1)` and the shape CVP's own body
+    /// skips (it needs two blocks). `const_guard` picks the portable zero guard
+    /// `x | C`, `via_cast` materialises `C` as `Cast(Const)` like the real
+    /// frontend, and `ty` sets the count width.
+    fn guarded_count_leaf(
+        op: IrUnaryOp,
+        guard: IrConst,
+        via_cast: bool,
+        ty: IrType,
+        wrap_in_trunc: bool,
+    ) -> IrFunction {
+        let mut insts = vec![Instruction::ParamRef {
+            dest: Value(1),
+            param_idx: 0,
+            ty,
+        }];
+        let mut next = 2u32;
+        let guard_op = if via_cast {
+            // v2 = (ty)1 (a Cast of a literal, as the C frontend builds it)
+            let literal = IrConst::I64(guard.to_i128().unwrap_or(0) as i64);
+            insts.push(Instruction::Cast {
+                dest: Value(next),
+                src: Operand::Const(literal),
+                from_ty: ty,
+                to_ty: ty,
+            });
+            next += 1;
+            Operand::Value(Value(next - 1))
+        } else {
+            Operand::Const(guard)
+        };
+        let safe = next;
+        insts.push(Instruction::BinOp {
+            dest: Value(safe),
+            op: IrBinOp::Or,
+            lhs: Operand::Value(Value(1)),
+            rhs: guard_op,
+            ty,
+        });
+        next += 1;
+        let counted = next;
+        insts.push(Instruction::UnaryOp {
+            dest: Value(counted),
+            op,
+            src: Operand::Value(Value(safe)),
+            ty,
+        });
+        next += 1;
+        let ret = if wrap_in_trunc {
+            // (u8)(count ^ (W-1)) + 1, the reviewed byte_bit_length wrapper:
+            // the XOR/ADD pair must not confuse the promotion.
+            let mask = next;
+            insts.push(Instruction::BinOp {
+                dest: Value(mask),
+                op: IrBinOp::Xor,
+                lhs: Operand::Value(Value(counted)),
+                rhs: Operand::Const(IrConst::I32(31)),
+                ty: IrType::I32,
+            });
+            next += 1;
+            let plus = next;
+            insts.push(Instruction::BinOp {
+                dest: Value(plus),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(mask)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            });
+            next += 1;
+            Operand::Value(Value(plus))
+        } else {
+            Operand::Value(Value(counted))
+        };
+        let mut f = IrFunction::new("guarded_count".to_string(), ty, vec![], false);
+        f.next_value_id = next;
+        f.blocks = vec![mk(0, insts, Terminator::Return(Some(ret)))];
+        f
+    }
+
+    fn count_op(f: &IrFunction) -> IrUnaryOp {
+        f.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::UnaryOp { op, .. } => Some(*op),
+                _ => None,
+            })
+            .expect("count instruction")
+    }
+
+    #[test]
+    fn single_block_zero_guard_is_promoted() {
+        // clz(x | 1) really is nonzero: the OR forces bit 0 on for every x.
+        let mut f = guarded_count_leaf(IrUnaryOp::Clz, IrConst::I64(1), false, IrType::U32, false);
+        assert_eq!(count_op(&f), IrUnaryOp::Clz);
+        assert_eq!(promote_guarded_counts(&mut f), 1);
+        assert_eq!(count_op(&f), IrUnaryOp::ClzNonZero);
+        // The guard instruction is NOT removed: only the opcode changes, so
+        // the promoted count keeps the exact value of the original.
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::BinOp {
+                op: IrBinOp::Or,
+                ..
+            }
+        ));
+        // Idempotent.
+        assert_eq!(promote_guarded_counts(&mut f), 0);
+    }
+
+    #[test]
+    fn frontend_cast_guard_still_promotes() {
+        // The C frontend materialises small literals as Cast(Const): the proof
+        // must look through that Cast, not only at a bare Const operand.
+        let mut f = guarded_count_leaf(
+            IrUnaryOp::Ctz,
+            IrConst::I64(0x8000_0000),
+            true,
+            IrType::U32,
+            false,
+        );
+        assert_eq!(promote_guarded_counts(&mut f), 1);
+        assert_eq!(count_op(&f), IrUnaryOp::CtzNonZero);
+    }
+
+    #[test]
+    fn wrapped_bit_length_keeps_its_promotion() {
+        // (u8)((clz(x|1)^31)+1) — the reviewed byte_bit_length shape. The XOR
+        // and ADD above the count must not hide the guard proof.
+        let mut f = guarded_count_leaf(IrUnaryOp::Clz, IrConst::I64(1), true, IrType::U32, true);
+        assert_eq!(promote_guarded_counts(&mut f), 1);
+        assert_eq!(count_op(&f), IrUnaryOp::ClzNonZero);
+    }
+
+    #[test]
+    fn zeroing_guards_are_not_promoted() {
+        // A guard constant of zero sets no bit: `x | 0 == x` can still be zero,
+        // so promoting would hand the lowering an input it may not assume.
+        let mut f = guarded_count_leaf(IrUnaryOp::Clz, IrConst::I64(0), false, IrType::U32, false);
+        assert_eq!(promote_guarded_counts(&mut f), 0);
+        assert_eq!(count_op(&f), IrUnaryOp::Clz);
+        // An `And` with a nonzero constant proves nothing either: it can clear
+        // every bit of x.
+        let mut g = IrFunction::new("and_guard".to_string(), IrType::U32, vec![], false);
+        g.next_value_id = 5;
+        g.blocks = vec![mk(
+            0,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::U32,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(0x100)),
+                    ty: IrType::U32,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(3),
+                    op: IrUnaryOp::Ctz,
+                    src: Operand::Value(Value(2)),
+                    ty: IrType::U32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(3)))),
+        )];
+        assert_eq!(promote_guarded_counts(&mut g), 0);
+        assert_eq!(count_op(&g), IrUnaryOp::Ctz);
+    }
+
+    #[test]
+    fn bare_param_has_no_definition_proof() {
+        // No guard at all: ctz(x) must keep its defined-zero contract.
+        let mut f = IrFunction::new("bare".to_string(), IrType::U32, vec![], false);
+        f.next_value_id = 3;
+        f.blocks = vec![mk(
+            0,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::U32,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(2),
+                    op: IrUnaryOp::Ctz,
+                    src: Operand::Value(Value(1)),
+                    ty: IrType::U32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        )];
+        assert_eq!(promote_guarded_counts(&mut f), 0);
+    }
+
+    #[test]
+    fn nested_or_guard_is_promoted() {
+        // or(or(x, 0), 1): the proof may sit one level down.
+        let mut f = IrFunction::new("nested".to_string(), IrType::U32, vec![], false);
+        f.next_value_id = 6;
+        f.blocks = vec![mk(
+            0,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::U32,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Or,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::U32,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Or,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(4)),
+                    ty: IrType::U32,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(4),
+                    op: IrUnaryOp::Clz,
+                    src: Operand::Value(Value(3)),
+                    ty: IrType::U32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(4)))),
+        )];
+        assert_eq!(promote_guarded_counts(&mut f), 1);
+        assert_eq!(count_op(&f), IrUnaryOp::ClzNonZero);
     }
 
     fn cmp0(d: u32, op: IrCmpOp) -> Instruction {

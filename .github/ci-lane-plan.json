@@ -725,7 +725,7 @@
     "codegen-a": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 402.91,
+      "predicted_gate_seconds": 404.51,
       "shards": 2,
       "steps": [
         {
@@ -847,6 +847,10 @@
         {
           "measured_s": 0.25,
           "name": "Pipefail/SIGPIPE detector"
+        },
+        {
+          "measured_s": 1.6,
+          "name": "Pointer IV collapse and zero-guard count instruction selection"
         }
       ]
     },
