@@ -10681,6 +10681,49 @@ impl X86Codegen {
             "i32x4 rotl: rotate amount out of range"
         );
         self.state.invalidate_vec_peephole();
+        // A 32-bit lane rotate by 16 is a swap of the two 16-bit halves
+        // inside every dword, which SSE2 can do with two shuffles instead of
+        // the shift/OR triple:
+        //   pshuflw $0xb1, %src, %dst     (words 0..3: w1, w0, w3, w2)
+        //   pshufhw $0xb1, %dst, %dst     (words 4..7: same swap)
+        // Both are genuine three-operand encodings (ModRM reg = destination,
+        // rm = source), so the destination home receives the result directly
+        // and no %xmm0 staging, no `movdqa` source copy, and no second live
+        // temporary are needed.  In the ARX transform this is the quarter
+        // round's first rotate, emitted twice per double round, so the
+        // specialization removes two instructions AND one 128-bit temporary
+        // from every occurrence — which is what the register pressure of the
+        // packing depends on.
+        if amt == 16 {
+            if let Some(&dest_reg) = self.reg_assignments.get(&dest.0) {
+                if is_xmm_reg(dest_reg) {
+                    if let Operand::Value(src_v) = &args[0] {
+                        if let Some(src) = self.vec_operand_reg(src_v) {
+                            let target = phys_reg_name(dest_reg);
+                            if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(src_v.0) {
+                                self.state.pending_vec_store = None;
+                            } else {
+                                self.flush_pending_vec_store_impl();
+                            }
+                            self.state
+                                .emit_fmt(format_args!("    pshuflw $0xb1, %{}, %{}", src, target));
+                            self.state.emit_fmt(format_args!(
+                                "    pshufhw $0xb1, %{}, %{}",
+                                target, target
+                            ));
+                            self.sse_mark_in_place(dest, target);
+                            return;
+                        }
+                    }
+                }
+            }
+            self.sse_load_arg(&args[0], "xmm0");
+            self.state.emit("    pshuflw $0xb1, %xmm0, %xmm0");
+            self.state.emit("    pshufhw $0xb1, %xmm0, %xmm0");
+            self.state.sse_last_store_reg = false;
+            self.sse_store_dest(dest, "xmm0");
+            return;
+        }
         // Dest-homed fast path: bring the input into the destination home
         // (a no-op when the RA coalesced the dying input onto it), then
         // pslld via %xmm0 and psrld in place —

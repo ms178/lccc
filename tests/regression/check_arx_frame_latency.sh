@@ -100,6 +100,29 @@ check() {
     fail=1
     return
   fi
+  # The SSE2 baseline has no pshufb and no vprold, so the 16-bit rotate is
+  # the quarter round's first rotate and its most frequent one.  A 32-bit
+  # lane rotate by 16 is an intra-dword swap of the two 16-bit halves, and
+  # the backend folds it to `pshuflw $0xb1` + `pshufhw $0xb1` (two 1-cycle
+  # shuffles that both write their own destination) instead of the
+  # `movdqa`/`pslld`/`psrld`/`por` staging through %xmm0.  Pin both
+  # directions: the swap must be there, and the shift triple for that
+  # amount must not come back — `pslld $16` is emitted for no other
+  # ChaCha rotate (12/8/7 keep their triples).
+  case "$flags" in
+    ""|"-march=x86-64")
+      local body
+      body=$(awk "/^$func:/,/^\\.size $func/" "$tmp/$form.s")
+      if ! grep -q 'pshuflw \$0xb1' <<<"$body"; then
+        echo "FAIL [$tag]: rotate-by-16 is not the pshuflw/pshufhw half swap" >&2
+        fail=1
+      fi
+      if grep -qE 'ps(l|r)ld \$16' <<<"$body"; then
+        echo "FAIL [$tag]: rotate-by-16 still stages through the shift triple" >&2
+        fail=1
+      fi
+      ;;
+  esac
   local got
   got=$($lat "$tmp/$form.s" --function "$func" --json |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["cycles_per_iteration"])')

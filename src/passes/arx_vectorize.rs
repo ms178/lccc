@@ -34,7 +34,10 @@
 //! SSSE3+ every whole-byte rotate is a byte permutation — one `pshufb`
 //! each with a loop-invariant mask (one mask per DISTINCT byte-multiple
 //! amount) — and the other rotates stay 3-instruction
-//! `pslld/psrld/por` sequences.  RFC 7539 ChaCha20 then lands at 38 data
+//! `pslld/psrld/por` sequences.  At the SSE2 baseline the 16-bit rotate is
+//! never a triple either: it is an intra-dword swap of the two 16-bit halves
+//! and the backend folds it to `pshuflw $0xb1` + `pshufhw $0xb1`.
+//! RFC 7539 ChaCha20 then lands at 38 data
 //! instructions per double round (SSSE3), 46 at the plain SSE2 baseline,
 //! versus 96 scalar instructions — and versus 40+2 for
 //! `icx -O3 -march=x86-64-v3` (Ice Lake's own AVX2 lowering).
@@ -1298,7 +1301,9 @@ fn transform_arx_loop(
     // Loop-invariant pshufb masks, one per DISTINCT whole-byte rotate
     // amount used by either group (SSSE3+; the profile exposes SSE4.1,
     // which implies SSSE3).  Non-byte rotates (and the SSE2 fallback)
-    // use the 3-instruction pslld/psrld/por form instead.
+    // use the 3-instruction pslld/psrld/por form instead, except a
+    // 16-bit rotate, which the backend folds to the pshuflw/pshufhw
+    // intra-dword half swap.
     let mut rot_masks: FxHashMap<u8, Value> = FxHashMap::default();
     if use_pshufb {
         fn mask_into(bytes: [u8; 16], pre: &mut Vec<Instruction>, next_val_id: &mut u32) -> Value {

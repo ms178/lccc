@@ -1279,6 +1279,15 @@ gate "arm-visibility-shared" fast \
 gate "i386-call-staging-asm" fast \
     bash tests/regression/check_i386_call_staging_asm.sh
 
+# Pointer induction variables that advance by one constant share an index
+# register, and the portable zero guards around clz/ctz are proven nonzero by
+# construction.  Both are instruction-selection facts with no observable
+# output, so only the emitted assembly can see them regress; the gate is
+# two-sided (the pass-off build and the unguarded counts must still show the
+# old shape).
+gate "ptr-iv-collapse-codegen" fast \
+    env CCC="$LCCC" bash tests/regression/check_ptr_iv_collapse_codegen.sh
+
 gate "loop-invert-census" fast \
     python3 scripts/loop_invert_census.py --lccc "$LCCC" --quiet
 

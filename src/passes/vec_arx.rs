@@ -24,7 +24,11 @@
 //! every group of four isomorphic ops becomes ONE vector instruction:
 //!
 //! * `a += b`   → `paddd`     * `d ^= a`  → `pxor`
-//! * `rol(d,n)` → `pslld + psrld + por` (the SSE2 rotate triple)
+//! * `rol(d,n)` → `pslld + psrld + por` (the SSE2 rotate triple), except
+//!   `n = 16`: a 32-bit lane rotate by half a lane is an intra-dword swap of
+//!   the two 16-bit halves, so the backend folds it to `pshuflw $0xb1` +
+//!   `pshufhw $0xb1` — two 1-cycle shuffles with no `%xmm0` staging and no
+//!   second live temporary (see `emit_int_rotl_i32x4`)
 //!
 //! The diagonal round reads its b/c/d operands from *lane-rotated* frames
 //! (`QR_l` uses `x[4h + (l+r_h)%4]`); those frames materialize with one
