@@ -10239,6 +10239,16 @@ impl ArchCodegen for X86Codegen {
     /// sqlite_varint regression). The i686 override keeps its own
     /// staging check: i686's accumulator/x87 staging genuinely differs,
     /// so that mirror is NOT covered by this proof.
+    fn guarantees_indexed_store_fold(&self) -> bool {
+        // The write-confinement proof below applies to BOTH loads and stores:
+        // integer staging writes reserved rax, symbol staging reserved rcx,
+        // FP staging xmm0; none is an allocatable SIB home. The shared operand
+        // builder and indexed_fold_ok enforce the same shape/type constraints.
+        // Home freshness is the existing folded-index RA/liveness contract,
+        // exactly as for a load; stores add no value-dependent refusal.
+        true
+    }
+
     fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
         let _ = self;
         if info.shift > 3 {

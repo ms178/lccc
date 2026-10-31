@@ -1337,6 +1337,14 @@ jobs:
     # lane-split: is duplicated, or a shard drifts from this record.
     - name: i386 call-staging assembly gate
       run: bash tests/regression/check_i386_call_staging_asm.sh
+    - name: SIMD folded-index correctness and runner failure contracts
+      run: |
+        set -euo pipefail
+        python3 -m unittest discover -s tests/simd -p 'test_*.py'
+        python3 tests/simd/check_scoreboard.py --check-clock-failure --lccc target/fastbuild/lccc --reference gcc-16
+        python3 tests/simd/aos_pair_shapes.py --lccc target/fastbuild/lccc --reference gcc-16
+        python3 tests/simd/aos_pair_shapes.py --guarded --mixed --stride 4 \
+          --lccc target/fastbuild/lccc --reference gcc-16
     - name: Pointer IV collapse and zero-guard count instruction selection
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ptr_iv_collapse_codegen.sh
     - name: One-level self-recursion clone shape
@@ -3203,6 +3211,18 @@ jobs:
           --function gap_pairs --flags='-O2 -march=x86-64-v3' --local target/fastbuild/lccc \
           --oracles '' --local-ref "icx=$LCCC_ICX_BIN" --artifact-dir intel-evidence/gap-oracle \
           --json intel-evidence/gap-oracle/manifest.json
+    - name: SIMD folded-index correctness against authenticated ICX
+      run: |
+        set -euo pipefail
+        python3 tests/simd/aos_pair_shapes.py --lccc target/fastbuild/lccc \
+          --reference "$LCCC_ICX_BIN" --json intel-evidence/simd-aos.json
+        python3 tests/simd/aos_pair_shapes.py --guarded --mixed --stride 4 \
+          --lccc target/fastbuild/lccc --reference "$LCCC_ICX_BIN" \
+          --json intel-evidence/simd-aos-guarded.json
+    - name: SIMD scoreboard checksums against authenticated ICX
+      run: |
+        python3 tests/simd/check_scoreboard.py --check-clock-failure --lccc target/fastbuild/lccc \
+          --reference "$LCCC_ICX_BIN -fp-model=strict" --json intel-evidence/simd-scoreboard.json
     - name: Qualifier composition against authenticated ICX
       run: |
         python3 tests/regression/check_qualifier_composition.py \

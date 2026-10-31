@@ -741,7 +741,7 @@
     "codegen-a": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 404.9,
+      "predicted_gate_seconds": 410.17,
       "shards": 2,
       "steps": [
         {
@@ -875,6 +875,10 @@
         {
           "measured_s": 0.06,
           "name": "Compile-time fold refuses an unfinishable constant recursion"
+        },
+        {
+          "measured_s": 5.27,
+          "name": "SIMD folded-index correctness and runner failure contracts"
         }
       ]
     },

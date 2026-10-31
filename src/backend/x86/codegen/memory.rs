@@ -4998,6 +4998,61 @@ mod indexed_fold_contract_tests {
         }
     }
 
+    #[test]
+    fn store_offset_elision_is_x86_64_only() {
+        assert!(X86Codegen::new().guarantees_indexed_store_fold());
+        assert!(!crate::backend::i686::I686Codegen::new().guarantees_indexed_store_fold());
+        assert!(!crate::backend::arm::ArmCodegen::new().guarantees_indexed_store_fold());
+        assert!(!crate::backend::riscv::RiscvCodegen::new().guarantees_indexed_store_fold());
+    }
+
+    #[test]
+    fn guaranteed_store_profiles_emit_for_all_scales_and_staging_classes() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::Ptr,
+            IrType::F32,
+            IrType::F64,
+            IrType::D32,
+            IrType::D64,
+        ] {
+            for shift in 0..=3 {
+                for (base, index) in [
+                    (PhysReg(10), PhysReg(16)),
+                    (PhysReg(16), PhysReg(10)),
+                    (PhysReg(1), PhysReg(3)),
+                ] {
+                    let mut cg = X86Codegen::new();
+                    cg.reg_assignments.insert(1, base);
+                    cg.reg_assignments.insert(2, index);
+                    cg.value_types.insert(2, IrType::I64);
+                    let mut info = gep_info(vec![ty], true, shift);
+                    info.index_ty = IrType::I64;
+                    assert!(cg.indexed_fold_ok(&info));
+                    let val = if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
+                    {
+                        xmm_home(&mut cg, 100);
+                        Operand::Value(Value(100))
+                    } else {
+                        Operand::Const(IrConst::I64(i64::MAX))
+                    };
+                    assert!(
+                        cg.emit_store_indexed_impl(&val, &Value(1), &Value(2), shift, 4, ty),
+                        "accepted profile refused: {ty:?} scale={shift} base={base:?} index={index:?}"
+                    );
+                    assert!(cg.state.out.buf.contains("mov"));
+                }
+            }
+        }
+    }
+
     // ── the emitter half: D32/D64 reach the SSE arms width-exactly ─────────
 
     #[test]
