@@ -1737,6 +1737,17 @@ gate "narrow-int-codegen" fast \
 gate "default-codegen-mode" fast \
     bash tests/regression/check_default_codegen_mode.sh
 
+# A call-free leaf pays no callee-saved register: the volatile pool carries its
+# loop state, the kill switch restores the old shape, and a call the compiler
+# cannot summarize still preserves its state.
+gate "leaf-caller-homes" fast \
+    bash tests/regression/check_leaf_caller_homes.sh
+
+# Narrow arithmetic: wrapped values, sign extension and comparisons over the
+# whole u8 grid and a sampled i16 grid, at -O0..-Os.
+gate "narrow-alu-arithmetic" fast \
+    bash tests/regression/check_narrow_alu_arithmetic.sh
+
 # The builtin linkers against gcc's link semantics: -shared startup files and
 # default libraries, user -l before the defaults, -rpath, as-needed libm.
 gate "builtin-dso-link" fast \
