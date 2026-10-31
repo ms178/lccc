@@ -191,6 +191,20 @@ jobs:
             --markdown "bench-summary-$SHARD.md" \
             --strict | tee "bench-terminal-$SHARD.txt"
 
+      # The ratios otherwise exist only in a log (not queryable from the API)
+      # and in an artifact (not readable either); a reusable-workflow job's
+      # step summary does not surface in `output.summary`. One annotation
+      # makes what the shard measured API-visible, which is what a performance
+      # change has to be judged on. Publishing at warning level is the only
+      # level the checks API returns, so the instrument stays opt-in
+      # (LCCC_BENCH_RATIOS=1) and a normal run carries no annotation.
+      - name: Publish paired ratios
+        if: always()
+        env:
+          REPORT: ${{ inputs.report }}
+          LCCC_BENCH_RATIOS: ${{ vars.LCCC_BENCH_RATIOS }}
+        run: python3 .github/scripts/ci_bench_ratios.py --report "$REPORT" --annotate
+
       - name: Post shard summary
         if: always()
         env:
