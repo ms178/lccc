@@ -1908,6 +1908,23 @@ Do after SV-06 S1 so the new framework defines the trait. **Effort** M.
   a substantial static-code gap against GCC/Clang; instruction counts are not
   runtime wins. SM-1 is not yet complete.
 
+### 9b.6 Red-team follow-up (2026-10-31)
+
+The address-fold audit repaired alias over-crediting, alias fallback root
+protection, missing-count handling and effectful-producer suppression. A
+256-case independent edge oracle and target/store-profile tests protect the
+new proof boundary. x86-64's explicit guaranteed-store contract recovers
+`glibc_memcmp` from 156 instructions / 18 stack operands to 154 / 17 without
+changing the golden gate. Other targets retain fallback offsets.
+
+SV-02 now also has a strict **44-name checksum-only gate**. Signed sink overflow
+(reproduced with GCC 16.2 UBSan), negative signed left-shift, truncated FP
+receipts, cross-row pointer traversal and zero matmul repetitions were repaired.
+GCC and authenticated ICX CI run this gate; controlled timing is still open.
+AoS probe compilation now denies warnings and process timeouts kill compiler
+descendants as well as their parent. The complete audit and its measured limits
+are in `engineering/SIMD-ADDRESS-FOLD-AUDIT-2026-10-31.md`.
+
 ## 10. Carried over from the superseded live queue (full text in the archives)
 
 Everything open in the 478-line queue that this file replaces is listed here with

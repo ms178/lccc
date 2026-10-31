@@ -1553,15 +1553,14 @@ fn dead_indexed_offset_producers(
         };
         // Fail closed if fold-map construction ever grows a new producer
         // class. A dead address value never licenses deleting its effects.
-        if !matches!(
-            inst,
-            Instruction::Copy { .. }
-                | Instruction::Cast { .. }
-                | Instruction::BinOp {
-                    op: IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Shl,
-                    ..
-                }
-        ) {
+        let integer_or_pointer = |ty: IrType| ty.is_integer() || ty == IrType::Ptr;
+        let pure = matches!(inst, Instruction::Copy { .. })
+            || matches!(inst, Instruction::Cast { from_ty, to_ty, .. }
+                if integer_or_pointer(*from_ty) && integer_or_pointer(*to_ty))
+            || matches!(inst, Instruction::BinOp {
+                op: IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Shl, ty, ..
+            } if integer_or_pointer(*ty));
+        if !pure {
             continue;
         }
         dead.insert(v);
@@ -9987,6 +9986,18 @@ mod indexed_offset_dead_tests {
             ty: IrType::I64,
             volatile: true,
             seg_override: crate::common::types::AddressSpace::Default,
+        };
+        assert!(dead(&f, &m, &[]).is_empty());
+    }
+
+    #[test]
+    fn floating_conversion_is_not_an_effect_free_offset_producer() {
+        let (mut f, m) = shared_offset();
+        f.blocks[0].instructions[4] = Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Const(IrConst::F64(1.25)),
+            from_ty: IrType::F64,
+            to_ty: IrType::I64,
         };
         assert!(dead(&f, &m, &[]).is_empty());
     }

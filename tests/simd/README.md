@@ -70,16 +70,16 @@ One address can peel through `i+1`, while another retains `i+1` as its SIB
 index. The old per-address walk could suppress that index's definition even
 though the allocator had assigned it a register for the second address.
 `dead_indexed_offset_producers` now protects every selected index globally,
-counts only guaranteed load-fold uses (stores may need offset rematerialization),
+counts real GEP edges (not alias metadata), protects fallback offsets,
 and revisits shared operands when their final attributable use disappears.
 Ambiguous definitions and ordinary uses remain materialized. This keeps
 address folding and useful offset elimination enabled, rather than disabling
 unrolling/vectorization to avoid the symptom.
 
-Five Rust unit cases cover the cross-address root, shared-offset fixed point,
-store fallback, ordinary uses and ambiguous definitions. Runner tests cover
+Eleven Rust analysis cases cover the cross-address root, shared-offset fixed point,
+store fallback, ordinary uses, ambiguous definitions, effectful/FP producers, incomplete metadata and a 256-case independent oracle. Target tests cover default refusal and 156 x86 store profiles. Runner tests cover
 failure propagation, stale artifacts, guard construction, command parsing,
-JSON completeness and invalid timeouts. GCC CI runs the default and mixed-sign
+JSON completeness, invalid timeouts and pipe-inheriting descendant termination. GCC CI runs the default and mixed-sign
 four-strided page-boundary probes; the existing authenticated ICX 2026.2 lane
 runs the same cases against its vendor snapshot.
 
