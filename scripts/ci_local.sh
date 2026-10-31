@@ -404,6 +404,20 @@ gate "shift-signext-fold" fast \
 gate "generator-map" fast \
     env CCC="$LCCC" bash tests/regression/check_generator_map.sh
 
+# RA harness self-tests: deterministic generation, GCC-only cross-opt checksum
+# agreement, UBSan, and assembly-parser edge cases. The real LCCC-vs-GCC
+# differential gate immediately follows after the compiler build.
+gate "ra-holdout-harness" fast \
+    python3 tests/ra/test_harness.py
+
+# Differential RA/code-shape run against the compiler built by this same CI
+# invocation. Checks checksums at every optimization level before recording
+# per-function assembly counts; the holdout is evaluated, never tuned.
+gate "ra-holdout-differential" fast \
+    python3 tests/ra/spill_compare.py --suite holdout \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --opt-levels 1,2,3 \
+        --check --text --json target/ra-holdout.json
+
 # Register-offset symbol folds (`Add(symbol, register)` -> `sym(%off,%idx)`):
 # the sliding-window shape `const u8 *m = window + cur; m[i]` must fold the
 # symbol into the memory operand where the derived pointer has no other use,
@@ -1685,6 +1699,12 @@ gate "tls-dynamic-witness" fast \
 # which it reaches only through PT_GNU_EH_FRAME.
 gate "cfi-unwind" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_cfi_unwind.sh
+
+# Narrow-integer staging and divide width, the executed probe-boundary frame,
+# and the >2 GiB CFA offsets decoded from .eh_frame bytes (`readelf` truncates
+# a large CFA offset when it PRINTS it, so the gate decodes the section).
+gate "narrow-int-codegen" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_narrow_int_codegen.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23
 
 # The builtin linkers against gcc's link semantics: -shared startup files and
 # default libraries, user -l before the defaults, -rpath, as-needed libm.

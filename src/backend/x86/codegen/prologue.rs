@@ -3459,9 +3459,7 @@ impl X86Codegen {
             if use_push_pop {
                 let local_size = frame_size - num_saved * 8;
                 if local_size > 0 {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    addq", local_size, "rsp");
+                    emit_stack_adjust_x86(&mut self.state, StackAdjust::Release, local_size);
                 }
                 for &reg in used_regs.iter().rev() {
                     let reg_name = phys_reg_name(reg);
@@ -3475,9 +3473,7 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    movq {}(%rsp), %{}", offset, reg_name));
                 }
                 if frame_size > 0 {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    addq", frame_size, "rsp");
+                    emit_stack_adjust_x86(&mut self.state, StackAdjust::Release, frame_size);
                 }
             }
         } else {
@@ -5148,6 +5144,93 @@ mod incoming_byval_tests {
     }
 }
 
+/// Direction of a stack-pointer adjustment, so the two legal spellings cannot
+/// be confused with each other or with an unrelated mnemonic at a call site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum StackAdjust {
+    /// `subq` -- allocate frame space (prologue).
+    Allocate,
+    /// `addq` -- release frame space (epilogue).
+    Release,
+}
+
+impl StackAdjust {
+    /// The immediate form's mnemonic.
+    fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Allocate => "subq",
+            Self::Release => "addq",
+        }
+    }
+
+    /// The register form. Spelled out rather than formatted: the operand is
+    /// `%r11` in both directions, and one template keeps the two shapes
+    /// visibly identical to the CFI model that parses them.
+    fn register_form(self) -> &'static str {
+        match self {
+            Self::Allocate => "    subq %r11, %rsp",
+            Self::Release => "    addq %r11, %rsp",
+        }
+    }
+
+    /// The CFI contract marker's payload: the sign repeats the direction, so
+    /// the marker and the instruction cross-check each other.
+    fn signed_amount(self, amount: i64) -> i64 {
+        match self {
+            Self::Allocate => amount,
+            Self::Release => -amount,
+        }
+    }
+}
+
+/// Adjust `%rsp` by `amount` (always positive; the direction is the enum).
+///
+/// `addq/subq r64, imm` encodes a **sign-extended imm32** and nothing wider, so
+/// a frame delta above `i32::MAX` has no immediate encoding at all. Deltas that
+/// fit keep the one-µop immediate form; larger ones materialize the constant
+/// into caller-saved `%r11` -- the scratch the ABI leaves free at both
+/// adjustment points -- and use the register form:
+///
+/// ```text
+///     movq $imm, %r11        # 6 bytes when zero-extendable, 10 above 2^32
+///     subq %r11, %rsp        # 4 bytes
+/// ```
+///
+/// `movq $imm, %r11` is the right spelling for BOTH assemblers: gas folds it to
+/// `movabs`, and LCCC's own encoder (`encode_mov_imm_reg`) resolves all three
+/// ranges identically -- sign-extended `C7 /0` for `[i32::MIN, i32::MAX]`, the
+/// *zero-extending* 32-bit `B8+rd` form (6 bytes, not 10) for
+/// `(i32::MAX, 2^32)`, and `B8+rd io` above that. Spelling it `movabsq` would
+/// forfeit the middle range's shorter encoding.
+///
+/// The register form is invisible to `cfi_synth`'s immediate-delta rule, so the
+/// emitter STATES the delta instead of leaving it to be re-derived: the
+/// `# LCCC_STACK_ADJUST` marker below is a contract with
+/// `backend::cfi_synth::materialized_stack_adjustments`, which prefers the
+/// marker, falls back to the textual `mov` + `add/sub` relation, and refuses to
+/// describe the frame when the two disagree. That adjacency is also what keeps
+/// the synthesized CFA exact for the giant-frame functions this path exists
+/// for.
+fn emit_stack_adjust_x86(
+    state: &mut crate::backend::state::CodegenState,
+    direction: StackAdjust,
+    amount: i64,
+) {
+    debug_assert!(amount > 0, "stack adjustment must be positive: {amount}");
+    if i32::try_from(amount).is_ok() {
+        state
+            .out
+            .emit_instr_imm_reg(direction.mnemonic(), amount, "rsp");
+    } else {
+        state.emit_fmt(format_args!(
+            "    # LCCC_STACK_ADJUST {}",
+            direction.signed_amount(amount)
+        ));
+        state.out.emit_instr_imm_reg("    movq", amount, "r11");
+        state.emit(direction.register_form());
+    }
+}
+
 /// Allocate `size` bytes on `%rsp` in an FPO prologue. When
 /// `-fstack-clash-protection` is active and `size > 4096`, unroll 4096-byte
 /// page probes so `cfi_synth` maintains an exact static `%rsp` CFA at every PC.
@@ -5167,7 +5250,7 @@ fn emit_fpo_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, mut
             state.emit("    orl $0, (%rsp)");
         }
     } else {
-        state.out.emit_instr_imm_reg("    subq", size, "rsp");
+        emit_stack_adjust_x86(state, StackAdjust::Allocate, size);
     }
 }
 

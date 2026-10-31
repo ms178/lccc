@@ -27,7 +27,13 @@
 #      gcc and the kill switch;
 #   3. a LOOP that both loads and stores through such a base keeps its exit
 #      code across folded / kill-switch / gcc;
-#   4. `-fpie` emits none of the form (the documented PIC refusal).
+#   4. `-fpie` emits none of the form (the documented PIC refusal);
+#   5. the fold decision never deletes an instruction the emitter will not
+#      consume: a LIVE `Add` keeps its address GEP and its whole offset chain,
+#      so the gzip longest-match kernel's own reference implementation agrees
+#      at `-O1 -fno-pie` — the level and mode where the decision used to
+#      answer "foldable" for a live base, skip the chain, and leave the
+#      emitter's fallback reading a never-written offset home.
 #
 # Usage: bash tests/regression/check_reg_off_sym_fold.sh
 #        CCC=/path/to/lccc bash tests/regression/check_reg_off_sym_fold.sh
@@ -210,6 +216,38 @@ if [ "$pie_shape" -eq 0 ]; then
     note PASS "-fpie emits none of the form (documented PIC refusal)"
 else
     note FAIL "-fpie emitted ${pie_shape} symbol+two-register operands"
+    fail=1
+fi
+
+# ---- 5: a live `Add` must never delete its own address chain ---------------
+# The register-offset arm answers two different questions: "may this access use
+# the symbol SIB" (access sites, permissive — the emitter's dispatch then picks
+# the symbol form for a DEADENED `Add` and the plain register-base SIB
+# otherwise) and "will the emitter TAKE this fold" (the two skip decisions,
+# which delete the GEP and its offset producers).  Only the second may delete
+# instructions, and it must be the dispatch's own answer.  At `-O1 -fno-pie`
+# this kernel built its index as `Sub(best_len, 1)` + `Cast`, the `Add` stayed
+# live (a sibling use), the arm still said "foldable", and the skip removed the
+# chain: the access then refused the symbol form (live base), fell back to
+# rematerialising the address, and read the chain's never-written register home
+# — the sibling's register.  The self-check catches exactly that.
+GZIP=tests/benchmark/programs/gzip_longest_match.c
+GZIP_FLAGS="-O1 -march=x86-64-v3 -fno-pie -DPASSES=1"
+"$CCC" $GZIP_FLAGS -no-pie "$GZIP" -o "$TMP/gzip.bin"
+env CCC_NO_REG_OFF_SYM=1 "$CCC" $GZIP_FLAGS -no-pie "$GZIP" -o "$TMP/gzip_nofold.bin"
+# `-fpie` alone already links a PIE (the driver couples the two); passing a
+# bare `-pie` is a separate, unrelated knob and is deliberately not used here.
+"$CCC" -O1 -march=x86-64-v3 -fpie -DPASSES=1 "$GZIP" -o "$TMP/gzip_pie.bin"
+gcc $GZIP_FLAGS -no-pie "$GZIP" -o "$TMP/gzip_gcc.bin"
+rc_fold=0; out_fold=$("$TMP/gzip.bin") || rc_fold=$?
+rc_nofold=0; out_nofold=$("$TMP/gzip_nofold.bin") || rc_nofold=$?
+rc_pie=0; out_pie=$("$TMP/gzip_pie.bin") || rc_pie=$?
+rc_gcc=0; out_gcc=$("$TMP/gzip_gcc.bin") || rc_gcc=$?
+if [ "$rc_fold" -eq 0 ] && [ "$out_fold" = "$out_nofold" ] && [ "$out_fold" = "$out_gcc" ] \
+    && [ "$out_fold" = "$out_pie" ]; then
+    note PASS "live-\`Add\` kernel self-check agrees: fold = kill switch = gcc = -fpie (${out_fold#* })"
+else
+    note FAIL "live-\`Add\` kernel self-check disagrees: rc=$rc_fold/$rc_nofold/$rc_pie/$rc_gcc fold='$out_fold' nofold='$out_nofold' pie='$out_pie' gcc='$out_gcc'"
     fail=1
 fi
 

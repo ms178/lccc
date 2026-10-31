@@ -1483,6 +1483,448 @@ separate inventories. Conditional alternatives are retained, not preprocessed.
 | SIMD-MANUAL-1 | Intel combined SDM 325462-093; AMD 26568 rev 3.27 (July 2026), 24594 rev 3.38. Selected Intel 2B MIN/MAX instruction sections are reviewed; combined Intel/AMD retrieval established edition/front matter only. A 30-page extraction is **not full-manual coverage** | Obtain full primary instruction sections, retain hashes/edition/page or instruction anchors and extraction method; map every public API, raw builtin, lowering and assembler encoding to actual instruction requirements. Check register/memory/immediate forms, widths, destructive/upper-lane effects, masks, alignment, fault behavior, rounding/MXCSR, NaNs/signaling/signed-zero/subnormals, memory tails and numerical edge cases. Both x86 modes; GAS/LLVM cross-checks are not substitutes for manuals. Publish per-row reviewed/untested/unsupported status; never infer whole-family coverage from selected runtime legs. |
 | SIMD-PERF-1 | `legacy_sse_native_chain.c`, generic helper chains, and YMM ABI carrier frames; `aggregate_abi.rs` documents the hidden-pointer IR shape even for register returns | Remove carrier/copy bridges only with an IR/inliner/ABI proof. Compare exact outputs against GCC 16.2 in all four caller/provider directions; guard pages, volatile/address spaces and inline/noinline controls; paired output-checked SSE2/AVX/AVX2 corpus runtime plus Valgrind/Callgrind, instruction/frame receipts, O2 native host screening and hosted EPYC results. Static or Callgrind counts alone are not a runtime speed claim. |
 
+## 9b. SIMD assessment and programme (measured 2026-10-31, `219f74a`)
+
+Scope: automatic vectorisation, vector codegen, intrinsics, ISA coverage and the
+correctness of all three, for x86-64 and (where stated) i686. This section is the
+SIMD *performance and design* programme; §9a above remains the SSE/AVX **API**
+audit (header names, permission tables, manual review) and is not repeated.
+
+### 9b.1 How to read the evidence
+- **R** = reproduced with the commands below on a fastbuild of `219f74a`
+  (rustc 1.91.1 + `if_let_guard` shim, 1 vCPU Xeon-class VM with AVX-512, GCC 13.3
+  as the *only* available reference; the GCC 16.2 / Clang 23.1 / ICX oracles must
+  rerun every number before a claim leaves this file).
+- Runtime numbers are **screening**, not target-hardware evidence: single VM,
+  minimum of three runs, `N = 4096` elements, one kernel per function. The
+  i7-14700KF (AVX2, FMA, AVX-VNNI, **no AVX-512**) has not been measured
+  (UP-6 in §10 stands). Static counts and Callgrind `Ir` are not runtime wins
+  (decision rules, §1).
+- The 44-kernel corpus (float/double/int/short/byte elementwise, conversions,
+  reductions, widen/narrow, selects, strides, gathers, aliasing, recurrences and a
+  matmul) is committed as tests/simd/scoreboard_kernels.c and the F1 shape matrix
+  as tests/simd/aos_pair_shapes.py; the runner/gates of SV-02 below are still to be
+  built, so the reproducers in each item remain authoritative.
+
+### 9b.2 Findings
+
+**F1 — wrong code and a crash in the vectoriser/unroller path (P0, R).**
+A loop that reads and writes two interleaved fields per iteration segfaults at
+`-O2`/`-O3` and is correct at `-O1`:
+```c
+#define N 64
+static float x[3*N+8], y[3*N+8], o[3*N+8];
+__attribute__((noinline)) void k(void){
+  for (int i = 0; i < N; i++) {              /* complex multiply, AoS */
+    float ar=x[2*i], ai=x[2*i+1], br=y[2*i], bi=y[2*i+1];
+    o[2*i]=ar*br-ai*bi; o[2*i+1]=ar*bi+ai*br; } }
+```
+Shape matrix (7 loop shapes × `-O1/-O2/-O3`, each compared with `gcc -O0` output):
+only the two shapes with *cross-field* uses fail — `o[2i]=x[2i]+y[2i+1];
+o[2i+1]=x[2i+1]+y[2i]` and the complex multiply above (rc 139 at `-O2`/`-O3`).
+Same-field shapes (`o[2i]=x[2i]*y[2i]`, 3-strided, plain copy, AoS add) pass.
+The `-O2` assembly shows the unrolled second copy indexing with `%r9`
+(`4(%rsi,%r9,8)`, `4(%rdx,%r9,8)`, `4(%rdi,%r9,8)`) while nothing in the function
+ever defines `%r9` (the loop only does `addq $2,%r8`): an index value (`i+1`) that
+the unroller/strength-reducer references but whose definition was lost. In the
+larger corpus (`N = 4096`) the same loop did not crash but produced a wrong
+checksum (the only mismatch among 44 kernels with `-ffp-contract=off`), i.e. the
+defect can be silent. Disabling `CCC_NO_TWO_BLOCK_UNROLL=1` or compiling with
+`-fno-tree-vectorize` makes the output correct (**not** root cause: both gate the
+path); `CCC_NO_FIXED_SLP`, `-fno-slp-vectorize`, `-fno-unroll-loops` do not.
+Everything else in the corpus (43 kernels × 5 configurations: `-O2` baseline,
+`-O2 -mavx2 -mfma`, `-O3 -mavx2 -mfma`, `-O2 -march=native`) is bit-identical to
+`gcc -O0` when FP contraction is off, which is a real positive result for the
+existing pattern passes.
+
+**F2 — the vectoriser is a collection of pattern recognisers, not a general
+loop vectoriser (design, R/S).** `src/passes/vectorize.rs` (38,513 lines) opens
+with "AVX2/SSE2 vectorization pass for matmul-style loops … Only handles
+matmul-style patterns"; the satellites are recogniser families
+(`vectorize_byte_count_normalize`, `vectorize_generator_map`,
+`vectorize_strict_recip`, `vectorize_strided_i32_reduce`,
+`vectorize/strict_i32_pack`, `arx_vectorize`, `vec_interleave`,
+`vec_mask_shifts`, `vec_shuffle`) plus the basic-block SLP
+(`slp_vectorizer.rs`, 6,895 lines). There is no shared legality layer
+(dependence distances, alias versioning), no VF selection, no cost model, no
+if-conversion and no masked-memory model. The measured consequences are F3–F6.
+Maintenance consequence: more than sixty `CCC_NO_*` kill switches in
+`src/passes/mod.rs`, each a different recogniser's escape hatch.
+
+**F3 — large, uniform performance gaps on ordinary loops (P1, R).** Per-kernel
+ns/element, lccc `-O2 -mavx2 -mfma` divided by `gcc -O3 -mavx2 -mfma` (higher =
+lccc slower; geometric mean over 44 kernels **1.96×**, 17 kernels above 2×):
+
+| Class | Kernel (ratio) |
+|---|---|
+| not vectorised **and** not if-converted | `select_f32` 35.4, `condstore` 10.6, `abs_f32` 5.8, `min_i32` 5.3, `clamp_i32` 2.4 |
+| conversions | `f2i` 7.2, `i2f` 7.1, `f2d` 3.8 |
+| width change / shifts | `narrow_i16_u8` 8.8, `widen_u8_u16` 6.4, `shift_i32` 5.0 |
+| permutes and access shapes | `reverse` 6.9, `aos_soa` 2.6, `cmul` 2.5, `stride2` 2.0 |
+| dependence distance | `overlap_dist1` (`a[i]=a[i+1]+b[i]`) 8.5, `alias_overlap` 4.0 |
+| idiom reductions | `sad_u8` 1.8, `satadd_u8` 1.7 |
+| near parity | `add_f32` .93, `fma3` .97, `stencil3` .97, `dot_i32` 1.0, `sum_f64` 1.0, `add_i16` .96, `matmul` 1.5 |
+| lccc faster | `count_eq_u8` .19 (byte-compare idiom), `mul_i32` .72, `unknown_n` .79, `add_i32` .82, `alias_ptr`/`restrict` ~.9, `gather`/`scatter` .9 |
+
+`select_f32` is the sharpest datum: the loop is a scalar `ucomiss`/`jbe` diamond
+(`movss` in both arms) on random data, so it is limited by branch mispredictions
+(3.9 ns/element vs 0.11) — it is neither vectorised nor converted to a
+select/blend/`cmov`. Excluded from the table as invalid or unexplained:
+`saxpy` (re-initialises inside the timed region), `sqrt_f32` (negative inputs →
+NaN path in both), `dot_f32_fast`/`sum_f64_fast` (compiled without fast-math in
+both; the 2× on the dot product is unexplained and needs a look at the strict-FP
+chain), `popcnt` (parity with scalar `popcnt`; GCC with AVX-512 `vpopcntd` is
+~11× faster but the Raptor Lake target has none).
+
+**F4 — `-O3` and `-march=native` change nothing for SIMD (P1, R).** `-O3` is
+indistinguishable from `-O2` on all 44 kernels (within noise) and
+`-march=native` on an AVX-512 host emits **0** `zmm` references and no opmask
+use, identical to `-mavx2` (107 `ymm` references total; GCC `-O3 -mavx2`: 657;
+GCC `-O3 -march=native -mprefer-vector-width=512`: 429 `zmm`, up to 2× faster on
+the same kernels, e.g. `add_f32` 0.040 → 0.024, `popcnt` 0.26 → 0.023 ns/element).
+Without any `-m` flag the baseline emits no `ymm` (SSE2 only), as designed.
+
+**F5 — intrinsics API breadth is small beyond SSE/AVX (P1, R screening).** A
+name-presence census of the GCC 13 headers against `include/*.h`
+(`_mm*_name(` definitions or `#define`s; counts only — presence is not
+correctness, and macro-generated names may be undercounted, so the first step of
+SV-05 is the compile-based version of this test): total **534 of 5,173**
+reference names (10.3 %). By group (reference/present): AVX 205/132, AVX2
+208/92, SSE4.x 84/44, FMA 32/6, F16C 4/0, AVX-VNNI **8/0**, GFNI 30/3, VAES
+8/4, VPCLMULQDQ 2/2, SHA 7/7, AES/PCLMUL 7/7; AVX-512F 1412/107, BW 284/64,
+VL 1260/10, VL+BW 449/15, DQ 212/13, VNNI 12/2, VBMI2 51/1, BITALG 27/5,
+VPOPCNTDQ 7/3, FP16 601/7. The bundled headers define 512-bit types and
+generated wrappers (`gen_lcccsimd.py`); §9a covers the audited SSE–AVX2 subset.
+For the stated primary target the relevant, currently missing extensions are
+AVX-VNNI (`_mm256_dpbusd_avx_epi32` family), F16C, 256-bit GFNI/VAES forms and
+the AVX2/FMA remainder (about half of AVX2 and 80 % of FMA names).
+
+**F6 — AVX/SSE transition discipline is incomplete (P1, R in asm, impact
+unmeasured).** In the `-O2 -mavx2` corpus, 2 of 18 functions that use `ymm`
+registers return without `vzeroupper` (`k_matmul`, `k_alias_ptr`); the other 16
+emit it (16 `vzeroupper` in total; GCC: 45). On Intel cores since Skylake a dirty
+upper state turns later legacy-SSE instructions (libm, memcpy via SSE paths,
+callers compiled without AVX) into merge-dependency stalls. Whether the omission
+is a deliberate decision must be established first (search `DECISIONS.md`); if
+not, it is a cheap, measurable fix.
+
+**F7 — design notes from reading the code (S).**
+- AVX-512 is present only as types, wrappers and a few native EVEX helper calls;
+  there is no opmask register class in the allocator and no masked-tail or
+  masked-condition model, so every AVX-512 gain in F4 is unreachable for the
+  autovectoriser today.
+- `lcccsimd.h` is generated and `-march`/`target()` gating is a per-instruction
+  permission table (§9a SIMD-PERM-1) — good — but the table is not derived from
+  one authoritative ISA description shared with the assembler encoder
+  (`encoder/avx.rs`, 7,042 lines), so API, encoder and cost model can drift apart.
+- Vector value passing is expensive through carrier frames (§9a SIMD-PERF-1),
+  which also taxes small hot helpers and the intrinsics themselves.
+
+### 9b.3 Programme
+
+Goal: no corpus kernel more than 1.2× slower than the best oracle on AVX2, zero
+SIMD miscompiles on the matrix below, and a measured AVX-VNNI/AVX-512 story, in
+this order. Each item has a reproducer, gates (mutation-verified) and an
+acceptance number. Effort S ≤ 1 day, M ≤ 1 week, L > 1 week.
+
+| ID | Pri | Item | Effort | Depends |
+|---|---|---|---|---|
+| SV-01 | P0 | Fix the two-block-unroll / vectoriser index loss (F1) | S–M | — |
+| SV-02 | P0 | SIMD scoreboard: correctness matrix + runtime table in the repo | M | — |
+| SV-03 | P1 | Scalar if-conversion: `select`/`min`/`max`/`abs`/`clamp` (F3) | S–M | — |
+| SV-04 | P1 | Vector conversions, widen/narrow, shifts, integer idioms (F3) | M | SV-02 |
+| SV-05 | P1 | Intrinsics: compile-based coverage + execution differential (F5) | M | — |
+| SV-06 | P1 | General loop vectoriser framework, staged (F2, F3) | L | SV-02, SV-04 |
+| SV-07 | P1 | `-O3` / `-march=native` / vector-width policy (F4) | S | SV-02 |
+| SV-08 | P1 | `vzeroupper` audit and policy (F6) | S | — |
+| SV-09 | P2 | AVX-512 enablement: opmask class, ZMM, masked tails (F4, F7) | L | SV-06 |
+| SV-10 | P2 | AVX-VNNI / F16C / GFNI / VAES for the Raptor Lake target (F5) | M | SV-05 |
+| SV-11 | P2 | One ISA description shared by headers, encoder, cost model (F7) | M | SV-05 |
+| SV-12 | P2 | Split `vectorize.rs` by recogniser family; one registry (F2) | M | SV-06 |
+
+#### SV-01 · P0 — fix the lost index in the unrolled interleaved-access loop
+**Reproducer.** The `k()` function above (also the `a_swapadd` shape);
+`lccc -O2 f.c -o f && ./f` → segmentation fault; `CCC_NO_TWO_BLOCK_UNROLL=1`
+makes it pass; `-O1` passes.
+**Plan.** (1) Dump IR before/after the passes in the order of
+`src/passes/mod.rs` for the 12-line reproducer (the repo's IR dump knobs; bisect
+with the existing `CCC_NO_*` switches by pass rather than by source) and find the
+instruction that defines `i+1` for the second unrolled copy; (2) establish
+whether the definition is created and then deleted (DCE/CSE after a rewrite that
+changed the use but not the value map) or never created (the unroller's
+induction-variable substitution for GEPs with *two* index forms `2*i` and `2*i+1`
+in the same body); (3) fix at the source of the invariant, not by a guard that
+declines the unroll — then add the invariant check (every operand of a cloned
+instruction is defined on every path to it) as a debug assertion in the cloner;
+(4) run the full matrix of SV-02.
+**Gates.** The 7-shape matrix as unit tests at `-O1/-O2/-O3`; a differential
+generator for AoS-pair loops (strides 2–4, 2–3 fields, cross-field uses, trip
+counts 0,1,2,3,7,8,9,31,33, element types f32/f64/i32/i16, with and without
+`restrict`) compared with `gcc -O0` and under a page-guard harness (arrays placed
+so that a one-element over-read or write faults); mutation: revert the fix and
+see the matrix fail.
+**Accept.** Zero failures on the generator for a day's seed range; reproducer
+and shape matrix permanent. **Risk.** The same root cause may affect scalar
+unrolling outside the vectoriser; extend the generator to scalar loops.
+
+#### SV-02 · P0 — SIMD scoreboard (correctness first, then speed)
+**What.** Commit the 44-kernel corpus (`kernels.c` as used here, split into one
+file per class so failures localise) and a runner (to be created, e.g.
+scripts/simd_scoreboard.py) that: (a) compiles with lccc in five configurations
+(`-O1`, `-O2`, `-O3`, `-O2 -mavx2 -mfma`, `-O2 -march=native`) and with the
+reference compilers (`gcc -O3 -mavx2 -mfma`, and `-march=native` with
+`-mprefer-vector-width=512`); (b) checks checksums against `gcc -O0` with
+`-ffp-contract=off` (and separately against a contracting reference when
+`-mfma` is on, since fused results legitimately differ); (c) sweeps trip counts
+{0,1,2,3,4,5,7,8,9,15,16,17,31,32,33,63,64,65,N−1,N}, source/destination
+misalignments {0..63 bytes} and partial overlaps; (d) places each array at the
+end of a page followed by `PROT_NONE` and at a page start preceded by
+`PROT_NONE`, so over-reads/over-writes by vector loops fault; (e) runs the timing
+table with paired, order-balanced repetitions, min and median, CPU frequency and
+affinity recorded, and **writes machine-readable output**. Timing only informs;
+the pass/fail gate is correctness + "no kernel regresses more than 3 % against
+the checked-in baseline on the same host".
+**Gates.** Fast lane: correctness over the reduced sweep (≈ 1 min). Slow lane:
+full sweep + timing. **Accept.** F1 is caught by the fast lane; the table in F3
+is reproduced from the committed corpus. **Effort** M.
+
+#### SV-03 · P1 — scalar if-conversion (the 35× case)
+**Why.** Independent of the vectoriser, branchy selects on unpredictable data
+cost an order of magnitude (F3: `select_f32` 3.9 vs 0.11 ns/element; `abs_f32`,
+`min_i32`, `clamp_i32` likewise). Doing this first is the highest ROI item in
+the programme: it fixes scalar code everywhere and is the legality foundation for
+vector blends.
+**Plan.** (1) A CFG pass on SSA before out-of-SSA: for each triangle/diamond whose
+arms contain only speculation-safe, cheap instructions (no loads that may fault
+unless dominated by an access to the same object, no division, no calls, no
+volatile/atomic), replace the join phi by a `select`; cost guard ≤ 2–3 cheap
+instructions per arm, never across loop back edges that carry a loop-exit
+branch; use profile data when present (PGO) and skip well-predicted branches
+only when a profile says so. (2) Lowering: integer → `cmov`/`pminsd/pmaxsd`
+(vector) / `pabsd`; float → `minss/maxss` only when NaN/signed-zero semantics
+match the C source (the `x < y ? x : y` form maps exactly to `minss`; other forms
+use compare + `blendv`/`and/andn/or`); `abs` → `andps` with sign mask. (3) Teach
+the scalar peephole to keep `cmov` chains short (a long dependent `cmov` chain is
+slower than a well-predicted branch on Raptor Lake — gate with the profile cost).
+**Gates.** Random-data microbenchmarks (misprediction-bound) and sorted-data
+controls (branch-friendly) so a pessimisation is visible; asm-shape tests;
+differential on edge values (NaN, ±0, INT_MIN, INT_MAX); mutation: disable the
+legality check for loads and watch a guard-page test fault.
+**Accept.** `select_f32`, `abs_f32`, `min_i32`, `clamp_i32`, `condstore` scalar
+versions ≥ 5× faster on random data, ≤ 3 % slower on sorted data. **Effort** S–M ·
+**ROI** highest.
+
+#### SV-04 · P1 — vector conversions, widen/narrow, shifts, integer idioms
+**Why.** F3 rows: conversions 3.8–7.2×, widen/narrow 6.4–8.8×, `shift_i32` 5×,
+`sad_u8`/`satadd_u8` 1.7–1.8×. Each is a single-instruction (or two) vector
+operation whose scalar form is a 6–9× slower loop.
+**Plan.** Add recognisers *through the framework of SV-06 stage S1* where
+possible; before that exists, extend the elementwise pattern pass with a table:
+`cvttps2dq/cvtdq2ps/cvtps2pd/cvtpd2ps` (VEX 128/256), `pmovzx/pmovsx` +
+`packus/packss` + `vpermq` fix-up for widen/narrow, `psll/psrl/psra` immediate
+and `vpsllv*` variable forms, `pabs*`, `pmin/pmax[su]*`, `psadbw`,
+`paddus*/psubus*`, `pavgb`, `pmulhw/pmulhuw`, `pmaddwd`. Semantics must follow C
+exactly: float→int conversion of out-of-range values is undefined in C but the
+hardware gives `INT_MIN`; the scalar code does the same, so vector and scalar
+agree — assert this in the differential sweep rather than assuming it.
+**Gates.** SV-02 sweep, full 2^16 exhaustive checks for 16-bit element ops,
+random + edge sweeps for 32-bit; asm-shape gate that the loop contains no scalar
+`cvtsi2ss`/`cvttss2si`. **Accept.** Each listed kernel ≤ 1.2× of GCC AVX2.
+**Effort** M.
+
+#### SV-05 · P1 — intrinsics: compile-based coverage and execution differential
+**Plan.** (1) A coverage test that, for every `_mm*`/`_mm256_*`/`_mm512_*` name
+in the SHA-pinned GCC 16.2 headers (the inventory already exists for SSE–AVX2 in
+`engineering/isa/`; extend to every `*intrin.h`), compiles a translation unit
+referencing the name under the minimal target flags and records
+*implemented / diagnosed / missing*; this replaces F5's regex census. (2) An
+**execution differential**: generate, from the GCC header prototypes, a program
+per intrinsic that applies it to random and edge inputs (including all-ones,
+zero, NaN payloads, denormals, shift counts at and beyond the lane width) and
+compares the bytes with GCC's result on the same host; run the AVX-512 subset on
+an AVX-512 host only. (3) Order by value to the target: AVX2/FMA remainder,
+AVX-VNNI, F16C, GFNI/VAES/VPCLMUL 256-bit, then AVX-512F/BW/VL/DQ/VNNI.
+(4) Every intrinsic must lower to **one** native instruction (or the documented
+sequence); add an asm-shape ratchet over the corpus so no helper call or carrier
+copy creeps back (links to §9a SIMD-PERF-1).
+**Accept.** AVX/AVX2/FMA/F16C/AVX-VNNI at 100 % *implemented or diagnosed* with
+execution differentials green; AVX-512 coverage ≥ 90 % of F/BW/VL/DQ names.
+**Effort** M (coverage + differential harness), then incremental.
+
+#### SV-06 · P1 — a general loop vectoriser, introduced behind the existing passes
+**Design.** One pass, five layers, each testable alone:
+1. **Loop forms.** Counted innermost loops (and the trip-count algebra
+   already in `loop_bound`/`loop_analysis`): canonical IV, bounds, runtime trip
+   counts, exit conditions; reject early with a *reason code* (see below).
+2. **Memory model and legality.** Affine subscripts per base object; for each
+   store/load pair compute dependence distance (GCD/Banerjee-lite is enough for
+   the corpus); classify: independent, loop-carried with distance ≥ VF (safe),
+   distance < VF (unsafe, or safe when the vectorised order preserves the
+   read-before-write relation — `a[i]=a[i+1]+b[i]` is the canonical safe case),
+   unknown (emit a **runtime alias/distance check** with a scalar fallback loop;
+   the pointer-pair check cost enters the cost model). Reductions: associative
+   integer ops always; FP only under `-fassociative-math` (strict FP keeps the
+   existing multi-accumulator interleave, which preserves order only per lane —
+   verify that this is what the code does before relying on it).
+3. **Plan and cost.** A `Plan {vf, interleave, epilogue, masks}` per loop; cost =
+   µops/throughput per instruction class from the calibrated tables (MB-30),
+   shuffle and gather penalties, register-pressure estimate, trip-count break-even
+   against versioning and epilogue overhead; choose among 128/256/(512) widths by
+   ISA and by policy (SV-07).
+4. **Widening.** Elementwise arithmetic, compare → mask, select → blend, masked
+   stores (`vmaskmov`, AVX-512 opmasks later), conversions (SV-04), induction
+   variables as vectors, interleaved/strided/reverse access via shuffles
+   (`vpermd/vpermq/vpshufb/unpck*`; AoS↔SoA, complex multiply with
+   `addsub`/`fmaddsub`), gather/scatter only when the model says so (lccc's scalar
+   gather already ties GCC).
+5. **Emission and epilogues.** Scalar remainder (existing), vector epilogue at
+   half width, masked epilogue when AVX-512 or `vmaskmov` is cheaper; alignment
+   peeling only when measured to pay.
+**Staging (each stage ships behind `CCC_GENERIC_VEC=1`, then default-on after
+the identity and scoreboard gates pass; the existing pattern passes stay as
+fast paths and are removed only when the generic path matches or beats them on
+their own kernels):** S1 elementwise unit-stride (includes SV-04 conversions);
+S2 if-conversion and masked stores (`condstore`, `select`, `abs`, `clamp`);
+S3 reductions (int add/min/max, `sad`, `dot` via `pmaddwd`, FP with
+`-fassociative-math`); S4 strided/reverse/interleaved; S5 runtime alias and
+dependence-distance versioning (`overlap_dist1`, `alias_overlap`); S6
+gather/scatter.
+**Explainability.** Every loop that is not vectorised records a reason code
+(`-Rpass-missed=vec`-style output or `-fopt-info-vec-missed` equivalent, tied to
+the compiler-explainability goal of the original charter): "unknown dependence
+a/b", "non-affine subscript", "unsupported cast", "cost: not profitable (vf=8,
+est 1.4× slower)". These feed the scoreboard so every remaining gap has a
+named cause.
+**Gates.** SV-02 matrix on every stage; byte-identical output when the knob is
+off; an IR-level legality fuzzer (random affine loop nests with seeded
+dependences, compared against scalar execution); mutation of the dependence test.
+**Accept (end of S5).** 44-kernel corpus: no kernel > 1.2× GCC AVX2 except
+documented exclusions; geometric mean ≤ 1.05×; zero correctness failures.
+**Effort** L (S1+S2 deliver most of F3).
+
+#### SV-07 · P1 — `-O3`, `-march=native` and vector-width policy
+**Plan.** (1) Decide and document what `-O3` means (more aggressive
+unrolling/interleave limits and cost thresholds, never different semantics) or
+make it an explicit alias; add a scoreboard assertion so it cannot silently stay
+identical. (2) `-march=native` must select the host ISA (it currently produces
+the same code as `-mavx2` on an AVX-512 machine): detect through the existing
+`cpu_model.rs`, and honour `-mprefer-vector-width=128|256|512` and
+`-mno-avx512…`. (3) GCC 16 vectorises at `-O2` with a conservative model; decide
+the lccc policy (the baseline emits SSE2 only without `-m` flags, deliberately;
+record the decision and its measured basis). **Accept.** Policy documented in
+`docs/`, scoreboard rows for each flag combination. **Effort** S.
+
+#### SV-08 · P1 — `vzeroupper` audit
+**Reproducer.** `lccc -O2 -mavx2 -S kernels.c`: functions using `ymm` and
+returning without `vzeroupper` (`k_matmul`, `k_alias_ptr`).
+**Plan.** (1) Find out whether the omission is deliberate (a loop that ends with
+upper halves already zero, or an ABI argument); (2) implement the standard rule —
+`vzeroupper` before `ret`, before calls to functions not known to be VEX-clean,
+and before inline asm that may use legacy SSE, unless the function takes or
+returns a 256/512-bit value; (3) a dirty-upper-state data-flow so the
+instruction is emitted once per exit, not per use. **Gates.** Asm-shape test over
+the corpus; a mixed legacy-SSE/AVX callee test measured with a paired runner on
+the target hardware (the Intel stall is hardware-dependent — report per CPU).
+**Accept.** Zero ymm-using functions without it unless justified in
+`DECISIONS.md`. **Effort** S.
+
+#### SV-09 · P2 — AVX-512 enablement (oracle hosts, EPYC, Sapphire Rapids; not Raptor Lake)
+**Plan.** (1) Allocator: an opmask register class (`k0–k7`, `k0` special),
+ZMM16–31 and YMM16–31 availability with the EVEX 32-register file; (2) EVEX
+encoder coverage audit against the SDM tables for every instruction the
+generator may emit (including `{k}{z}` masking, embedded broadcast `{1toN}`,
+disp8*N compression, `vpternlogd`); (3) codegen: masked tails (`vmovdqu8/16/32/64
+{k}{z}`), compare-into-mask, `vpcompress/vpexpand`, `vpopcnt*`, `vpermt2*`,
+`vpconflict*` where idioms exist; (4) policy: prefer 256-bit EVEX (VL) on cores
+where 512-bit lowers frequency, 512-bit where measured profitable (SV-07);
+(5) never emit AVX-512 without `-mavx512*` or `-march` that implies it.
+**Gates.** SV-02 on an AVX-512 host; execution differentials (SV-05);
+encoder round trip against GAS 2.47 for the full emitted set. **Accept.**
+`-march=native` AVX-512 builds beat `-mavx2` on ≥ 50 % of corpus kernels with no
+regression above 3 %. **Effort** L.
+
+#### SV-10 · P2 — extensions the Raptor Lake target actually has
+AVX-VNNI (`vpdpbusd/vpdpwssd` VEX, 0 of 8 header names present), F16C (0 of 4),
+256-bit GFNI/VAES/VPCLMULQDQ, SHA, BMI2. **Plan.** Intrinsics (SV-05), plus
+idioms: `dot_i32`-style int8/int16 multiply-accumulate loops → `vpdpwssd`/`vpdpbusd`
+(semantics: `vpdpbusd` is u8×s8 with *no* saturation, `vpdpbusds` saturates —
+select by the C expression, never by taste), `_Float16` ↔ float with F16C
+(MB-11 item), byte-LUT popcount with `vpshufb` where profitable (no
+`vpopcnt` on this core), `crc32`/`pclmul` folding left to intrinsics.
+**Gates.** Execution differentials; paired timing on the 14700KF. **Effort** M.
+
+#### SV-11 · P2 — one ISA description for headers, encoder and cost model
+Today the wrapper generator (`scripts/gen_lcccsimd.py`), the permission table
+(§9a SIMD-PERM-1), the assembler encoder (`encoder/avx.rs`) and the scheduler's
+cost constants each describe instructions separately. **Plan.** A single
+checked-in machine-readable instruction table (mnemonic, operand forms, encoding
+class VEX/EVEX, ISA feature set, latency/throughput/ports from the MB-30 tables,
+C prototype(s), semantics tag) from which generators emit the header wrappers,
+the permission table, encoder tables and cost entries; a gate that regenerating
+produces no diff. **Accept.** Adding an instruction touches the table once.
+**Effort** M.
+
+#### SV-12 · P2 — split `vectorize.rs` and unify kill switches
+Structure only, byte-identical output (identity gates from MB-20 apply): one
+module per recogniser family behind a `Recogniser` trait (`matches(loop) →
+Option<Plan>`, `apply(plan)`), one registry, one `CCC_NO_VEC_<NAME>` convention
+generated from it and documented through the knob registry (AUD-KNOB-1).
+Do after SV-06 S1 so the new framework defines the trait. **Effort** M.
+
+### 9b.4 Milestones
+- **SM-1 (correct):** SV-01 and SV-02 landed; the F1 matrix and sweep green in
+  the fast lane.
+- **SM-2 (no cliffs):** SV-03 and SV-04; no corpus kernel above 3× GCC AVX2.
+- **SM-3 (general):** SV-06 S1–S5 with reason codes; no kernel above 1.2× GCC
+  AVX2; geometric mean ≤ 1.05×.
+- **SM-4 (wide):** SV-07/SV-08/SV-10 and SV-09; AVX-512 hosts beat AVX2 builds;
+  AVX-VNNI/F16C on the Raptor Lake target measured on real hardware.
+- **Beating GCC/Clang/ICX** means passing the *oracle* comparison on the
+  committed corpus with GCC 16.2, Clang 23.1 and ICX on identical flags, on real
+  hardware, with the raw pairs published — not the VM screening above.
+
+### 9b.5 Implementation follow-up (2026-10-31)
+
+- **SV-01 root cause fixed; extended acceptance still open.** The AoS crash
+  is caused by backend dead-offset suppression, not a missing unroller IR
+  definition. A value peeled through by one address remains the selected SIB
+  index of another. Protect all selected indices across the function, retain
+  store-fallback offset chains, and make shared-offset deletion a worklist
+  fixed point. No unroll/vectorization kill switch is needed. Five Rust
+  regression cases pin these invariants.
+- **SV-01/SV-02 regression foundation:** the seven-shape runner now fails
+  closed on compilation/runtime/reference errors, compares every output
+  element, uses private scratch directories, emits optional JSON and supports
+  18 trip counts, start/end guard pages, four element types, pair strides 2–4
+  and bounded mixed-sign inputs. Local GCC 16.2 / Clang 23.1.4 differentials:
+  2,268 trip/layout checks plus 1,008 mixed-sign/type/stride checks passed.
+  GCC and authenticated ICX CI receive permanent smoke gates. See
+  `tests/simd/README.md` for commands, scope and oracle limitations.
+- **Still open:** SV-01's randomized one-day seed/page/misalignment/overlap
+  acceptance and scalar-loop extension; SV-02's hardened 44-kernel scoreboard,
+  controlled paired timing and full sweep. SV-03–SV-12 remain open; this fix
+  does not implement a general vectorizer, extend ISA coverage, or establish
+  target-hardware speedups. The offline Godbolt cross-add witness still shows
+  a substantial static-code gap against GCC/Clang; instruction counts are not
+  runtime wins. SM-1 is not yet complete.
+
+### 9b.6 Red-team follow-up (2026-10-31)
+
+The address-fold audit repaired alias over-crediting, alias fallback root
+protection, missing-count handling and effectful-producer suppression. A
+256-case independent edge oracle and target/store-profile tests protect the
+new proof boundary. x86-64's explicit guaranteed-store contract recovers
+`glibc_memcmp` from 156 instructions / 18 stack operands to 154 / 17 without
+changing the golden gate. Other targets retain fallback offsets.
+
+SV-02 now also has a strict **44-name checksum-only gate**. Signed sink overflow
+(reproduced with GCC 16.2 UBSan), negative signed left-shift, truncated FP
+receipts, cross-row pointer traversal and zero matmul repetitions were repaired.
+GCC and authenticated ICX CI run this gate; controlled timing is still open.
+AoS probe compilation now denies warnings and process timeouts kill compiler
+descendants as well as their parent. The complete audit and its measured limits
+are in `engineering/SIMD-ADDRESS-FOLD-AUDIT-2026-10-31.md`.
+
 ## 10. Carried over from the superseded live queue (full text in the archives)
 
 Everything open in the 478-line queue that this file replaces is listed here with

@@ -503,6 +503,15 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         false
     }
 
+    /// After can_indexed_addr_fold accepts an access, does the store have
+    /// the same no-refusal contract as a load? Default false: i686/AArch64
+    /// staging may still need orig_offset for fallback. A backend opting in
+    /// must prove value staging cannot clobber the selected base/index homes,
+    /// and its indexed_fold_ok must cover every accepted access type.
+    fn guarantees_indexed_store_fold(&self) -> bool {
+        false
+    }
+
     /// Whether `emit_fused_cmp_branch_blocks` handles floating-point compares
     /// (AArch64: fcmp + b.cc without materializing a cset boolean). Default
     /// false; x86 keeps its dedicated FP compare paths.

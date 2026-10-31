@@ -801,12 +801,25 @@ fn compute_omitted_tls_roots(cg: &dyn ArchCodegen, func: &IrFunction) -> FxHashM
     roots
 }
 
+/// The two callers ask two different questions, so the register-offset symbol
+/// arm (see below) is parameterised by `deadened_addrs`:
+///
+/// * `Some(dead)` — "will the emitter TAKE this fold?" Used only by the two
+///   skip decisions (`foldable_folds` and `idx_dead_producers`), which delete
+///   instructions. A fold the emitter refuses must never delete them, so this
+///   answer must be the dispatch's own answer, dead-`Add` gate included.
+/// * `None` — "is an indexed form ENCODABLE here?" Used at the accesses,
+///   where nothing is deleted: the emitter's dispatch picks the
+///   register-offset symbol form for a deadened `Add` and the plain
+///   register-base SIB otherwise. It must stay permissive for that class, or
+///   the second of those two forms would be lost.
 fn can_indexed_addr_fold(
     cg: &dyn ArchCodegen,
     info: &IndexedGepInfo,
     global_addr_map: &FxHashMap<u32, String>,
     reg_off_sym_map: &FxHashMap<u32, RegOffSym>,
     gep_dest: u32,
+    deadened_addrs: Option<&FxHashSet<u32>>,
 ) -> bool {
     // CCC_NO_FOLDED_INDEX_LIVENESS: same contract as the register-base arm
     // of can_const_addr_fold above — the SIB re-reads the index register
@@ -833,12 +846,21 @@ fn can_indexed_addr_fold(
     // Register-offset symbol base (`sym+disp(%off,%idx,scale)`): a GlobalAddr
     // `Add`ed with a register offset is consumed AT the access — the SIB's
     // base slot carries the offset register and the displacement the symbol.
-    // This arm answers "may this access fold"; the EMITTER dispatch only
-    // takes the symbol form once the deadening pass has removed the `Add`
-    // (dead_global_addrs), because that is the only case where the form pays
-    // for itself: a live `Add` reads fine through its own register home.
+    // The EMITTER dispatch only takes the symbol form once the deadening pass
+    // has removed the `Add` (dead_global_addrs), because that is the only case
+    // where the form pays for itself: a live `Add` reads fine through its own
+    // register home. This arm must therefore mirror the dispatch EXACTLY. A
+    // bare `reg_off_sym_fold_ok` answer is not enough: it says the SIB is
+    // ENCODABLE, not that the emitter will take this arm, and a "yes" here
+    // skips the GEP along with its whole offset chain (`idx_dead_producers`).
+    // When the `Add` stayed live the emitter's fallback walks
+    // `rematerialize_skipped_indexed`, which reads the offset's register home
+    // — a definition this file just skipped (gzip longest_match at
+    // `-O1 -fno-pie`: the skipped `Cast` of `best_len - 1` was read back as
+    // `%r11`, the register a sibling had redefined in the same block).
     if let Some(ro) = reg_off_sym_map.get(&info.base.0) {
-        if reg_off_sym_fold_ok(cg, ro, info) {
+        let deadened = deadened_addrs.is_none_or(|dead| dead.contains(&info.base.0));
+        if deadened && reg_off_sym_fold_ok(cg, ro, info) {
             return true;
         }
     }
@@ -1467,6 +1489,91 @@ fn retain_used(map: &mut FxHashMap<u32, impl Sized>, use_counts: &[u32]) {
     map.retain(|val_id, _| {
         (*val_id as usize) < use_counts.len() && use_counts[*val_id as usize] > 0
     });
+}
+
+/// Offset producers whose every IR use disappears in guaranteed memory folds.
+/// Machine-address index reads are not IR uses: protect ALL selected indices,
+/// not just the index of the chain currently being visited. One value can be
+/// peeled through in `a[2*(i+1)]` but remain the terminal index of
+/// `b[2*(i+1)+1]`. Deleting it through the former leaves the latter reading an
+/// unwritten register (SV-01). Store fallback paths still need orig_offset.
+fn dead_indexed_offset_producers(
+    func: &IrFunction,
+    indexed: &FxHashMap<u32, IndexedGepInfo>,
+    foldable: &FxHashSet<u32>,
+    fallback_stores: &FxHashSet<u32>,
+    uses: &[u32],
+    stab: &BaseStability,
+) -> FxHashSet<u32> {
+    let mut required: FxHashSet<u32> = indexed.values().map(|info| info.index.0).collect();
+    // A store through an alias can rematerialize the ORIGINAL offset even
+    // when the original GEP itself only feeds loads. Protect that root across
+    // all chains, just as we protect implicit machine-index reads.
+    for ptr in fallback_stores {
+        if let Some(info) = indexed.get(ptr) {
+            required.insert(info.orig_offset.0);
+        }
+    }
+    let defs = index_single_defs(func, stab);
+    let mut attributed: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut work = Vec::new();
+    for dest in foldable {
+        if fallback_stores.contains(dest) {
+            continue;
+        }
+        // Metadata aliases do NOT add IR offset uses. Credit exactly the
+        // offset edge of a unique, actually eliminated GEP instruction.
+        if let (
+            Some(info),
+            Some(Instruction::GetElementPtr {
+                offset: Operand::Value(off),
+                ..
+            }),
+        ) = (indexed.get(dest), defs.get(dest).copied())
+        {
+            if *off == info.orig_offset {
+                *attributed.entry(off.0).or_insert(0) += 1;
+                work.push(off.0);
+            }
+        }
+    }
+    let mut dead = FxHashSet::default();
+    while let Some(v) = work.pop() {
+        if required.contains(&v) || dead.contains(&v) {
+            continue;
+        }
+        let Some(&total) = uses.get(v as usize) else {
+            continue;
+        };
+        if total == 0 || attributed.get(&v).copied().unwrap_or(0) != total {
+            continue;
+        }
+        let Some(inst) = defs.get(&v) else {
+            continue;
+        };
+        // Fail closed if fold-map construction ever grows a new producer
+        // class. A dead address value never licenses deleting its effects.
+        let integer_or_pointer = |ty: IrType| ty.is_integer() || ty == IrType::Ptr;
+        let pure = matches!(inst, Instruction::Copy { .. })
+            || matches!(inst, Instruction::Cast { from_ty, to_ty, .. }
+                if integer_or_pointer(*from_ty) && integer_or_pointer(*to_ty))
+            || matches!(inst, Instruction::BinOp {
+                op: IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Shl, ty, ..
+            } if integer_or_pointer(*ty));
+        if !pure {
+            continue;
+        }
+        dead.insert(v);
+        for_each_operand_in_instruction(inst, |op| {
+            if let Operand::Value(x) = op {
+                *attributed.entry(x.0).or_insert(0) += 1;
+                // Revisit only when an actual eliminated operand edge is
+                // credited. Every instruction/edge is processed at most once.
+                work.push(x.0);
+            }
+        });
+    }
+    dead
 }
 
 /// Variable-offset GEPs foldable into indexed addressing.
@@ -6007,11 +6114,10 @@ fn generate_function_body(
     // 3-5 instruction offset materialisation inside the hot loop.  Skip those
     // single-use producers here.
     //
-    // SOUNDNESS GUARD: only GEPs consumed EXCLUSIVELY by LOADs qualify.  The
-    // indexed STORE hook can still refuse emission at the access site (the
-    // value-staging class: accumulator staging would clobber the base/index),
-    // in which case `rematerialize_skipped_indexed` re-emits the GEP from
-    // `base + orig_offset` — the offset producers must exist for that.
+    // SOUNDNESS GUARD: stores normally retain their offset for fallback.
+    // A target may opt into store offset elimination only when staging has
+    // the same guaranteed-fold contract as loads (x86-64's reserved staging
+    // registers); i686/AArch64 retain their independent refusal paths.
     //
     // Load→cmp-mem priority: an indexed GEP that feeds a load→cmp-mem
     // candidate must be kept OUT of both the skip set and the dead-producer
@@ -6035,7 +6141,7 @@ fn generate_function_body(
             if load_cmp_ptrs_func.contains(dest) {
                 continue; // pointer needed materialised by a cmp-mem fold
             }
-            if can_indexed_addr_fold(cg, info, &global_addr_map, &reg_off_sym_map, *dest) {
+            if can_indexed_addr_fold(cg, info, &global_addr_map, &reg_off_sym_map, *dest, None) {
                 foldable_folds.insert(*dest);
             }
         }
@@ -6122,68 +6228,46 @@ fn generate_function_body(
                 }
             }
         }
+        // Re-decide the foldability set with the deadening in place. The
+        // register-offset arm is only available for an `Add` this pass just
+        // deadened (the emitter's dispatch), so a fold whose base stayed live
+        // drops out HERE, before the offset-producer walk below can skip a
+        // chain for it. Without this second pass the walk would deaden the
+        // offset chain of a fold the emitter then refuses, and the access's
+        // rematerialisation path (`rematerialize_skipped_indexed`) would read
+        // the never-written offset home.
+        foldable_folds.retain(|dest| {
+            indexed_gep_map.get(dest).is_some_and(|info| {
+                can_indexed_addr_fold(
+                    cg,
+                    info,
+                    &global_addr_map,
+                    &reg_off_sym_map,
+                    *dest,
+                    Some(&dead_global_addrs),
+                )
+            })
+        });
         let mut has_store_consumer: FxHashSet<u32> = FxHashSet::default();
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Instruction::Store { ptr, .. } = inst {
-                    if foldable_folds.contains(&ptr.0) {
+                    if indexed_gep_map.contains_key(&ptr.0)
+                        && (!foldable_folds.contains(&ptr.0) || !cg.guarantees_indexed_store_fold())
+                    {
                         has_store_consumer.insert(ptr.0);
                     }
                 }
             }
         }
-        let single_defs = index_single_defs(func, &stab);
-        // Fixed-point dead-offset analysis. The old walk required
-        // `use_count == 1` per chain node, which stops at SHARED offsets:
-        // `a[i]; b[i]` both GEP the same `i*8` value (use_count 2), and the
-        // scaled-offset producer stayed live as dead code after both GEPs
-        // folded (linux_find_bit: `movq %r13,%rbx; shlq $3,%rbx` per scanned
-        // word). Instead, count uses ATTRIBUTABLE to the fold: (a) offset
-        // operands of foldable GEPs, (b) operand positions of other dead
-        // chain nodes. A node is dead iff every one of its uses is
-        // fold-attributable. The walk still stops at the fold's index value:
-        // the terminal index is live by construction (the RA keeps it
-        // register-resident to the access).
-        let mut fold_uses: FxHashMap<u32, u32> = FxHashMap::default();
-        for dest in &foldable_folds {
-            if let Some(info) = indexed_gep_map.get(dest) {
-                *fold_uses.entry(info.orig_offset.0).or_insert(0) += 1;
-            }
-        }
-        for (dest, info) in indexed_gep_map.iter() {
-            if !foldable_folds.contains(dest) || has_store_consumer.contains(dest) {
-                continue;
-            }
-            let index_val = info.index.0;
-            let mut stack = vec![info.orig_offset.0];
-            while let Some(v) = stack.pop() {
-                if v == index_val {
-                    continue;
-                }
-                if idx_dead_producers.contains(&v) {
-                    continue;
-                }
-                let total = value_use_counts.get(v as usize).copied().unwrap_or(0);
-                let attributed = fold_uses.get(&v).copied().unwrap_or(0);
-                if attributed < total {
-                    // Some use is outside the folded chains: keep the node
-                    // (and do not traverse through it — its operands may
-                    // still be live for those other uses).
-                    continue;
-                }
-                idx_dead_producers.insert(v);
-                if let Some(inst) = single_defs.get(&v) {
-                    for_each_operand_in_instruction(inst, |op| {
-                        if let Operand::Value(x) = op {
-                            stack.push(x.0);
-                            // This operand use is now attributable to the
-                            // fold (its consumer is dead).
-                            *fold_uses.entry(x.0).or_insert(0) += 1;
-                        }
-                    });
-                }
-            }
-        }
+        idx_dead_producers = dead_indexed_offset_producers(
+            func,
+            &indexed_gep_map,
+            &foldable_folds,
+            &has_store_consumer,
+            &value_use_counts,
+            &stab,
+        );
     }
 
     let emit_debug = cg.state_ref().debug_info && source_mgr.is_some() && !file_table.is_empty();
@@ -6630,6 +6714,7 @@ fn generate_function_body(
                             &global_addr_map,
                             &reg_off_sym_map,
                             dest.0,
+                            Some(&dead_global_addrs),
                         )
                     {
                         cg.state().folded_gep_values.insert(dest.0);
@@ -8091,7 +8176,7 @@ fn generate_load(
         // Same guard as the generic fold so the skip and emit decisions agree.
         if let Some(info) = indexed_gep_map.get(&ptr.0) {
             if seg_indexed_fold_ty(ty)
-                && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+                && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0, None)
             {
                 if cg.emit_seg_load_indexed(dest, info, ty, seg_override) {
                     return;
@@ -8166,7 +8251,7 @@ fn generate_load(
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
         if !is_wide_int_type(ty)
-            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0, None)
         {
             // Register-offset symbol form — ONLY when the base `Add` was
             // deadened, i.e. when every one of its uses is a fold taking
@@ -8264,7 +8349,7 @@ fn generate_store(
         }
         if let Some(info) = indexed_gep_map.get(&ptr.0) {
             if seg_indexed_fold_ty(ty)
-                && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+                && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0, None)
             {
                 if cg.emit_seg_store_indexed(val, info, ty, seg_override) {
                     return;
@@ -8310,7 +8395,7 @@ fn generate_store(
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
         if !is_wide_int_type(ty)
-            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0)
+            && can_indexed_addr_fold(cg, info, global_addr_map, reg_off_sym_map, ptr.0, None)
         {
             // Register-offset symbol form, deadened-`Add` only (see
             // generate_load).
@@ -9701,5 +9786,331 @@ mod masked_layout_selection_tests {
             true,
             Some((0, 0))
         ));
+    }
+}
+
+#[cfg(test)]
+mod indexed_offset_dead_tests {
+    use super::*;
+    use crate::ir::reexports::BlockId;
+
+    fn fixture() -> IrFunction {
+        let mut f = IrFunction::new("shared_index".into(), IrType::Void, vec![], false);
+        let add = |dest, lhs, rhs| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(lhs)),
+            rhs,
+            ty: IrType::I64,
+        };
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "a".into(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I64(7)),
+                },
+                add(2, 1, Operand::Const(IrConst::I64(1))),
+                add(3, 2, Operand::Value(Value(2))),
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I64(2)),
+                    ty: IrType::I64,
+                },
+                add(5, 3, Operand::Const(IrConst::I64(1))),
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(5)),
+                    rhs: Operand::Const(IrConst::I64(2)),
+                    ty: IrType::I64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(7),
+                    base: Value(0),
+                    offset: Operand::Value(Value(4)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(8),
+                    base: Value(0),
+                    offset: Operand::Value(Value(6)),
+                    ty: IrType::Ptr,
+                },
+            ],
+            terminator: Terminator::Return(None),
+        });
+        f.next_value_id = 9;
+        f.next_label = 1;
+        f
+    }
+
+    fn folds() -> FxHashMap<u32, IndexedGepInfo> {
+        [(7, 1, 4, 8), (8, 2, 6, 4)]
+            .into_iter()
+            .map(|(dest, index, off, disp)| {
+                (
+                    dest,
+                    IndexedGepInfo {
+                        base: Value(0),
+                        index: Value(index),
+                        index_ty: IrType::I64,
+                        shift: 3,
+                        disp,
+                        orig_offset: Value(off),
+                        access_tys: vec![IrType::F32],
+                        feeds_store: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn dead(
+        f: &IrFunction,
+        map: &FxHashMap<u32, IndexedGepInfo>,
+        stores: &[u32],
+    ) -> FxHashSet<u32> {
+        dead_indexed_offset_producers(
+            f,
+            map,
+            &map.keys().copied().collect(),
+            &stores.iter().copied().collect(),
+            &count_value_uses(f),
+            &analyze_base_stability(f),
+        )
+    }
+
+    #[test]
+    fn preserves_indices_selected_by_other_folds() {
+        let f = fixture();
+        let d = dead(&f, &folds(), &[]);
+        assert!(!d.contains(&1));
+        assert!(!d.contains(&2), "odd-field SIB still reads i+1");
+        for id in [3, 4, 5, 6] {
+            assert!(d.contains(&id), "offset v{id} is still eliminated");
+        }
+    }
+
+    fn shared_offset() -> (IrFunction, FxHashMap<u32, IndexedGepInfo>) {
+        let mut f = fixture();
+        // Both accesses use one scaled offset. Remove the unused odd chain.
+        f.blocks[0]
+            .instructions
+            .retain(|i| !matches!(i.dest(), Some(Value(5 | 6))));
+        if let Instruction::GetElementPtr { offset, .. } = &mut f.blocks[0].instructions[6] {
+            *offset = Operand::Value(Value(4));
+        } else {
+            panic!("expected second GEP");
+        }
+        let mut m = folds();
+        let first = m[&7].clone();
+        m.insert(8, first);
+        (f, m)
+    }
+
+    #[test]
+    fn shared_offsets_reach_fixed_point_in_either_insertion_order() {
+        let (f, m) = shared_offset();
+        for order in [[7, 8], [8, 7]] {
+            let map = order.into_iter().map(|id| (id, m[&id].clone())).collect();
+            let d = dead(&f, &map, &[]);
+            assert_eq!(d, [2, 3, 4].into_iter().collect());
+        }
+    }
+
+    #[test]
+    fn store_fallback_keeps_shared_offset_materialized() {
+        let (f, m) = shared_offset();
+        assert!(dead(&f, &m, &[8]).is_empty());
+    }
+
+    #[test]
+    fn ordinary_use_keeps_offset_materialized() {
+        let (mut f, m) = shared_offset();
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(9),
+            src: Operand::Value(Value(4)),
+        });
+        f.next_value_id = 10;
+        assert!(dead(&f, &m, &[]).is_empty());
+    }
+
+    fn alias(f: &mut IrFunction, map: &mut FxHashMap<u32, IndexedGepInfo>) {
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(9),
+            src: Operand::Value(Value(7)),
+        });
+        f.next_value_id = 10;
+        map.insert(9, map[&7].clone());
+    }
+
+    #[test]
+    fn alias_metadata_must_not_double_credit_an_offset_use() {
+        let (mut f, mut m) = shared_offset();
+        alias(&mut f, &mut m);
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(10),
+            src: Operand::Value(Value(4)),
+        });
+        f.next_value_id = 11;
+        assert!(
+            dead(&f, &m, &[]).is_empty(),
+            "ordinary offset use survives alias folding"
+        );
+    }
+
+    #[test]
+    fn fallback_through_alias_keeps_original_offset() {
+        let (mut f, mut m) = shared_offset();
+        alias(&mut f, &mut m);
+        assert!(
+            dead(&f, &m, &[9]).is_empty(),
+            "alias rematerialization needs orig_offset"
+        );
+    }
+
+    #[test]
+    fn side_effecting_offset_definition_is_never_suppressed() {
+        let (mut f, m) = shared_offset();
+        f.blocks[0].instructions[4] = Instruction::Load {
+            dest: Value(4),
+            ptr: Value(0),
+            ty: IrType::I64,
+            volatile: true,
+            seg_override: crate::common::types::AddressSpace::Default,
+        };
+        assert!(dead(&f, &m, &[]).is_empty());
+    }
+
+    #[test]
+    fn floating_conversion_is_not_an_effect_free_offset_producer() {
+        let (mut f, m) = shared_offset();
+        f.blocks[0].instructions[4] = Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Const(IrConst::F64(1.25)),
+            from_ty: IrType::F64,
+            to_ty: IrType::I64,
+        };
+        assert!(dead(&f, &m, &[]).is_empty());
+    }
+
+    #[test]
+    fn incomplete_use_metadata_must_fail_closed() {
+        let (f, m) = shared_offset();
+        let d = dead_indexed_offset_producers(
+            &f,
+            &m,
+            &m.keys().copied().collect(),
+            &FxHashSet::default(),
+            &[],
+            &analyze_base_stability(&f),
+        );
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn exhaustive_fold_alias_fallback_inventory_matches_slow_edge_oracle() {
+        // Independent pull-style oracle: subtract actual removed GEP edges,
+        // then repeatedly scan the remaining IR, rather than using a worklist.
+        for alias_present in [false, true] {
+            for ordinary_use in [false, true] {
+                for fold_mask in 0..8 {
+                    for fallback_mask in 0..8 {
+                        let (mut f, mut m) = shared_offset();
+                        if alias_present {
+                            alias(&mut f, &mut m);
+                        }
+                        if ordinary_use {
+                            f.blocks[0].instructions.push(Instruction::Copy {
+                                dest: Value(10),
+                                src: Operand::Value(Value(4)),
+                            });
+                            f.next_value_id = 11;
+                        }
+                        let folds: FxHashSet<u32> = (7..=9)
+                            .filter(|id| m.contains_key(id) && fold_mask & (1 << (id - 7)) != 0)
+                            .collect();
+                        let fallback: FxHashSet<u32> = (7..=9)
+                            .filter(|id| m.contains_key(id) && fallback_mask & (1 << (id - 7)) != 0)
+                            .collect();
+                        let uses = count_value_uses(&f);
+                        let mut residual = uses.clone();
+                        let protected: FxHashSet<u32> = m
+                            .values()
+                            .map(|i| i.index.0)
+                            .chain(fallback.iter().map(|id| m[id].orig_offset.0))
+                            .collect();
+                        for inst in &f.blocks[0].instructions {
+                            if let Instruction::GetElementPtr {
+                                dest,
+                                offset: Operand::Value(v),
+                                ..
+                            } = inst
+                            {
+                                if folds.contains(&dest.0) && !fallback.contains(&dest.0) {
+                                    residual[v.0 as usize] -= 1;
+                                }
+                            }
+                        }
+                        let mut expected = FxHashSet::default();
+                        loop {
+                            let before = expected.len();
+                            for inst in &f.blocks[0].instructions {
+                                let Some(dest) = inst.dest() else {
+                                    continue;
+                                };
+                                // This fixture's only candidate producers are 2,3,4.
+                                if !(2..=4).contains(&dest.0)
+                                    || protected.contains(&dest.0)
+                                    || expected.contains(&dest.0)
+                                    || residual[dest.0 as usize] != 0
+                                {
+                                    continue;
+                                }
+                                expected.insert(dest.0);
+                                for_each_operand_in_instruction(inst, |op| {
+                                    if let Operand::Value(v) = op {
+                                        residual[v.0 as usize] -= 1;
+                                    }
+                                });
+                            }
+                            if before == expected.len() {
+                                break;
+                            }
+                        }
+                        let got = dead_indexed_offset_producers(
+                            &f,
+                            &m,
+                            &folds,
+                            &fallback,
+                            &uses,
+                            &analyze_base_stability(&f),
+                        );
+                        assert_eq!(
+                            got, expected,
+                            "alias={alias_present} ordinary={ordinary_use} folds={fold_mask} fallback={fallback_mask}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_definition_is_not_deleted() {
+        let (mut f, m) = shared_offset();
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(4),
+            src: Operand::Const(IrConst::I64(0)),
+        });
+        assert!(dead(&f, &m, &[]).is_empty());
     }
 }
