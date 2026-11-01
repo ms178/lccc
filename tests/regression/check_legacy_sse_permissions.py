@@ -43,6 +43,16 @@ def run(command):
     return subprocess.run(command, capture_output=True, text=True, timeout=90)
 
 
+#: A compiler that cannot open a *system* header never reached a verdict, so
+#: "nonzero exit" is not "rejected". The `-m32` probes below include
+#: `<emmintrin.h>`, which pulls the libc headers, and an image without the
+#: 32-bit libc development package stops there -- measured: `bits/
+#: libc-header-start.h: No such file or directory` from GCC 16.2 and from the
+#: distro GCC alike. Treating that as a rejection made this gate demand that
+#: lccc reproduce a failure the oracle never made.
+HOST_GAP = re.compile(r'fatal error: \S+: No such file or directory')
+
+
 def check_legal(text):
     for line in text.splitlines():
         code = line.split('#')[0].strip()
@@ -61,14 +71,24 @@ def main():
     if version.returncode or version.stdout.strip() != '16.2.0':
         raise RuntimeError('GCC 16.2.0 is required, not a substituted oracle')
     count = 0
+    skipped = 0
     with tempfile.TemporaryDirectory(prefix='legacy-sse-') as directory:
         directory = Path(directory)
         source, assembly = directory / 'probe.c', directory / 'probe.s'
 
         def probe(text, flags, accepted, feature=None, legal=False, avx1_zero=False, require=None,
                   forbid=None):
-            nonlocal count
+            nonlocal count, skipped
             source.write_text(text)
+            # Ask the oracle first: without a verdict from it there is nothing
+            # to compare, and its own inability to preprocess the probe says
+            # nothing about lccc.
+            oracle = run([args.gcc, '-O2', *flags, '-S', str(source), '-o', str(assembly)])
+            if oracle.returncode != 0 and HOST_GAP.search(oracle.stderr):
+                skipped += 1
+                print(f'  skip {flags}: the oracle cannot preprocess this probe on this host',
+                      flush=True)
+                return
             for compiler in (args.lccc, args.gcc):
                 assembly.unlink(missing_ok=True)
                 result = run([compiler, '-O2', *flags, '-S', str(source), '-o', str(assembly)])
@@ -220,7 +240,11 @@ def main():
             probe(text, [mode, '-mno-sse2', '-msse'], True)
             text += '__m128i g(__m128i a,__m128i b) { return _mm_add_epi32(a,b); }\n'
             probe(text, [mode, '-mno-sse2', '-msse'], False, '-msse2')
-    print(f'PASS: {count} legacy SSE permission / legality compiler legs; both ABIs, zero skips')
+    if skipped:
+        print(f'PASS: {count} legacy SSE permission / legality compiler legs; {skipped} probe '
+              f'mode(s) skipped (this host cannot preprocess them, the oracle included)')
+    else:
+        print(f'PASS: {count} legacy SSE permission / legality compiler legs; both ABIs, zero skips')
 
 
 if __name__ == '__main__':

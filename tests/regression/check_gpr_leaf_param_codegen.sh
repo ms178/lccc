@@ -54,6 +54,11 @@ else:
     for reg in ("%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"):
         if reg not in mix:
             raise SystemExit(f"mix6 coalesced away a parameter register: {reg}")
-    if not re.search(r"movq\s+%\w+,\s*%rax", mix):
+    # The result must arrive in %rax, not in a particular *instruction*: the
+    # accumulator stays in %rdi and the last add fuses into the return move,
+    # `leaq (%rdi,%r9), %rax`.  Requiring `movq %src, %rax` here failed a body
+    # that is strictly better code -- the gate has to accept every spelling of
+    # "the final instruction writes %rax".
+    if not re.search(r"^[ \t]+[a-z][a-z0-9]*[ \t]+[^\n]*,[ \t]*%rax[ \t]*(?:#.*)?$", mix, re.M):
         raise SystemExit("mix6 does not return its result in %rax")
 PY

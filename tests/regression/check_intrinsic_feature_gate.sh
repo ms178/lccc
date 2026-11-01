@@ -155,15 +155,37 @@ __m128i aes_enc(__m128i a, __m128i b) { return _mm_aesenc_si128(a, b); }
 EOF
 
 # verdict <source> <flags...>: print "accept" or "reject" for compiler $1
+# verdict <compiler> <source> <flags...> -> accept | reject | host-gap
+#
+# The third answer exists because a failure only means "reject" when the
+# compiler actually got as far as deciding. An image without the 32-bit libc
+# headers cannot preprocess `<immintrin.h>` in `-m32` mode at all, and
+# collapsing that into "reject" made this gate claim agreement it never
+# measured (`ok: i686_ymm_int.c -m32 -mavx -mno-avx2 -> reject (gcc agrees)`)
+# and then report a real divergence where there was only a header gap
+# (`FAIL: i686_ymm_float.c with -m32 -mavx -mno-avx2: lccc accept, gcc
+# reject`) -- measured on the campaign image, where `gcc-16 -m32` and the
+# distro `gcc -m32` both stop at `bits/libc-header-start.h`. On a host with
+# the multilib installed the third answer never occurs, so no cell goes
+# unmeasured in CI.
 verdict() {
     local cc=$1 src=$2
     shift 2
-    if "$cc" -O2 "$@" -c "$tmp/$src" -o /dev/null >/dev/null 2>&1; then
+    local out rc
+    set +e
+    out=$("$cc" -O2 "$@" -c "$tmp/$src" -o /dev/null 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
         echo accept
+    elif grep -q 'fatal error: .*: No such file or directory' <<<"$out"; then
+        echo host-gap
     else
         echo reject
     fi
 }
+
+host_gaps=0
 
 compare() {
     local src=$1
@@ -171,6 +193,18 @@ compare() {
     local ours theirs
     ours=$(verdict "$ccc" "$src" "$@")
     theirs=$(verdict "$gcc_bin" "$src" "$@")
+    if [ "$theirs" = host-gap ]; then
+        # The oracle could not preprocess the probe, so it has no verdict to
+        # compare against. Its own gap is not evidence about lccc.
+        host_gaps=$((host_gaps + 1))
+        echo "skip: $src $* -> lccc $ours; the oracle cannot preprocess this probe on this host"
+        return 0
+    fi
+    # The mirror case is NOT a host gap in the image: the oracle compiled the
+    # same probe, so lccc is the one that cannot find a header and that is a
+    # real defect.
+    [ "$ours" != host-gap ] ||
+        fail "$src with $*: lccc cannot preprocess the probe although gcc can"
     [ "$ours" = "$theirs" ] ||
         fail "$src with $*: lccc $ours, gcc $theirs (the oracle is the tie-breaker)"
     echo "ok: $src $* -> $ours (gcc agrees)"
@@ -903,6 +937,11 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
     fi
 fi
 
+if [ "$host_gaps" -gt 0 ]; then
+    # Report the skips so a shrinking oracle window is visible rather than
+    # silent: the gate still proves every cell it could measure.
+    echo "note: $host_gaps oracle comparison(s) skipped (this host cannot preprocess the probe in that mode)"
+fi
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"
 
 # Legacy SSE1 / SSE2 permission, exact instruction ceiling and native ABI legs.
