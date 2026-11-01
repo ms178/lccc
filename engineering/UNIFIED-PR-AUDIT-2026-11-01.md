@@ -1,5 +1,25 @@
 # Unified PR audit — 2026-11-01
 
+## Latest branch validation (2026-11-01; supersedes historical status below)
+
+The unified changes were rebased onto `origin/main` at `9e93005b8` after main
+absorbed the earlier PR commits. On the resulting pre-rebase-validation tree
+`7fe29e478`, hosted CI run `41315532314` completed successfully, including
+assertion-enabled units, all three frontend/ABI shards, both codegen/runtime
+shards, assembler/linker contracts, both benchmark shards, and the aggregate
+benchmark report. The Debian exact-version oracle (`41315532322`), relocation
+contracts (`41315532407`), IPA/LRS (`41315532403`) and targeted research
+(`41315532335`) also completed successfully. Targeted research's explicitly
+optional patched-LLVM comparison was skipped, not passed. These runs are for
+`7fe29e478`, before the latest-main rebase; the rebased result must be retested.
+
+The hosted CI lane reports warning-denied builds, formatting, Clippy, MSRV,
+GCC 16.2 / Clang 23.1.4 contracts and authenticated ICX 2026.2 integration.
+Local `cargo test --offline --locked --profile fastbuild` separately passed
+7,445 tests, with 10 ignored and 0 failures; it is not a replacement for the
+hosted multilib/cross-target suites.
+
+
 ## Hosted-only validation update
 
 At the user's direction, the local full-suite process was stopped before
@@ -451,3 +471,51 @@ https://github.com/ms178/lccc/pull/1063#issuecomment-6557857349 . Do not import
 that uncorrected feature or discard its valuable tests to manufacture acceptance.
 Its corrected integration and the remaining Chromium/LLVM work are outstanding;
 there is no universal-superiority or exhaustive-production-certification claim.
+## Final focused review and local evidence (2026-11-01)
+
+### #1056 / #1062 compared with #1051
+
+The review is against the fetched PR head snapshots, not author descriptions.
+The retained #1056 SLP changes preserve the prior literal-operand emitter and
+its refusal cases; the #1051 baseline remains the comparison point for the
+pre-existing optimizer/ABI improvements. #1062's wider-constant splat change
+is not retained: all eight workload shapes produced identical output hashes,
+but its candidate-vs-#1056 24-round medians varied in both directions. On this
+single pinned virtual CPU (`-O2 -mavx2`), the candidate was +0.39% on the
+separate-buffer kernel, +0.25% on the by-value kernel, +0.73% on four-lane
+wide arithmetic, +0.34%/+0.85% on four-lane unsigned min/max, +0.38% on
+8-lane wide arithmetic, +0.37% on 8-lane unsigned min, and -0.74% on 8-lane
+unsigned max. Those sub-percent, mixed-direction observations do not establish
+a speedup or regression; the optimization was reverted rather than promoted
+from codegen plausibility alone. Raw samples and compiler identities are in
+`/tmp/lightpixel-splat-comparison.json` (ephemeral local evidence, not a
+repository artifact).
+
+The focused ABI comparison remeasured 30 convention/target cells against GCC
+16.2, including caller-visible preservation, argument assignment, stack
+realignment, and return behavior; all supported cells passed. Unsupported
+foreign ABI contracts remain refused by default, with the documented explicit
+compatibility escape warning-producing. The `CCC_ALLOW_UNSUPPORTED_ABI` knob
+accounts for the single corresponding census literal increase. Correctness
+probes and the census do not imply interoperability for ignored conventions.
+
+### Current-tree checks and boundaries
+
+- `cargo test --offline --locked --profile fastbuild`: **7,445 passed, 10
+  ignored, 0 failed**.
+- `python3 tests/regression/abi_attribute_matrix.py`: **30/30 GCC 16.2 cells
+  passed**; `python3 scripts/audit_census.py --check` and `cargo fmt --all --
+  --check`: PASS.
+- Targeted SLP dword-constant, BB-SLP, LightPixel, joint-pixel and AoS-pair
+  codegen/runtime checks passed in earlier focused runs. These are correctness
+  receipts, not performance claims.
+- The local broad CI attempt is **incomplete, not green**: `empty-aggregate-abi`
+  and `vector-abi-boundary` passed, then `aggregate-call-abi` could not find
+  i686 libc headers because the invocation lacked `LCCC_SYSROOT`; the run was
+  stopped during `sysv-aggregate-abi`. This environment has no complete system
+  32-bit runtime setup. Do not count this as a compiler regression or as an
+  acceptance pass.
+- `gh pr view 1056` reports PR #1056 open against `main`, but its head is
+  `arena/b673aa4d-lccc` at `d8ded5e9`, not this working branch. Its retrieved
+  checks are successful on that separate head; they do not certify this tree.
+  Current-head hosted checks and a clean broad local run remain outstanding.

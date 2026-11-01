@@ -194,7 +194,7 @@ done
 
 # --- class 5: the __name__ spelling is normalized in the message -----------
 expect "spelling:normalized" "'stdcall' attribute ignored" \
-    'int f(void) __attribute__((__stdcall__));' 
+    'int f(void) __attribute__((__stdcall__));'
 
 # --- class 6: C23 [[...]] -------------------------------------------------
 expect "c23:unknown" "'frobnicate' attribute ignored" \
