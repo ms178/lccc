@@ -531,7 +531,7 @@ impl Lowerer {
     pub(super) fn materialize_compound_literals_in_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::CompoundLiteral(type_spec, init, _, st) => {
-                let key = expr as *const Expr as usize;
+                let key = Self::compound_literal_key(expr);
                 if !self.materialized_compound_literals.contains_key(&key) {
                     // Materialize this compound literal as an anonymous global
                     let init_result =
@@ -545,14 +545,17 @@ impl Lowerer {
             Expr::Cast(_, inner, _, _) => {
                 self.materialize_compound_literals_in_expr(inner);
             }
-            Expr::BinaryOp(_, lhs, rhs, _) => {
+            Expr::BinaryOp(_, lhs, rhs, _) | Expr::ArraySubscript(lhs, rhs, _) => {
                 self.materialize_compound_literals_in_expr(lhs);
                 self.materialize_compound_literals_in_expr(rhs);
             }
             Expr::UnaryOp(_, inner, _) => {
                 self.materialize_compound_literals_in_expr(inner);
             }
-            Expr::AddressOf(inner, _) | Expr::Deref(inner, _) => {
+            Expr::AddressOf(inner, _)
+            | Expr::Deref(inner, _)
+            | Expr::MemberAccess(inner, _, _)
+            | Expr::PointerMemberAccess(inner, _, _) => {
                 self.materialize_compound_literals_in_expr(inner);
             }
             Expr::Conditional(cond, then_e, else_e, _) => {
@@ -1830,6 +1833,11 @@ impl Lowerer {
 // =============================================================================
 
 impl Lowerer {
+    pub(super) fn compound_literal_key(expr: &Expr) -> (u32, u32, u32) {
+        let span = expr.span();
+        (span.file_id, span.start, span.end)
+    }
+
     /// Materialize (or reuse) an anonymous static/TLS global for a C23
     /// `(static [thread_local] [const] T){...}` compound literal.
     pub(super) fn ensure_static_compound_literal_global(
@@ -1839,7 +1847,7 @@ impl Lowerer {
         init: &Initializer,
         storage: &crate::frontend::parser::ast::CompoundLiteralStorage,
     ) -> String {
-        let key = cl_expr as *const Expr as usize;
+        let key = Self::compound_literal_key(cl_expr);
         if let Some(existing) = self.materialized_compound_literals.get(&key) {
             return existing.clone();
         }
@@ -1904,6 +1912,22 @@ impl Lowerer {
             };
 
         let ctype = self.type_spec_to_ctype(type_spec);
+        let mut array_dim_strides = Vec::new();
+        let mut leaf = &ctype;
+        while let CType::Array(element, _) = leaf {
+            array_dim_strides.push(element.size_ctx(&*self.types.borrow_struct_layouts()));
+            leaf = element;
+        }
+        // The initializer dispatcher needs LEAF elements and every dimension,
+        // not sizeof(the first row) with no strides for a multidimensional array.
+        let (elem_size, base_ty) = if is_array {
+            (
+                leaf.size_ctx(&*self.types.borrow_struct_layouts()),
+                IrType::from_ctype(leaf),
+            )
+        } else {
+            (elem_size, base_ty)
+        };
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         // For arrays, struct_layout is for the element type, not the whole array,
         // so always use computed_alloc_size which accounts for the element count.
@@ -1926,7 +1950,7 @@ impl Lowerer {
             elem_size,
             alloc_size,
             &struct_layout,
-            &[],
+            &array_dim_strides,
             Some(&ctype),
         );
 

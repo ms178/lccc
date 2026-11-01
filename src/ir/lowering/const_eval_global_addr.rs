@@ -66,6 +66,13 @@ impl Lowerer {
         match expr {
             // &x -> GlobalAddr("x")
             Expr::AddressOf(inner, _) => {
+                if let Some((label, offset, _)) = self.compound_lvalue_address(inner) {
+                    return Some(if offset == 0 {
+                        GlobalInit::GlobalAddr(label)
+                    } else {
+                        GlobalInit::GlobalAddrOffset(label, offset)
+                    });
+                }
                 match inner.as_ref() {
                     // &*p is p, without evaluating either operator (C11
                     // 6.5.3.2p3). Preserve symbolic relocations and offsets,
@@ -97,7 +104,7 @@ impl Lowerer {
                     }
                     // &(compound_literal) - look up previously materialized compound literal
                     Expr::CompoundLiteral(_, _, _, _) => {
-                        let key = inner.as_ref() as *const Expr as usize;
+                        let key = Self::compound_literal_key(inner);
                         self.materialized_compound_literals
                             .get(&key)
                             .map(|label| GlobalInit::GlobalAddr(label.clone()))
@@ -159,7 +166,7 @@ impl Lowerer {
             // where the compound literal wraps a function pointer.
             Expr::CompoundLiteral(_, init, _, _) => {
                 // Check if this compound literal was pre-materialized as an anonymous global
-                let key = expr as *const Expr as usize;
+                let key = Self::compound_literal_key(expr);
                 if let Some(label) = self.materialized_compound_literals.get(&key) {
                     return Some(GlobalInit::GlobalAddr(label.clone()));
                 }
@@ -280,6 +287,48 @@ impl Lowerer {
                 } else {
                     Some(GlobalInit::GlobalAddrOffset(name, total))
                 }
+            }
+            _ => None,
+        }
+    }
+
+    /// A typed lvalue path rooted in a materialized file-scope compound
+    /// literal. Track each array dimension and member type rather than
+    /// guessing strides from the final scalar type (i915's sysfs attributes).
+    fn compound_lvalue_address(&self, expr: &Expr) -> Option<(String, i64, CType)> {
+        match expr {
+            Expr::CompoundLiteral(spec, _, _, _) => {
+                let key = Self::compound_literal_key(expr);
+                let label = self.materialized_compound_literals.get(&key)?.clone();
+                Some((label, 0, self.type_spec_to_ctype(spec)))
+            }
+            Expr::ArraySubscript(base, index, _) => {
+                let (label, offset, ty) = self.compound_lvalue_address(base)?;
+                let CType::Array(element, _) = ty else {
+                    return None;
+                };
+                let index = self.const_to_i64(&self.eval_const_expr(index)?)?;
+                let stride =
+                    i64::try_from(element.size_ctx(&*self.types.borrow_struct_layouts())).ok()?;
+                Some((
+                    label,
+                    offset.checked_add(index.checked_mul(stride)?)?,
+                    *element,
+                ))
+            }
+            Expr::MemberAccess(base, field, _) => {
+                let (label, offset, ty) = self.compound_lvalue_address(base)?;
+                let (CType::Struct(key) | CType::Union(key)) = ty else {
+                    return None;
+                };
+                let layouts = self.types.borrow_struct_layouts();
+                let (field_offset, field_type) =
+                    layouts.get(&*key)?.field_offset(field, &*layouts)?;
+                Some((
+                    label,
+                    offset.checked_add(i64::try_from(field_offset).ok()?)?,
+                    field_type,
+                ))
             }
             _ => None,
         }

@@ -51,7 +51,7 @@ at `-O0`, `-O2`, `-Os`, and `-O2 -fstack-clash-protection`:
 The frozen kernel compiler SHA256 remains
 `883b8b34d4b13e7685de9426729bca9827c76bd8aa99c485e885895200e1a87c`.
 The subsequently rebuilt scalar/record/variadic test compiler is
-`645d6cc37e60476a4f6f4b0c2baa4f0f4aa546167c0e17336a83c650f024567a`.
+`6cce8a32fa17c14fd17608ede004a617d802c8ceb30d6922fd57d404f9218b39`.
 These are intentionally separate executables; kernel artifacts are not
 attributed to the newer compiler. Hosted CI must validate the submitted source.
 
@@ -70,6 +70,16 @@ The latest boot-only run passed at **31,024 / 32,768 bytes**, with 24 ISA-scanne
 objects and a byte-identical GNU-linker parity check. No GCC target compilation
 was used. The full build subsequently compiled `arch/x86/kernel/cpu/common.o`,
 the translation unit previously stopped by fourteen `ms_abi` diagnostics.
+That full run subsequently stopped in `drivers/gpu/drm/i915/i915_pmu.c`: a
+valid static address of a nested array-compound-literal member was rejected.
+The rebuilt compiler passes that actual translation unit in a focused compile
+and a ten-address mutable-object reduction at O0/O2/Os. The reduction also
+caught and now guards transient AST-pointer reuse in literal caches and missing
+multidimensional initializer strides. Existing compound-literal verdict,
+runtime and relocation checks pass all 41 rows (35 accepted).
+
+See `KERNEL-PATTERN-REVIEW.md` for source-inventory coverage, remaining semantic
+review obligations, and measured non-kernel variadic-home-save improvements.
 
 ## Remaining acceptance criteria
 
@@ -84,7 +94,8 @@ the translation unit previously stopped by fourteen `ms_abi` diagnostics.
 - Parser attribute placement and inherited conventions need further adversarial
   coverage, including post-asm attributes and typedef-derived declarations.
 - Further kernel compiler/linker defects and unsupported-option warnings must
-  be resolved. The full build is still in progress, not a successful kernel.
+  be resolved. The previous full build failed at i915; a clean, content-identified
+  rebuild with the validated fix is required, not a successful kernel yet.
 - Latest main (`4494df45b`) has been merged into the draft branch. The running
   full build still uses the identified pre-merge executable; merged-source
   compiler rebuilding and kernel validation remain necessary.
