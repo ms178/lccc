@@ -71,10 +71,12 @@ Two verdicts are deliberately *not* "ignore it because gcc does":
 * `preserve_none` and `no_callee_saved_registers` are refused on both x86
   targets. Preserving extra registers is not a sufficient ABI proof: measured
   GCC 16.2 x86-64 `preserve_none` passes the first arguments in R12/R13, not
-  the native RDI/RSI. Separate caller/callee translation units, identically
-  named functions, and EBX/ESI/EDI clobber controls expose contracts hidden by
-  arithmetic-only or differently named twins. Both preservation attributes
-  therefore select `Unsupported`, never `GccIgnored`.
+  the native RDI/RSI. The regression probe keeps five values live across a
+  call in an attributed six-argument callee, then separately compares callers
+  that call a plain versus an attributed external declaration. Together these
+  expose both sides of the contract; arithmetic-only leaf functions do not.
+  Both preservation attributes therefore select `Unsupported`, never
+  `GccIgnored`.
 * `no_caller_saved_registers` is the opposite promise: the callee promises not
   to clobber caller-saved registers, and the caller may then stop saving them.
   lccc cannot yet prove that of a body it emits (gcc enforces it by diagnosing
@@ -94,10 +96,14 @@ placement flag for exactly the tag-level attribute parse
 Unsupported ABI/layout verdicts deliberately reject some programs GCC accepts.
 For example, lccc has no Microsoft bit-field layout yet; silently emitting the
 SysV layout under an `ms_struct` tag would reproduce the ABI failure this work
-removes. Likewise x86-64 `force_align_arg_pointer` is refused until entry-stack
-realignment is implemented. On x86-64 `regparm` is ignored with GCC's warning,
-not claimed as an implemented register-argument convention. GCC's own behaviour on the conflicting-attribute form is recorded for
-whoever implements the layout: first attribute wins, the later one produces
+removes. Likewise `force_align_arg_pointer` is refused: GCC emits an entry
+prologue that realigns `%rsp`/`%esp`, specifically allowing callers that do not
+meet the usual stack-alignment guarantee. That is observable at the call
+boundary, not merely a local code-shape choice; lccc does not yet implement the
+required dynamic entry-stack realignment. On x86-64 `regparm` is ignored with
+GCC's warning, not claimed as an implemented register-argument convention.
+GCC's own behaviour on the conflicting-attribute form is recorded for whoever
+implements the layout: first attribute wins, the later one produces
 `warning: 'ms_struct' incompatible attribute ignored`, exit status 0.
 
 ## Escape hatch
@@ -116,10 +122,15 @@ documents that it does.
 gate, which both CI mirrors run):
 
 * parses `ABI_VERDICTS` out of the registry,
-* re-measures every cell against the live gcc — integer, floating,
-  aggregate-return and record-layout twin bodies in both targets and both
-  placements — and derives the expected verdict from *what gcc does*, so the
-  table cannot rot,
+* re-measures every cell against the live GCC oracle — integer, floating,
+  aggregate-return, register-preservation and record-layout probes in both
+  targets — and derives the expected verdict from *what GCC does*, so the table
+  cannot rot; the register probe inspects argument input registers, callee-saved
+  push/pop behavior, stack realignment and return cleanup rather than treating
+  any register mentioned in a body as an ABI fact. A separate call-site probe
+  checks that a caller spills around a declaration whose callee may clobber the
+  callee-saved set,
+
 * asserts lccc's side of every cell: silence for `Default`, gcc's verbatim
   sentence for the ignored classes, a named refusal for `Unsupported`, and the
   documented downgrade under the escape hatch,

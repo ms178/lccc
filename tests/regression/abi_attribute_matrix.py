@@ -14,8 +14,9 @@ Two independent directions are asserted, because either one alone can lie:
 1. **The table versus gcc.** `src/frontend/parser/attribute_registry.rs`
    declares one verdict per (name, target). This module re-derives that verdict
    from a live gcc by *observing* what gcc does — not by trusting the comment:
-   compile three twin bodies (integer, floating, aggregate-return) and a record
-   layout with and without the attribute, then decide between
+   compile integer, floating, aggregate-return and register-preservation
+   probes with and without the attribute, including a caller-side preservation
+   probe, plus a separate record-layout probe; then decide between
 
        rejects      gcc diagnoses the attribute as unusable here
        only32       gcc says `'x' attribute only available for 32-bit`
@@ -92,14 +93,41 @@ struct Q {{ char a; int b : 5; int c : 3; }};
 int rs(void) {{ return (int)sizeof(struct R); }}
 int qs(void) {{ return (int)sizeof(struct Q); }}
 """
-# A leaf arithmetic body need not use any callee-saved registers. Explicit
-# clobbers expose preservation contracts without depending on register pressure.
-PRESERVE_PROBE = """\
-void {attr}f(void) {{ __asm__ volatile("" ::: "ebx", "esi", "edi"); }}
-void g(void) {{ __asm__ volatile("" ::: "ebx", "esi", "edi"); }}
+# Register preservation. The three probes above make no call, so nothing has
+# to survive one and no compiler ever saves a callee-saved register: they are
+# structurally blind to `no_callee_saved_registers`/`preserve_none`, which are
+# pure prologue attributes (measured: with them GCC 16.2 keeps five arguments
+# live across the call in stack slots instead of %rbx/%r12-%r15 and emits no
+# push at all). Five live-across-call values force the reference compiler to
+# use its callee-saved set, so the probe sees the convention the attribute
+# selects.
+REG_PROBE = """\
+extern int sink(int);
+int {attr}ps(int a, int b, int c, int d, int e, int f) {{
+    int s = sink(a);
+    return s + b * 3 + c * 5 + d * 7 + e * 11 + f * 13;
+}}
+int qs2(int a, int b, int c, int d, int e, int f) {{
+    int s = sink(a);
+    return s + b * 3 + c * 5 + d * 7 + e * 11 + f * 13;
+}}
 """
-BODIES = {'int': INT_PROBE, 'fp': FP_PROBE, 'agg': AGG_PROBE,
-          'rec': REC_PROBE, 'preserve': PRESERVE_PROBE}
+# Caller-side preservation probe. The attributed callee is only a declaration,
+# so the caller compiler must honor its clobber set at the call site. Keeping
+# five computed values live across the call makes the ABI difference visible
+# as callee-saved pushes and stack spills, rather than just an instruction-set
+# difference in the attributed function.
+CALLER_REG_PROBE = """\
+extern int {attr}sink(int);
+int caller(int a, int b, int c, int d, int e, int f) {{
+    int x1=b*3, x2=c*5, x3=d*7, x4=e*11, x5=f*13;
+    int y=sink(a);
+    return y+x1+x2+x3+x4+x5;
+}}
+"""
+PRESERVATION_ATTRS = {'no_callee_saved_registers', 'preserve_none'}
+BODIES = {'int': INT_PROBE, 'fp': FP_PROBE, 'agg': AGG_PROBE, 'rec': REC_PROBE,
+          'reg': REG_PROBE}
 RECORD_ONLY = {'ms_struct', 'gcc_struct'}
 
 # Attributes that take a mandatory integer argument, spelled the way a user
@@ -171,19 +199,128 @@ def _canon_reg(name: str) -> str:
 def abi_signature(probe_id: str, body: str) -> tuple:
     """The part of a function body that an ABI decision can change.
 
-    Deliberately *not* the instruction stream: gcc emits equivalent but
-    different code for two identical twin functions in the same translation
-    unit (`combine` sees them independently), so a byte comparison would report
-    a false "the attribute changed the ABI" for every name. What a convention
-    actually decides is which registers carry the arguments and who pops the
-    outgoing argument area, plus — for the layout probe — the record's size.
+    Deliberately *not* the full instruction stream or the set of registers
+    mentioned anywhere in it. The selected fields are limited to ABI-observable
+    properties: input registers, callee-save actions, dynamic stack realignment,
+    and return cleanup. The same function symbol is compiled separately with
+    and without the attribute, preventing register allocation differences
+    between differently named same-TU twins from masquerading as ABI changes.
+
+    What a convention actually decides is:
+      * `inputs`   -- which registers the callee reads before writing them,
+                      i.e. where the arguments arrived;
+      * `preserved`-- which callee-saved registers it pushes/pops, i.e. the
+                      register-preservation contract (`preserve_none`,
+                      `no_callee_saved_registers`);
+      * `realign`  -- whether the prologue aligns `%rsp` itself
+                      (`force_align_arg_pointer`);
+      * `ret`      -- the epilogue form and any `ret $N` callee-pop count;
+      * for the record probe, the record sizes only.
     """
     body = re.sub(r'\$[A-Za-z_][\w.]*', '$SYM', body)
     if probe_id == 'rec':
         return tuple(sorted(set(re.findall(r'\$(\d+)', body))))
-    regs = tuple(sorted({_canon_reg(r) for r in re.findall(r'%([a-z][a-z0-9]*)', body)}))
-    ret = tuple(re.findall(r'\b(ret|jmp)\b\s*(\$?\d*)', body))
-    return (regs, ret)
+    return (
+        _input_registers(body),
+        tuple(sorted(_saved_registers(body))),
+        bool(re.search(r'\band[ql]\s+\$-?\d+,\s*%(?:rsp|esp)\b', body)),
+        tuple(re.findall(r'\b(retq?|jmpq?)\b\s*(\$?\d*)', body)),
+    )
+
+
+#: Callee-saved registers on the two SysV targets. `%rbp` is deliberately
+#: absent when it is the frame pointer: the reference compiler's choice to
+#: omit a frame pointer is not an ABI decision this gate measures.
+_CALLEE_SAVED = {
+    'x86-64': {'rbx', 'r12', 'r13', 'r14', 'r15', 'rbp'},
+    'i686': {'ebx', 'esi', 'edi', 'ebp'},
+}
+
+#: Mnemonics that only read their operands, so the last one is not a
+#: destination.  Everything else in AT&T syntax writes its last operand.
+_READ_ONLY = frozenset({
+    'cmp', 'cmpl', 'cmpq', 'cmpw', 'cmpb', 'test', 'testl', 'testq', 'testw',
+    'testb', 'push', 'pushq', 'pushl', 'pushw', 'call', 'callq', 'jmp', 'jmpq',
+    'ret', 'retq', 'nop', 'nopw', 'nopl', 'vzeroupper', 'vzeroall', 'ud2',
+})
+#: Mnemonics whose equal-operand form is a pure write (`xor %eax,%eax`).
+_SELF_WRITE = ('xor', 'pxor', 'vpxor', 'sub', 'psub')
+#: `%rsp`/`%rbp` are the frame, not an argument channel, so their early reads
+#: are not evidence of a convention: the pointer to the frame is always read
+#: first, in a different order depending on whether a frame pointer is used.
+_FRAME_REGS = frozenset({'rsp', 'rbp'})
+
+
+def _saved_registers(body: str) -> list[tuple[str, str]]:
+    """Every `push`/`pop` of a callee-saved register, in body order.
+
+    Returns `(canonical_register, 'push' | 'pop')` pairs. Both SysV targets
+    spell the mnemonic `push`/`pushq`/`pop`/`popq`, so the match is on the
+    stem and the canonical register name decides membership.
+    """
+    saved = _CALLEE_SAVED['x86-64'] | _CALLEE_SAVED['i686']
+    out = []
+    for kind, reg in re.findall(r'\b(push|pop)[ql]?\s+%([a-z][a-z0-9]*)', body):
+        name = _canon_reg(reg)
+        if name in saved:
+            out.append((name, kind))
+    return out
+
+
+def _input_registers(body: str) -> tuple:
+    """Registers the body reads before it writes them, in first-read order.
+
+    That is the machine-level definition of "where did the arguments arrive",
+    and unlike the set of mentioned registers it is stable under the code
+    generator's freedom to rematerialise values.
+    """
+    written: set[str] = set()
+    inputs: list[str] = []
+    for line in body.splitlines():
+        text = line.split('#', 1)[0].strip()
+        if not text or text.startswith('.') or text.endswith(':'):
+            continue
+        mnemonic, _, rest = text.partition('\t')
+        if not rest:
+            mnemonic, _, rest = text.partition(' ')
+        mnemonic = mnemonic.strip()
+        operands = [op.strip() for op in rest.split(',') if op.strip()]
+        if not operands:
+            continue
+        if mnemonic.startswith(('push', 'pop')):
+            # Save/restore traffic is an ABI consequence, not evidence that the
+            # saved register carried an incoming argument.
+            continue
+        if mnemonic in _READ_ONLY:
+            reads, dest = operands, None
+        else:
+            reads, dest = operands[:-1], operands[-1]
+            if mnemonic.startswith(_SELF_WRITE) and len(operands) == 2 \
+                    and operands[0] == operands[1]:
+                reads = []
+        for op in reads:
+            for reg in re.findall(r'%([a-z][a-z0-9]*)', op):
+                name = _canon_reg(reg)
+                if name in _FRAME_REGS or name in written:
+                    continue
+                written.add(name)
+                if name not in inputs:
+                    inputs.append(name)
+        if dest is None:
+            continue
+        if '(' in dest:
+            # A memory destination reads its base/index registers.
+            for reg in re.findall(r'%([a-z][a-z0-9]*)', dest):
+                name = _canon_reg(reg)
+                if name in _FRAME_REGS or name in written:
+                    continue
+                written.add(name)
+                if name not in inputs:
+                    inputs.append(name)
+        else:
+            for reg in re.findall(r'%([a-z][a-z0-9]*)', dest):
+                written.add(_canon_reg(reg))
+    return tuple(inputs)
 
 
 def run_bounded(cmd: list[str], *, timeout: float, **kwargs) -> subprocess.CompletedProcess:
@@ -228,43 +365,54 @@ def gcc_version(gcc: str) -> tuple[int, int]:
 
 
 def gcc_observation(gcc: str, name: str, target: str) -> tuple[str, str]:
-    """What gcc actually does with `name` on `target`: (observation, evidence)."""
+    """Measure attributed and plain ABI twins in isolated compilations."""
     attr = attribute_spelling(name)
     base = ['-O2'] + (['-m32'] if target == 'i686' else [])
     diagnostics: list[str] = []
     errors: list[str] = []
-    changed = False
     diffs: list[str] = []
-    probe_ids = ['rec'] if name in RECORD_ONLY else ['int', 'fp', 'agg', 'preserve']
-    for probe_id in probe_ids:
-        first, second = _pair(probe_id)
-        # Compile the SAME named function separately, changing only the
-        # attribute. Twin functions in one TU can get distinct temporary
-        # registers or IPA folding even when their ABI is identical.
-        source = '\n'.join(line for line in BODIES[probe_id].format(attr=attr).splitlines()
-                           if not re.match(rf'^(?:void|int|double|Big)\s+{second}\s*\(', line))
+    changed = False
+    probe_ids = ['rec'] if name in RECORD_ONLY else ['int', 'fp', 'agg', 'reg']
+
+    def compare(probe_id: str, source: str, symbol: str) -> None:
+        nonlocal changed
+        reference_source = source.replace(attr, '', 1)
         rc, out, err = compile_to(gcc, source, base)
-        reference_rc, reference, reference_err = compile_to(gcc, source.replace(attr, '', 1), base)
-        if reference_rc:
-            errors.append(f'{probe_id} reference failed: {reference_err}')
-            continue
+        ref_rc, ref_out, ref_err = compile_to(gcc, reference_source, base)
         for line in err.splitlines():
             if 'attribute' in line and ('warning:' in line or 'error:' in line):
                 diagnostics.append(line.split(': ', 2)[-1].strip())
         if rc != 0:
-            errors.append(err.strip().splitlines()[0] if err.strip() else 'compile failure')
-            continue
-        bodies, references = function_bodies(out), function_bodies(reference)
-        if first not in bodies or first not in references:
-            errors.append(f'{probe_id} probe bodies missing from the listing')
-            continue
-        measured = abi_signature(probe_id, bodies[first])
-        reference_sig = abi_signature(probe_id, references[first])
-        if measured != reference_sig:
+            errors.append(err.strip().splitlines()[0] if err.strip() else
+                          f'{probe_id} attributed compile failed ({rc})')
+            return
+        if ref_rc != 0:
+            errors.append(ref_err.strip().splitlines()[0] if ref_err.strip() else
+                          f'{probe_id} reference compile failed ({ref_rc})')
+            return
+        bodies, references = function_bodies(out), function_bodies(ref_out)
+        if symbol not in bodies or symbol not in references:
+            errors.append(f'{probe_id} same-symbol probe body missing from listing')
+            return
+        measured = abi_signature(probe_id, bodies[symbol])
+        reference = abi_signature(probe_id, references[symbol])
+        if measured != reference:
             changed = True
-            diffs.append(f'{probe_id}: {attr_pair(measured, reference_sig)}')
-    # The same sentence is emitted once per probe; stating it four times in an
-    # annotation costs the reader three redundant lines.
+            diffs.append(f'{probe_id}: {attr_pair(measured, reference)}')
+
+    for probe_id in probe_ids:
+        source = BODIES[probe_id].format(attr=attr)
+        first, second = _pair(probe_id)
+        # Remove the un-attributed twin: compare one identically named body
+        # compiled separately with and without the attribute.
+        source = re.sub(
+            rf'(?ms)^(?:void|int|double|Big)\s+{re.escape(second)}\s*'
+            rf'\([^)]*\)\s*\{{.*?^\}}\s*', '', source)
+        compare(probe_id, source, first)
+
+    if name in PRESERVATION_ATTRS:
+        compare('reg', CALLER_REG_PROBE.format(attr=attr), 'caller')
+
     unique = list(dict.fromkeys(errors or diagnostics))
     evidence = ' | '.join(unique) or 'silent'
     if changed and diffs:
@@ -289,9 +437,9 @@ def _show_signature(part) -> str:
 def attr_pair(measured: tuple, reference: tuple) -> str:
     """A short `attr=<...> plain=<...>` description of two ABI signatures.
 
-    `abi_signature` returns `(registers, return_forms)` for code probes, where
-    the return forms are themselves tuples, and a flat tuple of sizes for the
-    record-layout probe; the renderer therefore recurses instead of unpacking.
+    `abi_signature` returns nested input-register, callee-save, realignment,
+    and return-form data for code probes, plus a flat tuple of sizes for the
+    record-layout probe; recursive rendering keeps diagnostics stable.
     An annotation that says only 'honours' names a cell but no cause.
     """
     return f'attr={_show_signature(measured)} plain={_show_signature(reference)}'
@@ -300,9 +448,9 @@ def attr_pair(measured: tuple, reference: tuple) -> str:
 def _pair(probe_id: str) -> tuple[str, str]:
     return {
         'int': ('f', 'g'),
-        'preserve': ('f', 'g'),
         'fp': ('h', 'k'),
         'agg': ('ha', 'ka'),
+        'reg': ('ps', 'qs2'),
         'rec': ('rs', 'qs'),
     }[probe_id]
 
@@ -592,7 +740,33 @@ def check_sentinels(driver: Path | None = None,
     return failures, notes
 
 
+def check_probe_model() -> list[str]:
+    """Red-team the assembly classifier independently of the live oracle."""
+    body = """\
+    pushq %rbx
+    movq %r12, %rax
+    movl %edi, %ecx
+    andq $-16, %rsp
+    popq %rbx
+    ret $4
+    """
+    expected = (
+        ('r12', 'rdi'),
+        (('rbx', 'pop'), ('rbx', 'push')),
+        True,
+        (('ret', '$4'),),
+    )
+    actual = abi_signature('int', body)
+    return [] if actual == expected else [f'probe parser expected {expected}, got {actual}']
+
+
 def main() -> int:
+    model_failures = check_probe_model()
+    if model_failures:
+        print('FAIL: ABI probe model self-test')
+        for failure in model_failures:
+            print('  ', failure)
+        return 1
     gcc = shutil.which(os.environ.get('GCC') or 'gcc')
     if not gcc:
         print('SKIP: no gcc found')
