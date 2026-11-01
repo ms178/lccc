@@ -44,9 +44,11 @@ if objdump -d -M intel --disassemble=vector_small_packed_wrappers_test_main \
     call_site=${call_site//$'\n'/;}
     printf '::notice title=i686 ret caller call-site::%s\n' "$call_site"
 fi
-eip=$(sed -n 's/^SIGSEGV EIP=0x\([[:xdigit:]]\{8\}\)$/0x\1/p' "$work/run.err" | head -n 1)
+registers=$(grep -m1 '^SIGSEGV EIP=' "$work/run.err" || true)
+eip=$(sed -n 's/^SIGSEGV EIP=0x\([[:xdigit:]]\{8\}\).*/0x\1/p' "$work/run.err" | head -n 1)
 if [[ -n $eip ]]; then
     source_line=$(addr2line -e "$work/probe" -f -C "$eip" 2>/dev/null | tr '\n' ' ')
+    echo "::notice title=i686 vector fault registers::$registers"
     echo "::notice title=i686 vector fault address::EIP=$eip $source_line (rc=$rc)"
     addr=$((eip))
     lo=$((addr > 24 ? addr - 24 : 0))
