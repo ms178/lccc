@@ -24,10 +24,14 @@
 #   3. `CCC_NO_PREDICATE_MATERIALIZE=1` restores every count and brings the
 #      `cmov` back, which is what proves the assertions above belong to this
 #      fold,
-#   4. the other backends never get *longer* (i686, AArch64, RISC-V),
+#   4. the other backends never get *longer* (i686, AArch64, RISC-V), and the
+#      indicator fold of section 7 fires on all of them,
 #   5. -O0, -O1, -O2, -O3, -Os, the kill switch and GCC agree bit for bit on a
 #      checksum over the shapes,
-#   6. the vectorizer's mask store stays correct: a loop that stores
+#   6. the indicator fold refuses what it cannot prove (different operand pairs,
+#      mixed signedness classes), and every answer it produces agrees with a
+#      branch-written reference over 231,000 comparisons,
+#   8. the vectorizer's mask store stays correct: a loop that stores
 #      `lo <= c && c <= hi ? 1 : 0` is vectorized once the condition is a
 #      comparison, and a packed compare is 0/-1 per lane while the C program
 #      stores 0/1.  The element-wise check sweeps every trip count around the
@@ -310,5 +314,170 @@ for level in -O1 -O2 -O3; do
     out=$("$tmp/ms$level")
     [ "$out" = "VALIDATION OK" ] || { echo "mask store at $level: $out" >&2; exit 1; }
 done
+
+# ── 7. A three-way comparator folds back to the compare it came from ───────
+# `(a > b) - (a < b)` is the sign of `a - b`, and comparing it against zero is
+# comparing `a` and `b`.  Once `c ? 1 : 0` is materialized as a comparison, the
+# sign value is what an inlined comparator (`if (key_cmp(x, y) <= 0)`) hands
+# to its caller -- and a fold that only knew the `Select` spelling left the
+# two indicators, the subtraction and a second comparison behind (nine
+# instructions where one `cmp` is the answer).  The entry point is the same
+# question in `simplify`, so the same gate owns it: the folded shape, its
+# predicate table, and the refusals that must not move.
+cat > "$tmp/three_way.c" <<'C'
+/* A zero-extension is non-negative, so the SIGNED question against zero
+   answers itself: `(int)(unsigned char)a < 0` is false for every input, and
+   `<= 0`/`> 0` are `== 0`/`!= 0` at the narrow width.  GCC and Clang fold both
+   spellings; LCCC knew only the unsigned-typed operand. */
+int zx_lt0(int a) { return (int)(unsigned char)a < 0; }
+int zx_le0(int a) { return (int)(unsigned char)a <= 0; }
+int le(int a, int b)  { int t = (a > b) - (a < b); int u = t; return u <= 0; }
+int lt(int a, int b)  { int t = (a > b) - (a < b); int u = t; return u < 0; }
+int rev(int a, int b) { int t = (a < b) - (a > b); int u = t; return u <= 0; }
+int byte(int a, int b){ int t = (a > b) - (a < b); int u = t; return (unsigned)u > 0u; }
+/* A NESTED pair: the two indicators are not complementary but nested, so their
+   difference is the equality indicator -- `(a >= b) - (a > b)` is 1 exactly when
+   `a == b` -- and `u > 0` is `a == b`.  The same enumeration answers it. */
+int nested_eq(int a, int b) { int t = (a >= b) - (a > b); int u = t; return u > 0; }
+/* Refusals.  Different operand pairs relate nothing. */
+int keep_pairs(int a, int b, int c, int d) { int t = (a > b) - (c < d); int u = t; return u <= 0; }
+/* Mixed signedness classes are not complementary either: `a = -1, b = 1` is
+   false for both `a >s b` and `a <u b`, so the difference is not the sign of
+   anything and the shape must stay. */
+int keep_mixed(int a, int b) { int t = (a > b) - (int)((unsigned)a < (unsigned)b); int u = t; return u <= 0; }
+/* A second reader of the sign keeps the subtraction alive; the folded compare
+   may not cost more than the unfolded one. */
+int g_sink;
+int keep_second_reader(int a, int b) { int t = (a > b) - (a < b); g_sink = t; int u = t; return u <= 0; }
+C
+"$CCC" -O2 -S "$tmp/three_way.c" -o "$tmp/three_way_on.s"
+CCC_SIMPLIFY_SKIP=booldiff "$CCC" -O2 -S "$tmp/three_way.c" -o "$tmp/three_way_off.s"
+count_in() { # $1 = asm file, $2 = label
+    fn_body "$1" "$2" | grep -c -e '^[[:space:]]\+[a-z]' || true
+}
+for label in le lt rev byte nested_eq; do
+    on=$(count_in "$tmp/three_way_on.s" "$label")
+    off=$(count_in "$tmp/three_way_off.s" "$label")
+    [ "$on" -le 5 ] || {
+        printf '%s: the folded three-way comparator costs %s instructions:\n' "$label" "$on" >&2
+        fn_body "$tmp/three_way_on.s" "$label" >&2
+        exit 1
+    }
+    [ "$off" -gt "$on" ] || {
+        printf '%s: the fold has no effect (%s on, %s with CCC_SIMPLIFY_SKIP=booldiff)\n' \
+            "$label" "$on" "$off" >&2
+        exit 1
+    }
+    # One compare and one `setcc` -- the answer's own.  Two of each means the
+    # two indicators survived, which is exactly the shape this fold removes.
+    body=$(fn_body "$tmp/three_way_on.s" "$label")
+    cmps=$(grep -cE '^[[:space:]]+cmp' <<<"$body" || true)
+    sets=$(grep -cE '^[[:space:]]+set[a-z]+ ' <<<"$body" || true)
+    if [ "$cmps" -ne 1 ] || [ "$sets" -ne 1 ]; then
+        printf '%s: %s compares and %s setccs, expected one of each:\n' \
+            "$label" "$cmps" "$sets" >&2
+        printf '%s\n' "$body" >&2
+        exit 1
+    fi
+    if grep -qE '^[[:space:]]+sub[lqwb] ' <<<"$body"; then
+        printf '%s: the sign subtraction survived:\n' "$label" >&2
+        printf '%s\n' "$body" >&2
+        exit 1
+    fi
+done
+# The refusals keep their counts in BOTH builds, which is what proves the
+# assertions above belong to the indicator fold and not to a shape that was
+# going to collapse anyway.
+for label in keep_pairs keep_mixed; do
+    on=$(count_in "$tmp/three_way_on.s" "$label")
+    off=$(count_in "$tmp/three_way_off.s" "$label")
+    [ "$on" -eq "$off" ] || {
+        printf '%s moved without the fold (%s on, %s off); the refusal leaks:\n' \
+            "$label" "$on" "$off" >&2
+        exit 1
+    }
+done
+# A second reader of the sign cannot make the comparison longer: the fold
+# replaces one compare with one compare and only removes the second consumer.
+on=$(count_in "$tmp/three_way_on.s" keep_second_reader)
+off=$(count_in "$tmp/three_way_off.s" keep_second_reader)
+[ "$on" -le "$off" ] || {
+    printf 'keep_second_reader got longer (%s on, %s off)\n' "$on" "$off" >&2
+    exit 1
+}
+
+# The known-non-negative rule is `simplify_cmp`'s, not the indicator fold's, so
+# it is attributed through `CCC_SIMPLIFY_SKIP=cmp`: `zx_lt0` is the constant `0`
+# (two instructions including `ret`) with the rule and a real comparison without
+# it, while `zx_le0` is count-neutral -- `Eq 0` against a byte and `Ule 0` both
+# select a `testb` plus one `setcc`, so only the predicate moves (`sete` instead
+# of `setbe`) and the assertion pins that it stays at four.
+CCC_SIMPLIFY_SKIP=cmp "$CCC" -O2 -S "$tmp/three_way.c" -o "$tmp/three_way_nocmp.s"
+for pair in "zx_lt0 2 4" "zx_le0 4 4"; do
+    set -- $pair
+    on=$(count_in "$tmp/three_way_on.s" "$1")
+    off=$(count_in "$tmp/three_way_nocmp.s" "$1")
+    [ "$on" -le "$2" ] || {
+        printf '%s: expected at most %s instructions, got %s:\n' "$1" "$2" "$on" >&2
+        fn_body "$tmp/three_way_on.s" "$1" >&2
+        exit 1
+    }
+    [ "$off" -ge "$3" ] || {
+        printf '%s: CCC_SIMPLIFY_SKIP=cmp did not restore the comparison (%s):\n' "$1" "$off" >&2
+        fn_body "$tmp/three_way_nocmp.s" "$1" >&2
+        exit 1
+    }
+done
+
+# ── 7b. The indicator fold on every backend ───────────────────────────────
+# The fold is IR-level, so every target must gain from it and none may lose:
+# same probe, `booldiff` skipped as the only difference.  This is also the
+# cross-target proof for the three-way shape, since the corpus sweep cannot
+# compile the valence test for these targets (no cross libc in CI's sandbox).
+cross_three_way() { # $1 = binary, $2 = target name
+    local bin=$1 name=$2 label on off
+    "$bin" -O2 -S "$tmp/three_way.c" -o "$tmp/tw-$name-on.s"
+    CCC_SIMPLIFY_SKIP=booldiff "$bin" -O2 -S "$tmp/three_way.c" -o "$tmp/tw-$name-off.s"
+    for label in le lt rev byte nested_eq; do
+        on=$(count_in "$tmp/tw-$name-on.s" "$label")
+        off=$(count_in "$tmp/tw-$name-off.s" "$label")
+        [ "$on" -le "$off" ] || {
+            printf '%s: %s got longer with the fold (%s on, %s off)\n' \
+                "$name" "$label" "$on" "$off" >&2
+            fn_body "$tmp/tw-$name-on.s" "$label" >&2
+            exit 1
+        }
+    done
+    # And it must actually fire there: `le` is two `setcc`s and a `sub` wide.
+    on=$(count_in "$tmp/tw-$name-on.s" le)
+    off=$(count_in "$tmp/tw-$name-off.s" le)
+    [ "$off" -gt "$on" ] || {
+        printf '%s: the fold does not fire on this target (%s on, %s off)\n' \
+            "$name" "$on" "$off" >&2
+        exit 1
+    }
+}
+for t in i686 arm riscv; do
+    if [ -x "$bindir/lccc-$t" ]; then
+        cross_three_way "$bindir/lccc-$t" "$t"
+    fi
+done
+
+# ── 8. The values, not the counts ──────────────────────────────────────────
+# Every shape above is a question about `a - b`, and a fold that deletes six
+# instructions is worth nothing if it changes an answer.  This is the oracle:
+# `three_way_boolean_compare.c` checks every predicate over every width and
+# signedness against a branch-written reference, on the extrema, the values
+# around zero, 40,000 seeded pairs and a full +-128 x +-128 sweep, and it also
+# covers the shapes a *generalized* rule must refuse (mixed classes, different
+# pairs, a difference widened through an `unsigned char`), which no count can
+# distinguish from a correct fold.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+"$CCC" -O2 "$here/three_way_boolean_compare.c" -o "$tmp/three_way_values"
+out=$("$tmp/three_way_values")
+[ "$out" = "VALIDATION OK" ] || {
+    printf 'three_way_boolean_compare: %s\n' "$out" >&2
+    exit 1
+}
 
 echo "OK predicate_materialize ($sum)"

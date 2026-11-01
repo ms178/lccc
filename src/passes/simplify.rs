@@ -487,12 +487,21 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 rhs,
                 ty,
             } = inst
+                && let Some(folded) = fold_specific_cmp(
+                    *dest,
+                    *op,
+                    lhs,
+                    rhs,
+                    *ty,
+                    &is_fabs,
+                    &binop_defs,
+                    &cmp_defs,
+                    &cast_defs,
+                )
             {
-                if let Some(folded) = fold_fabs_lt_zero(*dest, *op, lhs, rhs, *ty, &is_fabs) {
-                    *inst = folded;
-                    total += 1;
-                    continue;
-                }
+                *inst = folded;
+                total += 1;
+                continue;
             }
             let mut simplified_here = false;
             if let Some(simplified) = try_simplify_with_types(
@@ -1349,19 +1358,56 @@ fn fold_cmp_of_select(
         (None, Some(k1)) => (k1, sdef.true_val, false),
         _ => return None,
     };
-    let Operand::Value(inner_v) = peel_int_cast_chain(inner_op, cast_defs, true) else {
+    // The inner leaf is normally a `Select`.  It may also be the `{1, 0}`
+    // materialization of a boolean written as a plain value: `predicate`
+    // rewrites `select(c, 1, 0)` into `Cast(c)` (and the frontend writes
+    // `int t = a < b;` the same way), which is the same leaf with only the
+    // carrier restated.  A comparison's result IS the `0`/`1` carrier at every
+    // integer width -- widening cannot introduce a bit and truncating a value
+    // with at most one low bit cannot drop one -- so the whole integer cast
+    // chain is peeled and the root has to be a `Cmp` for the leaf to be a
+    // boolean at all.  Without this, one `Cast` in the middle of an inlined
+    // three-way comparator defeats the trichotomy fold below and the whole
+    // comparator survives as `setcc`/`cmov`/`test` instead of `cmp`.
+    let same_size_leaf = peel_int_cast_chain(inner_op, cast_defs, true);
+    let Operand::Value(mut inner_v) = same_size_leaf else {
         return None;
     };
+    if select_defs
+        .get(inner_v.0 as usize)
+        .copied()
+        .flatten()
+        .is_none()
+    {
+        let Operand::Value(root) = peel_int_cast_chain(inner_op, cast_defs, false) else {
+            return None;
+        };
+        if cmp_defs.get(root.0 as usize).copied().flatten().is_some() {
+            inner_v = root;
+        }
+    }
     let inner_idx = inner_v.0 as usize;
     if def_counts.get(inner_idx).copied() != Some(1) {
         return None;
     }
-    let sdef2 = (*select_defs.get(inner_idx)?)?;
-    if !sdef2.ty.is_integer() || sdef2.ty.size() != ty.size() {
+    // `sdef2` with the boolean-leaf spelling folded back into the select form
+    // it stands for: `cast(c)` is `select(c, 1, 0)`.
+    let (sdef2_ty, sdef2_true, sdef2_false, sdef2_cond) =
+        match select_defs.get(inner_idx).copied().flatten() {
+            Some(sdef2) => (sdef2.ty, sdef2.true_val, sdef2.false_val, sdef2.cond),
+            None if cmp_defs.get(inner_idx).copied().flatten().is_some() => (
+                ty,
+                Operand::Const(IrConst::from_i64(1, ty)),
+                Operand::Const(IrConst::from_i64(0, ty)),
+                Operand::Value(inner_v),
+            ),
+            None => return None,
+        };
+    if !sdef2_ty.is_integer() || sdef2_ty.size() != ty.size() {
         return None;
     }
-    let k2 = resolve_select_const(sdef2.true_val, const_defs, cast_defs, def_counts)?;
-    let k3 = resolve_select_const(sdef2.false_val, const_defs, cast_defs, def_counts)?;
+    let k2 = resolve_select_const(sdef2_true, const_defs, cast_defs, def_counts)?;
+    let k3 = resolve_select_const(sdef2_false, const_defs, cast_defs, def_counts)?;
     let p1 = eval_int_cmp_bool(effective_op, k1, cval, ty)?;
     let p2 = eval_int_cmp_bool(effective_op, k2, cval, ty)?;
     let p3 = eval_int_cmp_bool(effective_op, k3, cval, ty)?;
@@ -1373,7 +1419,7 @@ fn fold_cmp_of_select(
     }
 
     // Trichotomy truth-table reduction when c1 and c2 compare the same integer operands.
-    let c2 = peel_bool_cond(sdef2.cond, cast_defs, is_boolean, cmp_defs, def_counts);
+    let c2 = peel_bool_cond(sdef2_cond, cast_defs, is_boolean, cmp_defs, def_counts);
     let (Operand::Value(cv1), Operand::Value(cv2)) = (c1, c2) else {
         return None;
     };
@@ -1456,6 +1502,364 @@ fn fold_cmp_of_select(
             }
         }
     }
+}
+
+/// Peel integer casts off an operand down to the comparison that produced it.
+///
+/// Returns `(compare value, definition, comparison operand type)` when the
+/// whole chain -- every cast and the compare itself -- has exactly one reader,
+/// which is what makes the chain deletable once the outer comparison is
+/// rewritten.  A cast that is read twice is not peeled: the fold would then
+/// leave the same instructions behind and buy nothing.
+fn cmp_through_casts(
+    mut op: Operand,
+    cast_defs: &[Option<CastDef>],
+    cmp_defs: &[Option<CmpDef>],
+    use_counts: &[u32],
+) -> Option<(Value, CmpDef, IrType)> {
+    for _ in 0..MAX_BOOL_CAST_PEEL {
+        let Operand::Value(v) = op else { return None };
+        let idx = v.0 as usize;
+        if use_counts.get(idx).copied() != Some(1) {
+            return None;
+        }
+        match cast_defs.get(idx).and_then(|d| d.as_ref()) {
+            Some(CastDef {
+                src,
+                from_ty,
+                to_ty,
+            }) if from_ty.is_integer() && to_ty.is_integer() => op = *src,
+            _ => {
+                let cdef = (*cmp_defs.get(idx)?)?;
+                return Some((v, cdef, cdef.ty));
+            }
+        }
+    }
+    None
+}
+
+/// The folds that own a whole `Cmp` rather than a general simplification of
+/// it, in the order they are tried.
+///
+/// Both answer a comparison from the comparisons it is built out of -- the
+/// absolute value of one operand, or the two indicators of a three-way
+/// comparison -- so they run before the generic `simplify_cmp` and are tried
+/// cheapest-arity first.
+fn fold_specific_cmp(
+    dest: Value,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    is_fabs: &[bool],
+    binop_defs: &[Option<BinOpDef>],
+    cmp_defs: &[Option<CmpDef>],
+    cast_defs: &[Option<CastDef>],
+) -> Option<Instruction> {
+    fold_fabs_lt_zero(dest, op, lhs, rhs, ty, is_fabs).or_else(|| {
+        fold_cmp_of_boolean_indicators(dest, op, lhs, rhs, ty, binop_defs, cmp_defs, cast_defs)
+    })
+}
+
+/// Comparing two indicators of a three-way comparison is comparing their
+/// operands, and so is comparing their difference against zero.
+///
+/// Inlined comparators build the sign of `a - b` out of two `0`/`1`
+/// indicators: `int c = (a > b) - (a < b); return c <= 0;` kept both `setcc`s,
+/// both `movzbl`s, the `sub` and the second comparison -- nine instructions
+/// where one `cmp` answers the question.  (Clang 23.1.4 emits four for this
+/// function, GCC 16.2 ten.)
+///
+/// Rather than tabulate the answers, the fold *enumerates* them.  Both
+/// indicators are predicates over the same operand pair and the same ordering
+/// class, so the pair `(a, b)` can only be in one of three states -- `a < b`,
+/// `a == b`, `a > b` -- and within a class exactly one of them holds.  Each
+/// indicator therefore has a three-row truth table (`indicator_regions`), the
+/// difference `d = indicator1 - indicator2` is `0`, `1` or `-1` per row, and
+/// the question -- `d <op> 0`, or `indicator1 <op> indicator2` -- evaluates to
+/// one row set of booleans.  A row set is one of the eight functions of a
+/// trichotomy (`const 0`, `const 1`, `<`, `<=`, `==`, `!=`, `>=`, `>`), and
+/// `trichotomy_answer` names it.  Three rows, no case analysis, and no table to
+/// get wrong: the earlier hand-written version of this fold mirrored the
+/// predicate before applying the unsigned-collapse rules and miscompiled the
+/// reversed operand order, which is exactly the bug a table invites.
+///
+/// Two consequences the enumeration makes free, and both are real shapes:
+/// `(a >= b) - (a > b) > 0` is `a == b` (the pair is nested rather than
+/// complementary, and the difference is the equality indicator), and an
+/// *unsigned* question about a signed difference is not the signed one with a
+/// different flag -- `-1` is the all-ones value, so `d <u 0` is never true while
+/// `d >u 0` is `d != 0`.
+///
+/// Rejected on purpose: indicators over different operand pairs, and ordering
+/// indicators from different classes (signed against unsigned are not
+/// complementary -- `a = -1, b = 1` is false for both `a >s b` and `a <u b`).
+fn fold_cmp_of_boolean_indicators(
+    dest: Value,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    binop_defs: &[Option<BinOpDef>],
+    cmp_defs: &[Option<CmpDef>],
+    cast_defs: &[Option<CastDef>],
+) -> Option<Instruction> {
+    if simplify_skip("booldiff") || !ty.is_integer() {
+        return None;
+    }
+    // Form A: `indicator <op> indicator`.
+    if let Some(pair) = related_indicators(*lhs, *rhs, cast_defs, cmp_defs) {
+        let pair = oriented_pair(pair)?;
+        let mask = pair.question(|a, b| op.eval_i64(a as i64, b as i64));
+        return answer_for(mask, pair.signed).map(|answer| answer.emit(dest, &pair.operands));
+    }
+    // Form B: `difference <op> 0`, the spelling the frontend emits.
+    //
+    // The casts between the subtraction and this comparison are peeled only
+    // while the SIGNED reading of the `{-1, 0, 1}` pattern survives: a
+    // same-width cast keeps the bits, a truncation keeps the low bits (so `-1`
+    // becomes the all-ones pattern of the narrower type), and a widening cast
+    // is transparent only when it sign-extends.  A zero-extension is not
+    // transparent: `unsigned char d = (a > b) - (a < b); (int)d < 0` reads `255`
+    // at the comparison, not `-1`, and folding that to `a < b` returned true
+    // where every other compiler returns false.
+    let lhs = peel_sign_preserving_casts(*lhs, cast_defs);
+    let rhs = peel_sign_preserving_casts(*rhs, cast_defs);
+    // `0 <op> diff` is `diff <swap(op)> 0`.
+    let (value, op) = match (lhs, rhs) {
+        (Operand::Value(v), zero) if is_zero(&zero) => (v, op),
+        (zero, Operand::Value(v)) if is_zero(&zero) => (v, swap_cmp_op(op)),
+        _ => return None,
+    };
+    let sub = (*binop_defs.get(value.0 as usize)?)?;
+    if sub.op != IrBinOp::Sub || !sub.ty.is_integer() {
+        return None;
+    }
+    // The subtraction cannot overflow between `-1` and `1`, so `d = x - y`.
+    let pair = related_indicators(sub.lhs, sub.rhs, cast_defs, cmp_defs)?;
+    let pair = oriented_pair(pair)?;
+    let mask = pair.question(|a, b| zero_question(op, a as i32 - b as i32));
+    answer_for(mask, pair.signed).map(|answer| answer.emit(dest, &pair.operands))
+}
+
+/// Two indicators over one operand pair, read in that pair's order, plus the
+/// ordering class their predicates share.
+struct OrientedPair {
+    /// The comparison whose operands the answer is expressed over.
+    operands: CmpDef,
+    /// The first indicator's predicate, in the operand order above.
+    first: u8,
+    /// The second indicator's predicate, likewise.
+    second: u8,
+    signed: bool,
+}
+
+impl OrientedPair {
+    /// Evaluate `question` once per trichotomy state and return the answer as
+    /// the mask `int_cmp_from_trichotomy_mask` reads.
+    fn question(&self, question: impl Fn(bool, bool) -> bool) -> u8 {
+        let mut mask = 0u8;
+        for state in [0b001u8, 0b010, 0b100] {
+            if question(self.first & state != 0, self.second & state != 0) {
+                mask |= state;
+            }
+        }
+        mask
+    }
+}
+
+/// Name the predicates of both indicators in the pair's operand order, and
+/// refuse a pair that draws them from two different ordering classes.
+fn oriented_pair(pair: (CmpDef, CmpDef, bool)) -> Option<OrientedPair> {
+    let (first, second, forward) = pair;
+    let (first, second) = orient(first, second, forward);
+    let signed = pair_class(first.op, second.op)?;
+    Some(OrientedPair {
+        operands: first,
+        first: int_cmp_trichotomy_mask(first.op),
+        second: int_cmp_trichotomy_mask(second.op),
+        signed,
+    })
+}
+
+/// Turn the enumerated mask into the instruction that answers it.
+///
+/// The two constant masks are handled here; every other mask is one of the
+/// eight trichotomy functions, which `int_cmp_from_trichotomy_mask` names (the
+/// same helper the select-leaf fold uses, so both folds agree by construction
+/// rather than by two tables that have to be kept in step).
+fn answer_for(mask: u8, signed: bool) -> Option<TrichotomyAnswer> {
+    Some(match mask & 0b111 {
+        0b000 => TrichotomyAnswer::Constant(0),
+        0b111 => TrichotomyAnswer::Constant(1),
+        _ => TrichotomyAnswer::Compare(int_cmp_from_trichotomy_mask(mask, !signed)?),
+    })
+}
+
+/// `Some(true)` for the signed ordering class, `Some(false)` for the unsigned
+/// one, `None` for a predicate that does not order (`==`, `!=`, which are the
+/// same predicate in both classes).
+fn cmp_class(op: IrCmpOp) -> Option<bool> {
+    match op {
+        IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => Some(true),
+        IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => Some(false),
+        IrCmpOp::Eq | IrCmpOp::Ne => None,
+    }
+}
+
+/// The single ordering class two indicators share, if they share one.
+///
+/// Two ordering indicators must agree; a class-neutral `==`/`!=` indicator
+/// takes the class of the other one (and two of them are free to use either,
+/// because their answers never order the operands).
+fn pair_class(first: IrCmpOp, second: IrCmpOp) -> Option<bool> {
+    match (cmp_class(first), cmp_class(second)) {
+        (Some(a), Some(b)) if a == b => Some(a),
+        (Some(_), Some(_)) => None,
+        (Some(signed), None) | (None, Some(signed)) => Some(signed),
+        (None, None) => Some(true),
+    }
+}
+
+/// `d <op> 0` where `d` is a difference of two `0`/`1` indicators.
+///
+/// The unsigned rows are the ones worth spelling out: `-1` is the all-ones
+/// value of the difference's width, so it is the largest unsigned value and
+/// every unsigned comparison against zero separates exactly "zero" from
+/// "everything else".
+fn zero_question(op: IrCmpOp, d: i32) -> bool {
+    match op {
+        IrCmpOp::Eq => d == 0,
+        IrCmpOp::Ne => d != 0,
+        IrCmpOp::Slt => d < 0,
+        IrCmpOp::Sle => d <= 0,
+        IrCmpOp::Sgt => d > 0,
+        IrCmpOp::Sge => d >= 0,
+        IrCmpOp::Ult => false,
+        IrCmpOp::Ule => d == 0,
+        IrCmpOp::Ugt => d != 0,
+        IrCmpOp::Uge => true,
+    }
+}
+
+/// The answer the enumeration produced: a function of the trichotomy, which is
+/// either a constant or one comparison of the two operands.
+#[derive(Clone, Copy)]
+enum TrichotomyAnswer {
+    Constant(i32),
+    Compare(IrCmpOp),
+}
+
+impl TrichotomyAnswer {
+    fn emit(self, dest: Value, operands: &CmpDef) -> Instruction {
+        match self {
+            // `Instruction::result_type` types every comparison as `i8`, and
+            // the rest of `simplify_cmp` writes its folded answers that way.
+            TrichotomyAnswer::Constant(v) => Instruction::Copy {
+                dest,
+                src: Operand::Const(IrConst::I8(v as i8)),
+            },
+            TrichotomyAnswer::Compare(op) => Instruction::Cmp {
+                dest,
+                op,
+                lhs: operands.lhs,
+                rhs: operands.rhs,
+                ty: operands.ty,
+            },
+        }
+    }
+}
+
+/// The comparison behind `op` after peeling integer casts, or `None`.
+///
+/// Any integer cast maps `0` and `1` onto themselves, so every cast between an
+/// indicator and the value the caller compares is transparent here.
+fn indicator_of(
+    op: Operand,
+    cast_defs: &[Option<CastDef>],
+    cmp_defs: &[Option<CmpDef>],
+) -> Option<CmpDef> {
+    let mut operand = op;
+    for _ in 0..MAX_BOOL_CAST_PEEL {
+        let Operand::Value(v) = operand else {
+            return None;
+        };
+        match cast_defs.get(v.0 as usize).and_then(|d| d.as_ref()) {
+            Some(CastDef {
+                src,
+                from_ty,
+                to_ty,
+            }) if from_ty.is_integer() && to_ty.is_integer() => operand = *src,
+            _ => return (*cmp_defs.get(v.0 as usize)?).as_ref().copied(),
+        }
+    }
+    None
+}
+
+/// Two indicators over the same operand pair, and whether the first one's
+/// operands are already in the order the pair is described by.
+fn related_indicators(
+    lhs: Operand,
+    rhs: Operand,
+    cast_defs: &[Option<CastDef>],
+    cmp_defs: &[Option<CmpDef>],
+) -> Option<(CmpDef, CmpDef, bool)> {
+    let first = indicator_of(lhs, cast_defs, cmp_defs)?;
+    let second = indicator_of(rhs, cast_defs, cmp_defs)?;
+    if !first.ty.is_integer() || first.ty != second.ty {
+        return None;
+    }
+    let forward = same_operand(&first.lhs, &second.lhs) && same_operand(&first.rhs, &second.rhs);
+    if forward {
+        return Some((first, second, true));
+    }
+    let swapped = same_operand(&first.lhs, &second.rhs) && same_operand(&first.rhs, &second.lhs);
+    swapped.then_some((first, second, false))
+}
+
+/// Read both indicators in the first one's operand order.
+fn orient(first: CmpDef, second: CmpDef, forward: bool) -> (CmpDef, CmpDef) {
+    if forward {
+        (first, second)
+    } else {
+        (
+            first,
+            CmpDef {
+                op: swap_cmp_op(second.op),
+                ..second
+            },
+        )
+    }
+}
+
+/// Peel integer casts while the signed reading of an `{-1, 0, 1}` value
+/// survives: same-width casts keep the bits, truncations keep the low bits, and
+/// a widening cast is only transparent when it sign-extends.
+///
+/// The last condition is the whole point.  `unsigned char d = (a > b) - (a < b)`
+/// stores `255` where the difference is negative, and `(int)d` reads `255`
+/// rather than `-1`: a zero-extending chain does not preserve the sign, so it
+/// must not be peeled.  A sign-extending one does (`signed char` there reads
+/// `-1`), and a truncation does within its own width (`(char)d < 0` still
+/// answers "is the difference negative").
+fn peel_sign_preserving_casts(mut op: Operand, cast_defs: &[Option<CastDef>]) -> Operand {
+    for _ in 0..MAX_BOOL_CAST_PEEL {
+        let Operand::Value(v) = op else { break };
+        match cast_defs.get(v.0 as usize).and_then(|d| d.as_ref()) {
+            Some(CastDef {
+                src,
+                from_ty,
+                to_ty,
+            }) if from_ty.is_integer()
+                && to_ty.is_integer()
+                && (to_ty.size() <= from_ty.size() || from_ty.is_signed()) =>
+            {
+                op = *src;
+            }
+            _ => break,
+        }
+    }
+    op
 }
 
 /// Recognize the integer absolute-value idiom `a < 0 ? -a : a` (and the
@@ -2415,7 +2819,7 @@ struct BinOpDef {
 /// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`,
 /// `negneg`, `addneg`, `cast_narrow`, `cast_widen`, `cast_same`, `cast_mix`,
 /// `pack_extract`, `rotate_chain`, `widened_cond`, `zeroneg`, `negcast`,
-/// `notcast`.
+/// `notcast`, `booldiff`.
 /// `zeroneg` (`0 - x` => `Neg`), `negcast` (a truncation distributes over a
 /// negate) and `notcast` (a truncation distributes over a complement) are the
 /// pieces of a narrow unary op; each is measured on its own by
@@ -3962,6 +4366,45 @@ fn simplify_cmp(
                 // Boolean values are 0 or 1, so we can simplify some patterns.
                 // However, these are rare enough that we skip them for now.
             }
+        }
+    }
+
+    // A zero-extension is non-negative, so it answers the SIGNED comparisons
+    // against zero as well: `(int)(unsigned char)c` is in `[0, 255]`, so
+    // `(int)c < 0` is false, `>= 0` is true, and `<= 0`/`> 0` are `c == 0` and
+    // `c != 0` at the narrow width (the extension is injective).  GCC 16.2 and
+    // Clang 23.1.4 fold both spellings; LCCC knew only the unsigned-typed
+    // operand, which is why `unsigned u; return u < 0;` was two instructions and
+    // `unsigned char c; return (int)c < 0;` was four.
+    if is_zero_const
+        && let Some(Some(cdef)) = cast_defs.get(idx)
+        && cdef.to_ty == ty
+        && cdef.from_ty.is_unsigned()
+        && cdef.from_ty.is_integer()
+        && cdef.from_ty.size() < cdef.to_ty.size()
+    {
+        match effective_op {
+            IrCmpOp::Slt | IrCmpOp::Sge => {
+                let value = i8::from(effective_op == IrCmpOp::Sge);
+                return Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::I8(value)),
+                });
+            }
+            IrCmpOp::Sle | IrCmpOp::Sgt => {
+                return Some(Instruction::Cmp {
+                    dest,
+                    op: if effective_op == IrCmpOp::Sle {
+                        IrCmpOp::Eq
+                    } else {
+                        IrCmpOp::Ne
+                    },
+                    lhs: cdef.src,
+                    rhs: Operand::Const(IrConst::from_i64(0, cdef.from_ty)),
+                    ty: cdef.from_ty,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -10895,6 +11338,666 @@ mod exact_product_half_tests {
                             ..
                         } if *op == expected_op && *ty == cmp_ty
                     ));
+                }
+                other => panic!("unexpected folded instruction: {other:?}"),
+            }
+        }
+    }
+
+    /// Comparing the two indicators of a three-way comparison is comparing
+    /// the operands: `(a > b) <op> (a < b)` is `a <op> b`.  Every predicate and
+    /// both operand orders are covered, plus the refusals.
+    #[test]
+    fn comparing_complementary_indicators_folds_to_the_compare() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+        for (gt, lt, outer, expected) in [
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Sle, IrCmpOp::Sle),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Slt, IrCmpOp::Slt),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Sge, IrCmpOp::Sge),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Sgt),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Eq, IrCmpOp::Eq),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Ne, IrCmpOp::Ne),
+            (IrCmpOp::Ugt, IrCmpOp::Ult, IrCmpOp::Sle, IrCmpOp::Ule),
+            (IrCmpOp::Ugt, IrCmpOp::Ult, IrCmpOp::Slt, IrCmpOp::Ult),
+            (IrCmpOp::Ugt, IrCmpOp::Ult, IrCmpOp::Uge, IrCmpOp::Uge),
+            // The indicators the other way round swap every predicate.
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Sle, IrCmpOp::Sge),
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Sgt),
+            (IrCmpOp::Ult, IrCmpOp::Ugt, IrCmpOp::Sge, IrCmpOp::Ule),
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Eq, IrCmpOp::Eq),
+        ] {
+            let mut func = IrFunction::new("three_way".to_string(), IrType::I32, vec![], false);
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I32,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 1,
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: gt,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(3),
+                        op: lt,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(4),
+                        op: outer,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Value(Value(3)),
+                        ty: IrType::I32,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+                source_spans: Vec::new(),
+            });
+            func.next_value_id = 5;
+
+            assert!(simplify_function(&mut func) > 0, "{gt:?} {lt:?} {outer:?}");
+            let folded = func.blocks[0]
+                .instructions
+                .iter()
+                .find(|i| i.dest() == Some(Value(4)))
+                .expect("the outer compare survives");
+            match folded {
+                Instruction::Cmp {
+                    op,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(1)),
+                    ..
+                } => assert_eq!(*op, expected, "{gt:?} {lt:?} {outer:?}"),
+                other => panic!("unexpected folded instruction: {other:?}"),
+            }
+        }
+    }
+
+    /// A zero-extension is non-negative, so it answers the signed comparison
+    /// against zero: `(int)(unsigned char)c < 0` is false, `<= 0` is `c == 0`,
+    /// and a same-width or sign-extending cast carries no such information.
+    #[test]
+    fn zero_extensions_answer_signed_comparisons_against_zero() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+        // (from_ty, to_ty, predicate, expectation)
+        enum Want {
+            Constant(i8),
+            Narrow(IrCmpOp, IrType),
+            Unchanged,
+        }
+        let cases = [
+            (IrType::U8, IrType::I32, IrCmpOp::Slt, Want::Constant(0)),
+            (IrType::U8, IrType::I32, IrCmpOp::Sge, Want::Constant(1)),
+            (
+                IrType::U8,
+                IrType::I32,
+                IrCmpOp::Sle,
+                Want::Narrow(IrCmpOp::Eq, IrType::U8),
+            ),
+            (
+                IrType::U8,
+                IrType::I32,
+                IrCmpOp::Sgt,
+                Want::Narrow(IrCmpOp::Ne, IrType::U8),
+            ),
+            (IrType::U16, IrType::I64, IrCmpOp::Slt, Want::Constant(0)),
+            // A SIGNED narrow source can be negative, so the question is not a
+            // constant -- but it is still answerable at the narrow width, which
+            // `narrow_cast_cmp` does on its own.
+            (
+                IrType::I8,
+                IrType::I32,
+                IrCmpOp::Slt,
+                Want::Narrow(IrCmpOp::Slt, IrType::I8),
+            ),
+            // A same-width cast keeps the sign bit: no constant, no narrowing.
+            (IrType::U32, IrType::I32, IrCmpOp::Slt, Want::Unchanged),
+            // Without an extension there is nothing to prove about the signed
+            // question at the operand's own width.
+            (IrType::U8, IrType::U8, IrCmpOp::Slt, Want::Unchanged),
+        ];
+        for (from_ty, to_ty, op, want) in cases {
+            let mut func = IrFunction::new("z".to_string(), IrType::I32, vec![], false);
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: from_ty,
+                    },
+                    Instruction::Cast {
+                        dest: Value(1),
+                        src: Operand::Value(Value(0)),
+                        from_ty,
+                        to_ty,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::from_i64(0, to_ty)),
+                        ty: to_ty,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+                source_spans: Vec::new(),
+            });
+            func.next_value_id = 3;
+
+            simplify_function(&mut func);
+            let inst = func.blocks[0]
+                .instructions
+                .iter()
+                .find(|i| i.dest() == Some(Value(2)))
+                .expect("the comparison survives");
+            match want {
+                Want::Constant(v) => match inst {
+                    Instruction::Copy {
+                        src: Operand::Const(c),
+                        ..
+                    } => assert_eq!(c.to_i64(), Some(v as i64), "{from_ty:?} {to_ty:?} {op:?}"),
+                    other => panic!("expected a constant, got {other:?}"),
+                },
+                Want::Narrow(pred, at) => match inst {
+                    Instruction::Cmp {
+                        op: got,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(c),
+                        ty,
+                        ..
+                    } => {
+                        assert_eq!(
+                            (*got, *ty, c.to_i64()),
+                            (pred, at, Some(0)),
+                            "{from_ty:?} {to_ty:?} {op:?}"
+                        );
+                    }
+                    other => panic!("expected a narrow compare, got {other:?}"),
+                },
+                Want::Unchanged => assert!(
+                    matches!(
+                        inst,
+                        Instruction::Cmp {
+                            lhs: Operand::Value(Value(1)),
+                            ..
+                        }
+                    ),
+                    "{from_ty:?} {to_ty:?} {op:?} folded: {inst:?}"
+                ),
+            }
+        }
+    }
+
+    /// A widening cast is transparent only when it sign-extends: `-1` survives
+    /// `signed char -> int`, and `unsigned char -> int` turns it into 255.
+    /// Peeling the second one is the miscompile this test exists for
+    /// (`unsigned char d = (a > b) - (a < b); return (int)d < 0;` answered
+    /// `a < b` until the peel learned to ask which extension it is).
+    #[test]
+    fn sign_preserving_peel_stops_at_a_zero_extension() {
+        // Value 0: (int) -> (unsigned char) truncation, 1 -> 2 widening.
+        let mut casts: Vec<Option<CastDef>> = vec![None; 4];
+        casts[0] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::U8,
+            to_ty: IrType::I32,
+        });
+        casts[1] = Some(CastDef {
+            src: Operand::Value(Value(2)),
+            from_ty: IrType::I32,
+            to_ty: IrType::U8,
+        });
+        casts[2] = Some(CastDef {
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I8,
+            to_ty: IrType::I32,
+        });
+        casts[3] = Some(CastDef {
+            src: Operand::Value(Value(0)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I8,
+        });
+        // A zero-extension is opaque: the walk stops at the cast itself.
+        assert_eq!(
+            peel_sign_preserving_casts(Operand::Value(Value(0)), &casts),
+            Operand::Value(Value(0))
+        );
+        // A sign-extension is transparent, and so is a truncation below it.
+        assert_eq!(
+            peel_sign_preserving_casts(Operand::Value(Value(2)), &casts),
+            Operand::Value(Value(0))
+        );
+        // Constants are not casts and are returned unchanged.
+        assert_eq!(
+            peel_sign_preserving_casts(Operand::Const(IrConst::I32(0)), &casts),
+            Operand::Const(IrConst::I32(0))
+        );
+    }
+
+    /// The fold's answer must equal the trichotomy question it replaces, for
+    /// EVERY pair of indicator predicates and every outer predicate -- 1,000
+    /// combinations, in both operand orders, in both spellings.
+    ///
+    /// Nothing here is hand-tabulated: the oracle evaluates the *original* C
+    /// question on three representative operands (one per trichotomy state) with
+    /// `IrCmpOp::eval_i64`, and the rewritten instruction has to agree on those
+    /// same three.  The representatives are all positive, so the signed and the
+    /// unsigned predicates agree on them and one triple serves both classes.
+    ///
+    /// The test also pins completeness: a pair whose ordering predicates come
+    /// from the same class must fold (the outer instruction stops mentioning the
+    /// difference), and a pair that mixes classes must not.
+    #[test]
+    fn boolean_indicator_folds_agree_with_the_trichotomy_for_every_predicate_pair() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+        // Value pairs, not abstract states: the signed and the unsigned
+        // predicates disagree on `(-1, 1)` and `(1, -1)`, which is exactly what
+        // a fold that mixed the two classes would get wrong, and `(2, 3)`,
+        // `(0, 0)` and `(9, 8)` are the three states themselves.
+        const PAIRS: [(i64, i64); 7] =
+            [(-1, 1), (1, -1), (0, 0), (2, 3), (9, 8), (-5, -5), (7, -7)];
+        const OPS: [IrCmpOp; 10] = [
+            IrCmpOp::Eq,
+            IrCmpOp::Ne,
+            IrCmpOp::Slt,
+            IrCmpOp::Sle,
+            IrCmpOp::Sgt,
+            IrCmpOp::Sge,
+            IrCmpOp::Ult,
+            IrCmpOp::Ule,
+            IrCmpOp::Ugt,
+            IrCmpOp::Uge,
+        ];
+        // Same ordering class (or class-neutral) is foldable; mixing the signed
+        // class with the unsigned one is not, because the two indicators are not
+        // complementary (`a = -1, b = 1` is false for both `a >s b` and
+        // `a <u b`).
+        fn class(op: IrCmpOp) -> Option<bool> {
+            match op {
+                IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => Some(true),
+                IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => Some(false),
+                IrCmpOp::Eq | IrCmpOp::Ne => None,
+            }
+        }
+        let same_class = |p: IrCmpOp, q: IrCmpOp| match (class(p), class(q)) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+
+        for &first in &OPS {
+            for &second in &OPS {
+                for &outer in &OPS {
+                    for swapped in [false, true] {
+                        for spelling in ["difference", "indicators"] {
+                            // Operands of the second indicator, possibly mirrored.
+                            let (l2, r2) = if swapped {
+                                (Operand::Value(Value(1)), Operand::Value(Value(0)))
+                            } else {
+                                (Operand::Value(Value(0)), Operand::Value(Value(1)))
+                            };
+                            let mut func =
+                                IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+                            let mut body = vec![
+                                Instruction::ParamRef {
+                                    dest: Value(0),
+                                    param_idx: 0,
+                                    ty: IrType::I32,
+                                },
+                                Instruction::ParamRef {
+                                    dest: Value(1),
+                                    param_idx: 1,
+                                    ty: IrType::I32,
+                                },
+                                Instruction::Cmp {
+                                    dest: Value(2),
+                                    op: first,
+                                    lhs: Operand::Value(Value(0)),
+                                    rhs: Operand::Value(Value(1)),
+                                    ty: IrType::I32,
+                                },
+                                Instruction::Cmp {
+                                    dest: Value(3),
+                                    op: second,
+                                    lhs: l2,
+                                    rhs: r2,
+                                    ty: IrType::I32,
+                                },
+                            ];
+                            if spelling == "difference" {
+                                body.push(Instruction::BinOp {
+                                    dest: Value(4),
+                                    op: IrBinOp::Sub,
+                                    lhs: Operand::Value(Value(2)),
+                                    rhs: Operand::Value(Value(3)),
+                                    ty: IrType::I32,
+                                });
+                                body.push(Instruction::Cmp {
+                                    dest: Value(5),
+                                    op: outer,
+                                    lhs: Operand::Value(Value(4)),
+                                    rhs: Operand::Const(IrConst::I32(0)),
+                                    ty: IrType::I32,
+                                });
+                            } else {
+                                body.push(Instruction::Cmp {
+                                    dest: Value(5),
+                                    op: outer,
+                                    lhs: Operand::Value(Value(2)),
+                                    rhs: Operand::Value(Value(3)),
+                                    ty: IrType::I32,
+                                });
+                            }
+                            func.blocks.push(BasicBlock {
+                                label: BlockId(0),
+                                instructions: body,
+                                terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+                                source_spans: Vec::new(),
+                            });
+                            func.next_value_id = 6;
+
+                            simplify_function(&mut func);
+                            let folded = func.blocks[0]
+                                .instructions
+                                .iter()
+                                .find(|i| i.dest() == Some(Value(5)))
+                                .expect("the outer comparison survives")
+                                .clone();
+
+                            // The oracle asks the original C question of every
+                            // value pair, using the IR's own comparison
+                            // semantics.
+                            for &(a, b) in &PAIRS {
+                                let x = first.eval_i64(a, b);
+                                let y = if swapped {
+                                    second.eval_i64(b, a)
+                                } else {
+                                    second.eval_i64(a, b)
+                                };
+                                let want = if spelling == "difference" {
+                                    outer.eval_i64(x as i64 - y as i64, 0)
+                                } else {
+                                    outer.eval_i64(x as i64, y as i64)
+                                };
+                                let eval = |o: &Operand| match o {
+                                    Operand::Value(Value(0)) => a,
+                                    Operand::Value(Value(1)) => b,
+                                    Operand::Value(Value(2)) => x as i64,
+                                    Operand::Value(Value(3)) => y as i64,
+                                    Operand::Value(Value(4)) => x as i64 - y as i64,
+                                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                                    other => panic!("unexpected operand {other:?}"),
+                                };
+                                let got = match &folded {
+                                    Instruction::Cmp { op, lhs, rhs, .. } => {
+                                        op.eval_i64(eval(lhs), eval(rhs))
+                                    }
+                                    Instruction::Copy {
+                                        src: Operand::Const(c),
+                                        ..
+                                    } => c.to_i64() == Some(1),
+                                    other => panic!("unexpected rewrite {other:?}"),
+                                };
+                                assert_eq!(
+                                    got, want,
+                                    "{first:?} {second:?} {outer:?} swapped={swapped} \
+                                     {spelling} on ({a}, {b})"
+                                );
+                            }
+
+                            // Completeness: a same-class pair must stop reading
+                            // the derived value.  A mixed-class pair may be left
+                            // alone or answered by another rule, so only the
+                            // same-class half is asserted.
+                            if same_class(first, second) {
+                                let derived = match (&folded, spelling) {
+                                    (Instruction::Cmp { lhs, .. }, "difference") => {
+                                        matches!(lhs, Operand::Value(Value(4)))
+                                    }
+                                    (Instruction::Cmp { lhs, rhs, .. }, _) => {
+                                        matches!(lhs, Operand::Value(Value(2)))
+                                            || matches!(rhs, Operand::Value(Value(3)))
+                                    }
+                                    _ => false,
+                                };
+                                assert!(
+                                    !derived,
+                                    "{first:?} {second:?} {outer:?} swapped={swapped} \
+                                     {spelling} was not folded"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The subtraction spelling, over every predicate and both operand orders,
+    /// including the UNSIGNED comparisons of a signed difference.  `-1` is
+    /// `UINT_MAX` in those, so they are not the mirror of the signed table --
+    /// `(l - g) >u 0` is TRUE when `l - g` is `-1`, which is why the unsigned
+    /// collapse is decided before the indicator order mirrors the predicate.
+    #[test]
+    fn boolean_difference_compares_fold_with_unsigned_predicates() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+        // (left indicator, right indicator, predicate, expected predicate)
+        // `None` means the fold must produce a constant.  Forward =
+        // `(a > b) - (a < b)`; reversed = `(a < b) - (a > b)`.
+        let cases: &[(IrCmpOp, IrCmpOp, IrCmpOp, Option<IrCmpOp>)] = &[
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Sle, Some(IrCmpOp::Sle)),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Slt, Some(IrCmpOp::Slt)),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Sgt, Some(IrCmpOp::Sgt)),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Sge, Some(IrCmpOp::Sge)),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Eq, Some(IrCmpOp::Eq)),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Ne, Some(IrCmpOp::Ne)),
+            // Unsigned against zero: `<=u 0` is `== 0`, `>u 0` is `!= 0`.
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Ule, Some(IrCmpOp::Eq)),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Ugt, Some(IrCmpOp::Ne)),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Ult, None),
+            (IrCmpOp::Sgt, IrCmpOp::Slt, IrCmpOp::Uge, None),
+            // Reversed indicators mirror the signed table ...
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Sle, Some(IrCmpOp::Sge)),
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Slt, Some(IrCmpOp::Sgt)),
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Sge, Some(IrCmpOp::Sle)),
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Sgt, Some(IrCmpOp::Slt)),
+            // ... and the unsigned questions stay themselves: `-1` is
+            // `UINT_MAX`, not a small negative.
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Ugt, Some(IrCmpOp::Ne)),
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Ule, Some(IrCmpOp::Eq)),
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Ult, None),
+            (IrCmpOp::Slt, IrCmpOp::Sgt, IrCmpOp::Uge, None),
+            // Unsigned indicators map the same question onto unsigned compare.
+            (IrCmpOp::Ugt, IrCmpOp::Ult, IrCmpOp::Sle, Some(IrCmpOp::Ule)),
+            (IrCmpOp::Ugt, IrCmpOp::Ult, IrCmpOp::Slt, Some(IrCmpOp::Ult)),
+        ];
+        for &(left, right, outer, expected) in cases {
+            let mut func = IrFunction::new("diff".to_string(), IrType::I32, vec![], false);
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I32,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 1,
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: left,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(3),
+                        op: right,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(4),
+                        op: IrBinOp::Sub,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Value(Value(3)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(5),
+                        op: outer,
+                        lhs: Operand::Value(Value(4)),
+                        rhs: Operand::Const(IrConst::I32(0)),
+                        ty: IrType::I32,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+                source_spans: Vec::new(),
+            });
+            func.next_value_id = 6;
+
+            assert!(
+                simplify_function(&mut func) > 0,
+                "{left:?} {right:?} {outer:?}"
+            );
+            let folded = func.blocks[0]
+                .instructions
+                .iter()
+                .find(|i| i.dest() == Some(Value(5)))
+                .expect("the outer compare survives");
+            match expected {
+                Some(want) => match folded {
+                    Instruction::Cmp {
+                        op,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ..
+                    } => assert_eq!(*op, want, "{left:?} {right:?} {outer:?}"),
+                    other => panic!("expected a compare, got {other:?}"),
+                },
+                None => match folded {
+                    Instruction::Copy {
+                        src: Operand::Const(c),
+                        ..
+                    } => {
+                        let want = if outer == IrCmpOp::Uge { 1 } else { 0 };
+                        assert_eq!(c.to_i64(), Some(want), "{left:?} {right:?} {outer:?}");
+                    }
+                    other => panic!("expected a constant, got {other:?}"),
+                },
+            }
+        }
+    }
+
+    /// The same three-way comparator with its inner `1`/`0` leaf spelled as
+    /// `predicate` materializes it: a `Cast` (at every integer relation
+    /// between the two widths) of the comparison, not a `Select` over the two
+    /// constants.  `cast(c)` IS `select(c, 1, 0)`, so the trichotomy has to
+    /// reach the same single compare -- otherwise one cast in the middle of an
+    /// inlined comparator defeats the fold and the whole comparison survives as
+    /// `setcc`/`cmov`/`test` (measured on `linux_list_sort.c`: 50 vs 36
+    /// instructions in `merge_and_count`).
+    #[test]
+    fn three_way_comparator_folds_through_a_materialized_boolean_leaf() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+        for (cmp_ty, leaf_ty) in [
+            (IrType::U64, IrType::I32), // narrowing cast: the fold's own output
+            (IrType::U32, IrType::I32), // same width: the copy-free spelling
+            (IrType::U32, IrType::I64), // widening cast: `long t = a < b;`
+            (IrType::I8, IrType::U64),  // byte comparison widened to 64 bits
+        ] {
+            let mut func = IrFunction::new("cmp3_cast".to_string(), IrType::I32, vec![], false);
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: cmp_ty,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 1,
+                        ty: cmp_ty,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: IrCmpOp::Ult,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: cmp_ty,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(3),
+                        op: IrCmpOp::Ugt,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: cmp_ty,
+                    },
+                    // `select(a > b, 1, 0)` materialized as `cast(a > b)`.
+                    Instruction::Cast {
+                        dest: Value(4),
+                        src: Operand::Value(Value(3)),
+                        from_ty: cmp_ty,
+                        to_ty: leaf_ty,
+                    },
+                    Instruction::Select {
+                        dest: Value(5),
+                        cond: Operand::Value(Value(2)),
+                        true_val: Operand::Const(IrConst::from_i64(-1, leaf_ty)),
+                        false_val: Operand::Value(Value(4)),
+                        ty: leaf_ty,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(6),
+                        op: IrCmpOp::Sle,
+                        lhs: Operand::Value(Value(5)),
+                        rhs: Operand::Const(IrConst::from_i64(0, leaf_ty)),
+                        ty: leaf_ty,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
+                source_spans: Vec::new(),
+            });
+            func.next_value_id = 7;
+
+            assert!(simplify_function(&mut func) > 0);
+            let folded = func.blocks[0]
+                .instructions
+                .iter()
+                .find(|i| i.dest() == Some(Value(6)))
+                .expect("the compare survives");
+            match folded {
+                Instruction::Cmp {
+                    op,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(1)),
+                    ty,
+                    ..
+                } => {
+                    assert_eq!(*op, IrCmpOp::Ule, "{cmp_ty:?} -> {leaf_ty:?}");
+                    assert_eq!(*ty, cmp_ty);
                 }
                 other => panic!("unexpected folded instruction: {other:?}"),
             }
