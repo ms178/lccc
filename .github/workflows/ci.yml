@@ -3301,6 +3301,8 @@ jobs:
         key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
     - name: Install the Clang 23.1.4 oracle
       run: bash scripts/ci_install_clang_oracle.sh
+    - name: Verify the lane's oracle toolchain
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
     - name: Select exact modern oracles for vendor comparisons
       run: |
         set -euo pipefail
