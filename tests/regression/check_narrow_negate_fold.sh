@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# The narrow negate: `0 - x` is a `Neg`, and a 64-bit negate truncated to 32
-# bits is the same negate at 32.
+# The narrow unary ops: `0 - x` is a `Neg`, and a 64-bit negate or complement
+# narrowed to 32 bits is the same operation at 32.
 #
 # Both rules come from the C integer promotions, which wrap narrow negations in
 # a widen/negate/narrow round trip:
 #
 #   `0 - x`                lowers to   sub(0, x)          -> one `negl` once folded
 #   `-(x != 0)`            lowers to   trunc32(neg64(sext64(cmp)))
+#   `x & ~(1 << n)`        lowers to   and32(x, trunc32(not64(sext64(1 << n))))
 #
 # Left alone, the codegen cannot see through the second round trip and pays it
 # in instructions it cannot remove: `setne; movzbl; movslq; negq; movl` where
@@ -14,11 +15,17 @@
 # the extension's high bits die in the truncation, so `(I32)(-(I64)(I32)v)` is
 # `-(I32)v` and both the extension and the second copy disappear.
 #
-# The fold is restricted to that one width pair because it MEASURED as a pure
-# win there and as a pessimisation elsewhere (see the comment on the fold in
-# `src/passes/simplify.rs`).  The narrower shapes are therefore pinned as
+# The negate fold is restricted to that one width pair because it MEASURED as a
+# pure win there and as a pessimisation elsewhere (see the comment on the fold
+# in `src/passes/simplify.rs`).  The narrower shapes are therefore pinned as
 # controls: their counts must not move, so widening the fold later has to come
 # with a fresh measurement instead of slipping in.
+#
+# The complement (`notcast`) needs no width restriction -- `Not` is bitwise and
+# therefore commutes with truncation outright -- but it does need the outer step
+# to be a NARROWING one, because `ext(~x)` and `~ext(x)` differ in the high
+# bits.  Its owned shape is the `x & ~(1 << n)` bit-clear, which used to widen
+# the complement to 64 bits and pay `cltq; notq` for it.
 #
 # The gate pins five things, because an instruction-count win that changes
 # answers is worthless:
@@ -44,6 +51,12 @@ unsigned char  neg8(unsigned char x)  { return (unsigned char)-x; }
 short          negs16(short x)        { return (short)-x; }
 unsigned short isol16(unsigned short x) { return x & (unsigned short)(0 - x); }
 int            notzero(int x)         { return -(x != 0); }
+/* The complement's round trip: `~(1 << n)` was widened to 64 bits. */
+int            bclear(int x, int n)   { return x & ~(1 << n); }
+unsigned       bclearu(unsigned x, unsigned n) { return x & ~(1u << n); }
+/* Control: a WIDENING cast observes the high bits of the complement, so the
+   wide `Not` must stay. */
+unsigned long  notw(unsigned x)       { return ~(unsigned long)x; }
 /* Control: the negation is observed at the WIDE width, so it must stay there
    (folding it to `-(int)` would drop the sign extension of `x`). */
 long           wide(int x)            { return -(long)x; }
@@ -55,6 +68,7 @@ C
 "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/shapes.s"
 CCC_SIMPLIFY_SKIP=negcast "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_negcast.s"
 CCC_SIMPLIFY_SKIP=zeroneg "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_zeroneg.s"
+CCC_SIMPLIFY_SKIP=notcast "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_notcast.s"
 
 fn_body() { # $1 = asm file, $2 = label; body between the label and ret
     sed -n "/^$2:/,/ret/p" "$1"
@@ -125,6 +139,41 @@ if ! has "$(fn_body "$tmp/no_negcast.s" notzero)" 'negq'; then
     exit 1
 fi
 
+# ── 2b. The complement's round trip is gone ────────────────────────────────
+n=$(count "$tmp/shapes.s" bclear)
+[ "$n" -le 8 ] || {
+    echo "bclear costs $n instructions; the complement is widened again:" >&2
+    fn_body "$tmp/shapes.s" bclear >&2
+    exit 1
+}
+lacks "$(fn_body "$tmp/shapes.s" bclear)" 'notq\|cltq' \
+    "bclear complements at 64 bits"
+if ! has "$(fn_body "$tmp/shapes.s" bclear)" 'notl'; then
+    echo "bclear must complement at 32 bits:" >&2
+    fn_body "$tmp/shapes.s" bclear >&2
+    exit 1
+fi
+expect bclear 8 shapes.s
+# `notcast` owns it: with the rule off the extension and the 64-bit complement
+# come back, otherwise the assertions above hold for some other reason.
+expect bclear 9 no_notcast.s
+if ! has "$(fn_body "$tmp/no_notcast.s" bclear)" 'notq'; then
+    echo "CCC_SIMPLIFY_SKIP=notcast does not restore the 64-bit complement:" >&2
+    fn_body "$tmp/no_notcast.s" bclear >&2
+    exit 1
+fi
+# Controls: the unsigned spelling never widened, and a widening cast keeps its
+# wide complement in both builds.
+expect bclearu 8 shapes.s
+expect bclearu 8 no_notcast.s
+expect notw 4 shapes.s
+expect notw 4 no_notcast.s
+if ! has "$(fn_body "$tmp/shapes.s" notw)" 'notq'; then
+    echo "notw must complement at 64 bits (`~(unsigned long)x` observes all of it):" >&2
+    fn_body "$tmp/shapes.s" notw >&2
+    exit 1
+fi
+
 # ── 3. `0 - x` is a negate, `0.0 - x` is not ────────────────────────────────
 body=$(fn_body "$tmp/shapes.s" fsub)
 if ! has "$body" 'subsd'; then
@@ -176,6 +225,9 @@ static unsigned char  neg8(unsigned char x)  { return (unsigned char)-x; }
 static short          negs16(short x)        { return (short)-x; }
 static unsigned short isol16(unsigned short x) { return x & (unsigned short)(0 - x); }
 static int            notzero(int x)         { return -(x != 0); }
+static int            bclear(int x, int n)   { return x & ~(1 << n); }
+static unsigned       bclearu(unsigned x, unsigned n) { return x & ~(1u << n); }
+static unsigned long  notw(unsigned x)       { return ~(unsigned long)x; }
 static long           wide(int x)            { return -(long)x; }
 static double         fsub(double x)         { return 0.0 - x; }
 /* The result is observed as `unsigned`, so the zero extension of the narrow
@@ -203,6 +255,9 @@ int main(void) {
         mix(notzero((int)s));
         mix(notzero(-(int)s));
         mix(notzero(0));
+        mix((unsigned)bclear((int)s, (int)(x & 31u)));
+        mix(bclearu(x, x & 31u));
+        mix(notw(x));
         unsigned bits;
         double d = (double)(int)s * 0.5;
         memcpy(&bits, &(double){fsub(d)}, sizeof bits);
@@ -239,7 +294,7 @@ done
 # The kill switches may change the code, never the answers.  (The float row is
 # in the same program on purpose: the `zeroneg` guard is what keeps `0.0 - x`
 # a subtraction, and the answers must be bit-identical either way.)
-for knob in CCC_SIMPLIFY_SKIP=negcast CCC_SIMPLIFY_SKIP=zeroneg; do
+for knob in CCC_SIMPLIFY_SKIP=negcast CCC_SIMPLIFY_SKIP=zeroneg CCC_SIMPLIFY_SKIP=notcast; do
     env $knob "$CCC" -O2 "$tmp/exec.c" -o "$tmp/ek"
     "$tmp/ek" > "$tmp/outk"
     if ! cmp -s "$ref" "$tmp/outk"; then
@@ -261,7 +316,7 @@ if command -v "${GCC_ORACLE:-gcc-16}" >/dev/null 2>&1; then
 fi
 
 # ── Instruction counts, printed so a drift is visible in the CI log ─────────
-for name in neg16 neg8 negs16 isol16 notzero wide fsub; do
+for name in neg16 neg8 negs16 isol16 notzero wide fsub bclear bclearu notw; do
     echo "  $name: $(count "$tmp/shapes.s" "$name") instructions (negcast off: $(count "$tmp/no_negcast.s" "$name"))"
 done
 
