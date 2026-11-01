@@ -116,7 +116,7 @@ done
 # foreign ABI are refused instead of ignored.
 #   sysv_abi                     -> this target's own convention: silent
 #   cdecl stdcall thiscall fastcall sseregparm -> gcc ignores them here
-#   preserve_none no_callee_saved_registers    -> gcc's "directive ignored"
+#   preserve_none no_callee_saved_registers    -> real GCC 16.2 contracts: refused
 #   callee_pop_aggregate_return  -> gcc's "only available for 32-bit"
 #   ms_abi no_caller_saved_registers           -> refused
 for a in sysv_abi; do
@@ -126,10 +126,8 @@ for a in cdecl stdcall thiscall fastcall sseregparm; do
     expect "convention-ignored:$a" "'$a' attribute ignored" \
         "int f(void) __attribute__(($a));"
 done
-for a in preserve_none no_callee_saved_registers; do
-    expect "convention-ignored:$a" "'$a' attribute directive ignored" \
-        "int f(void) __attribute__(($a));"
-done
+expect "convention-ignored:regparm" "'regparm' attribute ignored" \
+    'int f(void) __attribute__((regparm(3)));'
 expect "convention-only32" \
     "'callee_pop_aggregate_return' attribute only available for 32-bit" \
     "int f(void) __attribute__((callee_pop_aggregate_return(0)));"
@@ -173,6 +171,9 @@ refuse() { # refuse <case> <source>
 }
 refuse ms_abi 'int f(void) __attribute__((ms_abi));'
 refuse no_caller_saved_registers 'int f(void) __attribute__((no_caller_saved_registers));'
+refuse no_callee_saved_registers 'int f(void) __attribute__((no_callee_saved_registers));'
+refuse preserve_none 'int f(void) __attribute__((preserve_none));'
+refuse force_align_arg_pointer 'int f(void) __attribute__((force_align_arg_pointer));'
 refuse ms_struct 'struct __attribute__((ms_struct)) S { char c; int b : 3; };'
 
 # --- class 4: not a GCC attribute -> "attribute directive ignored" ---------
