@@ -349,7 +349,7 @@ pub(crate) fn unimplemented_names() -> impl Iterator<Item = &'static str> {
 // The choice between `GccIgnored` and `Unsupported` is not a matter of taste:
 // an attribute gcc *honours* must never be ignored by lccc (that is a silent
 // ABI change), while an attribute gcc *ignores* must not become an error here
-// (that rejects working gcc programs). Measured inventory, gcc 12.2.0,
+// (that rejects working gcc programs). Measured inventory, GCC 16.2.0,
 // `-O2 -c` and `-m32 -O2 -c`, each name on a function definition, on a
 // function pointer and on a struct definition:
 //
@@ -360,12 +360,12 @@ pub(crate) fn unimplemented_names() -> impl Iterator<Item = &'static str> {
 //   stdcall/thiscall  `attribute ignored`  stdcall/thiscall honours them
 //   fastcall          `attribute ignored`  fastcall        honours it (implemented)
 //   sseregparm        `attribute ignored`  sseregparm      hard error without SSE2
-//   regparm           silent, inert        regparm         honours it (implemented)
+//   regparm           `attribute ignored`        regparm         honours it (implemented)
 //   callee_pop_aggregate_return  `only available for 32-bit`  ... honours it
-//   force_align_arg_pointer  silent, inert  ...             realigns the prologue
+//   force_align_arg_pointer  realigns stack  ...             realigns the prologue
 //   no_caller_saved_registers  accepts      ...             accepts
-//   no_callee_saved_registers  `directive ignored`  ...     `directive ignored`
-//   preserve_none              `directive ignored`  ...     `directive ignored`
+//   no_callee_saved_registers  honours it       ...     honours it
+//   preserve_none              honours it       ...     honours it
 //   ms_struct         changes layout      ms_struct       changes layout
 //   gcc_struct        silent, is default  gcc_struct      silent, is default
 //
@@ -373,12 +373,12 @@ pub(crate) fn unimplemented_names() -> impl Iterator<Item = &'static str> {
 // ignore it like gcc does" would be wrong for one and "just refuse it" would be
 // wrong for the other:
 //
-//   * `no_callee_saved_registers` / `preserve_none` are *register-preservation*
-//     promises, not argument-passing conventions. Ignoring one costs speed and
-//     nothing else: lccc already preserves every callee-saved register, which
-//     is the stronger side of the contract, so a body compiled by lccc stays
-//     correct for a caller that relies on the attribute. gcc ignores both on
-//     this target, and the gate re-measures that every run.
+//   * `no_callee_saved_registers` / `preserve_none` change the caller's
+//     preservation obligations in GCC 16.2. `preserve_none` additionally passes
+//     x86-64 integer arguments in R12/R13 etc. Preserving extra registers in
+//     an lccc CALLEE would be safe, but an lccc CALLER must also account for
+//     a GCC callee clobbering normally preserved registers. Without function-
+//     type/call-clobber support, both attributes must be refused, not ignored.
 //   * `no_caller_saved_registers` is the opposite promise — the *callee* must
 //     not clobber caller-saved registers, and the caller may then skip saving
 //     them. lccc cannot yet prove that of a body it emits (gcc enforces it by
@@ -473,7 +473,7 @@ pub(crate) const ABI_VERDICTS: &[(&str, AbiEffect, AbiEffect)] = &[
     ("thiscall", AbiEffect::GccIgnored, AbiEffect::Unsupported),
     ("fastcall", AbiEffect::GccIgnored, AbiEffect::Implemented),
     ("sseregparm", AbiEffect::GccIgnored, AbiEffect::Unsupported),
-    ("regparm", AbiEffect::Default, AbiEffect::Implemented),
+    ("regparm", AbiEffect::GccIgnored, AbiEffect::Implemented),
     (
         "callee_pop_aggregate_return",
         AbiEffect::OnlyAvailable32Bit,
@@ -481,7 +481,7 @@ pub(crate) const ABI_VERDICTS: &[(&str, AbiEffect, AbiEffect)] = &[
     ),
     (
         "force_align_arg_pointer",
-        AbiEffect::Default,
+        AbiEffect::Unsupported,
         AbiEffect::Unsupported,
     ),
     (
@@ -491,13 +491,13 @@ pub(crate) const ABI_VERDICTS: &[(&str, AbiEffect, AbiEffect)] = &[
     ),
     (
         "no_callee_saved_registers",
-        AbiEffect::GccIgnored,
-        AbiEffect::GccIgnored,
+        AbiEffect::Unsupported,
+        AbiEffect::Unsupported,
     ),
     (
         "preserve_none",
-        AbiEffect::GccIgnored,
-        AbiEffect::GccIgnored,
+        AbiEffect::Unsupported,
+        AbiEffect::Unsupported,
     ),
     ("ms_struct", AbiEffect::Unsupported, AbiEffect::Unsupported),
     ("gcc_struct", AbiEffect::Default, AbiEffect::Default),
@@ -512,6 +512,7 @@ pub(crate) fn abi_convention(name: &str) -> &'static str {
         "ms_struct" => "Microsoft bit-field layout",
         "force_align_arg_pointer" => "a realigning prologue",
         "no_caller_saved_registers" => "the no-caller-saved-registers contract",
+        "no_callee_saved_registers" | "preserve_none" => "a non-preserving calling convention",
         "callee_pop_aggregate_return" => "a callee-pops aggregate return",
         _ => "a calling convention",
     }
@@ -573,17 +574,4 @@ pub(crate) fn is_abi_attribute(name: &str) -> bool {
 fn lookup(name: &str) -> Option<&'static (&'static str, AbiEffect, AbiEffect)> {
     let bare = canonical(name);
     ABI_VERDICTS.iter().find(|(n, _, _)| *n == bare)
-}
-
-/// Whether gcc's wording for an ignored ABI attribute is the *unknown-name*
-/// sentence (`directive ignored`) rather than the known-but-ignored one.
-///
-/// Measured: gcc answers `'preserve_none' attribute directive ignored` and
-/// `'no_callee_saved_registers' attribute directive ignored`, because neither
-/// name exists as a register contract on these targets.
-pub(crate) fn abi_gcc_directive_ignored(name: &str) -> bool {
-    matches!(
-        canonical(name),
-        "preserve_none" | "no_callee_saved_registers"
-    )
 }

@@ -2277,6 +2277,22 @@ impl Parser {
         };
         let is_32bit = target == super::attribute_registry::AbiTarget::I686;
         let spelling = super::attribute_registry::canonical(name).to_string();
+        // Even a target-ignored convention must obey the attribute grammar.
+        // Count only top-level arguments, not commas in nested expressions.
+        let expected = usize::from(matches!(
+            spelling.as_str(),
+            "regparm" | "callee_pop_aggregate_return"
+        ));
+        let found = self.abi_attribute_argument_count();
+        if found != expected {
+            self.emit_error(
+                format!("wrong number of arguments specified for '{spelling}' attribute"),
+                span,
+            );
+            self.diagnostics
+                .note(format!("expected {expected}, found {found}"), span);
+            return true;
+        }
         match effect {
             // The attribute names the convention this target already emits.
             // Applying nothing is the whole implementation, and gcc is silent
@@ -2287,11 +2303,7 @@ impl Parser {
             // explicit so a future table edit cannot silently swallow one.
             AbiEffect::Implemented => return false,
             AbiEffect::GccIgnored => {
-                let message = if super::attribute_registry::abi_gcc_directive_ignored(name) {
-                    format!("'{spelling}' attribute directive ignored")
-                } else {
-                    format!("'{spelling}' attribute ignored")
-                };
+                let message = format!("'{spelling}' attribute ignored");
                 // `explicit_only = false`: gcc emits this without being asked,
                 // and it is the only signal that the declaration is not what it
                 // looks like.
@@ -2331,6 +2343,35 @@ impl Parser {
             }
         }
         true
+    }
+
+    /// The cursor is on the attribute name; absence of parentheses means zero.
+    fn abi_attribute_argument_count(&self) -> usize {
+        if !matches!(self.peek_nth(1), TokenKind::LParen) {
+            return 0;
+        }
+        if matches!(self.peek_nth(2), TokenKind::RParen) {
+            return 0;
+        }
+        let mut count = 1;
+        let mut depth = 1usize;
+        let mut offset = 2;
+        loop {
+            match self.peek_nth(offset) {
+                TokenKind::Eof => break,
+                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
+                TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                TokenKind::Comma if depth == 1 => count += 1,
+                _ => {}
+            }
+            offset += 1;
+        }
+        count
     }
 
     /// Emit a `-Wattributes` diagnostic at the attribute's name token (the

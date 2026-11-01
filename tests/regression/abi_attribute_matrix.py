@@ -74,7 +74,14 @@ struct Q {{ char a; int b : 5; int c : 3; }};
 int rs(void) {{ return (int)sizeof(struct R); }}
 int qs(void) {{ return (int)sizeof(struct Q); }}
 """
-BODIES = {'int': INT_PROBE, 'fp': FP_PROBE, 'agg': AGG_PROBE, 'rec': REC_PROBE}
+# A leaf arithmetic body need not use any callee-saved registers. Explicit
+# clobbers expose preservation contracts without depending on register pressure.
+PRESERVE_PROBE = """\
+void {attr}f(void) {{ __asm__ volatile("" ::: "ebx", "esi", "edi"); }}
+void g(void) {{ __asm__ volatile("" ::: "ebx", "esi", "edi"); }}
+"""
+BODIES = {'int': INT_PROBE, 'fp': FP_PROBE, 'agg': AGG_PROBE,
+          'rec': REC_PROBE, 'preserve': PRESERVE_PROBE}
 RECORD_ONLY = {'ms_struct', 'gcc_struct'}
 
 # Attributes that take a mandatory integer argument, spelled the way a user
@@ -180,22 +187,30 @@ def gcc_observation(gcc: str, name: str, target: str) -> tuple[str, str]:
     diagnostics: list[str] = []
     errors: list[str] = []
     changed = False
-    probe_ids = ['rec'] if name in RECORD_ONLY else ['int', 'fp', 'agg']
+    probe_ids = ['rec'] if name in RECORD_ONLY else ['int', 'fp', 'agg', 'preserve']
     for probe_id in probe_ids:
-        source = BODIES[probe_id].format(attr=attr)
+        first, second = _pair(probe_id)
+        # Compile the SAME named function separately, changing only the
+        # attribute. Twin functions in one TU can get distinct temporary
+        # registers or IPA folding even when their ABI is identical.
+        source = '\n'.join(line for line in BODIES[probe_id].format(attr=attr).splitlines()
+                           if not re.match(rf'^(?:void|int|double|Big)\s+{second}\s*\(', line))
         rc, out, err = compile_to(gcc, source, base)
+        reference_rc, reference, reference_err = compile_to(gcc, source.replace(attr, '', 1), base)
+        if reference_rc:
+            errors.append(f'{probe_id} reference failed: {reference_err}')
+            continue
         for line in err.splitlines():
             if 'attribute' in line and ('warning:' in line or 'error:' in line):
                 diagnostics.append(line.split(': ', 2)[-1].strip())
         if rc != 0:
             errors.append(err.strip().splitlines()[0] if err.strip() else 'compile failure')
             continue
-        bodies = function_bodies(out)
-        first, second = _pair(probe_id)
-        if first not in bodies or second not in bodies:
+        bodies, references = function_bodies(out), function_bodies(reference)
+        if first not in bodies or first not in references:
             errors.append(f'{probe_id} probe bodies missing from the listing')
             continue
-        if abi_signature(probe_id, bodies[first]) != abi_signature(probe_id, bodies[second]):
+        if abi_signature(probe_id, bodies[first]) != abi_signature(probe_id, references[first]):
             changed = True
     evidence = ' | '.join(errors or diagnostics) or 'silent'
     if errors:
@@ -211,6 +226,7 @@ def gcc_observation(gcc: str, name: str, target: str) -> tuple[str, str]:
 def _pair(probe_id: str) -> tuple[str, str]:
     return {
         'int': ('f', 'g'),
+        'preserve': ('f', 'g'),
         'fp': ('h', 'k'),
         'agg': ('ha', 'ka'),
         'rec': ('rs', 'qs'),
@@ -344,9 +360,7 @@ def check_lccc(verdicts: dict[tuple[str, str], str]) -> tuple[list[tuple], list[
                 failures.append((f'abi:{name}/{target}', 'Default must be silent',
                                  '', (proc.returncode, diag)))
         elif verdict == 'GccIgnored':
-            want = (f"'{name}' attribute directive ignored"
-                    if name in ('preserve_none', 'no_callee_saved_registers')
-                    else f"'{name}' attribute ignored")
+            want = f"'{name}' attribute ignored"
             if proc.returncode != 0 or want not in proc.stderr:
                 failures.append((f'abi:{name}/{target}', 'gcc wording not reproduced',
                                  want, (proc.returncode, diag)))
@@ -371,6 +385,17 @@ def check_lccc(verdicts: dict[tuple[str, str], str]) -> tuple[list[tuple], list[
                                  'escape hatch does not downgrade the refusal',
                                  'warning + success',
                                  (again.returncode, first_diag(again.stderr))))
+    # The convention funnel must not swallow malformed argument lists, even
+    # for an ignored/default convention. Exercise both GNU attribute spellings.
+    for target in ('x86-64', 'i686'):
+        for spelling in ('sysv_abi(1)', 'cdecl(1)', 'ms_abi(1)',
+                         'regparm()', 'regparm(1,2)', 'regparm'):
+            for attr in (f'__attribute__(({spelling}))', f'[[gnu::{spelling}]]'):
+                proc, _ = _syntax_only(_driver(), f'int {attr} f(void);',
+                                       _arch_flags(target), ENV)
+                if proc.returncode == 0:
+                    failures.append((f'abi:arity/{target}', 'malformed attribute accepted',
+                                     'nonzero exit', attr))
     sentinel_failures, sentinel_notes = check_sentinels()
     return failures + sentinel_failures, notes + sentinel_notes
 

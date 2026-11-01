@@ -1476,6 +1476,13 @@ impl Preprocessor {
             self.system_include_paths
                 .insert(at, sysroot_candidate("/usr/include/i386-linux-gnu"));
         }
+        // Debian multilib shares macro-selected libc/kernel headers under the
+        // x86-64 tuple. Admit that tree only when its explicit 32-bit glibc
+        // support marker exists; a pure 64-bit installation is not a fallback.
+        let multilib = sysroot_candidate("/usr/include/x86_64-linux-gnu");
+        if multilib.join("gnu/stubs-32.h").is_file() {
+            self.system_include_paths.push(multilib);
+        }
     }
 
     /// Insert architecture-specific include paths, keeping the bundled include
