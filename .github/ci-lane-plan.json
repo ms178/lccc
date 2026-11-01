@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 446.02,
+      "predicted_gate_seconds": 448.02,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -378,6 +378,10 @@
         {
           "measured_s": 1.34,
           "name": "bash tests/regression/check_phi_acyclic_order.sh"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "bash tests/regression/check_predicate_materialize.sh"
         }
       ]
     },
