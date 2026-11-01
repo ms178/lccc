@@ -1097,7 +1097,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 285.78,
+      "predicted_gate_seconds": 276.56,
       "shards": 3,
       "steps": [
         {
@@ -1283,17 +1283,13 @@
         {
           "measured_s": 2.35,
           "name": "Multiline comment and splice translation phases"
-        },
-        {
-          "measured_s": 9.22,
-          "name": "Microsoft x64 scalar, record and variadic ABI interoperability and unwind contracts"
         }
       ]
     },
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 270.0,
+      "predicted_gate_seconds": 279.22,
       "shards": 3,
       "steps": [
         {
@@ -1475,6 +1471,10 @@
         {
           "measured_s": 0.25,
           "name": "Verify restored linker oracle versions"
+        },
+        {
+          "measured_s": 9.22,
+          "name": "Microsoft x64 scalar, record and variadic ABI interoperability and unwind contracts"
         }
       ]
     },
