@@ -53,6 +53,22 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       GCC_TORTURE_JOBS: '2'
       GCC_BIN: gcc-16
+      # The reference compiler is GCC 16.2 EXACTLY, delivered from the tag cache
+      # by ci_install_gcc_oracle.sh below, not whatever `gcc-16` the runner image
+      # happens to package (16.0.1 on ubuntu-24.04). The campaign's per-test
+      # identities were measured against 16.2, so a rolling oracle would leave
+      # every report comparing against a version no document claims. The driver
+      # asserts this value at the point of use as well, so the pin survives a
+      # provisioning step that silently fails to shadow `gcc-16`.
+      GCC_TORTURE_GCC_VERSION: '16.2'
+      # A full corpus has candidate failures today (the campaign record
+      # inventories 49 x86-64 / 48 i686 compile-leg gaps, and known gap 1 says
+      # the per-test inventory is the deliverable). The driver publishes those
+      # -- both files are uploaded as this lane's artifact -- and keeps the lane
+      # green on runner exit 1, while exit 2 (all-skipped, reference preflight,
+      # mid-flight input drift) is still fatal. Flip to strict by removing this
+      # line once a baseline inventory is checked in.
+      GCC_TORTURE_ADVISORY_FAILURES: '1'
       GCC_TORTURE_FLAGS: ${{ inputs.flags }}
       GCC_TORTURE_FILTER: ${{ inputs.filter }}
       GCC17_TORTURE_REF: ${{ inputs.ref }}
@@ -79,13 +95,45 @@ jobs:
           key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
       - name: Provision GCC 16 multilib and cached oracle toolchain
         run: bash scripts/ci_provision_toolchain.sh --multilib
-      - name: Verify GCC 16 and i686 multilib
-        run: bash scripts/ci_verify_oracles.sh
+      # The pin has to be DELIVERED, not merely asserted (the same lesson as run
+      # 39822157492 in ci.yml): this image's `gcc-16` is 16.0.1, while the
+      # torture reports are compared against GCC 16.2. The tag cache's
+      # relocatable 16.2 prefix ships its own 32-bit libgcc, and it only shadows
+      # `gcc-16`/`g++-16` -- `gcc` keeps meaning the provisioned multilib driver
+      # that `-m32` eligibility probes need.
+      - name: Cache the GCC 16.2 oracle
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc/gcc-oracle
+          key: lccc-gcc-oracle-${{ runner.os }}-16.2-${{ hashFiles('scripts/ci_install_gcc_oracle.sh') }}
+      - name: Install the GCC 16.2 oracle
+        run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
+      - name: Verify GCC 16.2 and i686 multilib
+        run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2
       - name: Download compiler artifacts
         uses: actions/download-artifact@v8
         with:
-          name: lccc-fast-${{ github.sha }}
+          name: lccc-fast-binaries-${{ github.sha }}
           path: target/fastbuild
+      # Why this step exists, and why it is not in the other lanes: ci.yml and
+      # bench.yml ship `lccc-fast.tar.gz`, whose member modes survive `tar -xzf`,
+      # so extraction *is* their mode restoration. This lane uploads the six
+      # binaries as bare artifact paths and `actions/upload-artifact` stores
+      # content only -- the download arrives at 0644. The corpus driver's first
+      # guard is `[[ -x $compiler ]]`, so without this line the job dies in
+      # under a second with "compiler not executable" and publishes no reports
+      # (the artifact-upload step then reports the missing results directory).
+      - name: Restore the compiler executables' mode bits
+        run: |
+          set -euo pipefail
+          chmod +x target/fastbuild/lccc target/fastbuild/lccc-x86 \
+            target/fastbuild/lccc-arm target/fastbuild/lccc-riscv \
+            target/fastbuild/lccc-i686 target/fastbuild/lccc-ld
+          for binary in target/fastbuild/lccc target/fastbuild/lccc-x86 \
+            target/fastbuild/lccc-arm target/fastbuild/lccc-riscv \
+            target/fastbuild/lccc-i686 target/fastbuild/lccc-ld; do
+            [ -x "$binary" ] || { echo "::error title=Compiler artifact::not executable: $binary"; exit 1; }
+          done
       - name: Verify compiler artifact identity
         run: |
           set -euo pipefail
