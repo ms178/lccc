@@ -482,7 +482,11 @@ pub(crate) const ABI_VERDICTS: &[(&str, AbiEffect, AbiEffect)] = &[
         AbiEffect::GccIgnored,
         AbiEffect::GccIgnored,
     ),
-    ("preserve_none", AbiEffect::GccIgnored, AbiEffect::GccIgnored),
+    (
+        "preserve_none",
+        AbiEffect::GccIgnored,
+        AbiEffect::GccIgnored,
+    ),
     ("ms_struct", AbiEffect::Unsupported, AbiEffect::Unsupported),
     ("gcc_struct", AbiEffect::Default, AbiEffect::Default),
 ];
@@ -566,5 +570,8 @@ fn lookup(name: &str) -> Option<&'static (&'static str, AbiEffect, AbiEffect)> {
 /// `'no_callee_saved_registers' attribute directive ignored`, because neither
 /// name exists as a register contract on these targets.
 pub(crate) fn abi_gcc_directive_ignored(name: &str) -> bool {
-    matches!(canonical(name), "preserve_none" | "no_callee_saved_registers")
+    matches!(
+        canonical(name),
+        "preserve_none" | "no_callee_saved_registers"
+    )
 }

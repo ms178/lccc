@@ -2252,7 +2252,7 @@ impl Parser {
     /// parsed without applying, so a caller and a callee could disagree about
     /// where every argument lives and still link.
     fn attribute_abi_effect(&mut self, name: &str, span: crate::common::source::Span) -> bool {
-        use super::attribute_registry::{abi_effect, abi_target, AbiEffect, AbiPlacement};
+        use super::attribute_registry::{AbiEffect, AbiPlacement, abi_effect, abi_target};
         // Cheap rejection first: an attribute that is not a convention must
         // not pay for a target lookup.
         if !super::attribute_registry::is_abi_attribute(name) {
