@@ -1840,7 +1840,10 @@ jobs:
     - name: Verify basic-block SLP v5 contracts
       env:
         CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_bb_slp_v5_codegen.sh
+      run: |
+        set -euo pipefail
+        bash tests/regression/check_bb_slp_v5_codegen.sh
+        bash tests/regression/check_slp_dword_constants.sh
     - name: Verify basic-block SLP v7 contracts
       env:
         CCC: target/fastbuild/lccc

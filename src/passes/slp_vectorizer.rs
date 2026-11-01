@@ -6429,19 +6429,13 @@ fn apply_plan(
                 dest_ptr: None,
                 args: vec![
                     Operand::Value(vec_dest[*lhs]),
-                    // Integer dword arithmetic already accepts a lane constant
-                    // as its r/m operand. Keep it literal instead of forcing a
-                    // broadcast register (DCE retires an otherwise unused splat).
-                    // Other lane sizes must retain their own width semantics.
                     match &plan.packs[*rhs].kind {
                         PackKind::Splat {
                             src: Operand::Const(c),
                             ..
-                        } if matches!(cand.ty, IrType::I32 | IrType::U32)
-                            && c.to_i64().is_some() =>
-                        {
-                            Operand::Const(IrConst::I32(c.to_i64().unwrap() as i32))
-                        }
+                        } => dword_rhs_literal(*vec_op, cand.ty, c, x86_sse41_available_pub())
+                            .map(Operand::Const)
+                            .unwrap_or(Operand::Value(vec_dest[*rhs])),
                         _ => Operand::Value(vec_dest[*rhs]),
                     },
                 ],
@@ -6834,9 +6828,104 @@ fn rewrite_term_uses_in_place(term: &mut Terminator, map: &FxHashMap<u32, Value>
     });
 }
 
+/// Only emit literal lanes for consumers whose lowering explicitly supports
+/// them. The SSE2 multiply fallback loads vector values/addresses, not splats:
+/// passing the multiplier as a literal would dereference it as an address.
+/// Preserve the register-only all-ones idiom instead of introducing a pool read.
+fn dword_rhs_literal(op: IntrinsicOp, ty: IrType, c: &IrConst, sse41: bool) -> Option<IrConst> {
+    use IntrinsicOp::*;
+    if !matches!(ty, IrType::I32 | IrType::U32) {
+        return None;
+    }
+    let value = match c {
+        IrConst::I8(v) => *v as i32,
+        IrConst::I16(v) => *v as i32,
+        IrConst::I32(v) => *v,
+        IrConst::I64(v) => *v as i32,
+        IrConst::Zero => 0,
+        _ => return None,
+    };
+    let supported = matches!(
+        op,
+        VecAddI32x4
+            | VecAddI32x8
+            | VecSubI32x4
+            | VecSubI32x8
+            | VecAndI32x4
+            | VecAndI32x8
+            | VecOrI32x4
+            | VecOrI32x8
+            | VecXorI32x4
+            | VecXorI32x8
+            | VecMulI32x8
+    ) || (op == VecMulI32x4 && sse41);
+    (supported && value != -1).then_some(IrConst::I32(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_rhs_requires_a_supporting_consumer_and_exact_dword_width() {
+        for sse41 in [false, true] {
+            assert_eq!(
+                dword_rhs_literal(
+                    IntrinsicOp::VecMulI32x4,
+                    IrType::U32,
+                    &IrConst::I32(1664525),
+                    sse41
+                )
+                .is_some(),
+                sse41
+            );
+            assert!(
+                dword_rhs_literal(
+                    IntrinsicOp::VecXorI32x4,
+                    IrType::U32,
+                    &IrConst::I64(0xffff_ffff),
+                    sse41
+                )
+                .is_none()
+            );
+            assert!(
+                dword_rhs_literal(
+                    IntrinsicOp::VecAddI32x4,
+                    IrType::U64,
+                    &IrConst::I32(17),
+                    sse41
+                )
+                .is_none()
+            );
+            assert!(
+                dword_rhs_literal(
+                    IntrinsicOp::VecMulI64x2,
+                    IrType::I32,
+                    &IrConst::I32(17),
+                    sse41
+                )
+                .is_none()
+            );
+            assert!(
+                dword_rhs_literal(
+                    IntrinsicOp::VecAddI32x4,
+                    IrType::I32,
+                    &IrConst::F32(17.0),
+                    sse41
+                )
+                .is_none()
+            );
+        }
+        assert!(matches!(
+            dword_rhs_literal(
+                IntrinsicOp::VecAddI32x4,
+                IrType::U32,
+                &IrConst::I64(0x1_8000_0001),
+                false
+            ),
+            Some(IrConst::I32(-2147483647))
+        ));
+    }
 
     #[test]
     fn unsigned_dword_minmax_requires_exact_order_width_and_isa() {

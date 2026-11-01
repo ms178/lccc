@@ -2580,6 +2580,9 @@ gate "bb-slp-v4" fast \
 gate "bb-slp-v5" fast \
     bash tests/regression/check_bb_slp_v5_codegen.sh
 
+gate "slp-dword-constants" fast \
+    bash tests/regression/check_slp_dword_constants.sh
+
 # BB-SLP v6: the 128-bit VEX memory fold, FP negation (one-instruction
 # sign-mask composite), integer min/max folds, the general cmp+blendv
 # composite, and the rule-(b) cross-block relaxation; plus the W5
