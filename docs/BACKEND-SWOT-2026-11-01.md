@@ -89,7 +89,8 @@ monolith where adding one pass means editing a 8k–25k-line file.
 - Size makes regressions cheap to introduce and slow to bisect; the kill-switch
   set is the mitigation and it is already 37 entries wide.
 - Any refactor touching shared helpers (`x86_common.rs`, `inline_asm.rs`) hits
-  both x86 back ends at once — as the `reg_to_8l` finding in §5.2 shows.
+  both x86 back ends at once — as the `%b`/`%h` register-allocator defect in
+  §5.2 shows, which needed a different answer on each of them.
 
 ### 3.2 i686
 
@@ -115,8 +116,10 @@ monolith where adding one pass means editing a 8k–25k-line file.
 - Byte-register pressure: the six-register pool (`ecx, edx, esi, edi, eax, ebx`)
   contains three registers (`esi`, `edi`, `ebp`) with **no 8-bit low form** on
   IA-32, while the shared `x86_common::reg_to_8l` only knows the 64-bit
-  spellings (`rsi→sil`). See §5.2 — a live defect on the `%b`/`%h` template path
-  and on byte-typed operand stores.
+  spellings (`rsi→sil`). Fixed in §5.2 by restricting byte-printed,
+  byte-typed and `=@cc` operands to the four byte-addressable registers before
+  allocation, but the pressure itself remains: four is the ceiling, so a fifth
+  byte operand is unallocatable by construction (as it is in GCC).
 - No `-mregparm`/`fastcall` argument-passing clean-up of the kind x86-64 gets for
   free (SysV has enough registers that the problem never appears).
 
@@ -276,19 +279,80 @@ targets, and both `gcc` (x86 precedent: `unknown 'asm' flag output`) and clang
 (`invalid output constraint '=@ccz'`) refuse the operand. Implementing it would
 mean inventing a condition the ISA does not have.
 
-### 5.2 Defect found, not yet fixed (documented here, tracked in §6)
+### 5.2 Fixed: `%b`/`%h` operands could be given a register that cannot print them
 
-`x86_common::reg_to_8l` maps 64-bit names (`rsi→sil`, `rdi→dil`) but passes
-32-bit-only names through unchanged. i686 allocates asm operands from
-`ecx, edx, esi, edi, eax, ebx` (`i686/codegen/asm_emitter.rs::assign_scratch_reg`),
-and `esi`/`edi` have **no 8-bit low form** in IA-32, so `%b1` on such an operand
-(and any `char`/`unsigned char` operand whose default modifier is `b`) prints
-`%esi`, which the assembler rejects. This is a hard error, not a silent
-miscompile, which is why it survived: the tests that exercise `%b` all land in
-`ecx`/`edx`. The fix is allocation-side (do not hand a byte-typed operand a
-register without a byte view) plus store-side staging for the `=@cc`/narrow-store
-paths; it is deliberately kept out of this change so that the flag-output fix can
-be validated in isolation.
+**The defect.** An `asm` template names operands through modifiers, and two of
+them ask for a *narrower view* of the register than the operand's natural width.
+`%b<n>` asks for the low byte; on x86-64 every general register has one (`sil`,
+`dil`, `bpl`, `spl` and `r8b`-`r15b` are REX encodings), but on IA-32 only
+`al`, `bl`, `cl` and `dl` are byte-addressable -- `esi`, `edi` and `ebp` have no
+8-bit form under *any* name. `%h<n>` asks for the high byte, which exists only
+for `rax`/`rbx`/`rcx`/`rdx` (`ah`, `bh`, `ch`, `dh`) on both x86 targets;
+`x86_common::reg_to_8h` answers every other register with its *low* byte name.
+
+Neither fact was visible to the allocator. `assign_scratch_reg` walks the
+general pool and hands out the next free register, so on i686 the third
+byte-printed operand got `esi`, `reg_to_8l` passed the name through unchanged
+(correctly -- there is no mapping to invent), the template printed `%esi`, and
+the assembler rejected `movb %esi ...`. On x86-64 a `%h` operand could be given
+`rsi`, and `reg_to_8h` printed `%sil`: the **low** byte where the template asked
+for the high one, i.e. silent wrong code, not a build error.
+
+The constraint string cannot express either requirement, so the template is the
+only place it is written down.
+
+**The fix.** `inline_asm::operand_reg_views` parses the dialect-expanded
+template once, before any register is assigned, and reports per operand whether
+it is printed through the low byte, the high byte, or its natural width. It
+handles `%%` literals, `[name]` operands, multi-digit indices and saturating
+numeric parse; a reference it cannot attribute leaves the operand at its natural
+width, i.e. exactly the previous behaviour; `%h` dominates `%b` for the same
+operand because it is the stricter of the two.
+
+The `InlineAsmEmitter` trait grew two methods with deliberately conservative
+defaults, so AArch64 and RISC-V -- where `%w0`/`%x0` are width names for one
+uniform register file -- are byte-for-byte unaffected:
+
+| hook | i686 | x86-64 |
+|---|---|---|
+| `assign_scratch_reg_for_view` | byte-printed, `I8`/`U8`-typed and `=@cc` operands are allocated from `ecx, edx, eax, ebx` only, with the general pool's two-pass "avoid RA homes, then take them" policy and its `-fPIC` reservation of `ebx` | forwards to `assign_scratch_reg`; the high-byte view is routed to the existing `QReg` class, which *is* the four legacy registers |
+| `home_reg_usable_for_view` | a home is reusable only if it is one of those four | a home is reusable unless the view is the high byte and the home is not `rax`/`rbx`/`rcx`/`rdx` |
+
+`assign_one_scratch` takes the view list as one more argument and
+`assign_scratch_registers` threads it through both allocation passes, so the
+"the input is already fresh in a register, use it in place" shortcut is gated
+too: a home without the required view is copied to a scratch register that has
+it, instead of being printed through a name that does not exist.
+
+**Why allocation-side rather than store-side staging.** The alternative -- keep
+handing out `esi` and stage the narrow access through a `pushl %eax` /
+`movl %esi, %eax` / `movb %al, ...` / `popl %eax` sequence -- is always correct
+(no `push`/`pop`/`mov` writes flags), but it costs three extra instructions on
+the hot path of every byte operand and leaves the template's own `%b<n>` text
+unfixable: the substitution layer has no instruction stream to inject a move
+into. Allocation-side is also what GCC's i386 port does, and it is one decision
+in one place instead of a rule every store path must remember.
+
+**Known limit, unchanged.** A bare `r`/`q` operand whose template is a *single*
+character modifier (`%b`, `%h`) with an implicit `0` is not valid GCC asm either;
+the allocator cannot restrict a register for a modifier it cannot see. For
+i686 `%h` specifically, any of the four byte registers prints a real high byte,
+and `ah`-`dh` are all legal operands, so the emission is valid whenever a byte
+register was allocated.
+
+**Evidence.** Unit tests cover the parser (modifiers, `%%`, named and multi-digit
+operands, strictest-use, totality on malformed and out-of-range input) and both
+overrides (i686 never leaves the four byte registers for a byte view, a byte
+type or a `=@cc` output, still reaches `esi`/`edi`/`eax`/`ebx` for full-width
+operands, and only accepts byte-addressable homes; x86-64 restricts `%h` to the
+legacy four and leaves `%b` unrestricted).
+`tests/regression/check_asm_flag_outputs.sh` adds two assembly-level assertions:
+`%h2` on x86-64 must print a real high byte, and the third `%b` operand on i686
+must be a byte register with no `%esi`/`%edi`/`%ebp` in any `movb` of that
+function. The GCC oracle used to derive the expected behaviour was
+`gcc -m32 -O2 -S` on four `char` outputs with `"=q"`/`%b0..%b3`, which prints
+`movb %dl,%dl`, `movb %cl,%cl`, `movb %al,%al`, `movb %bl,%bl` -- the four
+legacy registers in that order, never `esi`/`edi`.
 
 ## 6. Ranked cross-pollination backlog
 
@@ -297,7 +361,7 @@ and the mechanism.
 
 | # | item | donor → recipient | impact | risk | notes |
 |---|---|---|---|---|---|
-| 1 | byte-register-safe asm operand allocation (§5.2) | x86-64 semantics → i686 | hard error removed on `%b`/`%h`, byte outputs | medium | needs a typed `assign_scratch_reg` hook; i686 is a priority target |
+| 1 | ~~byte-register-safe asm operand allocation~~ (§5.2) | x86-64 semantics → i686 | **done** — hard error on `%b`/`%h`, wrong-byte `%h` on x86-64 | medium | landed as `operand_reg_views` + two `InlineAsmEmitter` hooks |
 | 2 | `else_hoist_diamonds` | i686 → AArch64, RISC-V | shrinks every if/else region | medium | pure CFG rewrite; needs a scheduler that can undo fall-through |
 | 3 | `thread_trivial_blocks` / `merge_duplicate_epilogues_terminal` | i686 → AArch64, RISC-V | removes `b`→`b` trampolines and duplicate returns | low | RISC-V already has `fuse_branch_over_jump`; reuse its range checks |
 | 4 | `eliminate_unused_callee_saves` / `eliminate_dead_frame_allocation` | i686 → AArch64 | shrinks prologue/epilogue of every leaf-ish function | low | AArch64 prologue is simpler than i686's; slot model already shared |
