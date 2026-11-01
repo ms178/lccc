@@ -485,10 +485,7 @@ impl ArmCodegen {
             let dest_name = callee_saved_name(dest_phys);
             let dest_name_32 = callee_saved_name_32(dest_phys);
 
-            if matches!(
-                op,
-                IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle
-            ) {
+            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle) {
                 if self.emit_bit_modify_into(op, dest_phys, lhs, rhs, ty) {
                     self.state.reg_cache.invalidate_acc();
                     return;
