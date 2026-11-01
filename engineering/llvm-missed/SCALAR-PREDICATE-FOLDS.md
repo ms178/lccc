@@ -233,13 +233,21 @@ operand ring. A window that starts below zero therefore stores its lower bound
 window as ~2^64 values wide and refused it. That is why `x > 3 && x < 10` folded
 and `x > -8 && x < 8` did not: same pass, same shape, one negative constant.
 
-`Interval::width` now counts the span in the operand ring (`(upper - lower) mod
-2^W + 1`), which gives 15 for `[-7, 7]`, 0 for an inverted window
-(`[-5, -9]`), and leaves the `> 2^31-1` refusal to `emit` as before. All eight
-mixed-strictness combinations of `> -8 / >= -7 / < 8 / <= 7` now fold to the same
-biased compare (`leal 7(%rdi); cmpl $15; setb`), and the gate's brute-force
-sweep — which previously skipped every such window by the same guard — now
-asserts them.
+`Interval::width` now counts the span **in the comparison's own domain** —
+sign-extended bounds for a signed window, plain unsigned for an unsigned one.
+That is the whole subtlety, and getting it half right is a miscompile rather
+than a missed fold: the signed window `[-7, 7]` and the unsigned predicate
+`x >= 0xFFFF_FFF7u && x <= 10u` store the *same* masked bound pair, yet the
+first has 15 values and the second has none. Counting the span around the ring
+fabricates a 20-value window that accepts both `0..10` and
+`0xFFFF_FFF7..0xFFFF_FFFF` — the phantom window `range_fold_branch.c` A11
+reproduces live, at u32 and u64 width, which the SSA corpus caught on this
+branch before it landed. A signed interval is contiguous in the ring, so
+`emit`'s `(x - L) < width` stays exact; an unsigned inverted pair is empty and
+`emit` refuses it. All eight mixed-strictness combinations of
+`> -8 / >= -7 / < 8 / <= 7` fold to the same biased compare
+(`leal 7(%rdi); cmpl $15; setb`), and the gate's brute-force sweep — which
+previously skipped every such window by the old guard — now asserts them.
 
 ### 9. Truncated negate — `negcast`
 
@@ -333,11 +341,11 @@ accident.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --profile fastbuild --locked --lib` | **7,160 passed, 0 failed, 10 ignored** |
+| `cargo test --profile fastbuild --locked --lib` | **7,161 passed, 0 failed, 10 ignored** |
 | `check_predicate_differences_and_ranges.py` | PASS — values at `-O0`…`-O3`, per-fold mechanism, five controls, attribution, GCC 16.2 length oracle (1.7 s) |
 | `check_lowest_set_bit_fold.sh` | PASS — both widths, both arms of the zero select, plain forms pinned at ≤5/≤6 |
 | `check_narrow_negate_fold.sh` | PASS — `negcast` ownership, `zeroneg` shapes, widening/float controls, the untouched widths pinned exactly, `-O0`…`-O3` + both switches + GCC agree on a 65,536-row checksum |
-| `Interval::width` unit tests | crossing window `[-7, 7]` = 15, inverted `[-5, -9]` = 0, `[7, 7]` = 1, 64-bit span unchanged |
+| `Interval::width` unit tests | crossing window `[-7, 7]` = 15, inverted `[-5, -9]` = 0, `[7, 7]` = 1, unsigned wrapping window (`u32` and `u64`) refused, brute-force sweeps at every signed width |
 | `check_mask_and_interval_folds.py` | PASS (0.6 s) |
 | Exhaustive matcher tests | 8/16-bit rings brute-forced for interval and membership; 32/64-bit boundary sweeps; refusal tables |
 | Corpus A/B, 3,016 `tests/**/*.c` | **27 files shorter, 0 longer, net −147 instructions** with the three passes on versus off |
