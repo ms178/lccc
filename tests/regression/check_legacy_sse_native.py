@@ -19,6 +19,27 @@ def run(command):
     return result.stdout
 
 
+def host_links_i386(gcc):
+    """True when the oracle can link a `-m32` program on this host.
+
+    The legs below *execute* 32-bit binaries and link them with the oracle, so
+    a host without the 32-bit startup files and libc cannot measure them at
+    all. Skipping them is the honest answer; pretending they passed is not,
+    and blaming lccc for them is worse -- measured on the campaign image,
+    where `gcc-16 -m32` stops at `cannot find crti.o`.
+    """
+    with tempfile.TemporaryDirectory(prefix='i386-link-probe-') as directory:
+        source = Path(directory) / 'probe.c'
+        binary = Path(directory) / 'probe'
+        source.write_text('int main(void) { return 0; }\n')
+        try:
+            proc = subprocess.run([str(gcc), '-m32', str(source), '-o', str(binary)],
+                                  capture_output=True, timeout=90)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return proc.returncode == 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--lccc', default=os.environ.get('CCC', str(ROOT / 'target/fastbuild/lccc')))
@@ -51,7 +72,13 @@ def main():
                     if not 0 < count <= ceiling:
                         raise RuntimeError(f'{name}/{flags}: {count} instructions exceeds {ceiling}')
                     print(f'PASS codegen {name}/{flags}: {count} <= {ceiling}', flush=True)
+        can_link_i386 = host_links_i386(args.gcc)
+        if not can_link_i386:
+            print('  skip -m32: this host cannot link or run 32-bit programs '
+                  '(the oracle fails the same link)', flush=True)
         for mode in ('-m32', '-m64'):
+            if mode == '-m32' and not can_link_i386:
+                continue
             for opt in ('-O0', '-O2'):
                 for profile, flags in profiles.items():
                     base = [mode, opt, '-ffp-contract=off', *flags]
@@ -74,7 +101,11 @@ def main():
                                                f'{output!r} != GCC {expected!r}')
                         legs += 1
                     print(f'PASS {mode} {opt} {profile}: all four caller/provider directions', flush=True)
-    print(f'PASS: {legs} native packed arithmetic ABI/runtime legs, zero skips')
+    if can_link_i386:
+        print(f'PASS: {legs} native packed arithmetic ABI/runtime legs, zero skips')
+    else:
+        print(f'PASS: {legs} native packed arithmetic ABI/runtime legs (i686 legs skipped: '
+              f'this host cannot link 32-bit programs)')
     # Exercise the separate native type-punning/cross-family vector-SSA
     # contract in this already measured SIMD gate (no additional CI shard).
     checker = ROOT / 'tests/regression/check_native_vector_bitcasts.py'

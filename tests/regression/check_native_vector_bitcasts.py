@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 
@@ -17,14 +18,41 @@ def run(command):
     return result.stdout
 
 
+def host_links_i386(gcc):
+    """True when the oracle can link a `-m32` program here.
+
+    The `-m32` legs link and then *run* 32-bit executables, so a host without
+    the 32-bit startup files cannot measure them. Skipping them is honest;
+    reporting them as failures blames lccc for the image.
+    """
+    with tempfile.TemporaryDirectory(prefix='i386-link-probe-') as tmp:
+        source = Path(tmp) / 'probe.c'
+        source.write_text('int main(void) { return 0; }\n')
+        try:
+            proc = subprocess.run([str(gcc), '-m32', str(source), '-o', str(Path(tmp) / 'probe')],
+                                  capture_output=True, timeout=90)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return proc.returncode == 0
+
+
 def main():
     lccc = os.environ.get('CCC', str(ROOT / 'target/fastbuild/lccc'))
-    gcc = os.environ.get('GCC', '/home/user/bin/gcc-oracle')
+    # `$GCC` is how the CI harness names the pinned oracle. Falling back to a
+    # hard-coded home directory made this gate unrunnable anywhere else, and a
+    # silent `-m32`-less default would have hidden the fact that nothing ran.
+    gcc = os.environ.get('GCC') or shutil.which('gcc-16') or shutil.which('gcc')
+    if not gcc:
+        raise SystemExit('check_native_vector_bitcasts: no gcc oracle found (set GCC)')
     modes = [('-m32', ('sse2',)), ('-m64', ('sse2', 'avx2'))]
+    can_link_i386 = host_links_i386(gcc)
     legs = 0
     with tempfile.TemporaryDirectory(prefix='native-vector-bitcast-') as tmp:
         tmp = Path(tmp)
         for mode, profiles in modes:
+            if mode == '-m32' and not can_link_i386:
+                print('  skip -m32: this host cannot link or run 32-bit programs', flush=True)
+                continue
             for profile in profiles:
                 flags = ['-O2', '-ffp-contract=off']
                 flags += ['-msse2', '-mno-avx'] if profile == 'sse2' else ['-mavx2']
@@ -58,7 +86,11 @@ def main():
                         raise RuntimeError(f'{symbol}/{profile}: type-pun lowered to an out-of-line copy')
                 legs += 2
                 print(f'PASS output/ISA/ABI {mode}/{profile}', flush=True)
-    print(f'PASS: {legs} independent native vector-bitcast executable comparisons')
+    if can_link_i386:
+        print(f'PASS: {legs} independent native vector-bitcast executable comparisons')
+    else:
+        print(f'PASS: {legs} independent native vector-bitcast executable comparisons '
+              f'(i686 legs skipped: this host cannot link 32-bit programs)')
 
 
 if __name__ == '__main__':
