@@ -127,3 +127,19 @@ for case in wrong_start_type wrong_copy_type extra_end missing_start sysv_contex
   done
 done
 echo 'PASS Microsoft variadic malformed cursors/arity/context rejected in syntax-only and code-generation modes'
+
+cat > "$tmp/homes.c" <<'C'
+__attribute__((ms_abi)) long named_four(long a,long b,long c,long d,...) {
+    __builtin_ms_va_list ap;
+    __builtin_ms_va_start(ap,d);
+    long v=__builtin_va_arg(ap,long);
+    __builtin_ms_va_end(ap);
+    return a+b+c+d+v;
+}
+C
+"$CCC" -O2 -mno-sse -mno-sse2 -S "$tmp/homes.c" -o "$tmp/homes.s"
+if grep -Eq 'movq[[:space:]]+%(rcx|rdx|r8|r9),[[:space:]]+(16|24|32|40)\(%rbp\)' "$tmp/homes.s"; then
+    echo 'FAIL named Microsoft argument home slots were needlessly saved' >&2
+    exit 1
+fi
+echo 'PASS Microsoft variadic fixed slots omitted from home saves (including no-SSE emission)'

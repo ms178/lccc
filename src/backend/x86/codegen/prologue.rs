@@ -3514,7 +3514,14 @@ impl X86Codegen {
             // The caller supplies these four contiguous 8-byte home slots.
             // Unnamed FP values are duplicated in the corresponding GP regs;
             // no SysV register-save area or AL-based XMM census belongs here.
-            for (slot, reg) in ["rcx", "rdx", "r8", "r9"].iter().enumerate() {
+            // va_start begins after ALL fixed IR parameters (including an
+            // implicit sret pointer). Named slots can never be consumed by
+            // this cursor; only save registers carrying unnamed arguments.
+            for (slot, reg) in ["rcx", "rdx", "r8", "r9"]
+                .iter()
+                .enumerate()
+                .skip(func.params.len().min(4))
+            {
                 self.state
                     .out
                     .emit_instr_reg_rbp("    movq", reg, 16 + slot as i64 * 8);
