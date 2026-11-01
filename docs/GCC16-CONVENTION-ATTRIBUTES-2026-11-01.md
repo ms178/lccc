@@ -125,3 +125,48 @@ gate, which both CI mirrors run):
 
 The registry's "known but not applied" inventory drops the thirteen names that
 no longer belong to it, and the shell gate pins the new classes end to end.
+
+## How the gate itself is kept honest
+
+A gate that reports PASS while measuring nothing is worse than no gate, so the
+matrix is held to the same standard as the compiler it polices.
+
+**The oracle is pinned, not whatever gcc is installed.** `ORACLE_GCC = (16, 2)`
+is the release every cell was measured on. On that release — or a newer one — a
+disagreement is a failure; on an older gcc it is a note that names both
+verdicts. This is not leniency, it is the only behaviour that can be correct:
+gcc changes its mind about these names between releases (measured: `regparm` is
+silent on x86-64 in 12.2 and emits `'regparm' attribute ignored` in 16.2), so a
+table that followed the local gcc would flap instead of pinning a contract,
+while a developer on an older release would see a red gate that no code change
+could fix. Detection of oracle drift is unaffected — a *newer* gcc is still
+checked strictly, which is how a future release changing a verdict gets caught.
+
+**Every probe is bounded in wall-clock time.** Compiles get 120 s, links 60 s,
+executed sentinels 30 s. A hung or thrashing compiler used to consume the job's
+multi-hour budget and report nothing at all; now a timeout is a *failure with a
+reason*, and a missing binary is a 127 result rather than a traceback. Gate
+scripts must never crash, because a crash names no cell.
+
+**A mismatch carries its evidence.** `verdict disagrees with gcc` alone names a
+cell but no cause, which is unactionable from a check annotation where the log
+is not readable. The observation now carries the two ABI signatures that
+differ — `attr=[...] plain=[...]` — so the annotation usually names the
+convention that changed.
+
+**One resolved compiler per run.** The gate takes the driver and the oracle from
+its caller (`LCCC`, `GCC`) instead of guessing a second path internally: two
+independent guesses could measure one binary and name another.
+
+**The census ratchet cannot lie about itself.** `scripts/audit_census.py` now
+asserts that `knob_literals` equals `len(knob_names)` — two views of one set. A
+baseline that disagrees with itself makes a metric look like it grew while every
+diagnostic that explains a growth stays silent, which is exactly how a phantom
+CI failure cost a cycle; `--check` and `--update` both refuse such an artefact
+now, and a growth line names the new knob inline.
+
+`tests/corpus/test_abi_contract_tools.py` pins all of the above without a
+compiler: the parsed table's shape and measured cells, oracle strictness on a
+pinned/newer/older release, the evidence renderer, bounded-subprocess behaviour
+(timeout, missing binary), every lccc-side verdict branch against a specification
+stub, and the census invariants.

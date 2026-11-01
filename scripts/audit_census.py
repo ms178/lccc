@@ -624,10 +624,63 @@ RATCHETED = (
 )
 
 
+def check_self_consistency(report: dict[str, object]) -> str | None:
+    """`knob_literals` and `knob_names` are two views of one set.
+
+    A report whose count disagrees with its own name list is a corrupted
+    artefact, and it fails the ratchet in a way no code change can explain: the
+    count grows, the name sets are identical, and the "new knob" diagnostics
+    stay silent. That combination cost a full CI cycle to recognise, so it is
+    named explicitly instead of looking like a regression in code that did not
+    change.
+    """
+    names = report.get("knob_names")
+    literals = report.get("knob_literals")
+    if isinstance(names, list) and isinstance(literals, int) and len(names) != literals:
+        return (f"knob_literals ({literals}) disagrees with knob_names "
+                f"({len(names)} entries)")
+    return None
+
+
+def describe_growth(key: str, baseline: dict[str, object],
+                    current: dict[str, object]) -> str:
+    """Name what grew, not just by how much.
+
+    "knob_literals: 550 -> 551" in a CI annotation is unactionable: the reader
+    has no tree to diff against and no way to tell an intentional new knob from
+    a generated file leaking into the walk. The names already travel in the
+    report for this purpose, so they go on the same line as the count.
+    """
+    if not key.endswith(("_literals", "_sites")):
+        return ""
+    names = sorted(set(current.get("knob_names", ())) - set(baseline.get("knob_names", ())))
+    if not names:
+        return ""
+    shown = ", ".join(names[:8]) + (", ..." if len(names) > 8 else "")
+    return f" [{shown}]"
+
+
+def baseline_label() -> str:
+    """`scripts/...` when the baseline lives in the tree, the whole path otherwise.
+
+    `relative_to` raises when the baseline is outside the repository, and a
+    diagnostic path must never raise: the caller is already reporting a failure.
+    """
+    try:
+        return str(BASELINE.relative_to(ROOT))
+    except ValueError:
+        return str(BASELINE)
+
+
 def cmd_check(current: dict[str, object]) -> int:
     baseline = load_baseline()
+    problem = check_self_consistency(baseline) if baseline else None
+    if problem:
+        print(f"FAIL: {baseline_label()} is self-inconsistent: {problem}"
+              f" (re-run --update)", file=sys.stderr)
+        return 1
     if not baseline:
-        print(f"FAIL: {BASELINE.relative_to(ROOT)} is missing (run --update)", file=sys.stderr)
+        print(f"FAIL: {baseline_label()} is missing (run --update)", file=sys.stderr)
         return 1
     grown = []
     for key in RATCHETED:
@@ -636,7 +689,8 @@ def cmd_check(current: dict[str, object]) -> int:
             print(f"FAIL: metric {key} missing from the baseline", file=sys.stderr)
             return 1
         if now > was:
-            grown.append(f"{key}: {was} -> {now} (+{now - was})")
+            grown.append(f"{key}: {was} -> {now} (+{now - was})"
+                         f"{describe_growth(key, baseline, current)}")
     for key in RATCHETED:
         print(f"  {key:22} {current[key]:6}   baseline {baseline[key]:6}")
     if grown:
@@ -659,6 +713,11 @@ def cmd_check(current: dict[str, object]) -> int:
 
 
 def cmd_update(current: dict[str, object]) -> int:
+    problem = check_self_consistency(current)
+    if problem:
+        print(f"FAIL: refusing to write an inconsistent baseline: {problem}",
+              file=sys.stderr)
+        return 1
     baseline = load_baseline()
     payload = {key: current[key] for key in RATCHETED}
     # Diagnostic only (never ratcheted): when a later --check sees the knob
@@ -667,7 +726,7 @@ def cmd_update(current: dict[str, object]) -> int:
     old = {key: baseline.get(key) for key in RATCHETED}
     increased = [k for k in RATCHETED if old.get(k) is not None and payload[k] > old[k]]
     BASELINE.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    print(f"baseline written: {BASELINE.relative_to(ROOT)}")
+    print(f"baseline written: {baseline_label()}")
     for key in RATCHETED:
         before = old.get(key)
         arrow = "=" if before == payload[key] else f"{before} -> {payload[key]}"
