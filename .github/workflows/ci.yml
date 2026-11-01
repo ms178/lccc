@@ -2532,6 +2532,14 @@ jobs:
         # agreement against GCC.  Mirrored in scripts/ci_local.sh
         # (parity-checked).
         bash tests/regression/check_compare_dominance_fold.sh
+        # Single-bit selection: `x | 1 << n`, `x & ~(1 << n)` and
+        # `(x & 1 << n) != 0` become BitSet/BitClear/BitTest, which x86 lowers
+        # to bts/btr/bt (6/8/7 -> 3/3/4).  Pins the shapes and the dead
+        # producers, the CCC_NO_BIT_SELECT ownership, the non-single-bit
+        # controls, the i686/AArch64/RISC-V lengths (never longer than the
+        # knob-off build) and -O0..-O3 agreement against GCC.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_bit_select_fold.sh
         # Predicate differences and ranges: difference compares, interval and
         # membership tests, sign-magnitude selects, five near-miss controls.
         python3 tests/regression/check_predicate_differences_and_ranges.py

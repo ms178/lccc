@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 441.24,
+      "predicted_gate_seconds": 444.24,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -334,6 +334,10 @@
         {
           "measured_s": 1.3,
           "name": "bash tests/regression/check_compare_dominance_fold.sh"
+        },
+        {
+          "measured_s": 3.0,
+          "name": "bash tests/regression/check_bit_select_fold.sh"
         },
         {
           "measured_s": 1.49,

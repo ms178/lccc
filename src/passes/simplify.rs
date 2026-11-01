@@ -4669,6 +4669,21 @@ fn simplify_binop(
                 return Some(rewritten);
             }
         }
+        IrBinOp::BitSet | IrBinOp::BitClear => {
+            // Bit set/clear are produced by `bit_idioms` from the shift/OR and
+            // shift/NOT/AND shapes (see `bit_idioms::bit_select`), so there is
+            // no producer here.  Only one identity holds without knowing the
+            // index: clearing any bit of zero leaves zero.  Setting a bit of
+            // zero is `1 << (n mod W)`, never a constant, so there is no
+            // mirrored fold -- folding it to zero (or to one) was the same
+            // trap as the zero-index `BitTest` above.
+            if op == IrBinOp::BitClear && lhs_zero {
+                return Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::zero(ty)),
+                });
+            }
+        }
     }
 
     // Commutative operand canonicalization: for commutative operations

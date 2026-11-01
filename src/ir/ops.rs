@@ -94,6 +94,28 @@ pub enum IrBinOp {
     /// larger k both forms return x.  Only the x86-64 frontend creates it,
     /// from the BMI2 builtins when BMI2 is enabled; no pass synthesizes it.
     Bzhi,
+    /// Set one bit: `BitSet(x, n)` is `x | (1 << (n mod W))`, W the width of
+    /// the operation's IR type -- x86 `bts`, AArch64 `mov`+`lsl`+`orr` (there
+    /// is no variable-immediate BFI), RISC-V `sll`+`or`.  This is the
+    /// cross-target canonical form of the C idiom `x | 1u << n`, which
+    /// otherwise costs an instruction for the constant, one for the shift and
+    /// one for the OR, with the shift pinned to `%cl` on x86.  The index is
+    /// taken modulo W exactly as [`IrBinOp::BitTest`]'s is, so an index of W
+    /// or more -- an undefined C shift that may sit in dead code -- still
+    /// compiles and still agrees with the constant folder.
+    ///
+    /// Typed I32/U32/I64/U64 only, and the bit index is the second operand:
+    /// the operation is NOT commutative.  Passes synthesize it from the
+    /// shift/OR pair, so every backend must lower it; the portable lowering
+    /// is `lhs | (1 << (rhs mod W))` at the operation's width, which is why
+    /// a 64-bit operation may not appear on a 32-bit target (the wide-int
+    /// pair path has no bit-set lowering).
+    BitSet,
+    /// Clear one bit: `BitClear(x, n)` is `x & ~(1 << (n mod W))`, the
+    /// canonical form of `x & ~(1u << n)` -- x86 `btr`, and the portable
+    /// `x & ~(1 << (rhs mod W))` elsewhere.  Same typing, index semantics,
+    /// backend obligation and non-commutativity as [`IrBinOp::BitSet`].
+    BitClear,
     /// High half of the double-width product: `UMulHigh(a, b)` is
     /// `(zext(a) * zext(b)) >> W` and `SMulHigh(a, b)` is
     /// `(sext(a) * sext(b)) >> W` (arithmetic), W the width of the
@@ -206,6 +228,28 @@ pub fn zero_high_bits_from(value: u128, index: u128, bits: u32) -> u128 {
     }
 }
 
+/// `BitSet`/`BitClear` at container width `bits`: force bit `index mod bits`
+/// of `value` to `set` (`true`) or clear, keeping only the low `bits` bits of
+/// the container so a sign-extended operand does not leak into the result
+/// (see [`IrBinOp::BitSet`]).  Callers truncate the result to the operation's
+/// type.  `bits` is 1..=128 and the index is reduced here, so an index of W
+/// or more -- an undefined C shift that may sit in dead code -- is defined and
+/// matches what the hardware does with the same index.
+pub fn bit_op_within_bits(value: u128, index: u128, bits: u32, set: bool) -> u128 {
+    debug_assert!(bits >= 1 && bits <= 128);
+    let mask = if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    let bit = 1u128 << (index % bits as u128);
+    if set {
+        (value | bit) & mask
+    } else {
+        (value & !bit) & mask
+    }
+}
+
 /// The non-x86-64 backends' arm for [`IrBinOp::Bzhi`]: only the x86-64
 /// frontend creates it (from the BMI2 builtins) and no pass synthesizes it,
 /// so reaching another backend is a broken invariant, not an input error.
@@ -268,6 +312,14 @@ impl IrBinOp {
                 rotate_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, false) as i64
             }
             IrBinOp::Bzhi => zero_high_bits_from(lhs as u64 as u128, rhs as u64 as u128, 64) as i64,
+            // Container-width bit set/clear; a narrower IR type is folded by
+            // `fold_binop` with its own width, never through here.
+            IrBinOp::BitSet => {
+                bit_op_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, true) as i64
+            }
+            IrBinOp::BitClear => {
+                bit_op_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, false) as i64
+            }
             IrBinOp::UMulHigh => mul_high_within_bits(lhs, rhs, 64, false),
             IrBinOp::SMulHigh => mul_high_within_bits(lhs, rhs, 64, true),
             IrBinOp::SDiv => {
@@ -321,6 +373,8 @@ impl IrBinOp {
                 rotate_within_bits(lhs as u128, rhs as u128, 128, false) as i128
             }
             IrBinOp::Bzhi => zero_high_bits_from(lhs as u128, rhs as u128, 128) as i128,
+            IrBinOp::BitSet => bit_op_within_bits(lhs as u128, rhs as u128, 128, true) as i128,
+            IrBinOp::BitClear => bit_op_within_bits(lhs as u128, rhs as u128, 128, false) as i128,
             // No 128-bit form exists (I64/U64 only); refuse rather than
             // evaluate at the wrong width.
             IrBinOp::UMulHigh | IrBinOp::SMulHigh => return None,

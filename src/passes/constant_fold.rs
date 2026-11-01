@@ -1169,6 +1169,23 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
                 crate::ir::ops::zero_high_bits_from(lhs as u64 as u128, rhs as u64 as u128, bits);
             return Some(ty.truncate_i64(kept as i64));
         }
+        // Width-typed like the rotates and Bzhi: the index is reduced modulo
+        // the operation width (an undefined C shift that may sit in dead code
+        // must still fold to what codegen emits), and masking to the width
+        // drops the sign extension a signed operand carries in the container.
+        IrBinOp::BitSet | IrBinOp::BitClear => {
+            let bits = (ty.size() * 8) as u32;
+            if !(1..=64).contains(&bits) {
+                return None;
+            }
+            let result = crate::ir::ops::bit_op_within_bits(
+                lhs as u64 as u128,
+                rhs as u64 as u128,
+                bits,
+                op == IrBinOp::BitSet,
+            );
+            return Some(ty.truncate_i64(result as i64));
+        }
         // Width-typed: the high half of the 2W-bit product (I64/U64 in
         // practice; any W up to 64 evaluates exactly).
         IrBinOp::UMulHigh | IrBinOp::SMulHigh => {
@@ -1285,6 +1302,103 @@ mod tests {
             fold_binop(IrBinOp::BitTest, 0x7777, 70, IrType::I64),
             Some(1)
         );
+    }
+
+    /// `BitSet`/`BitClear` fold modulo the operation's width, at every width
+    /// the operations are created at, and the container-width evaluators the
+    /// other passes use agree once truncated to that width.
+    #[test]
+    fn bit_set_and_clear_fold_modulo_the_width() {
+        let sources = [
+            0u64,
+            1,
+            0x8000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x0123_4567_89AB_CDEF,
+            0xAAAA_AAAA_5555_5555,
+        ];
+        for width in [8u32, 16, 32, 64] {
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
+            let ty = match width {
+                8 => IrType::U8,
+                16 => IrType::U16,
+                32 => IrType::U32,
+                _ => IrType::U64,
+            };
+            for &x in &sources {
+                for index in [0u64, 1, 7, 8, 15, 16, 31, 32, 63, 64, 65, 255] {
+                    let bit = 1u64 << (index % u64::from(width));
+                    let want_set = (x | bit) & mask;
+                    let want_clear = (x & !bit) & mask;
+                    assert_eq!(
+                        fold_binop(IrBinOp::BitSet, x as i64, index as i64, ty),
+                        Some(want_set as i64),
+                        "BitSet {x:#x} bit {index} at {width}"
+                    );
+                    assert_eq!(
+                        fold_binop(IrBinOp::BitClear, x as i64, index as i64, ty),
+                        Some(want_clear as i64),
+                        "BitClear {x:#x} bit {index} at {width}"
+                    );
+                    // The container-width evaluators answer at 64 bits
+                    // (`eval_i128` at 128), exactly like the rotates: a
+                    // narrower operation must be folded by `fold_binop`,
+                    // which is what every constant-folding path calls.  They
+                    // agree with the width-typed answer once truncated only
+                    // while the index stays inside the width -- above it the
+                    // container has already wrapped at 64, not at W.
+                    assert_eq!(
+                        IrBinOp::BitSet.eval_i64(x as i64, index as i64),
+                        Some((x | (1u64 << (index % 64))) as i64),
+                        "eval_i64 BitSet {x:#x} bit {index}"
+                    );
+                    assert_eq!(
+                        IrBinOp::BitClear.eval_i64(x as i64, index as i64),
+                        Some((x & !(1u64 << (index % 64))) as i64),
+                        "eval_i64 BitClear {x:#x} bit {index}"
+                    );
+                    if index < u64::from(width) {
+                        assert_eq!(
+                            ty.truncate_i64(
+                                IrBinOp::BitSet.eval_i64(x as i64, index as i64).unwrap()
+                            ),
+                            want_set as i64,
+                            "eval_i64 BitSet {x:#x} bit {index} at {width}"
+                        );
+                        assert_eq!(
+                            ty.truncate_i64(
+                                IrBinOp::BitClear.eval_i64(x as i64, index as i64).unwrap()
+                            ),
+                            want_clear as i64,
+                            "eval_i64 BitClear {x:#x} bit {index} at {width}"
+                        );
+                    }
+                    assert_eq!(
+                        IrBinOp::BitSet.eval_i128(x as i128, index as i128),
+                        // `u128` is already the widest containment:
+                        // there is no mask above it to apply.
+                        Some((x as u128 | (1u128 << (index % 128))) as i128),
+                        "eval_i128 BitSet {x:#x} bit {index}"
+                    );
+                }
+            }
+        }
+        // The identity that is easy to get backwards: setting a bit of zero is
+        // never zero, and clearing a bit of zero is always zero.
+        assert_eq!(fold_binop(IrBinOp::BitSet, 0, 3, IrType::U32), Some(8));
+        assert_eq!(fold_binop(IrBinOp::BitClear, 0, 3, IrType::U32), Some(0));
+        // A signed operand's sign extension must not survive the mask: an
+        // I8 `-1` cleared at bit 0 is the bit pattern 0xFE, which the signed
+        // ring carries as -2 (0xFF would mean the clear did nothing).
+        assert_eq!(fold_binop(IrBinOp::BitClear, -1, 0, IrType::I8), Some(-2));
+        assert_eq!(fold_binop(IrBinOp::BitClear, -1, 0, IrType::U8), Some(0xFE));
+        // 128-bit values are not foldable through `fold_binop` (it works in a
+        // 64-bit container); the pair path refuses rather than truncating.
+        assert_eq!(fold_binop(IrBinOp::BitSet, 0, 0, IrType::U128), None);
     }
 
     /// Multiply-high folds at the operation's own width: at I64/U64 the

@@ -1866,6 +1866,15 @@ gate "narrow-negate-fold" fast \
 gate "compare-dominance-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_compare_dominance_fold.sh
 
+# Single-bit selection: `x | 1 << n` is `bts`, `x & ~(1 << n)` is `btr` and
+# `(x & 1 << n) != 0` is `bt` (6/8/7 -> 3/3/4 instructions), selected by the
+# new `BitSet`/`BitClear` IR operations.  Pins the shapes and the dead
+# producers, the CCC_NO_BIT_SELECT ownership, the non-single-bit controls, the
+# i686/AArch64/RISC-V lengths (never longer than the knob-off build) and
+# -O0..-O3 agreement against GCC.
+gate "bit-select-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_bit_select_fold.sh
+
 # Observable-access gates.  Three instruments, because each catches a
 # different way the `volatile` contract gets broken and each was proved to do
 # so by mutation (reintroducing the guard deletion in licm.rs):

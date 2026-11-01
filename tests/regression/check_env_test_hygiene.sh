@@ -106,7 +106,11 @@ MARKER='FIX''ME'
 #        src/passes/bit_idioms_facts.rs.  The truncated-complement rule reuses
 #        the existing CCC_SIMPLIFY_SKIP parse and adds no read.  Raised to the
 #        measurement, exactly.
-ENV_READ_BUDGET=145
+#   146  2026-11-01: the single-bit selection kill switch (CCC_NO_BIT_SELECT),
+#        resolved once next to the three above in src/passes/bit_idioms_facts.rs
+#        so the matcher pays one read per process, not one per block.  Raised to
+#        the measurement, exactly.
+ENV_READ_BUDGET=146
 
 fail=0
 report() { # report <label> <offending lines>
