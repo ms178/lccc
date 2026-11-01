@@ -91,6 +91,26 @@ jobs:
           set -euo pipefail
           test "$(cat target/fastbuild/ci-build.commit)" = "$(git rev-parse HEAD)"
           sha256sum -c target/fastbuild/ci-build.sha256
+      # Artifact transport is a zip, and a zip has no Unix mode: every restored
+      # binary arrives 0644. The lanes in ci.yml and bench.yml never see this
+      # because they ship ONE tarball and extract it (`tar -xzf` restores the
+      # mode from the tar header); this job ships the binaries themselves, so it
+      # restores the bit explicitly. Without this step `ci_gcc17_torture.sh`
+      # fails its first `[[ -x $compiler ]]` guard in under a second -- the
+      # shape every run of this lane has failed with since it was created, with
+      # no visible reason, because the guard's message only reaches the job log.
+      - name: Restore the executable bits artifact transport drops
+        run: |
+          set -euo pipefail
+          for binary in lccc lccc-x86 lccc-arm lccc-riscv lccc-i686 lccc-ld; do
+            path="target/fastbuild/$binary"
+            test -f "$path" || { echo "::error::artifact is missing $path"; exit 1; }
+            chmod +x "$path"
+            test -x "$path" || { echo "::error::$path is still not executable"; exit 1; }
+          done
+          # Prove the toolchain runs, not just that the bit is set: a transport
+          # that truncates a binary would pass an `-x` test and fail here.
+          target/fastbuild/lccc --version
       - name: Run full GCC 17 compile + execute corpus
         env:
           GCC_TORTURE_RESULTS_DIR: ${{ runner.temp }}/gcc17-torture/${{ inputs.arch }}

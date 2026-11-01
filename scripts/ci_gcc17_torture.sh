@@ -24,8 +24,14 @@ esac
 linker=${LCCC_LD:-$repo_root/target/fastbuild/lccc-ld}
 gcc=${GCC_BIN:-$(command -v gcc-16 || command -v gcc || true)}
 [[ -n $gcc ]] || { echo "ci_gcc17_torture: GCC reference compiler not found" >&2; exit 2; }
-[[ -x $compiler ]] || { echo "ci_gcc17_torture: compiler not executable: $compiler" >&2; exit 2; }
-[[ -x $linker ]] || { echo "ci_gcc17_torture: standalone linker not executable: $linker" >&2; exit 2; }
+# A missing file and an unexecutable one are different defects with different
+# fixes, and both used to print the same "not executable" line: a lane that
+# downloads the compiler as an artifact always arrives 0644 (zip transport keeps
+# no Unix mode), so the message has to name the actual remedy.
+[[ -e $compiler ]] || { echo "ci_gcc17_torture: compiler not found: $compiler" >&2; exit 2; }
+[[ -x $compiler ]] || { echo "ci_gcc17_torture: compiler is not executable (chmod +x it; artifact transport drops the mode): $compiler" >&2; exit 2; }
+[[ -e $linker ]] || { echo "ci_gcc17_torture: standalone linker not found: $linker" >&2; exit 2; }
+[[ -x $linker ]] || { echo "ci_gcc17_torture: standalone linker is not executable (chmod +x it; artifact transport drops the mode): $linker" >&2; exit 2; }
 
 suite_root=${GCC17_TORTURE_ROOT:-$HOME/.cache/lccc-gcc17}
 results=${GCC_TORTURE_RESULTS_DIR:-$repo_root/artifacts/gcc17-torture/$arch}
