@@ -26,6 +26,14 @@
 #   * a valid translation unit still compiles (a gate that only asserted
 #     rejections would pass with every construct deleted).
 set -euo pipefail
+# A bare `set -e` abort names nothing in the CI check UI. A DEBUG trap records
+# the last command executed (it never changes control flow, which matters here:
+# the gate deliberately runs compilers that must fail, so an ERR trap would
+# abort on the first intended rejection) and the EXIT trap reports it when the
+# script ends badly.
+last_command=
+trap 'last_command=$BASH_COMMAND' DEBUG
+trap 'rc=$?; if ((rc)); then echo "::error::severity gate exited $rc; last command: $last_command"; fi' EXIT
 redteam_runner=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/check_diagnostic_redteam.py
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -351,7 +359,13 @@ fi
 
 echo "PASS: gcc-16.2 diagnostic severity, message and column parity"
 
-CCC="$CCC" GCC="$GCC" python3 "$redteam_runner"
+if ! redteam=$(CCC="$CCC" GCC="$GCC" python3 "$redteam_runner" 2>&1); then
+    printf '%s\n' "$redteam" >&2
+    printf '::error::%s\n' "$(printf '%s\n' "$redteam" \
+        | grep -m1 -E 'FAIL|Traceback|error:' || printf 'redteam matrix failed')"
+    exit 1
+fi
+printf '%s\n' "$redteam"
 
 "$CCC" -O2 "${redteam_runner%/*}/diagnostic_const_legal_execute.c" -o "$tmp/const-legal"
 "$tmp/const-legal"
