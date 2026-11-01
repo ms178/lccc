@@ -1097,7 +1097,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 276.56,
+      "predicted_gate_seconds": 277.86,
       "shards": 3,
       "steps": [
         {
@@ -1283,6 +1283,10 @@
         {
           "measured_s": 2.35,
           "name": "Multiline comment and splice translation phases"
+        },
+        {
+          "measured_s": 1.3,
+          "name": "Microsoft x64 scalar ABI interoperability and unwind contracts"
         }
       ]
     },
