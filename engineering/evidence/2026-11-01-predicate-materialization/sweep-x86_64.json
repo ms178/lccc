@@ -1,6 +1,6 @@
 {
  "level": "-O2",
- "files": 3116,
+ "files": 3124,
  "shorter": [
   [
    "tests/benchmark/programs/chacha20_block.c",
@@ -259,8 +259,8 @@
   ],
   [
    "tests/regression/range_fold_branch.c",
-   1093,
-   1121
+   1114,
+   1142
   ],
   [
    "tests/regression/remat_globaladdr_no_silent_zero.c",
@@ -348,6 +348,11 @@
    78
   ],
   [
+   "tests/regression/three_way_boolean_compare.c",
+   2092,
+   2097
+  ],
+  [
    "tests/regression/tier2_branch_join_width.c",
    97,
    98
@@ -416,15 +421,15 @@
    "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_reader.c",
    10,
    11
+  ],
+  [
+   "engineering/evidence/2026-11-01-predicate-materialization/predicate-materialize.c",
+   91,
+   117
   ]
  ],
- "same": 2231,
+ "same": 2237,
  "longer": [
-  [
-   "tests/benchmark/programs/linux_list_sort.c",
-   246,
-   232
-  ],
   [
    "tests/regression/bb_slp_v3.c",
    1346,
@@ -434,6 +439,11 @@
    "tests/regression/loop_rotate_pressure_gate.c",
    176,
    169
+  ],
+  [
+   "tests/regression/predicate_materialize_mask_store.c",
+   460,
+   408
   ],
   [
    "tests/regression/simd_sse2_arith.c",
@@ -463,5 +473,5 @@
  ],
  "both_reject": 794,
  "verdict": [],
- "net_delta": -218
+ "net_delta": -211
 }

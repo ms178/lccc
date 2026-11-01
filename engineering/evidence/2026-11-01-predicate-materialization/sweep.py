@@ -52,11 +52,17 @@ def sibling(path: Path, suffix: str) -> Path | None:
 
 
 def build(
-    binary: str, src: Path, level: str, off: bool, knob: str, timeout: float = 120
+    binary: str,
+    src: Path,
+    level: str,
+    off: bool,
+    knob: str,
+    knob_value: str = "1",
+    timeout: float = 120,
 ) -> tuple[bool, int, str]:
     env = dict(os.environ)
     if off:
-        env[knob] = "1"
+        env[knob] = knob_value
     else:
         env.pop(knob, None)
     # The corpus's own convention: `NAME.flags` appends words, `NAME.env` sets
@@ -102,6 +108,12 @@ def main() -> int:
     ap.add_argument("--roots", nargs="+", required=True)
     ap.add_argument("--level", default="-O2")
     ap.add_argument("--knob", default="CCC_NO_PREDICATE_MATERIALIZE")
+    ap.add_argument(
+        "--knob-value",
+        default="1",
+        help="value assigned to --knob for the 'off' build (for list knobs such "
+        "as CCC_SIMPLIFY_SKIP=booldiff)",
+    )
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument(
         "--timeout",
@@ -121,10 +133,10 @@ def main() -> int:
 
     def one(path: Path):
         on_ok, on_n, on_err = build(
-            args.bin, path, args.level, False, args.knob, args.timeout
+            args.bin, path, args.level, False, args.knob, args.knob_value, args.timeout
         )
         off_ok, off_n, off_err = build(
-            args.bin, path, args.level, True, args.knob, args.timeout
+            args.bin, path, args.level, True, args.knob, args.knob_value, args.timeout
         )
         return str(path), (on_ok, on_n, on_err), (off_ok, off_n, off_err)
 

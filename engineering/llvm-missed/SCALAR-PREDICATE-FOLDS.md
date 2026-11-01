@@ -509,6 +509,224 @@ Two pipeline facts were learned by measuring, and both are pinned by the gate:
   `vec_signed_range_fusion` rows cost +70 static instructions (a 4-lane SIMD body
   and its prologue) and run ~3.3x fewer dynamic instructions.
 
+### 14. Three-way indicator comparisons — `booldiff`
+
+```c
+int le(int a, int b) { int t = (a > b) - (a < b); return t <= 0; }  /* 9 -> 4 */
+int lt(int a, int b) { int t = (a > b) - (a < b); return t < 0; }   /* 9 -> 4 */
+long w(int a, int b) { long t = (a > b) - (a < b); return t <= 0; } /* 10 -> 5 */
+int eq(int a, int b) { int t = (a >= b) - (a > b); return t > 0; }  /* 9 -> 4 */
+```
+
+§13's fold leaves a comparison where a select used to be, and the next shape in
+every inlined comparator is the sign value built out of two of those
+comparisons. `(a > b) - (a < b)` is the sign of `a - b`, so *any* `cmp` of it
+against zero is a `cmp` of `a` and `b`: the two `setcc`s, the two `movzbl`s, the
+subtraction and the second comparison are all one instruction's worth of
+question. Clang folds this (4 instructions); GCC 16.2 does not (10), so the
+fold ends one instruction behind the best oracle only because of the `xor
+%eax,%eax` that materializes the answer.
+
+`fold_cmp_of_boolean_indicators` accepts both spellings, because which one
+arrives depends on whether the rest of the pass has already folded the
+subtraction away: `indicator <op> indicator` directly, and `diff <op> 0` where
+`diff` is their subtraction.
+
+#### The design: enumerate the trichotomy, do not tabulate it
+
+Both indicators are predicates over the same operand pair and the same ordering
+class, so the pair `(a, b)` can only be in one of three states -- `a < b`,
+`a == b`, `a > b` -- and within one class exactly one holds. A predicate over
+that class is therefore exactly a three-row truth table
+(`indicator_regions`), the difference `d = first - second` is `-1`, `0` or `1`
+per row, and the question -- `d <op> 0`, or `first <op> second` -- evaluates to
+one row set of booleans. There are exactly eight such row sets, and every one of
+them is one comparison of the operands or a constant:
+
+| rows (`<`, `==`, `>`) | answer | | rows | answer |
+| --- | --- | --- | --- | --- |
+| `000` | constant `0` | | `100` | `a < b` |
+| `111` | constant `1` | | `110` | `a <= b` |
+| `010` | `a == b` | | `001` | `a > b` |
+| `101` | `a != b` | | `011` | `a >= b` |
+
+`trichotomy_answer` *is* that table, so the mapping is total and cannot mislabel
+an answer. The first version of this fold hand-tabulated the same information
+instead, and it was wrong: it mirrored the predicate for the reversed operand
+order *before* applying the unsigned-collapse rules, so `(a < b) - (a > b) >u 0`
+was answered "never true" (`-1` is `UINT_MAX`, so it is true exactly when
+`a > b`). Enumerating three rows removes the class of bug, not just the
+instance: there is no order of operations to get wrong, and the unsigned
+question is evaluated on the value it is about (`-1` as the all-ones pattern)
+rather than derived from the signed one.
+
+The enumeration also makes two shapes free that a hand table would have to be
+extended for:
+
+* **nested pairs** -- `(a >= b) - (a > b)` is the *equality* indicator, not a
+  sign, so `> 0` is `a == b` (9 -> 4 on x86-64, matching both oracles);
+* **any predicate pair in the same class** -- `(a == b) - (a < b) <= 0` is
+  `a != b`, and the same predicate twice (`(a > b) - (a > b) <= 0`) is a
+  constant.
+
+What the enumeration cannot fix is where the *values* come from, and that is the
+second half of the design.
+
+#### The casts: which extension is it?
+
+The difference reaches the comparison through whatever casts the C source asked
+for, and peeling them is only sound while the signed reading of the
+`{-1, 0, 1}` pattern survives. A same-width cast keeps the bits and a truncation
+keeps the low bits (so `-1` becomes the all-ones pattern of the narrower type),
+but a widening cast is transparent **only when it sign-extends**. The case that
+proves it:
+
+```c
+int f(int a, int b) { unsigned char d = (a > b) - (a < b); return (int)d < 0; }
+```
+
+`d` holds `255` where the difference is negative, and `(int)d` reads `255`, not
+`-1` -- so the answer is `0` for every input. A peel that ignores *which*
+extension it is folds this to `a < b` and returns `1` whenever `a < b`. That
+miscompile was in this round's first implementation and was caught by a
+differential probe against GCC 16.2 and Clang 23.1.4 (both returned `0`):
+
+| build | checksum of the probe |
+| --- | --- |
+| LCCC with the first `booldiff` implementation | 1001456958 |
+| LCCC with `CCC_SIMPLIFY_SKIP=booldiff` | 2984546946 |
+| GCC 16.2 | 2984546946 |
+| Clang 23.1.4 | 2984546946 |
+
+`peel_sign_preserving_casts` now refuses to cross a zero-extension, and
+`sign_preserving_peel_stops_at_a_zero_extension` pins all three cases
+(truncation, sign-extension, zero-extension). The shape is in the valence test
+as `zext_uchar_{lt0,gt0,ule0}`, and re-introducing the unconditional peel makes
+that test report `VALIDATION FAILED (30450)` with 20,300 of the failures in the
+`zext`/`trunc_uchar` rows.
+
+#### What is refused, and why
+
+* **Mixed ordering classes** -- `(a >s b) - (a <u b)` is not a sign: with
+  `a = -1, b = 1` both indicators are false, so the difference is not the sign of
+  anything. Refused, and pinned by both the gate and the valence test.
+* **Different operand pairs** -- `(a > b) - (c < d)` relates nothing.
+* **Floating operands** -- with a NaN both comparisons are false, so the
+  difference is `0` and every question about it answers from `0`; no trichotomy
+  of the operands can express that. Refused, and pinned with a NaN in the
+  valence test.
+* **A second reader of the difference** is *not* a refusal any more: the folded
+  comparison is never longer than the one it replaces (one `cmp` for one `cmp`),
+  so folding one of several readers is a free win and the rest of the chain dies
+  with the last reader. The gate asserts the multi-reader shape never gets
+  longer rather than that it never moves.
+
+#### The proof
+
+The proof that this fold is right is not the four-instruction count:
+
+* `tests/regression/three_way_boolean_compare.c` checks every predicate over
+  every width and signedness against a branch-written reference, on the extrema
+  (`INT_MIN`, `INT_MAX`, `ULLONG_MAX`), the values around zero, 40,000 seeded
+  pairs and a full ±128 × ±128 sweep -- 231,000 comparisons, plus the eight
+  refusal shapes above, NaN included. The reference value is forced through a
+  `volatile` before it is questioned, so the *driver* computes the expectation
+  and the file cannot agree with its own bug. It passes under LCCC, GCC 16.2 and
+  Clang 23.1.4.
+* `boolean_indicator_folds_agree_with_the_trichotomy_for_every_predicate_pair`
+  is exhaustive where the C file is sampled: all 10 × 10 indicator predicate
+  pairs × 10 outer predicates × both operand orders × both spellings = 1,000
+  combinations, each checked against an oracle that evaluates the *original* C
+  question with `IrCmpOp::eval_i64` on seven value pairs -- including
+  `(-1, 1)` and `(1, -1)`, where the signed and unsigned classes disagree. It
+  also asserts completeness: a same-class pair must fold, a mixed-class pair
+  must not.
+* Mutating the `<=` mapping to `>=` makes the C file report
+  `VALIDATION FAILED (231000)`; mutating the cast peel makes it report
+  `VALIDATION FAILED (30450)`.
+
+#### Measurements
+
+`g = (a > b)`, `l = (a < b)`, so `(g, l)` is `(0, 1)` when `a < b`, `(0, 0)` when
+`a == b` and `(1, 0)` when `a > b`, and the raw trichotomy the fold enumerates
+reads:
+
+| question | `a < b` | `a == b` | `a > b` | answer |
+| --- | --- | --- | --- | --- |
+| `g == l` / `g != l` | `0` / `1` | `1` / `0` | `0` / `1` | `a == b` / `a != b` |
+| `g < l` | `1` | `0` | `0` | `a < b` |
+| `g <= l` | `1` | `1` | `0` | `a >= b` |
+| `g > l` | `0` | `0` | `1` | `a > b` |
+| `g >= l` | `0` | `1` | `1` | `a <= b` |
+| `s = g - l`, `s <= 0` / `s < 0` | `1` / `1` | `1` / `0` | `0` / `0` | `a >= b` / `a < b` |
+| `s <=u 0` | `0` | `1` | `0` | `a == b` |
+| `s >u 0` | `1` | `0` | `1` | `a != b` |
+| `s <u 0` / `s >=u 0` | `0` / `1` | `0` / `1` | `0` / `1` | constant `0` / `1` |
+
+Two entries are worth stating because both are easy to get wrong and the gate
+pins them: `g <= l` is `a >= b`, not `a < b` (the indicators being equal is
+`a == b`, which satisfies `<=`), and the unsigned rows are not the signed ones
+with a different flag -- `-1` is the all-ones value, so `s <u 0` is never true,
+`s >=u 0` always is, and the other two collapse onto equality.
+
+Fold off -> on, same binary, `-O2`, on the four targets:
+
+| probe | x86-64 | i686 | AArch64 | RISC-V |
+| --- | --- | --- | --- | --- |
+| `int t = (a > b) - (a < b); return t <= 0` | 9 -> **4** | 19 -> **9** | 16 -> **10** | 17 -> **9** |
+| `... return t < 0` | 9 -> **4** | 19 -> **9** | 16 -> **10** | 17 -> **8** |
+| `long t = (a > b) - (a < b); return t <= 0` | 10 -> **5** | 19 -> **9** | 19 -> **13** | 19 -> **11** |
+| `int t = (a >= b) - (a > b); return t > 0` (nested) | 9 -> **4** | 19 -> **9** | 16 -> **10** | 17 -> **9** |
+
+On x86-64 the four-instruction answer is `xorl; cmpl; setle; ret` -- equal to
+Clang 23.1.4 and six ahead of GCC 16.2. The `xorl` is the materialized boolean
+of §13, not a leftover of this fold; the `three_way_val` row keeps one
+`movzbl`/`movslq` pair because the result is returned in a 64-bit register. No
+target gets longer on any probe, which is the invariant the cross-target gate
+section and the sweeps check.
+
+### 15. A zero-extension compared against zero — `simplify_cmp`
+
+```c
+int zx_lt0(unsigned char c) { return (int)c < 0; }   /* 4 -> 2, gcc 2, clang 2 */
+int zx_le0(unsigned char c) { return (int)c <= 0; }  /* 4 -> 4, but `sete` */
+```
+
+A zero-extension is non-negative, so it answers the *signed* comparisons
+against zero on its own: `(int)(unsigned char)c` is in `[0, 255]`, so `< 0` is
+false, `>= 0` is true, and `<= 0`/`> 0` are `c == 0` and `c != 0` at the narrow
+width (the extension is injective, so `zext(x) == 0` iff `x == 0`).
+`simplify_cmp` already folded the same four questions for an
+unsigned-*typed* operand (`unsigned u; return u < 0;` was two instructions);
+it did not look through the extension, so the same question asked about a byte
+cost four. Both oracles fold it.
+
+This one is a three-line rule (a widening cast whose source is unsigned), and it
+is what the `booldiff` probe below measures when the difference is carried in an
+`unsigned char`: the whole indicator chain becomes dead once the comparison is a
+constant, so the shape goes from ten instructions to two.
+
+`CCC_SIMPLIFY_SKIP=cmp` attributes it, and the gate asserts both counts
+(`zx_lt0` 2 with the rule, 4 without; `zx_le0` 4 either way, because `Eq 0` and
+`Ule 0` against a byte both select `testb` plus one `setcc` -- only the
+predicate moves). The *values* are covered by `three_way_boolean_compare.c`'s
+`zext_uchar_*` shapes, which is also the shape that caught the cast-peel
+miscompile in §14.
+
+## What the LLVM tracker already knows about these shapes
+
+The round started from a differential probe, and the gaps it found have
+open `llvm-project` issues of their own, which is the useful cross-check: the
+shapes are not LCCC-specific.
+
+| issue | shape | status here |
+| --- | --- | --- |
+| [#228923](https://github.com/llvm/llvm-project/issues/228923) | clang 23 turns an inlined lexicographic comparator into a `setcc`/`and`/`or` chain where clang 22 branched, 18-88% slower in `std::ranges::sort` | **the reason §13 runs after if-conversion**: converting `c ? 1 : 0` earlier left live arithmetic behind, and the `simplify` fix that reads `Cast(cmp)` as the `{1,0}` leaf is what keeps the comparator itself a `cmp`. LCCC now folds the comparator to a single `cmp` (36 instructions in `merge_and_count`, where the pre-fix build had 50 and the fold-off build 36) |
+| [#45213](https://github.com/llvm/llvm-project/issues/45213) | division by multiplication moves the numerator into `%rax` although the magic number is the commutative operand | open here too: `div_const` is 9 (GCC 8, Clang 5). A copy-coalescing fix, not a fold |
+| [#33226](https://github.com/llvm/llvm-project/issues/33226) | comparison of a shift against zero keeps a redundant copy | open here: `int f(unsigned i, unsigned j, int a, int b) { if (0 == (i >> j)) return a; return b; }` is 9 (GCC 6; the `test` itself is already optimal -- the cost is a register copy and the duplicated `ret`) |
+| [#205978](https://github.com/llvm/llvm-project/issues/205978) | `cmovne` re-reads memory when the value is already in a register (a WAR hazard in the scheduler) | not observed here: LCCC's aggregate-return lowering spills instead of re-reading (`struct a` return of `d[1]` writes through the stack), which is a different -- and separately documented -- cost |
+| [#197671](https://github.com/llvm/llvm-project/issues/197671) | unnecessary comparison plus a duplicate addition for `__builtin_add_overflow` on AArch64 | open here on x86-64 as well: `add_ovf` is 8 (both oracles 4) |
+
 ## The sweep behind it
 
 This round began as a measurement, not a fold: a 76-function differential probe
@@ -578,6 +796,18 @@ installed in this sandbox, so its column is absent rather than guessed.
 | `x & ~(1 << n)` | 9 | **8** | 3 | 3 | round 3 (`notcast`); the rest is `btr` selection |
 | `x & ~(1u << n)` unsigned | 8 | 8 | 3 | 3 | never widened; the rest is `btr` selection |
 | `~(unsigned long)x` | 4 | 4 | 3 | 3 | control: a widening cast keeps the 64-bit complement |
+| `unsigned char c; return (int)c < 0` | 4 | **2** | 2 | 2 | round 6 (`cmp`): the constant `0` |
+| `unsigned char c; return (int)c <= 0` | 4 | 4 | 4 | 4 | round 6: count-neutral, `sete` instead of `setbe` |
+| `int t = (a > b) - (a < b); return t <= 0` | 9 | **4** | 10 | 4 | round 6 (`booldiff`): level with Clang, six ahead of GCC |
+| `... return t < 0` | 9 | **4** | 10 | 4 | round 6, same answer from the same `cmp` |
+| `long t = (a > b) - (a < b); return t <= 0` | 10 | **5** | 10 | 4 | round 6: the `movzbl`/`movslq` pair is the 64-bit return |
+| `(a > b) <= (a < b)` | 9 | **4** | 4 | 4 | round 6, the form that survives once the `Sub` folds away |
+| `int t = ...; return (unsigned)t <= 0u` | 10 | **4** | 4 | 4 | round 6: collapses onto `==`, not onto an ordering |
+| `int t = ...; return (unsigned)t > 0u` | 10 | **4** | 4 | 4 | round 6: collapses onto `!=` |
+| `((a >= b) - (a > b)) > 0` | 9 | **4** | 4 | 4 | round 6: the nested pair is the equality indicator, so this is `a == b` |
+| `((a > b) - (c < d)) <= 0` | 10 | 10 | 11 | 7 | control: different operand pairs; already ahead of GCC |
+| `((a > b) - ((int)((unsigned)a < (unsigned)b))) <= 0` | 9 | 9 | 8 | 6 | control: mixed signedness is not complementary |
+| `unsigned char d = (a > b) - (a < b); return (int)d < 0` | 10 | **2** | 2 | 2 | control: a zero-extending carrier -- always false, and now folded as such (§15); this is the shape that caught the first implementation's cast peel |
 Honest attribution, measured by re-running with
 `CCC_DISABLE_PASSES=diffcmp,interval,signmag`: `diff_gt`/`diff_ge` 5 → 4,
 `range_bitand` 9 → 5, `range_short` 7 → 5, `member_short` 7 → 4 and
@@ -603,7 +833,7 @@ accident.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --lib` | **7,206 passed, 0 failed, 10 ignored** after round 4 (+29), plus the toggle's 4 matcher/fold tests in round 5 |
+| `cargo test --lib` | **7,515 passed, 0 failed, 10 ignored** after round 6 (+29 in round 4, 4 in round 5, 4 in round 6: the 1,000-combination enumeration oracle, the cast-peel test, the zero-extension rule test and the direct-form spelling test) |
 | `check_compare_dominance_fold.sh` | PASS — four dominant shapes in both directions, 8/16/32/64-bit widths, `CCC_NO_COMPARE_DOMINANCE=1` restores every one of them, the two non-dominant shapes pinned at 9 in both builds, `-O0`…`-O3` + the switch + GCC agree on a 65,536-row checksum |
 | `check_bit_select_fold.sh` | PASS — set/clear/toggle/test at 8/16/32/64 bits and both operand orders, the dead `shl`/`not`/`xor` producers, `CCC_NO_BIT_SELECT=1` restoring every count, the non-single-bit controls pinned in both builds, never-longer lengths on i686/AArch64/RISC-V, and `-O0`…`-Os` + the switch + GCC agreeing on an executed checksum |
 | `bit_idioms_bit_select_tests.rs` | 16 tests — the four shapes over every ring and both operand orders, the `Not`/`Xor -1` complement spellings, the cast-peeled index, the shift-at-another-width refusal, and the toggle involution |
@@ -616,6 +846,14 @@ accident.
 | `check_mask_and_interval_folds.py` | PASS (0.6 s) |
 | Exhaustive matcher tests | 8/16-bit rings brute-forced for interval and membership; 32/64-bit boundary sweeps; refusal tables |
 | Corpus A/B, 3,016 `tests/**/*.c` | **27 files shorter, 0 longer, net −147 instructions** with the three passes on versus off |
+| `three_way_boolean_compare.c` (`-O2`) | PASS — every predicate over 8 widths, both operand orders and both signedness classes against a branch-written reference whose value is forced through a `volatile`, on the extrema, 40,000 seeded pairs and a ±128 × ±128 sweep, plus the refusal shapes (mixed classes, different pairs, a zero-extending carrier, NaN); `VALIDATION OK` under LCCC, GCC 16.2 and Clang 23.1.4, `VALIDATION FAILED (231000)` when the `<=` mapping is mutated to `>=`, and `VALIDATION FAILED (30450)` when the cast peel is made unconditional |
+| `boolean_indicator_folds_agree_with_the_trichotomy_for_every_predicate_pair` | 1,000 combinations — 10 × 10 indicator predicate pairs × 10 outer predicates × both operand orders × both spellings, each checked against an oracle that evaluates the original C question on seven value pairs; also asserts that a same-class pair folds and a mixed-class pair does not |
+| `sign_preserving_peel_stops_at_a_zero_extension` | the three cast cases: truncation and sign-extension are peeled, zero-extension is not |
+| `zero_extensions_answer_signed_comparisons_against_zero` | eight cases — the four signed questions for `u8 -> i32` and `u16 -> i64`, plus the three refusals (signed source, same-width cast, no cast) |
+| `check_predicate_materialize.sh` section 7 | PASS — `le`/`lt`/`rev`/`byte`/`nested_eq` at ≤5 instructions with exactly one `cmp` and one `setcc` and no `sub`, the two refusals (`keep_pairs`, `keep_mixed`) identical in both builds, and `keep_second_reader` never longer |
+| `check_predicate_materialize.sh` section 7b | PASS — the same probes on i686, AArch64 and RISC-V: `le` is strictly shorter with the fold on every one, and no shape on any target gets longer |
+| `check_predicate_materialize.sh` section 8 | PASS — the valence test (`three_way_boolean_compare.c`) returns `VALIDATION OK` inside the gate, so a green gate cannot come from counts alone |
+| Corpus A/B for `booldiff`, 3,124 files | **0 files longer**, no verdict change; the only shorter file is the valence test itself (2,612 -> 1,717), because no other corpus file asks a question about the difference of two indicators. The i686 and AArch64 sweeps cannot compile that file (this sandbox has no cross libc), so for them the claim is the weaker one the invariant needs: no file moved at all |
 
 ## Corpus-wide result
 

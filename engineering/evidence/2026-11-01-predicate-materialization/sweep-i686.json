@@ -1,6 +1,6 @@
 {
  "level": "-O2",
- "files": 3118,
+ "files": 3124,
  "shorter": [
   [
    "tests/regression/cfi_unwind/unwind.c",
@@ -105,7 +105,7 @@
  ],
  "same": 1251,
  "longer": [],
- "both_reject": 1847,
+ "both_reject": 1853,
  "verdict": [],
  "net_delta": -98
 }
