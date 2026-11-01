@@ -25,6 +25,16 @@ if [[ $rc -eq 0 ]]; then
     exit 0
 fi
 cat "$work/run.err"
+if objdump -d -M intel --disassemble=ret "$work/probe" \
+    >"$work/disassembly" 2>/dev/null; then
+    symbol_disassembly=$(tr '\n' ';' < "$work/disassembly")
+    printf '::notice title=i686 ret function disassembly::%s\n' "$symbol_disassembly"
+fi
+if objdump -d -M intel --disassemble=vector_small_packed_wrappers_test_main \
+    "$work/probe" >"$work/caller-disassembly" 2>/dev/null; then
+    caller_disassembly=$(head -n 56 "$work/caller-disassembly" | tr '\n' ';')
+    printf '::notice title=i686 vector caller disassembly::%s\n' "$caller_disassembly"
+fi
 eip=$(sed -n 's/^SIGSEGV EIP=0x\([[:xdigit:]]\{8\}\)$/0x\1/p' "$work/run.err" | head -n 1)
 if [[ -n $eip ]]; then
     source_line=$(addr2line -e "$work/probe" -f -C "$eip" 2>/dev/null | tr '\n' ' ')
@@ -32,16 +42,6 @@ if [[ -n $eip ]]; then
     addr=$((eip))
     lo=$((addr > 24 ? addr - 24 : 0))
     hi=$((addr + 24))
-    if objdump -d -M intel --disassemble=ret "$work/probe" \
-        >"$work/disassembly" 2>/dev/null; then
-        symbol_disassembly=$(tr '\n' ';' < "$work/disassembly")
-        printf '::notice title=i686 ret function disassembly::%s\n' "$symbol_disassembly"
-    fi
-    if objdump -d -M intel --disassemble=vector_small_packed_wrappers_test_main \
-        "$work/probe" >"$work/caller-disassembly" 2>/dev/null; then
-        caller_disassembly=$(head -n 56 "$work/caller-disassembly" | tr '\n' ';')
-        printf '::notice title=i686 vector caller disassembly::%s\n' "$caller_disassembly"
-    fi
     if objdump -d -M intel --start-address="$lo" --stop-address="$hi" \
         "$work/probe" >"$work/disassembly" 2>/dev/null; then
         context_disassembly=$(tr '\n' ';' < "$work/disassembly")
