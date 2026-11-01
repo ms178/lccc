@@ -37,6 +37,11 @@ if [[ -n $eip ]]; then
         symbol_disassembly=$(tr '\n' ';' < "$work/disassembly")
         printf '::notice title=i686 ret function disassembly::%s\n' "$symbol_disassembly"
     fi
+    if objdump -d -M intel --disassemble=vector_small_packed_wrappers_test_main \
+        "$work/probe" >"$work/caller-disassembly" 2>/dev/null; then
+        caller_disassembly=$(head -n 56 "$work/caller-disassembly" | tr '\n' ';')
+        printf '::notice title=i686 vector caller disassembly::%s\n' "$caller_disassembly"
+    fi
     if objdump -d -M intel --start-address="$lo" --stop-address="$hi" \
         "$work/probe" >"$work/disassembly" 2>/dev/null; then
         context_disassembly=$(tr '\n' ';' < "$work/disassembly")
