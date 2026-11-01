@@ -26,10 +26,14 @@
 #   * a valid translation unit still compiles (a gate that only asserted
 #     rejections would pass with every construct deleted).
 set -euo pipefail
-# A bare `set -e` abort names nothing in the CI check UI. The ERR trap turns the
-# failing command into an annotation, so a red step explains itself without
-# anyone having to open a log.
-trap 'rc=$?; echo "::error::severity gate aborted (exit $rc) at: $BASH_COMMAND"' ERR
+# A bare `set -e` abort names nothing in the CI check UI. A DEBUG trap records
+# the last command executed (it never changes control flow, which matters here:
+# the gate deliberately runs compilers that must fail, so an ERR trap would
+# abort on the first intended rejection) and the EXIT trap reports it when the
+# script ends badly.
+last_command=
+trap 'last_command=$BASH_COMMAND' DEBUG
+trap 'rc=$?; if ((rc)); then echo "::error::severity gate exited $rc; last command: $last_command"; fi' EXIT
 redteam_runner=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/check_diagnostic_redteam.py
 
 CCC=${CCC:-./target/fastbuild/lccc}
