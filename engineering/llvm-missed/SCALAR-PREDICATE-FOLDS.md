@@ -220,7 +220,7 @@ that the fixed accumulator forces — 297 instructions off `packed_mask_tree_16_
 and 499 off `packed_mask_shifts.c` as a whole, with the packed-mask gate green in
 all 15 mode/level combinations (`correct: true`).
 
-### 8. Ring-correct interval width — `interval`
+### 8. Domain-ordered interval width — `interval`
 
 ```c
 int f(int x) { return x > -8 && x < 8; }      /* 7 -> 5, GCC 5 */
