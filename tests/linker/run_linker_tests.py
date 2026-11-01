@@ -52,6 +52,20 @@ def _escape_github_annotation_data(value: str) -> str:
     return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+def fixture_library_env(directory):
+    """Prefer the fixture DSO without hiding a non-system compiler runtime.
+
+    Cache-selected multilib GCC installs libstdc++ outside the system loader
+    directories. Replacing LD_LIBRARY_PATH with the fixture directory made
+    the C++ exception test fail before it could exercise either linker.
+    An unset/empty inherited path must not introduce an implicit cwd entry.
+    """
+    env = dict(os.environ)
+    inherited = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = directory + (os.pathsep + inherited if inherited else "")
+    return env
+
+
 def compiler_for(fname):
     """Pick the driver for a fixture source; C++ needs g++, not gcc."""
     return CXX if os.path.splitext(fname)[1] in (".cpp", ".cc", ".cxx") else CC
@@ -4408,7 +4422,7 @@ def _dso_emit_semantics_test(args, oracles):
                 f.write(body)
         lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
         shim = _shim_for(td, lccc_ld)
-        env = dict(os.environ, LD_LIBRARY_PATH=td)
+        env = fixture_library_env(td)
         r = sh([CC, "-shared", "-fPIC", "-O1", "tlsdef.c", "-o", "libtv.so"], cwd=td)
         if r.returncode != 0:
             return Result(name, "FAIL", f"fixture libtv: {r.stderr.decode()[:200]}")
@@ -4540,7 +4554,7 @@ def _dso_emit_semantics_i386_test(args, oracles):
             return Result(name, status, f"no -m32 toolchain: {r.stderr.decode()[:150]}")
         lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
         shim = _shim_for(td, lccc_ld)
-        env = dict(os.environ, LD_LIBRARY_PATH=td)
+        env = fixture_library_env(td)
         for dialect in ("gnu", "gnu2"):
             for opt in ("-O0", "-O2"):
                 r = sh([CC, "-m32", "-B" + shim, "-shared", "-fPIC", opt,
@@ -8179,6 +8193,204 @@ def _exec_stack_warning_test(args, oracles):
                       "override, marker propagation and fatal promotion agree")
 
 
+def _raw_bfd(oracles):
+    """The raw `ld.bfd` behind the bfd oracle (a compiler-driver command)."""
+    if not oracles:
+        return None
+    prog = sh([*oracles[0][1], "-print-prog-name=ld.bfd"]).stdout.decode().strip()
+    return prog if os.path.isabs(prog) else shutil.which(prog or "ld.bfd")
+
+
+def _binary_input_matches_bfd_test(args, oracles):
+    """`-b binary` embeds a file exactly like bfd's `binary` input format.
+
+    `-b FORMAT` / `--format FORMAT` select the format of the input files
+    that FOLLOW (it is not `--oformat`).  Checked against bfd:
+
+    * `lccc-ld -r -b binary blob.bin` yields bfd's object: the same `.data`
+      bytes and flags, and the same `_binary_blob_bin_{start,end,size}`
+      symbols (`nm`: value, kind, name);
+    * a driver link that embeds the file through each spelling
+      (`-Wl,-b,binary,F,-b,elf64-x86-64`, `--format=`, a pair split across
+      `-Wl,` groups) prints what the bfd link of the same program prints,
+      for x86-64 and, when multilib is installed, i686;
+    * a non-ELF format lccc cannot read is refused.
+    """
+    name = "binary_input_matches_bfd"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    bfd = _raw_bfd(oracles)
+    if not bfd or not shutil.which("nm") or not shutil.which("objcopy"):
+        return Result(name, "SKIP", "no raw ld.bfd / nm / objcopy")
+    with tempfile.TemporaryDirectory(prefix="lccc-binary-input-") as td:
+        blob = bytes(range(256)) * 3 + b"\0tail"
+        with open(os.path.join(td, "blob.bin"), "wb") as stream:
+            stream.write(blob)
+
+        def nm(path):
+            r = sh(["nm", path], cwd=td)
+            return r.stdout.decode(errors="replace").split("\n") if not r.returncode else None
+
+        def data_bytes(path):
+            r = sh(["objcopy", "-O", "binary", "--only-section=.data", path, path + ".raw"], cwd=td)
+            if r.returncode:
+                return None
+            with open(os.path.join(td, path + ".raw"), "rb") as stream:
+                return stream.read()
+
+        mine = sh([lccc_ld, "-r", "-b", "binary", "blob.bin", "-o", "mine.o"], cwd=td)
+        ref = sh([bfd, "-r", "-b", "binary", "blob.bin", "-o", "ref.o"], cwd=td)
+        if ref.returncode:
+            return Result(name, "SKIP", "bfd -r -b binary failed")
+        if mine.returncode:
+            return Result(name, "FAIL", "-r -b binary failed: " +
+                          mine.stderr.decode(errors="replace")[:300])
+        if nm("mine.o") != nm("ref.o"):
+            return Result(name, "FAIL", f"-r symbols {nm('mine.o')} != bfd {nm('ref.o')}")
+        if data_bytes("mine.o") != blob or data_bytes("ref.o") != blob:
+            return Result(name, "FAIL", "-r .data does not hold the file's bytes")
+        flags = sh(["readelf", "-SW", "mine.o"], cwd=td).stdout.decode(errors="replace")
+        if not re.search(r"\.data\s+PROGBITS\s+\S+\s+\S+\s+\S+\s+\S+\s+WA\s+0\s+0\s+1\b", flags):
+            return Result(name, "FAIL", "-r .data is not a WA, align-1 PROGBITS section")
+
+        refused = sh([lccc_ld, "-r", "-b", "srec", "blob.bin", "-o", "srec.o"], cwd=td)
+        if refused.returncode == 0:
+            return Result(name, "FAIL", "-b srec was accepted: a format lccc cannot read")
+
+        with open(os.path.join(td, "main.c"), "w", encoding="utf-8") as stream:
+            stream.write(textwrap.dedent("""\
+                #include <stdio.h>
+                extern const unsigned char _binary_blob_bin_start[];
+                extern const unsigned char _binary_blob_bin_end[];
+                int main(void) {
+                    unsigned long h = 5381;
+                    const unsigned char *p = _binary_blob_bin_start;
+                    for (; p < _binary_blob_bin_end; p++)
+                        h = h * 33 + *p;
+                    printf("%lu %lu\\n",
+                           (unsigned long)(_binary_blob_bin_end - _binary_blob_bin_start), h);
+                    return 0;
+                }
+            """))
+        spellings = (
+            ["-Wl,-b,binary,blob.bin,-b,{elf}"],
+            ["-Wl,--format=binary", "-Wl,blob.bin", "-Wl,--format=default"],
+            ["-Wl,-b", "-Wl,binary", "-Wl,blob.bin", "-Wl,-b", "-Wl,default"],
+        )
+        legs = [("", "elf64-x86-64")]
+        probe = sh([CC, "-m32", "main.c", "-o", "probe32", "-fuse-ld=bfd",
+                    "-Wl,-b,binary,blob.bin,-b,elf32-i386"], cwd=td)
+        if probe.returncode == 0:
+            legs.append(("-m32", "elf32-i386"))
+        checked = 0
+        for mflag, elf in legs:
+            m = [mflag] if mflag else []
+            ref_link = sh([*oracles[0][1], *m, "-O1", "main.c", "-o", "ref.x",
+                           *[s.format(elf=elf) for s in spellings[0]]], cwd=td)
+            if ref_link.returncode:
+                return Result(name, "SKIP", f"bfd {mflag or '-m64'} embed link failed")
+            expected = sh(["./ref.x"], cwd=td).stdout
+            if expected != f"{len(blob)} ".encode() + expected.split(b" ", 1)[1]:
+                return Result(name, "FAIL", f"oracle printed {expected!r}")
+            for spelling in spellings:
+                words = [s.format(elf=elf) for s in spelling]
+                link = sh([args.lccc, *m, "-O1", "main.c", "-o", "mine.x", *words], cwd=td)
+                label = f"{mflag or '-m64'} {' '.join(words)}"
+                if link.returncode:
+                    return Result(name, "FAIL", f"{label}: link failed: " +
+                                  link.stderr.decode(errors="replace")[:300])
+                got = sh(["./mine.x"], cwd=td).stdout
+                if got != expected:
+                    return Result(name, "FAIL", f"{label}: printed {got!r}, bfd {expected!r}")
+                checked += 1
+        return Result(name, "PASS", f"-r object matches bfd; {checked} driver embeds match")
+
+def _exec_stack_report_matches_bfd_test(args, oracles):
+    """Every executable-stack report switch behaves like bfd, byte for byte.
+
+    bfd names only the *first* input whose `.note.GNU-stack` is executable,
+    honours `--no-warn-execstack` (silence), `--warn-execstack` (which also
+    reports a `-z execstack` request), `--warn-execstack-objects` (the
+    default), and `--error-execstack` (the error wording and a failed link).
+    The standalone `lccc-ld` front end once classified two of these switches
+    as "benign" and dropped them, so the command line differed from the
+    `-Wl,` path; this compares the raw linker against bfd directly.  The
+    `--fatal-warnings` promotion is covered by exec_stack_warning_and_header
+    (lccc words every promoted warning "warning treated as error").
+    """
+    name = "exec_stack_report_matches_bfd"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    if not oracles:
+        return Result(name, "SKIP", "no bfd oracle")
+    bfd = _raw_bfd(oracles)
+    if not bfd:
+        return Result(name, "SKIP", "no raw ld.bfd")
+    helptext = sh([bfd, "--help"]).stdout.decode(errors="replace")
+    if "--error-execstack" not in helptext:
+        return Result(name, "SKIP", "bfd predates --error-execstack")
+
+    with tempfile.TemporaryDirectory(prefix="lccc-exec-stack-bfd-") as td:
+        if _linker_start_object(td).returncode:
+            return Result(name, "SKIP", "fixture compile failed")
+        for stem in ("first", "second"):
+            with open(os.path.join(td, f"{stem}.s"), "w", encoding="utf-8") as stream:
+                stream.write(f"\t.text\n\t.globl {stem}\n{stem}:\n\tret\n")
+            r = sh([CC, "-c", "-Wa,--execstack", f"{stem}.s", "-o", f"{stem}.o"], cwd=td)
+            if r.returncode:
+                return Result(name, "SKIP", "cannot mark .note.GNU-stack executable")
+
+        def report(stderr):
+            # Execstack diagnostics only, without the program-name prefix;
+            # bfd's follow-up "failed to set dynamic section sizes" is noise.
+            lines = []
+            for line in stderr.decode(errors="replace").splitlines():
+                if "exec" in line and "stack" in line:
+                    lines.append(line.split(": ", 1)[1] if ": " in line else line)
+            return lines
+
+        def stack_of(path):
+            try:
+                with open(os.path.join(td, path), "rb") as image:
+                    phdrs = _elf_bytes_phdrs(image.read())
+            except OSError:
+                return None
+            stacks = [p for p in (phdrs or []) if p[0] == _PT_GNU_STACK]
+            return _gnu_stack_flags(stacks[0][1]) if len(stacks) == 1 else None
+
+        cases = (
+            [],
+            ["--no-warn-execstack"],
+            ["--warn-execstack-objects"],
+            ["--error-execstack"],
+            ["--error-execstack", "--no-error-execstack"],
+            ["-z", "execstack"],
+            ["-z", "execstack", "--warn-execstack"],
+            ["-z", "execstack", "--warn-execstack", "--error-execstack"],
+        )
+        objs = ["start.o", "first.o", "second.o"]
+        for flags in cases:
+            label = " ".join(flags) or "(default)"
+            mine = sh([lccc_ld, "-e", "_start", *flags, *objs, "-o", "mine.out"], cwd=td)
+            ref = sh([bfd, "-e", "_start", *flags, *objs, "-o", "ref.out"], cwd=td)
+            if (mine.returncode == 0) != (ref.returncode == 0):
+                return Result(name, "FAIL",
+                              f"{label}: lccc-ld rc={mine.returncode}, bfd rc={ref.returncode}: "
+                              f"{mine.stderr.decode(errors='replace').strip()[:300]}")
+            if report(mine.stderr) != report(ref.stderr):
+                return Result(name, "FAIL",
+                              f"{label}: lccc-ld reported {report(mine.stderr)}, "
+                              f"bfd reported {report(ref.stderr)}")
+            if ref.returncode == 0 and stack_of("mine.out") != stack_of("ref.out"):
+                return Result(name, "FAIL",
+                              f"{label}: PT_GNU_STACK {stack_of('mine.out')}, "
+                              f"bfd {stack_of('ref.out')}")
+        return Result(name, "PASS",
+                      f"{len(cases)} switch combinations match bfd (report, status, header)")
+
+
 def _script_link_unsupported_option_warnings_test(args, oracles):
     """Script links diagnose unsupported options and promote them consistently."""
     name = "script_link_unsupported_option_warnings"
@@ -8498,30 +8710,21 @@ def _binary_output_matches_objcopy_test(args, oracles):
                           f"driver flat image differs from objcopy "
                           f"({len(driver_got)} vs {len(driver_expected)} bytes)")
 
-        # `-b FORMAT` is BFD's deprecated alias for `--oformat`; it reaches a
-        # linker only through `-Wl,`, where an unparsed token is silently
-        # dropped rather than rejected.  Both joined spellings must produce the
-        # same flat image as the long option above.
-        for alias in (["-Wl,-b,binary"], ["-Wl,-bbinary"],
-                      # A driver forwards `-b binary` as two groups; the pair
-                      # has to be re-joined or `binary` becomes an input file.
-                      ["-Wl,-b", "-Wl,binary"]):
+        # `-b FORMAT` is NOT an `--oformat` alias: it names the format of the
+        # inputs that follow (bfd: "Specify target for following input
+        # files").  bfd links these command lines by reading the driver's
+        # trailing objects and libraries as raw data and fails; lccc refuses
+        # the open `binary` state up front.  Neither may write a flat image.
+        for alias in (["-Wl,-b,binary"], ["-Wl,-bbinary"], ["-Wl,-b", "-Wl,binary"]):
             alias_out = "driver.alias.bin"
             alias_link = sh([args.lccc, "-O1", "-fno-pic", "driver.c", "-o",
                              alias_out, *alias, "-Wl,--build-id=none"], cwd=td)
-            if alias_link.returncode:
-                return Result(name, "FAIL", f"{' '.join(alias)} link failed: " +
-                              alias_link.stderr.decode(errors="replace")[:300])
-            with open(os.path.join(td, alias_out), "rb") as image:
-                alias_bytes = image.read()
-            if alias_bytes.startswith(b"\x7fELF"):
+            if alias_link.returncode == 0:
                 return Result(name, "FAIL",
-                              f"{' '.join(alias)} produced an ELF file: the -b alias was "
-                              f"parsed as an unknown token and dropped")
-            if alias_bytes != driver_expected:
-                return Result(name, "FAIL",
-                              f"{' '.join(alias)} flat image differs from objcopy "
-                              f"({len(alias_bytes)} vs {len(driver_expected)} bytes)")
+                              f"{' '.join(alias)} linked: -b names the INPUT format, and "
+                              f"bfd fails this link (the trailing libraries become raw data)")
+            if os.path.exists(os.path.join(td, alias_out)):
+                return Result(name, "FAIL", f"{' '.join(alias)} left an output behind")
         return Result(name, "PASS")
 
 
@@ -12923,6 +13126,10 @@ def _registry(args, oracles):
             _script_link_unsupported_option_warnings_test, "options", "script", "diagnostics"),
         one("exec_stack_warning_and_header", _exec_stack_warning_test,
             "options", "security", "diagnostics"),
+        one("exec_stack_report_matches_bfd", _exec_stack_report_matches_bfd_test,
+            "options", "security", "diagnostics"),
+        one("binary_input_matches_bfd", _binary_input_matches_bfd_test,
+            "options", "inputs"),
         one("image_base_sets_first_load", _image_base_layout_test, "options", "layout"),
         one("binary_output_matches_objcopy", _binary_output_matches_objcopy_test,
             "options", "layout"),

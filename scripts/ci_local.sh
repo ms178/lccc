@@ -35,6 +35,10 @@
 #                                      # it to mode=full: fast + slow on one tree
 #                                      # is every gate GitHub runs.
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
+#   ./scripts/ci_local.sh --fast --skip-msrv
+#       Modern-toolchain-only local validation. Omits the compatibility-floor
+#       compiler, NOT any compiler correctness gate; never writes a pass stamp.
+#       Default local and hosted compatibility coverage is unchanged.
 #
 # A --fast pass is NOT CI-equivalent: GitHub runs all seven slow gates on every
 # PR.  PR #638 went red on check_peephole_whitespace.sh after a green
@@ -74,11 +78,13 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}"
 
 FAST=0
 SLOW_ONLY=0
+SKIP_MSRV=0
 ONLY=""
 for arg in "$@"; do
     case "$arg" in
         --fast) FAST=1 ;;
         --slow) SLOW_ONLY=1 ;;
+        --skip-msrv) SKIP_MSRV=1 ;;
         --only) ONLY="__NEXT__" ;;
         *) if [ "$ONLY" = "__NEXT__" ]; then ONLY="$arg"; else
                echo "unknown argument: $arg" >&2; exit 2
@@ -129,6 +135,11 @@ gate() {
     fi
     if [ "$FAST" = "1" ] && [ "$slow" = "slow" ]; then
         echo "SKIP  $name (--fast)"
+        SKIPPED=$((SKIPPED + 1))
+        return 0
+    fi
+    if [ "$SKIP_MSRV" = 1 ] && [ "$name" = msrv-check ]; then
+        echo "SKIP  $name (--skip-msrv: modern toolchains only; no pass stamp)"
         SKIPPED=$((SKIPPED + 1))
         return 0
     fi
@@ -261,6 +272,15 @@ gate "i128-atomic-reproducer" fast \
 gate "sibcall-shapes" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" \
     bash tests/regression/check_sibcall_shapes.sh
+# LICM load speculation of non-faulting objects (positives hoisted, refusals
+# kept, weak-undefined runtime); call-argument staging vs register homes
+# (pinned __int128 stack arguments + seeds 1-6 and 11/14/16/26/30, the
+# seeds that caught the staged-register scratch clobber).
+gate "licm-global-speculation" fast \
+    python3 tests/regression/check_licm_global_speculation.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
+gate "call-arg-staging-homes" fast \
+    python3 tests/regression/check_call_arg_staging.py --lccc "$LCCC" \
+    --seed-list 1,2,3,4,5,6,11,14,16,26,30
 gate "fno-builtin-fold-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
 gate "builtin-floor-float-narrowing" fast \
@@ -889,6 +909,8 @@ gate "c-digraphs" fast \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
 # GCC warning-group parity and DWARF line/link preservation are cheap focused
 # gates; keeping them in the local mirror prevents hosted-only drift.
+gate "warning-compatibility-selftest" fast \
+    python3 tests/regression/check_warning_compat.py --self-test
 gate "warning-compatibility" fast \
     python3 tests/regression/check_warning_compat.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
@@ -961,6 +983,12 @@ gate "qualifier-conversions" fast \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "qualifier-gate-selftest" fast \
     python3 tests/regression/test_qualifier_gate.py
+# -Wreturn-local-addr: GCC 16.2's front-end walk byte for byte at -O0/-O2,
+# option handling both ways, and GCC's null-return code generation (native
+# and i686 execution against gcc-16).
+gate "return-local-addr" fast \
+    python3 tests/regression/check_return_local_addr.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
 gate "qualifier-composition" fast \
     python3 tests/regression/check_qualifier_composition.py \
         --lccc "$LCCC" --lccc target/fastbuild/lccc-i686 \
@@ -1082,6 +1110,10 @@ gate "riscv-relocation-contract" fast \
 # object linked by lccc-ld, ld.lld and GNU ld must pass its run-time checks.
 gate "riscv-relax-layout" fast \
     env CCC_RISCV=target/fastbuild/lccc-riscv bash tests/regression/check_riscv_relax_layout.sh
+# Relaxation against the pinned bfd (scripts/ensure_riscv_ld_247.sh); SKIPs
+# without it locally, while CI passes --require.
+gate "riscv-relax-bfd" fast \
+    python3 tests/regression/check_riscv_relax_bfd.py --lccc target/fastbuild/lccc-riscv
 
 gate "pr824-boundaries" fast \
     python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross --json target/redteam/boundaries.json
@@ -1732,6 +1764,7 @@ gate "integer-order-networks" fast python3 tests/regression/check_integer_order_
 # switch, host fallback and pair liveness. Mirrors the hosted step.
 gate "peephole-pair-parallel" fast python3 tests/regression/check_peephole_pair_parallel.py
 gate "oracle-diagnostics" fast python3 scripts/test_ci_oracle_diagnostics.py
+gate "llvm-slp-oracle-builder" fast python3 scripts/test_llvm_slp_oracle_builder.py
 gate "cross-linker-discovery" fast python3 tests/regression/test_check_switch_cross_execute.py
 
 gate "tls-model-option" fast \
@@ -2559,6 +2592,9 @@ gate "bb-slp-v4" fast \
 gate "bb-slp-v5" fast \
     bash tests/regression/check_bb_slp_v5_codegen.sh
 
+gate "slp-dword-constants" fast \
+    bash tests/regression/check_slp_dword_constants.sh
+
 # BB-SLP v6: the 128-bit VEX memory fold, FP negation (one-instruction
 # sign-mask composite), integer min/max folds, the general cmp+blendv
 # composite, and the rule-(b) cross-block relaxation; plus the W5
@@ -2813,6 +2849,11 @@ gate "fma-peel-invariant" fast \
 # 157 sites from growing while they are migrated.
 gate "env-test-hygiene" fast \
     bash tests/regression/check_env_test_hygiene.sh
+
+# Best-effort EIP diagnostics for the known i686 small-vector runtime crash;
+# the standard regression corpus remains the authoritative correctness gate.
+gate "i686-small-vector-crash-diagnostic" fast \
+    bash tests/regression/trace_vector_small_packed_wrappers_m32.sh
 
 # `LCCC_IFCONV_ARM_BUDGET` is an A/B lever, and its contract is what keeps the
 # numbers comparable: =1 tightens, off/full disable, an unparsable value is
@@ -3332,8 +3373,8 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 echo "ALL GATES GREEN"
-if [ -n "$ONLY" ]; then
-    echo "(--only $ONLY: partial run, no pass stamp)"
+if [ -n "$ONLY" ] || [ "$SKIP_MSRV" = 1 ]; then
+    echo "(explicit gate selection: partial run, no pass stamp)"
 else
     TREE_END=$(bash scripts/worktree_tree.sh 2>/dev/null || true)
     if [ -n "$TREE_START" ] && [ "$TREE_START" = "$TREE_END" ]; then

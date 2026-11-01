@@ -234,7 +234,7 @@ def check_correctness(cc: str, src: Path, opt: str, extra: list[str], reference:
             )
         run = subprocess.run([str(exe)], text=True, capture_output=True, timeout=20)
         if run.returncode:
-            raise RuntimeError(f"program failed ({cc} -O{opt}): {run.stderr[-1000:]}")
+            raise RuntimeError(f"program failed ({cc} -O{opt}, exit={run.returncode}): {run.stderr[-1000:]}")
         output = run.stdout.strip()
         if reference is not None and output != reference:
             raise RuntimeError(f"checksum mismatch ({cc} -O{opt}): expected {reference!r}, got {output!r}")

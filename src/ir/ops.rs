@@ -104,7 +104,7 @@ pub enum IrBinOp {
     /// or more -- an undefined C shift that may sit in dead code -- still
     /// compiles and still agrees with the constant folder.
     ///
-    /// Typed I32/U32/I64/U64 only, and the bit index is the second operand:
+    /// Typed 8/16/32/64-bit integers, and the bit index is the second operand:
     /// the operation is NOT commutative.  Passes synthesize it from the
     /// shift/OR pair, so every backend must lower it; the portable lowering
     /// is `lhs | (1 << (rhs mod W))` at the operation's width, which is why

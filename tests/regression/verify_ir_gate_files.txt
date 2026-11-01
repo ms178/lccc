@@ -41,10 +41,23 @@ tests/corpus/clang-c/Sema/builtin-assume-aligned-downgrade.c
 tests/corpus/clang-c/Sema/builtins-hexagon-v55.c
 tests/corpus/clang-c/Sema/deep_recursion.c
 tests/corpus/clang-c/Sema/format-attr-missing.c
-tests/corpus/clang-c/Sema/gcc_ms_struct.c
+# `Sema/gcc_ms_struct.c` was replaced by the bit-field fixture at the end of
+# this list: it is a Clang *negative* test (its own RUN line expects
+# `ms_struct and gcc_struct attributes are not compatible` errors), and lccc
+# now refuses a record whose layout attribute it cannot honour, so the file can
+# never be a "compiles cleanly under -O2" fixture. It never belonged in this
+# sweep: a file whose purpose is to be rejected cannot also be the evidence that
+# accepted code produces valid IR. The replacement drives the same surface
+# (bit-field extract/insert, zero-width units, packed bit-fields, unions) with
+# no layout assertions, so it is strictly better evidence for this sweep.
+tests/regression/verify_ir_bitfield_record.c
 tests/corpus/clang-c/Sema/mips16_attr_not_allowed.c
 tests/corpus/clang-c/Sema/pid_t.c
-tests/corpus/clang-c/Sema/preserve-none-call-conv.c
+# A preservation-convention negative fixture must not pretend to be an
+# accepted-code IR invariant test: GCC 16.2 preserve_none changes argument
+# registers as well as preservation. Refusal is pinned by the ABI matrix;
+# accepted native direct/forwarded/indirect calls exercise IR here instead.
+tests/regression/verify_ir_native_convention.c
 tests/corpus/clang-c/Sema/sign-conversion.c
 tests/corpus/clang-c/Sema/typedef-prototype.c
 tests/corpus/clang-c/Sema/vector_swizzle_length.c

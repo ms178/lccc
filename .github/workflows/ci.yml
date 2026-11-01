@@ -129,6 +129,8 @@ jobs:
       with:
         name: lccc-fast-${{ github.sha }}
         path: lccc-fast.tar.gz
+        # Already gzip-compressed: avoid compressing the compiler bundle twice.
+        compression-level: 0
         if-no-files-found: error
         retention-days: 3
   # The test suite used to run inside `build`, which made every consumer lane
@@ -410,6 +412,10 @@ jobs:
           echo '== tested compiler =='
           sha256sum target/fastbuild/lccc target/fastbuild/lccc-ld
         } | tee ci-regression-environment.txt
+    - name: Diagnose i686 small-vector runtime failures
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/trace_vector_small_packed_wrappers_m32.sh
     - name: Run regression corpus with SSA validation
       env:
         CCC_VALIDATE_SSA: '1'
@@ -1149,6 +1155,14 @@ jobs:
         python3 tests/regression/check_qualifier_conversions.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
         python3 tests/regression/test_qualifier_gate.py
+        # Guard the newly added i686 ABI and optimizer contracts in hosted CI,
+        # not only in ci_local.sh.
+        python3 tests/regression/check_call_arg_staging.py \
+          --lccc target/fastbuild/lccc --seed-list 1,2,3,4,5,6,11,14,16,26,30
+        python3 tests/regression/check_licm_global_speculation.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_return_local_addr.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16 --m32
         python3 tests/regression/check_qualifier_composition.py \
           --lccc target/fastbuild/lccc --lccc target/fastbuild/lccc-i686 \
           --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
@@ -1344,6 +1358,8 @@ jobs:
         set -euo pipefail
         python3 -m unittest discover -s tests/simd -p 'test_*.py'
         python3 tests/simd/check_scoreboard.py --check-clock-failure --lccc target/fastbuild/lccc --reference gcc-16
+        python3 tests/simd/check_lightpixel.py --require-native --lccc target/fastbuild/lccc --reference gcc-16
+        python3 tests/simd/check_joint_pixels.py --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/aos_pair_shapes.py --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/aos_pair_shapes.py --guarded --mixed --stride 4 \
           --lccc target/fastbuild/lccc --reference gcc-16
@@ -1764,6 +1780,13 @@ jobs:
       env:
         LCCC_CROSS_DEB_DIR: /home/runner/.cache/lccc-cross-debs
       run: bash scripts/ci_provision_cross.sh
+    - name: Cache GNU ld 2.47 for RISC-V relaxation
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/bfd-ld-2.47-riscv64-linux-gnu
+        key: ${{ runner.os }}-bfd-ld-2.47-riscv64-${{ hashFiles('scripts/ensure_riscv_ld_247.sh', 'scripts/ensure_gas_247.sh') }}
+    - name: Install GNU ld 2.47 for the RISC-V relaxation oracle
+      run: bash scripts/ensure_riscv_ld_247.sh
     - name: Cache Clang 23 oracle
       uses: actions/cache@v6
       with:
@@ -1798,6 +1821,8 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Check RISC-V relaxation against pinned BFD
+      run: python3 tests/regression/check_riscv_relax_bfd.py --require
     - name: Execute switch and memory contracts on AArch64 and RISC-V
       run: python3 tests/regression/check_switch_cross_execute.py
     - name: Run destructive-path guard regression
@@ -1817,7 +1842,10 @@ jobs:
     - name: Verify basic-block SLP v5 contracts
       env:
         CCC: target/fastbuild/lccc
-      run: bash tests/regression/check_bb_slp_v5_codegen.sh
+      run: |
+        set -euo pipefail
+        bash tests/regression/check_bb_slp_v5_codegen.sh
+        bash tests/regression/check_slp_dword_constants.sh
     - name: Verify basic-block SLP v7 contracts
       env:
         CCC: target/fastbuild/lccc
@@ -1926,7 +1954,15 @@ jobs:
       # scripts/check_ci_gate_parity.py checks.
       run: |
         set -Eeuo pipefail
-        bash tests/regression/check_layout_tie_rule.sh
+        log="$RUNNER_TEMP/layout-tie-rule.log"
+        if bash tests/regression/check_layout_tie_rule.sh >"$log" 2>&1; then
+          cat "$log"
+        else
+          rc=$?
+          cat "$log"
+          python3 scripts/ci_annotate_log.py --title "Layout tie rule" --tail 80 "$log"
+          exit "$rc"
+        fi
 
     - name: Verify peephole phi-hoist safety contracts
       env:
@@ -3246,6 +3282,40 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
+      run: bash scripts/ci_provision_toolchain.sh --multilib
+    - name: Cache the GCC 16.2 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/gcc-oracle
+        key: lccc-gcc-oracle-${{ runner.os }}-16.2-${{ hashFiles('scripts/ci_install_gcc_oracle.sh') }}
+    - name: Install the GCC 16.2 oracle
+      run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
+    - name: Cache the Clang 23.1.4 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/clang-oracle
+        key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
+    - name: Install the Clang 23.1.4 oracle
+      run: bash scripts/ci_install_clang_oracle.sh
+    - name: Verify the lane's oracle toolchain
+      run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+    - name: Select exact modern oracles for vendor comparisons
+      run: |
+        set -euo pipefail
+        test "$(gcc-16 -dumpfullversion)" = 16.2.0
+        test "$("$CLANG" -dumpversion)" = 23.1.4
+        mkdir -p "$RUNNER_TEMP/lccc-modern-oracles"
+        ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-modern-oracles/gcc"
+        ln -s "$(command -v g++-16)" "$RUNNER_TEMP/lccc-modern-oracles/g++"
+        echo "$RUNNER_TEMP/lccc-modern-oracles" >> "$GITHUB_PATH"
+        echo "GCC16=$(command -v gcc-16)" >> "$GITHUB_ENV"
+        ln -s "$CLANG" "$RUNNER_TEMP/lccc-modern-oracles/clang"
     - name: Provision authenticated vendor compiler snapshot
       run: |
         set -euo pipefail
@@ -3280,11 +3350,10 @@ jobs:
         # The full differential gate runs here too, where a real authenticated
         # ICX 2026.2 binary exists; its local mirror skips ICX only when the
         # vendor snapshot is unavailable on the host.
-        # This lane's primary oracle is ICX; its GCC leg uses the runner
-        # default.  The pinned GCC 16.2 differential runs in
-        # backend-contracts-b, which provisions that exact oracle.
+        # All three comparison oracles are exact: authenticated ICX 2026.2,
+        # cached GCC 16.2 and cached Clang 23.1.4; never the runner defaults.
         env CCC=target/fastbuild/lccc \
-          GCC_SIGN_CMOV="${GCC16:-gcc}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
+          GCC_SIGN_CMOV="$GCC16" CLANG_SIGN_CMOV="$CLANG" \
           ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
           bash tests/regression/check_sign_test_cmov.sh
         # Same-host, correctness-gated SHA-256 comparison. The saved report is
@@ -3312,6 +3381,12 @@ jobs:
       run: |
         python3 tests/simd/check_scoreboard.py --check-clock-failure --lccc target/fastbuild/lccc \
           --reference "$LCCC_ICX_BIN -fp-model=strict" --json intel-evidence/simd-scoreboard.json
+    - name: LightPixel unsigned clamp and reduction against authenticated ICX
+      run: |
+        python3 tests/simd/check_lightpixel.py --require-native --lccc target/fastbuild/lccc \
+          --reference "$LCCC_ICX_BIN" --json intel-evidence/lightpixel.json
+        python3 tests/simd/check_joint_pixels.py --lccc target/fastbuild/lccc \
+          --reference "$LCCC_ICX_BIN" --json intel-evidence/joint-pixels.json
     - name: Qualifier composition against authenticated ICX
       run: |
         python3 tests/regression/check_qualifier_composition.py \

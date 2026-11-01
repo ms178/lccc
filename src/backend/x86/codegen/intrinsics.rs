@@ -17,6 +17,22 @@ use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
+/// Decode bounded internal vector controls without truncating wide constants.
+/// A malformed producer must fail closed, not silently change a shuffle/store.
+fn checked_vec_control(
+    arg: Option<&Operand>,
+    range: std::ops::RangeInclusive<i64>,
+    name: &str,
+) -> i64 {
+    let value = match arg {
+        Some(Operand::Const(c)) => c.to_i128().and_then(|v| i64::try_from(v).ok()),
+        _ => None,
+    };
+    value
+        .filter(|v| range.contains(v))
+        .unwrap_or_else(|| panic!("invalid {name}: expected an integer constant in {range:?}"))
+}
+
 /// Result destination of a value-producing intrinsic.  Source-level `_mm_`
 /// intrinsics write through a memory result slot (`dest_ptr`); internal pass
 /// emission uses the SSA form (`dest`).  Both spellings name the same result,
@@ -82,7 +98,7 @@ impl X86Codegen {
                 | "pand" | "por" | "pxor" | "xorps" | "xorpd"
                 // Integer min/max (no FP unordered/±0 asymmetry).
                 | "pminub" | "pmaxub" | "pminsw" | "pmaxsw"
-                | "pminsd" | "pmaxsd"
+                | "pminsd" | "pmaxsd" | "pminud" | "pmaxud"
                 // Sum of absolute byte differences: |a - b| is symmetric.
                 | "psadbw"
         )
@@ -1731,15 +1747,31 @@ impl X86Codegen {
         lane_bytes: usize,
         wide: bool,
     ) -> bool {
-        let lane = match args.first() {
-            Some(Operand::Const(IrConst::I8(v))) if lane_bytes == 1 => *v as u8 as u64,
-            Some(Operand::Const(IrConst::I16(v))) if lane_bytes == 2 => *v as u16 as u64,
-            Some(Operand::Const(IrConst::I32(v))) if lane_bytes == 4 => *v as u32 as u64,
-            Some(Operand::Const(IrConst::I64(v))) if lane_bytes == 8 => *v as u64,
+        // Match the generic movd/movq path: wider integer constants are
+        // truncated to the consuming lane, not tiled at their source width.
+        // Narrower constants still need the generic sign-extension policy.
+        if ![1, 2, 4, 8].contains(&lane_bytes) {
+            return false;
+        }
+        let (bits, natural_width) = match args.first() {
+            Some(Operand::Const(IrConst::I8(v))) => (*v as u8 as u64, 1),
+            Some(Operand::Const(IrConst::I16(v))) => (*v as u16 as u64, 2),
+            Some(Operand::Const(IrConst::I32(v))) => (*v as u32 as u64, 4),
+            Some(Operand::Const(IrConst::I64(v))) => (*v as u64, 8),
             _ => return false,
         };
+        if natural_width < lane_bytes {
+            return false;
+        }
+        let mask = u64::MAX >> (64 - 8 * lane_bytes);
+        let lane = bits & mask;
+        // Test the TRUNCATED lane. Passing the original wider constant to
+        // these helpers would miss zeros/ones present only in its low bits.
         if lane == 0 {
-            return self.try_zero_splat(args, dest, wide);
+            return self.try_zero_splat(&[Operand::Const(IrConst::Zero)], dest, wide);
+        }
+        if lane == mask {
+            return self.try_all_ones_splat(&[Operand::Const(IrConst::I64(-1))], dest, wide);
         }
         let total = if wide { 32 } else { 16 };
         let mut bytes = vec![0u8; total];
@@ -5032,10 +5064,10 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecLoadStrided2I32x4 => {
-                // Two exact-width reads, never the gap at +4. `movd` zeroes
-                // the rest of its destination, so no separate zeroing op is
-                // needed. SSE2 has no pinsrd; shift the second dword to lane
-                // 2 in the reserved xmm1 scratch and merge it.
+                // Four exact-width reads at +0/+8/+16/+24, never a gap.
+                // SSE2 has no pinsrd: `movd` zeroes the rest of its
+                // destination, `punpckldq` pairs [e0, e8] and [e16, e24], and
+                // `punpcklqdq` joins the pairs into lanes 0..3.
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
@@ -5047,9 +5079,25 @@ impl X86Codegen {
                 self.state
                     .emit_fmt(format_args!("    movd (%rax), %{}", work));
                 self.state.emit("    movd 8(%rax), %xmm1");
-                self.state.emit("    pslldq $8, %xmm1");
                 self.state
-                    .emit_fmt(format_args!("    por %xmm1, %{}", work));
+                    .emit_fmt(format_args!("    punpckldq %xmm1, %{}", work));
+                if work == "xmm0" {
+                    // xmm1 is the only scratch: shift each upper element into
+                    // its lane and merge (two more ops than the form below).
+                    self.state.emit("    movd 16(%rax), %xmm1");
+                    self.state.emit("    pslldq $8, %xmm1");
+                    self.state.emit("    por %xmm1, %xmm0");
+                    self.state.emit("    movd 24(%rax), %xmm1");
+                    self.state.emit("    pslldq $12, %xmm1");
+                    self.state.emit("    por %xmm1, %xmm0");
+                } else {
+                    // xmm0 and xmm1 are both scratch here.
+                    self.state.emit("    movd 16(%rax), %xmm0");
+                    self.state.emit("    movd 24(%rax), %xmm1");
+                    self.state.emit("    punpckldq %xmm1, %xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    punpcklqdq %xmm0, %{}", work));
+                }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
                     if let Some(home) = dst_home {
@@ -5908,6 +5956,78 @@ impl X86Codegen {
                     self.sse_store_dest(d, "xmm0");
                 }
             }
+            IntrinsicOp::VecWidenByteFieldsI32x4 => {
+                assert!(
+                    self.isa.sse41 && args.len() == 2,
+                    "byte fields require SSE4.1 and two operands"
+                );
+                let pattern = checked_vec_control(args.get(1), 0..=255, "byte-field pattern");
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.operand_to_reg(&args[0], "rax");
+                let prefix = if self.avx2_enabled { "v" } else { "" };
+                self.state
+                    .emit_fmt(format_args!("    {}movd %eax, %xmm0", prefix));
+                self.state
+                    .emit_fmt(format_args!("    {}pmovzxbd %xmm0, %xmm0", prefix));
+                if pattern != 0xe4 {
+                    self.state.emit_fmt(format_args!(
+                        "    {}pshufd ${}, %xmm0, %xmm0",
+                        prefix, pattern
+                    ));
+                }
+                if let Some(d) = dest {
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
+            IntrinsicOp::VecLoadWidenU8ToI32x4 => {
+                assert!(
+                    self.isa.sse41 && args.len() == 5,
+                    "byte widening requires SSE4.1 and five operands"
+                );
+                let pattern = checked_vec_control(args.get(3), 0..=255, "three-byte shuffle");
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let disp = Self::vec_disp_arg(args, 2);
+                let count = checked_vec_control(args.get(4), 3..=4, "widening byte count");
+                let prefix = if self.avx2_enabled { "v" } else { "" };
+                if count == 4 {
+                    let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                    self.state
+                        .emit_fmt(format_args!("    {}pmovzxbd {}, %xmm0", prefix, mem));
+                } else {
+                    let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                    self.state
+                        .emit_fmt(format_args!("    movzwl {}, %eax", mem));
+                    self.state
+                        .emit_fmt(format_args!("    {}movd %eax, %xmm0", prefix));
+                    // Re-evaluate after EAX staging: slot-homed pointers may
+                    // themselves use RAX as temporary address scratch.
+                    let mem = self.vec_mem_operand(
+                        &args[0],
+                        &args[1],
+                        disp.checked_add(2).expect("widening displacement overflow"),
+                    );
+                    if self.avx2_enabled {
+                        self.state
+                            .emit_fmt(format_args!("    vpinsrb $2, {}, %xmm0, %xmm0", mem));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    pinsrb $2, {}, %xmm0", mem));
+                    }
+                    self.state
+                        .emit_fmt(format_args!("    {}pmovzxbd %xmm0, %xmm0", prefix));
+                }
+                if pattern != 0xe4 {
+                    self.state.emit_fmt(format_args!(
+                        "    {}pshufd ${}, %xmm0, %xmm0",
+                        prefix, pattern
+                    ));
+                }
+                if let Some(d) = dest {
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
             IntrinsicOp::VecLoadI32x4Pair => {
                 // HALF-WIDE dword-pair load: two consecutive dwords into
                 // lanes 0/1, upper 64 bits ZEROED (MOVQ xmm, m64 clears
@@ -5944,6 +6064,56 @@ impl X86Codegen {
                     if !loaded_home {
                         self.sse_store_dest(d, "xmm0");
                     }
+                }
+            }
+            IntrinsicOp::VecStoreNarrowMaxU8x4 | IntrinsicOp::VecNarrowMaxU8x4 => {
+                let store = *op == IntrinsicOp::VecStoreNarrowMaxU8x4;
+                assert!(
+                    self.isa.sse41 && args.len() == if store { 5 } else { 2 },
+                    "joint narrow/max store requires SSE4.1 and five operands"
+                );
+                let control = checked_vec_control(args.last(), 0..=7, "joint store control");
+                self.flush_pending_vec_store_impl();
+                self.sse_load_arg(&args[0], "xmm0");
+                self.state.invalidate_vec_peephole();
+                // Range proof belongs to the producer. In [0,255], signed
+                // dword->unsigned word and signed word->unsigned byte packing
+                // are exact, and byte-domain max commutes with narrowing.
+                if self.avx2_enabled {
+                    self.state.emit("    vpackusdw %xmm0, %xmm0, %xmm0");
+                    self.state.emit("    vpackuswb %xmm0, %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    packusdw %xmm0, %xmm0");
+                    self.state.emit("    packuswb %xmm0, %xmm0");
+                }
+                let alpha = control as usize & 3;
+                let independent = control & 4 != 0;
+                let mut lanes = (0..4).filter(|i| *i != alpha);
+                if !independent {
+                    lanes.next();
+                } // producer duplicated this lane
+                for lane in lanes {
+                    let mut mask: Vec<u8> = (0..16).collect();
+                    mask[alpha] = lane as u8;
+                    let label = self.state.get_vec_const_label(&mask);
+                    if self.avx2_enabled {
+                        self.state
+                            .emit_fmt(format_args!("    vpshufb {}(%rip), %xmm0, %xmm1", label));
+                        self.state.emit("    vpmaxub %xmm1, %xmm0, %xmm0");
+                    } else {
+                        self.state.emit("    movdqa %xmm0, %xmm1");
+                        self.state
+                            .emit_fmt(format_args!("    pshufb {}(%rip), %xmm1", label));
+                        self.state.emit("    pmaxub %xmm1, %xmm0");
+                    }
+                }
+                let mnemonic = if self.avx2_enabled { "vmovd" } else { "movd" };
+                if store {
+                    self.emit_vec_store_addr(args, dest_ptr, mnemonic, "xmm0");
+                } else if let Some(d) = dest {
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, %eax", mnemonic));
+                    self.store_rax_to(d);
                 }
             }
             IntrinsicOp::VecStoreI32x4Pair => {
@@ -6837,6 +7007,17 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "pminsw");
                 }
             }
+            IntrinsicOp::VecMinU32x4 | IntrinsicOp::VecMaxU32x4 => {
+                assert!(self.isa.sse41, "unsigned dword min/max requires SSE4.1");
+                if let Some(d) = dest {
+                    let inst = if *op == IntrinsicOp::VecMaxU32x4 {
+                        "pmaxud"
+                    } else {
+                        "pminud"
+                    };
+                    self.emit_sse_binary_128(d, args, inst);
+                }
+            }
             IntrinsicOp::VecSminI32x4 => {
                 if let Some(d) = dest {
                     self.emit_sminmax_i32x4(d, args, false);
@@ -7724,6 +7905,17 @@ impl X86Codegen {
                 // and the freshly-loaded 8 lanes fold into a new accumulator.
                 if let Some(d) = dest {
                     self.emit_avx_binary_256(d, args, "vpmaxsd", true);
+                }
+            }
+            IntrinsicOp::VecMinU32x8 | IntrinsicOp::VecMaxU32x8 => {
+                assert!(self.avx2_enabled, "unsigned 8-dword min/max requires AVX2");
+                if let Some(d) = dest {
+                    let inst = if *op == IntrinsicOp::VecMaxU32x8 {
+                        "vpmaxud"
+                    } else {
+                        "vpminud"
+                    };
+                    self.emit_avx_binary_256(d, args, inst, true);
                 }
             }
             IntrinsicOp::VecMinI32x8 => {
@@ -11170,6 +11362,28 @@ impl X86Codegen {
             }
             return;
         }
+        // Splats (the vector-fill pass's run-time values): one broadcast
+        // instead of the general four-lane assembly.  Same scratch registers
+        // (%rax/%rcx, %xmm0/%xmm1) as the general path below.
+        if args[1..].iter().all(|a| *a == args[0]) {
+            self.operand_to_reg(&args[0], "rax");
+            self.state.emit("    movd %eax, %xmm0");
+            self.state.emit("    pshufd $0, %xmm0, %xmm0"); // [x0, x0, x0, x0]
+            self.state.sse_last_store_reg = false;
+            self.sse_store_dest(dest, "xmm0");
+            return;
+        }
+        if args[2] == args[0] && args[3] == args[1] {
+            self.operand_to_reg(&args[0], "rax");
+            self.state.emit("    movd %eax, %xmm0");
+            self.operand_to_reg(&args[1], "rcx");
+            self.state.emit("    movd %ecx, %xmm1");
+            self.state.emit("    punpckldq %xmm1, %xmm0"); // [x0, x1, 0, 0]
+            self.state.emit("    punpcklqdq %xmm0, %xmm0"); // [x0, x1, x0, x1]
+            self.state.sse_last_store_reg = false;
+            self.sse_store_dest(dest, "xmm0");
+            return;
+        }
         self.operand_to_reg(&args[0], "rax");
         self.state.emit("    movd %eax, %xmm0");
         self.operand_to_reg(&args[1], "rcx");
@@ -12099,14 +12313,16 @@ mod vector_address_contract_tests {
         assert!(!out.contains("vmovdqu"), "{out}");
     }
 
-    #[test]
-    fn strided_load_sse2_reads_only_two_dwords() {
+    /// The emitted instruction lines, without comments or directives.
+    fn strided_gather_lines(dest: Option<Value>, home: Option<PhysReg>) -> Vec<String> {
         let mut cg = X86Codegen::new();
         cg.reg_assignments.insert(0, super::super::machinst::R12);
         cg.reg_assignments.insert(1, super::super::machinst::R13);
-        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6
+        if let Some(home) = home {
+            cg.reg_assignments.insert(2, home);
+        }
         cg.emit_intrinsic_impl(
-            &Some(Value(2)),
+            &dest,
             &IntrinsicOp::VecLoadStrided2I32x4,
             &None,
             &[
@@ -12115,18 +12331,78 @@ mod vector_address_contract_tests {
                 Operand::Const(IrConst::I64(16)),
             ],
         );
-        let out = &cg.state.out.buf;
-        for inst in [
-            "leaq 16(%r12,%r13), %rax",
-            "movd (%rax), %xmm6",
-            "movd 8(%rax), %xmm1",
-            "pslldq $8, %xmm1",
-            "por %xmm1, %xmm6",
-        ] {
-            assert!(out.contains(inst), "missing {inst}: {out}");
-        }
-        assert!(!out.contains("movdqu"), "{out}");
-        assert!(!out.contains("movdqa %xmm0, %xmm6"), "{out}");
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('.'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every memory operand is one of the four scalar elements' own dwords.
+    fn assert_only_exact_element_reads(lines: &[String]) {
+        let reads: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains("(%rax)"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            reads
+                .iter()
+                .map(|l| l.split(',').next().unwrap_or(""))
+                .collect::<Vec<_>>(),
+            [
+                "movd (%rax)",
+                "movd 8(%rax)",
+                "movd 16(%rax)",
+                "movd 24(%rax)"
+            ],
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn strided_load_sse2_gathers_four_exact_dwords() {
+        let lines = strided_gather_lines(Some(Value(2)), Some(PhysReg(24))); // xmm6
+        assert_eq!(
+            lines,
+            [
+                "leaq 16(%r12,%r13), %rax",
+                "movd (%rax), %xmm6",
+                "movd 8(%rax), %xmm1",
+                "punpckldq %xmm1, %xmm6",
+                "movd 16(%rax), %xmm0",
+                "movd 24(%rax), %xmm1",
+                "punpckldq %xmm1, %xmm0",
+                "punpcklqdq %xmm0, %xmm6",
+            ]
+        );
+        assert_only_exact_element_reads(&lines);
+    }
+
+    /// Without an XMM home the result is built in xmm0 with xmm1 as the only
+    /// scratch; the lane placement must still be `[e0, e8, e16, e24]`.
+    #[test]
+    fn strided_load_sse2_gather_without_home_uses_one_scratch() {
+        let lines = strided_gather_lines(None, None);
+        assert_eq!(
+            lines,
+            [
+                "leaq 16(%r12,%r13), %rax",
+                "movd (%rax), %xmm0",
+                "movd 8(%rax), %xmm1",
+                "punpckldq %xmm1, %xmm0",
+                "movd 16(%rax), %xmm1",
+                "pslldq $8, %xmm1",
+                "por %xmm1, %xmm0",
+                "movd 24(%rax), %xmm1",
+                "pslldq $12, %xmm1",
+                "por %xmm1, %xmm0",
+            ]
+        );
+        assert_only_exact_element_reads(&lines);
     }
 
     #[test]
@@ -13316,5 +13592,123 @@ mod scalar_saturation_cache_tests {
         cg.operand_to_reg(&Operand::Value(Value(0)), "rcx");
         assert!(cg.state.reg_cache.sec_has(0, false));
         assert_eq!(cg.state.out.buf, "");
+    }
+}
+
+#[cfg(test)]
+mod bounded_vector_control_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_controls_accept_all_encodings_and_reject_bad_metadata() {
+        for range in [0..=255, 3..=4, 0..=7] {
+            for n in range.clone() {
+                assert_eq!(
+                    checked_vec_control(
+                        Some(&Operand::Const(IrConst::I64(n))),
+                        range.clone(),
+                        "test"
+                    ),
+                    n
+                );
+            }
+            let mut bad = vec![
+                None,
+                Some(Operand::Value(Value(1))),
+                Some(Operand::Const(IrConst::F64(0.0))),
+                Some(Operand::Const(IrConst::I64(*range.start() - 1))),
+                Some(Operand::Const(IrConst::I64(*range.end() + 1))),
+            ];
+            for low in range.clone() {
+                bad.push(Some(Operand::Const(IrConst::I128(
+                    (1_i128 << 64) + i128::from(low),
+                ))));
+            }
+            for arg in &bad {
+                assert!(
+                    std::panic::catch_unwind(|| checked_vec_control(
+                        arg.as_ref(),
+                        range.clone(),
+                        "test"
+                    ))
+                    .is_err(),
+                    "accepted {arg:?} for {range:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod truncated_splat_tests {
+    use super::*;
+
+    #[test]
+    fn wide_constants_tile_only_consuming_lane_bytes() {
+        let cases = [
+            IrConst::I64(0x1234_5678_89ab_cdef),
+            IrConst::I64(-257),
+            IrConst::I32(0x1234_abcd),
+            IrConst::I16(0x1234),
+        ];
+        for constant in cases {
+            let width = match constant {
+                IrConst::I64(_) => 8,
+                IrConst::I32(_) => 4,
+                _ => 2,
+            };
+            for lane_bytes in [1, 2, 4, 8] {
+                for wide in [false, true] {
+                    let mut cg = X86Codegen::new();
+                    cg.avx2_enabled = wide;
+                    let accepted = cg.try_const_splat_load(
+                        &[Operand::Const(constant.clone())],
+                        &None,
+                        lane_bytes,
+                        wide,
+                    );
+                    assert_eq!(accepted, lane_bytes <= width);
+                    if !accepted {
+                        continue;
+                    }
+                    let mask = u64::MAX >> (64 - lane_bytes * 8);
+                    let lane = constant.to_i64().unwrap() as u64 & mask;
+                    if lane == 0 || lane == mask {
+                        assert!(cg.state.vec_const_pool.is_empty());
+                    } else {
+                        let expected = lane.to_le_bytes()[..lane_bytes].repeat(if wide {
+                            32 / lane_bytes
+                        } else {
+                            16 / lane_bytes
+                        });
+                        assert!(cg.state.vec_const_pool.contains_key(&expected));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_zero_and_ones_do_not_read_a_constant_pool() {
+        for (constant, lane_bytes) in [
+            (IrConst::I64(1 << 32), 4),
+            (IrConst::I64(0xffff_ffff), 4),
+            (IrConst::I32(0x1_0000), 2),
+            (IrConst::I32(0x1_ffff), 2),
+            (IrConst::I16(0x100), 1),
+            (IrConst::I16(0x1ff), 1),
+        ] {
+            for wide in [false, true] {
+                let mut cg = X86Codegen::new();
+                cg.avx2_enabled = wide;
+                assert!(cg.try_const_splat_load(
+                    &[Operand::Const(constant.clone())],
+                    &None,
+                    lane_bytes,
+                    wide,
+                ));
+                assert!(cg.state.vec_const_pool.is_empty());
+            }
+        }
     }
 }

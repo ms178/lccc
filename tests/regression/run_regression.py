@@ -330,7 +330,16 @@ def host_lacks_i386_headers(gcc: str, src: str, flags: str) -> bool:
     err = probe.stderr
     # Only a missing multilib header counts. Anything else — a real
     # preprocessor or parse error — must stay visible as a failure.
-    return "No such file or directory" in err and "bits/" in err
+    #
+    # Both spellings matter: glibc's 32-bit layer is reached through `bits/`
+    # (`bits/libc-header-start.h`), while the kernel UAPI tests reach for
+    # `asm/` (`asm/types.h`, `asm/posix_types.h`), which a host without
+    # linux-libc-dev:i386 never provides.  A host that fails on `asm/` fails
+    # every `-m32` test that includes a kernel header for exactly the same
+    # reason, so the same downgrade applies.
+    return "No such file or directory" in err and (
+        "bits/" in err or "asm/" in err
+    )
 
 
 _I386_LINK_OK: dict[str, bool] = {}

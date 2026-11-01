@@ -1,14 +1,15 @@
 {
   "fns_over_1000": 26,
-  "fns_over_300": 233,
+  "fns_over_300": 232,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 550,
+  "knob_literals": 551,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
     "CCC_AGG_SPLIT_DEBUG",
     "CCC_AGG_SPLIT_MAX_FIELDS",
+    "CCC_ALLOW_UNSUPPORTED_ABI",
     "CCC_ASM_DEBUG",
     "CCC_BEPRE_FP",
     "CCC_CALLER_SAVE_SPANNING",
@@ -556,8 +557,8 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 264,
-  "panic_sites": 882,
+  "knobs_undocumented": 262,
+  "panic_sites": 878,
   "panic_sites_hot": 101,
   "unsafe_sites": 25
 }

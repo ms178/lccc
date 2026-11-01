@@ -1914,10 +1914,7 @@ fn push_helper_fn(
             }
         }
         // Prepend the param setup to the entry block.
-        let entry = &mut blocks[0];
-        let mut is = entry_is;
-        is.append(&mut entry.instructions);
-        entry.instructions = is;
+        blocks[0].insert_insts(0, entry_is, crate::common::source::Span::dummy());
     }
     // Block labels are TU-global in the emitted assembly: every `.LBB{id}`
     // must be unique across ALL functions (observed: a helper reusing label

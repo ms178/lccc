@@ -11,15 +11,16 @@ use super::elf_read::*;
 use super::got::{GotKind, GotLayout};
 use super::relocations::{
     GlobalSym, MergedSection, R_RISCV_32, R_RISCV_32_PCREL, R_RISCV_64, R_RISCV_ADD8,
-    R_RISCV_ADD16, R_RISCV_ADD32, R_RISCV_ADD64, R_RISCV_ALIGN, R_RISCV_BRANCH, R_RISCV_CALL_PLT,
-    R_RISCV_GOT_HI20, R_RISCV_HI20, R_RISCV_JAL, R_RISCV_LO12_I, R_RISCV_LO12_S,
-    R_RISCV_PCREL_HI20, R_RISCV_PCREL_LO12_I, R_RISCV_PCREL_LO12_S, R_RISCV_RELAX,
-    R_RISCV_RVC_BRANCH, R_RISCV_RVC_JUMP, R_RISCV_SET_ULEB128, R_RISCV_SET6, R_RISCV_SET8,
-    R_RISCV_SET16, R_RISCV_SET32, R_RISCV_SUB_ULEB128, R_RISCV_SUB6, R_RISCV_SUB8, R_RISCV_SUB16,
-    R_RISCV_SUB32, R_RISCV_SUB64, R_RISCV_TLS_GD_HI20, R_RISCV_TLS_GOT_HI20, R_RISCV_TPREL_ADD,
-    R_RISCV_TPREL_HI20, R_RISCV_TPREL_LO12_I, R_RISCV_TPREL_LO12_S, got_sym_key, patch_b_type,
-    patch_cb_type, patch_cj_type, patch_i_type, patch_j_type, patch_s_type, patch_u_type,
-    resolve_symbol_value,
+    R_RISCV_ADD16, R_RISCV_ADD32, R_RISCV_ADD64, R_RISCV_ALIGN, R_RISCV_BRANCH, R_RISCV_CALL,
+    R_RISCV_CALL_PLT, R_RISCV_GOT_HI20, R_RISCV_GPREL_I, R_RISCV_GPREL_S, R_RISCV_HI20,
+    R_RISCV_JAL, R_RISCV_LO12_I, R_RISCV_LO12_S, R_RISCV_PCREL_HI20, R_RISCV_PCREL_LO12_I,
+    R_RISCV_PCREL_LO12_S, R_RISCV_RELAX, R_RISCV_RVC_BRANCH, R_RISCV_RVC_JUMP, R_RISCV_RVC_LUI,
+    R_RISCV_SET_ULEB128, R_RISCV_SET6, R_RISCV_SET8, R_RISCV_SET16, R_RISCV_SET32,
+    R_RISCV_SUB_ULEB128, R_RISCV_SUB6, R_RISCV_SUB8, R_RISCV_SUB16, R_RISCV_SUB32, R_RISCV_SUB64,
+    R_RISCV_TLS_GD_HI20, R_RISCV_TLS_GOT_HI20, R_RISCV_TPREL_ADD, R_RISCV_TPREL_HI20,
+    R_RISCV_TPREL_I, R_RISCV_TPREL_LO12_I, R_RISCV_TPREL_LO12_S, R_RISCV_TPREL_S, got_sym_key,
+    patch_b_type, patch_cb_type, patch_cj_type, patch_i_type, patch_j_type, patch_s_type,
+    patch_u_type, resolve_symbol_value,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -42,6 +43,12 @@ pub struct RelocContext<'a> {
     pub collect_relatives: bool,
     /// For shared library linking: PLT stub addresses for undefined symbols
     pub plt_sym_addrs: &'a FxHashMap<String, u64>,
+    /// `__global_pointer$`, or 0 when the link defines none (GNU ld's
+    /// `riscv_global_pointer_value`): the base of relaxed `GPREL_I/S`.
+    pub gp: u64,
+    /// Shared output: which default-visibility definitions `-Bsymbolic*`
+    /// binds locally (`Symbolic::None` for executables).
+    pub symbolic: crate::backend::linker_common::Symbolic,
 }
 
 /// Result of applying relocations to one object.
@@ -62,10 +69,10 @@ fn relocation_extent(kind: u32) -> Option<u64> {
         0 | R_RISCV_RELAX | R_RISCV_ALIGN | R_RISCV_TPREL_ADD => Some(0),
         R_RISCV_ADD8 | R_RISCV_SUB8 | R_RISCV_SET6 | R_RISCV_SUB6 | R_RISCV_SET8
         | R_RISCV_SET_ULEB128 | R_RISCV_SUB_ULEB128 => Some(1),
-        R_RISCV_ADD16 | R_RISCV_SUB16 | R_RISCV_SET16 | R_RISCV_RVC_BRANCH | R_RISCV_RVC_JUMP => {
-            Some(2)
-        }
-        R_RISCV_64 | R_RISCV_ADD64 | R_RISCV_SUB64 | R_RISCV_CALL_PLT => Some(8),
+        R_RISCV_ADD16 | R_RISCV_SUB16 | R_RISCV_SET16 | R_RISCV_RVC_BRANCH | R_RISCV_RVC_JUMP
+        | R_RISCV_RVC_LUI => Some(2),
+        R_RISCV_64 | R_RISCV_ADD64 | R_RISCV_SUB64 | R_RISCV_CALL | R_RISCV_CALL_PLT => Some(8),
+        R_RISCV_GPREL_I | R_RISCV_GPREL_S | R_RISCV_TPREL_I | R_RISCV_TPREL_S => Some(4),
         R_RISCV_32 | R_RISCV_32_PCREL | R_RISCV_ADD32 | R_RISCV_SUB32 | R_RISCV_SET32
         | R_RISCV_PCREL_HI20 | R_RISCV_PCREL_LO12_I | R_RISCV_PCREL_LO12_S | R_RISCV_GOT_HI20
         | R_RISCV_BRANCH | R_RISCV_JAL | R_RISCV_HI20 | R_RISCV_LO12_I | R_RISCV_LO12_S
@@ -415,7 +422,11 @@ fn shared_address_kind(sym: &Symbol, sym_idx: usize, ctx: &RelocContext) -> Shar
     } else {
         None
     };
-    if global.is_some_and(|g| g.visibility == STV_DEFAULT) {
+    // Default visibility is preemptible unless `-Bsymbolic*` binds this
+    // definition inside the library.
+    if global.is_some_and(|g| {
+        g.visibility == STV_DEFAULT && !(g.defined && ctx.symbolic.binds_locally(g.sym_type))
+    }) {
         return SharedAddressKind::Symbol;
     }
     let absolute = global.map_or(sym.shndx == SHN_ABS || sym_idx == 0, |g| {
@@ -451,6 +462,91 @@ fn relocate_address32(
         ));
     }
     Ok(s.wrapping_add(a as u64) as u32)
+}
+
+/// Where a call or jump to `sym` lands: an import's PLT entry in shared
+/// output (executables give imports their PLT entry as value already).
+/// `CALL`, `CALL_PLT`, `JAL` and `RVC_JUMP` must agree, or a call relaxed to
+/// `jal`/`c.j` would bypass the PLT (GNU ld uses one test for all four).
+fn call_target(sym: &super::elf_read::Symbol, s: u64, ctx: &RelocContext) -> u64 {
+    if sym.name.is_empty() || sym.binding() == STB_LOCAL {
+        return s;
+    }
+    if let Some(&plt_addr) = ctx.plt_sym_addrs.get(sym.name.as_str()) {
+        return plt_addr;
+    }
+    ctx.global_syms
+        .get(sym.name.as_str())
+        .map_or(s, |gs| gs.value)
+}
+
+/// A weak reference no input defines and no PLT entry serves.
+fn undefined_weak_without_plt(sym: &super::elf_read::Symbol, ctx: &RelocContext) -> bool {
+    sym.shndx == SHN_UNDEF
+        && sym.binding() == STB_WEAK
+        && !sym.name.is_empty()
+        && !ctx.plt_sym_addrs.contains_key(sym.name.as_str())
+        && ctx
+            .global_syms
+            .get(sym.name.as_str())
+            .is_none_or(|g| !g.defined)
+}
+
+/// Signed 12-bit I/S-type immediate range.
+fn valid_i(v: i64) -> bool {
+    (-2048..2048).contains(&v)
+}
+
+/// The `lui` immediate field (bits 31:12) for absolute value `v`, rounded
+/// for the paired signed low part.  RV64 `lui` sign-extends: the rounded
+/// high part must be a sign-extended 32-bit value (GNU ld's
+/// `VALID_UTYPE_IMM`), else the pair cannot materialise `v`.
+fn checked_hi20(
+    v: u64,
+    kind: &str,
+    sym: &super::elf_read::Symbol,
+    obj: &str,
+) -> Result<u32, String> {
+    let high = v.wrapping_add(0x800) & !0xFFF;
+    if high as i64 != i64::from(high as i32) {
+        return Err(format!(
+            "relocation truncated to fit: {kind} against '{}' in '{obj}' (value {v:#x})",
+            sym.name
+        ));
+    }
+    Ok(high as u32)
+}
+
+/// Point the I/S-type instruction at `off` at base register `rs1`.
+fn patch_rs1(data: &mut [u8], off: usize, rs1: u32) -> Result<(), String> {
+    let field = off
+        .checked_add(4)
+        .and_then(|end| data.get_mut(off..end))
+        .ok_or_else(|| "relaxed load/store exceeds output".to_string())?;
+    let insn = u32::from_le_bytes([field[0], field[1], field[2], field[3]]);
+    let insn = (insn & !(0x1F << 15)) | (rs1 << 15);
+    field.copy_from_slice(&insn.to_le_bytes());
+    Ok(())
+}
+
+/// Encode `c.lui rd, %hi(value)` (GNU ld `R_RISCV_RVC_LUI`).  A high part of
+/// zero is not a `c.lui` immediate: relaxation can move an address >= 0x800
+/// just below it, so the instruction becomes `c.li rd, 0`, which the paired
+/// low part completes.  `None` when the high part has no 6-bit encoding.
+fn encode_rvc_lui(insn: u16, value: i64) -> Option<u16> {
+    const MATCH_C_LUI: u16 = 0x6001;
+    const MATCH_C_LI: u16 = 0x4001;
+    const CI_IMM_MASK: u16 = 0x107C; // imm[5] at bit 12, imm[4:0] at 6:2
+    let high = value.wrapping_add(0x800) & !0xFFF;
+    if high == 0 {
+        return Some(((insn & !MATCH_C_LUI) | MATCH_C_LI) & !CI_IMM_MASK);
+    }
+    let imm = high >> 12;
+    if !(-32..32).contains(&imm) {
+        return None;
+    }
+    let imm = imm as u16;
+    Some((insn & !CI_IMM_MASK) | ((imm & 0x20) << 7) | ((imm & 0x1F) << 2))
 }
 
 /// Apply a single relocation to the merged section data.
@@ -529,7 +625,7 @@ fn apply_one_reloc(
                 patch_s_type(data, off, hi_val as u32);
             }
         }
-        R_RISCV_CALL_PLT => {
+        R_RISCV_CALL | R_RISCV_CALL_PLT => {
             if ctx.gd_tls_call_nop.contains(&p) {
                 // GD->LE relaxation: replace call with add a0, a0, tp + nop
                 if off + 8 <= data.len() {
@@ -539,27 +635,27 @@ fn apply_one_reloc(
                     data[off + 4..off + 8].copy_from_slice(&nop.to_le_bytes());
                 }
             } else {
-                let target = if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
-                    // For undefined symbols in shared libs, redirect through PLT stub
-                    if let Some(&plt_addr) = ctx.plt_sym_addrs.get(sym.name.as_str()) {
-                        plt_addr as i64
-                    } else {
-                        ctx.global_syms
-                            .get(sym.name.as_str())
-                            .map(|gs| gs.value as i64)
-                            .unwrap_or(s as i64)
-                    }
+                // A call to an undefined weak function (never relaxed) goes
+                // to absolute 0 through x0 rather than pc-relative: GNU ld's
+                // `riscv_elf_relocate_section`, the value that keeps working
+                // whatever the call's own address.
+                let undef_weak = undefined_weak_without_plt(sym, ctx);
+                let target = if undef_weak {
+                    p
                 } else {
-                    s as i64
+                    call_target(sym, s, ctx)
                 };
-                let offset_val = super::displacement::checked_auipc_delta(target as u64, a, p)?;
+                let offset_val = super::displacement::checked_auipc_delta(target, a, p)?;
                 let hi = ((offset_val + 0x800) >> 12) & 0xFFFFF;
                 let lo = offset_val & 0xFFF;
                 if off + 8 <= data.len() {
                     let auipc = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
                     let auipc = (auipc & 0xFFF) | ((hi as u32) << 12);
                     data[off..off + 4].copy_from_slice(&auipc.to_le_bytes());
-                    let jalr = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+                    let mut jalr = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap());
+                    if undef_weak {
+                        jalr &= !(0x1f << 15);
+                    }
                     let jalr = (jalr & 0x000FFFFF) | ((lo as u32) << 20);
                     data[off + 4..off + 8].copy_from_slice(&jalr.to_le_bytes());
                 }
@@ -571,8 +667,14 @@ fn apply_one_reloc(
             patch_b_type(data, off, offset_val);
         }
         R_RISCV_JAL => {
-            let offset_val =
-                super::displacement::checked_delta(super::displacement::Encoding::Jal, s, a, p)?;
+            // A relaxed call keeps its PLT redirection (`call_target`).
+            let target = call_target(sym, s, ctx);
+            let offset_val = super::displacement::checked_delta(
+                super::displacement::Encoding::Jal,
+                target,
+                a,
+                p,
+            )?;
             patch_j_type(data, off, offset_val);
         }
         R_RISCV_RVC_BRANCH => {
@@ -587,15 +689,14 @@ fn apply_one_reloc(
         R_RISCV_RVC_JUMP => {
             let offset_val = super::displacement::checked_delta(
                 super::displacement::Encoding::RvcJump,
-                s,
+                call_target(sym, s, ctx),
                 a,
                 p,
             )?;
             patch_cj_type(data, off, offset_val);
         }
         R_RISCV_HI20 => {
-            let val = (s as i64 + a) as u32;
-            let hi = (val.wrapping_add(0x800)) & 0xFFFFF000;
+            let hi = checked_hi20(s.wrapping_add(a as u64), "R_RISCV_HI20", sym, obj_name)?;
             if off + 4 <= data.len() {
                 let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
                 let insn = (insn & 0xFFF) | hi;
@@ -611,8 +712,8 @@ fn apply_one_reloc(
             patch_s_type(data, off, val & 0xFFF);
         }
         R_RISCV_TPREL_HI20 => {
-            let val = (s as i64 + a - ctx.tls_vaddr as i64) as u32;
-            let hi = (val.wrapping_add(0x800)) & 0xFFFFF000;
+            let tprel = s.wrapping_add(a as u64).wrapping_sub(ctx.tls_vaddr);
+            let hi = checked_hi20(tprel, "R_RISCV_TPREL_HI20", sym, obj_name)?;
             if off + 4 <= data.len() {
                 let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
                 let insn = (insn & 0xFFF) | hi;
@@ -628,93 +729,69 @@ fn apply_one_reloc(
             patch_s_type(data, off, val & 0xFFF);
         }
         R_RISCV_TPREL_ADD => { /* hint */ }
+        R_RISCV_GPREL_I | R_RISCV_GPREL_S => {
+            // A relaxed `lui`/`auipc` pair: the low part addresses the
+            // value from x0 when it fits, else from gp (GNU ld order).
+            let value = s.wrapping_add(a as u64) as i64;
+            let (base, imm) = if valid_i(value) {
+                (0, value)
+            } else if valid_i(value.wrapping_sub(ctx.gp as i64)) {
+                (3, value.wrapping_sub(ctx.gp as i64))
+            } else {
+                // GNU ld names the relocation's own howto.
+                let name = if rela_type == R_RISCV_GPREL_I {
+                    "R_RISCV_GPREL_I"
+                } else {
+                    "R_RISCV_GPREL_S"
+                };
+                return Err(format!(
+                    "relocation truncated to fit: {name} against '{}' in '{}'",
+                    sym.name, obj_name
+                ));
+            };
+            patch_rs1(data, off, base)?;
+            if rela_type == R_RISCV_GPREL_I {
+                patch_i_type(data, off, imm as u32 & 0xFFF);
+            } else {
+                patch_s_type(data, off, imm as u32 & 0xFFF);
+            }
+        }
+        R_RISCV_TPREL_I | R_RISCV_TPREL_S => {
+            // A relaxed local-exec access: tp-relative without the add.
+            let value = s.wrapping_add(a as u64).wrapping_sub(ctx.tls_vaddr) as i64;
+            if !valid_i(value) {
+                return Err(format!(
+                    "relocation truncated to fit: R_RISCV_TPREL_I/S against '{}' in '{}'",
+                    sym.name, obj_name
+                ));
+            }
+            patch_rs1(data, off, 4)?;
+            if rela_type == R_RISCV_TPREL_I {
+                patch_i_type(data, off, value as u32 & 0xFFF);
+            } else {
+                patch_s_type(data, off, value as u32 & 0xFFF);
+            }
+        }
+        R_RISCV_RVC_LUI => {
+            let field = off
+                .checked_add(2)
+                .and_then(|end| data.get_mut(off..end))
+                .ok_or_else(|| format!("R_RISCV_RVC_LUI field exceeds output in '{}'", obj_name))?;
+            let insn = u16::from_le_bytes([field[0], field[1]]);
+            let value = s.wrapping_add(a as u64) as i64;
+            let insn = encode_rvc_lui(insn, value).ok_or_else(|| {
+                format!(
+                    "relocation truncated to fit: R_RISCV_RVC_LUI against '{}' in '{}'",
+                    sym.name, obj_name
+                )
+            })?;
+            field.copy_from_slice(&insn.to_le_bytes());
+        }
 
-        R_RISCV_ADD8 => {
-            if off < data.len() {
-                data[off] = data[off].wrapping_add((s as i64 + a) as u8);
-            }
-        }
-        R_RISCV_ADD16 => {
-            if off + 2 <= data.len() {
-                let cur = u16::from_le_bytes(data[off..off + 2].try_into().unwrap());
-                let val = cur.wrapping_add((s as i64 + a) as u16);
-                data[off..off + 2].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-        R_RISCV_ADD32 => {
-            if off + 4 <= data.len() {
-                let cur = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-                let val = cur.wrapping_add((s as i64 + a) as u32);
-                data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-        R_RISCV_ADD64 => {
-            if off + 8 <= data.len() {
-                let cur = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-                let val = cur.wrapping_add((s as i64 + a) as u64);
-                data[off..off + 8].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-        R_RISCV_SUB8 => {
-            if off < data.len() {
-                data[off] = data[off].wrapping_sub((s as i64 + a) as u8);
-            }
-        }
-        R_RISCV_SUB16 => {
-            if off + 2 <= data.len() {
-                let cur = u16::from_le_bytes(data[off..off + 2].try_into().unwrap());
-                let val = cur.wrapping_sub((s as i64 + a) as u16);
-                data[off..off + 2].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-        R_RISCV_SUB32 => {
-            if off + 4 <= data.len() {
-                let cur = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-                let val = cur.wrapping_sub((s as i64 + a) as u32);
-                data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-        R_RISCV_SUB64 => {
-            if off + 8 <= data.len() {
-                let cur = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-                let val = cur.wrapping_sub((s as i64 + a) as u64);
-                data[off..off + 8].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-        R_RISCV_SET6 => {
-            if off < data.len() {
-                data[off] = (data[off] & 0xC0) | (((s as i64 + a) as u8) & 0x3F);
-            }
-        }
-        R_RISCV_SUB6 => {
-            if off < data.len() {
-                let cur = data[off] & 0x3F;
-                let val = cur.wrapping_sub((s as i64 + a) as u8) & 0x3F;
-                data[off] = (data[off] & 0xC0) | val;
-            }
-        }
-        R_RISCV_SET8 => {
-            if off < data.len() {
-                data[off] = (s as i64 + a) as u8;
-            }
-        }
-        R_RISCV_SET16 => {
-            if off + 2 <= data.len() {
-                let val = (s as i64 + a) as u16;
-                data[off..off + 2].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-        R_RISCV_SET32 => {
-            if off + 4 <= data.len() {
-                let val = (s as i64 + a) as u32;
-                data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-            }
-        }
-        R_RISCV_32_PCREL => {
-            if off + 4 <= data.len() {
-                let val = ((s as i64 + a) - p as i64) as u32;
-                data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-            }
+        R_RISCV_ADD8 | R_RISCV_ADD16 | R_RISCV_ADD32 | R_RISCV_ADD64 | R_RISCV_SUB8
+        | R_RISCV_SUB16 | R_RISCV_SUB32 | R_RISCV_SUB64 | R_RISCV_SET6 | R_RISCV_SUB6
+        | R_RISCV_SET8 | R_RISCV_SET16 | R_RISCV_SET32 | R_RISCV_32_PCREL => {
+            apply_data_reloc(rela_type, data, off, s.wrapping_add(a as u64), p);
         }
         R_RISCV_SET_ULEB128 | R_RISCV_SUB_ULEB128 => {
             return Err(format!(
@@ -736,6 +813,36 @@ fn apply_one_reloc(
     }
 
     Ok(())
+}
+
+/// The data-field relocations: label differences (`ADDn`/`SUBn` pairs,
+/// `SET6`/`SUB6` for DWARF CFA opcodes), absolute `SETn` and `32_PCREL`.  Each
+/// is a little-endian read-modify-write of a 1/2/4/8-byte field; the narrow
+/// result is the low bytes of the 64-bit wrapping result, and `SET6`/`SUB6`
+/// keep the field's top two bits.  `v` is `S + A`.  A field that runs past the
+/// section is left alone, as before this was factored out.
+fn apply_data_reloc(rela_type: u32, data: &mut [u8], off: usize, v: u64, p: u64) {
+    let width = match rela_type {
+        R_RISCV_ADD8 | R_RISCV_SUB8 | R_RISCV_SET6 | R_RISCV_SUB6 | R_RISCV_SET8 => 1,
+        R_RISCV_ADD16 | R_RISCV_SUB16 | R_RISCV_SET16 => 2,
+        R_RISCV_ADD32 | R_RISCV_SUB32 | R_RISCV_SET32 | R_RISCV_32_PCREL => 4,
+        _ => 8,
+    };
+    let Some(field) = data.get_mut(off..off.saturating_add(width)) else {
+        return;
+    };
+    let mut buf = [0u8; 8];
+    buf[..width].copy_from_slice(field);
+    let cur = u64::from_le_bytes(buf);
+    let new = match rela_type {
+        R_RISCV_ADD8 | R_RISCV_ADD16 | R_RISCV_ADD32 | R_RISCV_ADD64 => cur.wrapping_add(v),
+        R_RISCV_SUB8 | R_RISCV_SUB16 | R_RISCV_SUB32 | R_RISCV_SUB64 => cur.wrapping_sub(v),
+        R_RISCV_SET6 => (cur & 0xC0) | (v & 0x3F),
+        R_RISCV_SUB6 => (cur & 0xC0) | (cur.wrapping_sub(v) & 0x3F),
+        R_RISCV_32_PCREL => v.wrapping_sub(p),
+        _ => v,
+    };
+    field.copy_from_slice(&new.to_le_bytes()[..width]);
 }
 
 /// Patch the `auipc` of a PC-relative address access: `%pcrel_hi` of the
@@ -936,6 +1043,62 @@ pub fn collect_gd_tls_relax_info(
 mod tests {
     use super::*;
 
+    /// Every data-field relocation against a hand-computed field, including
+    /// narrow wrap-around, the preserved top bits of `SET6`/`SUB6`, untouched
+    /// neighbouring bytes, and a field that runs past the section.
+    #[test]
+    fn data_relocs_match_psabi_semantics() {
+        let run = |ty: u32, init: &[u8], off: usize, v: u64, p: u64| {
+            let mut d = init.to_vec();
+            apply_data_reloc(ty, &mut d, off, v, p);
+            d
+        };
+        let base = [0xF0u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xAA];
+        assert_eq!(run(R_RISCV_ADD8, &[0xFF, 0xAA], 0, 2, 0), [0x01, 0xAA]);
+        assert_eq!(run(R_RISCV_SUB8, &[0x01, 0xAA], 0, 2, 0), [0xFF, 0xAA]);
+        assert_eq!(
+            run(R_RISCV_ADD16, &[0xFF, 0xFF, 0xAA], 0, 1, 0),
+            [0, 0, 0xAA]
+        );
+        assert_eq!(
+            run(R_RISCV_SUB16, &[0, 0, 0xAA], 0, 1, 0),
+            [0xFF, 0xFF, 0xAA]
+        );
+        assert_eq!(
+            run(R_RISCV_ADD32, &base, 0, 0x10, 0)[..5],
+            [0x00, 0x02, 0x02, 0x03, 0x04]
+        );
+        assert_eq!(
+            run(R_RISCV_SUB32, &base, 1, 0x0302, 0)[..6],
+            [0xF0, 0xFF, 0xFE, 0x02, 0x04, 0x05]
+        );
+        let add64 = run(R_RISCV_ADD64, &base, 0, 0x10, 0);
+        assert_eq!(
+            add64[..9],
+            [0x00, 0x02, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xAA]
+        );
+        let sub64 = run(R_RISCV_SUB64, &[0u8; 9], 1, 1, 0);
+        assert_eq!(sub64, [0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(run(R_RISCV_SET6, &[0xC5], 0, 0xFF_FF7A, 0), [0xFA]);
+        assert_eq!(run(R_RISCV_SUB6, &[0x81], 0, 2, 0), [0xBF]);
+        assert_eq!(run(R_RISCV_SET8, &[0x11, 0xAA], 0, 0x1234, 0), [0x34, 0xAA]);
+        assert_eq!(
+            run(R_RISCV_SET16, &[0, 0, 0xAA], 0, 0x1_2345, 0),
+            [0x45, 0x23, 0xAA]
+        );
+        assert_eq!(
+            run(R_RISCV_SET32, &base, 2, 0x1_8765_4321, 0)[..7],
+            [0xF0, 0x01, 0x21, 0x43, 0x65, 0x87, 0x06]
+        );
+        assert_eq!(
+            run(R_RISCV_32_PCREL, &[0u8; 4], 0, 0x1000, 0x1010),
+            [0xF0, 0xFF, 0xFF, 0xFF]
+        );
+        // A field past the end of the section is not touched.
+        assert_eq!(run(R_RISCV_ADD32, &[1, 2, 3], 0, 5, 0), [1, 2, 3]);
+        assert_eq!(run(R_RISCV_ADD8, &[1], usize::MAX, 5, 0), [1]);
+    }
+
     fn object(section_flags: u64) -> super::super::elf_read::ElfObject {
         super::super::elf_read::ElfObject {
             sections: vec![
@@ -970,6 +1133,7 @@ mod tests {
             section_data: vec![],
             relocations: vec![],
             source_name: "probe.o".into(),
+            e_flags: 0,
         }
     }
 

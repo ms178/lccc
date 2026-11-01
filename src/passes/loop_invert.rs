@@ -44,7 +44,7 @@
 //!
 //! # When it is legal
 //!
-//! For a natural loop with header `H`, a single latch `T` (`T != H`) whose
+//! For a natural loop with header `H` and a latch `T` (`T != H`) whose
 //! terminator is `Branch(H)`:
 //!
 //! 1. `H` ends in a `CondBranch` with exactly one target inside the loop (the
@@ -68,6 +68,29 @@
 //! The transform then appends a renamed copy of `H`'s instructions to `T` and
 //! gives `T` a copy of `H`'s terminator. `H` keeps its own terminator and
 //! becomes the loop guard, executed once. The back edge becomes `T -> B`.
+//!
+//! # Several latches
+//!
+//! Each `Branch(H)` latch is rotated on its own, one per round: after `T1 ->
+//! B`, `H` is still the header of the loop the remaining back edges close, so
+//! the next round finds `T2` with every guard re-checked on the new CFG. The
+//! argument above is per edge (the copy runs at the end of its own latch,
+//! after that latch's phi copies), so it holds for each. When the last
+//! `Branch(H)` latch is rotated `H` is entered only from outside: one guard,
+//! and every back edge a bottom test into `B`. Latches ending in a
+//! conditional branch keep their edge to `H`, which stays correct (the header
+//! test simply runs there). This is the shape `phi_relay_fold` leaves when it
+//! folds a loop's shared relay latch into the header: every predecessor of the
+//! former relay becomes a latch, and each gets its own bottom test instead of
+//! a taken `jmp` back to the top test. (The body entry `B` is never `H`: a
+//! header whose in-loop successor is itself has no other block in its loop,
+//! so its only latch is the self-loop, which is skipped.)
+//!
+//! The two follow-up folds (`fold_value_bound_after_invert`,
+//! `downcount_after_invert`) argue by induction over "the previous latch
+//! test" of *the* latch and rewrite its induction step, so they run only for
+//! a sole latch: `H` had exactly one, and no earlier round already rotated a
+//! latch into the same body entry.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -209,16 +232,21 @@ pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) ->
     );
 
     let mut rotated = 0;
-    // One rotation per call per loop: the CFG changes, so re-derive it.
+    // Body entries some latch was already rotated into (see "Several
+    // latches": the folds need the rotated latch to be the loop's only one).
+    let mut rotated_into: FxHashSet<u32> = FxHashSet::default();
+    // One rotation per round: the CFG changes, so re-derive it.
     loop {
         let Some(plan) = find_one(func, debug) else {
             break;
         };
         apply(func, &plan);
-        if cfg.affine_fold {
+        let first_into_entry = rotated_into.insert(plan.body_entry.0);
+        let sole = plan.sole_latch && first_into_entry;
+        if sole && cfg.affine_fold {
             fold_value_bound_after_invert(func, &plan, cfg.affine_fold_debug);
         }
-        if cfg.downcount {
+        if sole && cfg.downcount {
             downcount_after_invert(func, &plan, debug);
         }
         rotated += 1;
@@ -232,6 +260,10 @@ pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) ->
 struct Plan {
     header: usize,
     latch: usize,
+    /// The header's in-loop successor, which the rotated back edge targets.
+    body_entry: BlockId,
+    /// `latch` was the header's only latch when the plan was made.
+    sole_latch: bool,
     /// The loop body (header included) at `find_one` time; the value-bound
     /// fold's invariance scans need it after the CFG changed.
     body: Vec<usize>,
@@ -240,9 +272,9 @@ struct Plan {
 fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
     let cfg = crate::ir::analysis::CfgAnalysis::build(func);
     // MERGE BY HEADER. `find_natural_loops` returns one loop per BACK EDGE,
-    // so a loop with two latches arrives as two single-latch loops and the
-    // single-latch guard below would wave both through, duplicating the test
-    // once per latch. Merging first makes the guard mean what it says.
+    // so a loop with two latches arrives as two single-latch loops; merged,
+    // the body is the whole loop (guards 1 and 3 must see all of it) and
+    // `sole_latch` is exact.
     let loops = crate::passes::loop_analysis::merge_loops_by_header(
         crate::passes::loop_analysis::find_natural_loops(
             cfg.num_blocks,
@@ -265,25 +297,24 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
             continue;
         }
 
-        // A single latch, branching unconditionally to the header.
-        let mut latch = None;
-        for &p32 in cfg.preds.row(h) {
-            let p = p32 as usize;
-            if lp.body.contains(&p) {
-                if latch.is_some() {
-                    continue 'next_loop; // more than one latch
-                }
-                latch = Some(p);
-            }
-        }
-        let Some(t) = latch else { continue };
-        if t == h {
-            continue; // self-loop: already bottom-tested
-        }
-        if !matches!(&func.blocks[t].terminator, Terminator::Branch(l) if *l == func.blocks[h].label)
-        {
+        // A latch branching unconditionally to the header (the first, in
+        // predecessor order; the others are taken in later rounds). A
+        // self-loop latch is already bottom-tested.
+        let header_label = func.blocks[h].label;
+        let latches: Vec<usize> = cfg
+            .preds
+            .row(h)
+            .iter()
+            .map(|&p| p as usize)
+            .filter(|p| lp.body.contains(p))
+            .collect();
+        let Some(&t) = latches.iter().find(|&&p| {
+            p != h
+                && matches!(&func.blocks[p].terminator, Terminator::Branch(l) if *l == header_label)
+        }) else {
             continue;
-        }
+        };
+        let sole_latch = latches.len() == 1;
 
         // Guard 1: the header decides the exit.
         let Terminator::CondBranch {
@@ -305,6 +336,7 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         if t_in == f_in {
             continue; // both inside (not an exit test) or both outside
         }
+        let body_entry = if t_in { *true_label } else { *false_label };
 
         // Guard 5 + 2: small, and every instruction pure.
         let hb = &func.blocks[h];
@@ -374,11 +406,18 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         }
 
         if debug {
-            eprintln!("[INV] rotating header={} latch={}", h, t);
+            eprintln!(
+                "[INV] rotating header={} latch={} ({} latches)",
+                h,
+                t,
+                latches.len()
+            );
         }
         return Some(Plan {
             header: h,
             latch: t,
+            body_entry,
+            sole_latch,
             body: lp.body.iter().copied().collect(),
         });
     }
@@ -1573,18 +1612,141 @@ mod tests {
         assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
     }
 
+    /// The bottom test of latch `b`: a fresh `Cmp` of `iv` as its last
+    /// instruction, branching to `body` or `exit`.
+    #[track_caller]
+    fn assert_bottom_tested(f: &IrFunction, b: usize, iv: u32, body: u32, exit: u32) -> u32 {
+        let latch = &f.blocks[b];
+        let Terminator::CondBranch {
+            cond: Operand::Value(c),
+            true_label,
+            false_label,
+        } = &latch.terminator
+        else {
+            panic!("latch {b} must end in a CondBranch: {:?}", latch.terminator);
+        };
+        assert_eq!((true_label.0, false_label.0), (body, exit), "latch {b}");
+        assert!(
+            matches!(latch.instructions.last(), Some(Instruction::Cmp { dest, lhs: Operand::Value(v), .. })
+                if dest == c && v.0 == iv),
+            "latch {b} must end with its own compare of v{iv}: {:?}",
+            latch.instructions
+        );
+        c.0
+    }
+
+    /// Two unconditional latches: each gets its own bottom test (fresh
+    /// compare after its increment), the header becomes the guard.
+    ///   1 header : ? 2 : 5 ; 2 : ? 3 : 4 ; 3 -> 1 ; 4 -> 1
     #[test]
-    fn a_loop_with_two_latches_is_not_inverted() {
-        //   1 header : ? 2 : 5 ; 2 : ? 3 : 4 ; 3 -> 1 ; 4 -> 1
+    fn every_unconditional_latch_is_bottom_tested() {
         let mut f = func_of(vec![
             blk(0, vec![], br(1)),
             blk(1, vec![cmp(10, 20)], cond(10, 2, 5)),
             blk(2, vec![cmp(11, 20)], cond(11, 3, 4)),
             blk(3, vec![add1(20, 20)], br(1)),
-            blk(4, vec![add1(21, 20)], br(1)),
+            blk(4, vec![add1(20, 20), add1(20, 20)], br(1)),
             blk(5, vec![], ret()),
         ]);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 2);
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::CondBranch { .. }
+        ));
+        let c3 = assert_bottom_tested(&f, 3, 20, 2, 5);
+        let c4 = assert_bottom_tested(&f, 4, 20, 2, 5);
+        assert!(c3 != 10 && c4 != 10 && c3 != c4, "fresh, distinct tests");
+        // The header is entered only from outside now.
+        let cfg = crate::ir::analysis::CfgAnalysis::build(&f);
+        assert_eq!(cfg.preds.row(1), &[0]);
+        // A second run finds nothing left to rotate.
         assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
+    }
+
+    /// A latch ending in a conditional branch keeps its edge to the header;
+    /// the unconditional one is still rotated.
+    #[test]
+    fn a_conditional_latch_stays_and_the_other_is_rotated() {
+        let mut f = func_of(vec![
+            blk(0, vec![], br(1)),
+            blk(1, vec![cmp(10, 20)], cond(10, 2, 5)),
+            blk(2, vec![cmp(11, 20)], cond(11, 3, 4)),
+            blk(3, vec![add1(20, 20), cmp(12, 20)], cond(12, 1, 5)),
+            blk(4, vec![add1(20, 20)], br(1)),
+            blk(5, vec![], ret()),
+        ]);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert_bottom_tested(&f, 4, 20, 2, 5);
+        assert!(matches!(
+            f.blocks[3].terminator,
+            Terminator::CondBranch {
+                true_label: BlockId(1),
+                ..
+            }
+        ));
+    }
+
+    /// The downcount and value-bound folds reason about *the* latch; with
+    /// two they must not fire, even though each rotation is legal. The
+    /// counted loop below would be downcounted with a single latch (see
+    /// `dead_constant_trip_loop_downcounts_and_removes_guard`).
+    #[test]
+    fn the_folds_do_not_run_on_a_loop_with_several_latches() {
+        let ty = IrType::I32;
+        let mut f = dead_counted_loop(10, ty);
+        // Split the latch: 2 now branches to two incrementing latches.
+        let latch = f.blocks[2].clone();
+        f.blocks[2] = blk(
+            2,
+            vec![Instruction::Cmp {
+                dest: Value(11),
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(Value(20)),
+                rhs: Operand::Const(IrConst::from_i64(7, ty)),
+                ty,
+            }],
+            cond(11, 4, 5),
+        );
+        let mut first = latch;
+        first.label = BlockId(4);
+        let second = blk(
+            5,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(27),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(20)),
+                    rhs: Operand::Const(IrConst::from_i64(1, ty)),
+                    ty,
+                },
+                Instruction::Copy {
+                    dest: Value(20),
+                    src: Operand::Value(Value(27)),
+                },
+            ],
+            br(1),
+        );
+        f.blocks.push(first);
+        f.blocks.push(second);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 2);
+        // The guard keeps its compare against the original limit, the IV
+        // still starts at 0, and both latches test `iv < 10` again.
+        assert!(matches!(
+            &f.blocks[1].instructions[..],
+            [Instruction::Cmp { rhs: Operand::Const(k), .. }] if *k == IrConst::from_i64(10, ty)
+        ));
+        assert!(matches!(
+            f.blocks[0].instructions[0],
+            Instruction::Copy { src: Operand::Const(k), .. } if k == IrConst::from_i64(0, ty)
+        ));
+        for b in [4, 5] {
+            assert_bottom_tested(&f, b, 20, 2, 3);
+            let Some(Instruction::Cmp { op, rhs, .. }) = f.blocks[b].instructions.last() else {
+                unreachable!()
+            };
+            assert_eq!(*op, IrCmpOp::Ult);
+            assert!(matches!(rhs, Operand::Const(k) if *k == IrConst::from_i64(10, ty)));
+        }
     }
 
     #[test]

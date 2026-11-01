@@ -38,11 +38,77 @@ use crate::ir::reexports::{Instruction, IrConst, IrModule, Operand, Terminator};
 /// both use — reaches an intermediate `ackermann(2, 16379)` and therefore
 /// nests ~16.4k calls, so anything near that number would turn a
 /// fully-folded benchmark back into a runtime loop. 65,536 leaves 4x
-/// headroom at ~100 bytes of interpreter frame per level (measured against
-/// the 64 MiB pipeline stack: an unbounded 10M-deep fold aborted at roughly
-/// 700k levels), so the cap converts a stack overflow into a refusal
-/// without rejecting any fold that fits.
+/// headroom over that depth without rejecting any fold that fits.
+///
+/// What a level costs in bytes depends on the build and on how far the body
+/// was expanded before this pass, not on this cap: an unbounded 10M-deep fold
+/// aborted near 700k levels (~96 bytes per level) in the build that
+/// introduced the cap, while `fastbuild` measures ~264 bytes per source level
+/// and reaches 98 % of the stack at the cap (see [`EVAL_STACK_BUDGET`], which
+/// is what keeps the overflow impossible).
 const MAX_EVAL_CALL_DEPTH: u32 = 65_536;
+
+/// Stack bytes nested evaluation may use, measured from the outermost
+/// evaluated call: the bound that actually keeps the evaluator inside the
+/// 64 MiB pipeline stack.
+///
+/// [`MAX_EVAL_CALL_DEPTH`] counts evaluated *calls*, and no call count bounds
+/// bytes: by the time this pass runs, the inliner may have expanded a
+/// recursive body several levels, and each evaluated call then walks all of
+/// them. Measured with Massif `--stacks=yes` on the `fastbuild` profile
+/// (opt-level 1) and `chain(n) = (chain(n - 1) * 3 + n) & 0xffff`: ~264
+/// bytes per source level, ~4 source levels per evaluated call, so the call
+/// cap alone is reached only at ~262k levels -- with a measured peak of
+/// 65,939,008 bytes, 98 % of the stack. A larger frame (another body, an
+/// unoptimized build, another rustc) turns that into an aborted compile.
+///
+/// 48 MiB refuses at 75 % of the stack and leaves 16 MiB for the shallow
+/// pipeline frames above the evaluator and the leaf calls below it. For most
+/// bodies the call cap still decides first; where this budget decides (in
+/// `fastbuild`, from ~190k levels of the body above), a borderline fold can
+/// depend on how the compiler itself was built -- the alternative was not
+/// compiling at all.
+const EVAL_STACK_BUDGET: usize = 48 * 1024 * 1024;
+
+/// Address of a fresh stack frame, for measuring stack growth.
+#[inline(never)]
+fn stack_marker() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
+/// Nesting state of one compile-time evaluation: the call depth and the
+/// stack position of the outermost evaluated call.
+#[derive(Clone, Copy)]
+struct EvalDepth {
+    depth: u32,
+    stack_base: usize,
+    stack_limit: usize,
+}
+
+impl EvalDepth {
+    fn outermost(stack_limit: usize) -> Self {
+        EvalDepth {
+            depth: 0,
+            stack_base: stack_marker(),
+            stack_limit,
+        }
+    }
+
+    fn nested(self) -> Self {
+        EvalDepth {
+            depth: self.depth + 1,
+            ..self
+        }
+    }
+
+    /// Either bound is reached. Stack growth is measured direction-agnostic
+    /// (`abs_diff`), so no assumption about the host's stack direction enters.
+    fn exhausted(self) -> bool {
+        self.depth > MAX_EVAL_CALL_DEPTH
+            || self.stack_base.abs_diff(stack_marker()) > self.stack_limit
+    }
+}
 
 /// Run interprocedural constant propagation on the module.
 ///
@@ -253,7 +319,7 @@ fn eval_const_function(
         memo,
         active,
         budget,
-        0,
+        EvalDepth::outermost(EVAL_STACK_BUDGET),
     )
 }
 
@@ -266,7 +332,8 @@ fn eval_const_function(
 /// (observed: `-O2` on a 10-millisecond tail-recursive sum aborted with
 /// "thread has overflowed its stack"). A depth cap turns that into the honest
 /// answer both callers already handle: this call is not a compile-time
-/// constant, so it stays a call.
+/// constant, so it stays a call. [`EVAL_STACK_BUDGET`] backs the cap with
+/// the bytes it actually costs in this build.
 fn eval_const_function_at(
     module: &IrModule,
     function_indices: &FxHashMap<String, usize>,
@@ -275,9 +342,9 @@ fn eval_const_function_at(
     memo: &mut FxHashMap<(usize, Vec<crate::ir::constants::ConstHashKey>), Option<IrConst>>,
     active: &mut FxHashSet<(usize, Vec<crate::ir::constants::ConstHashKey>)>,
     budget: &mut u64,
-    depth: u32,
+    depth: EvalDepth,
 ) -> Option<IrConst> {
-    if *budget == 0 || depth > MAX_EVAL_CALL_DEPTH {
+    if *budget == 0 || depth.exhausted() {
         return None;
     }
     let key = (function_idx, args.iter().map(|c| c.to_hash_key()).collect());
@@ -436,7 +503,7 @@ fn eval_const_function_at(
                             memo,
                             active,
                             budget,
-                            depth + 1,
+                            depth.nested(),
                         )?;
                         if let Some(dest) = info.dest {
                             values.insert(dest.0, result);
@@ -905,4 +972,44 @@ enum ParamState {
     Const(IrConst),
     /// Different call sites pass different values (or a non-constant).
     Varying,
+}
+
+#[cfg(test)]
+mod eval_depth_tests {
+    use super::*;
+
+    /// Recurse with a 256-byte frame payload until `depth` reports exhaustion;
+    /// returns the level at which it did (or `max` if it never did).
+    fn levels_until_exhausted(depth: EvalDepth, level: u32, max: u32) -> u32 {
+        let payload = std::hint::black_box([level as u8; 256]);
+        if level >= max || depth.exhausted() {
+            return level;
+        }
+        let below = levels_until_exhausted(depth.nested(), level + 1, max);
+        std::hint::black_box(payload);
+        below
+    }
+
+    #[test]
+    fn stack_budget_refuses_before_the_depth_cap_when_frames_are_large() {
+        // A 16 KiB budget is spent by a few dozen 256-byte-payload frames,
+        // long before the depth cap.
+        let hit = levels_until_exhausted(EvalDepth::outermost(16 * 1024), 0, 10_000);
+        assert!(hit > 0 && hit < 70, "exhausted at level {hit}");
+    }
+
+    #[test]
+    fn stack_budget_is_silent_while_the_depth_cap_decides() {
+        // With the real budget, 1,000 such frames (~0.3 MiB, well inside a 2 MiB test thread) are nowhere near
+        // it: the walk reaches its own limit.
+        let hit = levels_until_exhausted(EvalDepth::outermost(EVAL_STACK_BUDGET), 0, 1_000);
+        assert_eq!(hit, 1_000);
+        // And the depth cap still bounds an evaluation whose frames are free.
+        let mut d = EvalDepth::outermost(usize::MAX);
+        for _ in 0..=MAX_EVAL_CALL_DEPTH {
+            assert!(!d.exhausted());
+            d = d.nested();
+        }
+        assert!(d.exhausted());
+    }
 }

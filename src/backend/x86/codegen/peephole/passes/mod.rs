@@ -29,6 +29,7 @@ mod copy_coalesce;
 mod copy_propagation;
 mod dead_code;
 mod dead_writes;
+mod ebb_reuse;
 mod epilogue_merge;
 mod flag_peepholes;
 mod fma_forms;
@@ -41,6 +42,7 @@ mod lea_add_fuse;
 mod lea_narrow;
 mod liveness;
 mod load_bswap_movbe;
+mod load_mask_test;
 mod load_op_fuse;
 mod local_patterns;
 mod loop_trampoline;
@@ -54,6 +56,7 @@ mod relay_and_lea;
 mod return_bool;
 mod return_home;
 mod self_zext;
+mod sign_test;
 mod spill_deref;
 mod store_forwarding;
 mod tail_call;
@@ -1185,6 +1188,11 @@ fn peephole_optimize_inner(
             trace("fuse_zero_ext_cmp", pass_count, c, &store, &infos);
             changed |= c;
         }
+        if !sk("zero_ext_imm_cmp") {
+            let c = load_op_fuse::narrow_zero_ext_imm_cmp(&mut store, &mut infos);
+            trace("narrow_zero_ext_imm_cmp", pass_count, c, &store, &infos);
+            changed |= c;
+        }
         // Generic move-relay elimination and windowed lea->memory folding.
         // Both are block-local; see relay_and_lea.rs for the two deadness
         // proofs (block-local write-before-read, whole-function uniqueness).
@@ -1525,6 +1533,17 @@ fn peephole_optimize_inner(
                 );
                 changed |= c;
             }
+        }
+        if !sk("load_mask_test") {
+            let c = load_mask_test::fold_load_mask_into_memory_test(&mut store, &mut infos);
+            trace(
+                "fold_load_mask_into_memory_test",
+                pass_count,
+                c,
+                &store,
+                &infos,
+            );
+            changed |= c;
         }
         if !sk("base_index") {
             {
@@ -1939,6 +1958,9 @@ fn peephole_optimize_inner(
             if !sk("copy_mask_test") {
                 changed2 |= flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos);
             }
+            if !sk("load_mask_test") {
+                changed2 |= load_mask_test::fold_load_mask_into_memory_test(&mut store, &mut infos);
+            }
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
@@ -2186,6 +2208,17 @@ fn peephole_optimize_inner(
         local_patterns::rotate_loops(&mut store, &mut infos);
     }
 
+    // Phase 4e: extended-basic-block reuse. Delete copies and compares a
+    // single-predecessor path already established (`ebb_reuse`), then move a
+    // copy only the fall-through arm reads past its `jcc`; retire whatever
+    // the deletions left dead. `CCC_PEEPHOLE_SKIP=ebb_reuse` / `copy_sink`.
+    if !sk("ebb_reuse") && ebb_reuse::reuse_ebb_copies_and_flags(&mut store, &mut infos) {
+        retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+    }
+    if !sk("copy_sink") {
+        ebb_reuse::sink_copies_into_fallthrough(&mut store, &mut infos);
+    }
+
     // Phase 5: Tail call optimization.
     if !skip_phase5 {
         tail_call::optimize_tail_calls(&mut store, &mut infos);
@@ -2321,6 +2354,30 @@ fn peephole_optimize_inner(
 
     if !sk("return_bool") {
         return_bool::run(&mut store, &mut infos);
+    }
+
+    // Phase 8d': sign tests as a shift of the sign bit (`xorl; testl; setl`
+    // -> `movl; shrl $31`).  Unconditional and this late because its inputs
+    // are final only here: the setcc pre-zeroing and the mask-to-memory test
+    // folds produce them, and Phase 3 does not run when no global pass
+    // changed anything.  Before 8e, whose same-line marker blocks the
+    // liveness oracle cannot read.  `CCC_PEEPHOLE_SKIP=sign_test`.
+    if !sk("sign_test") {
+        sign_test::materialize_sign_tests(&mut store, &mut infos);
+    }
+    // Phase 8e: conditional sibling calls (`je .L; ... .L: jmp sym` ->
+    // `je sym`).  Terminal: the rewritten `jcc` carries the tail call's
+    // marker block on the same store line, which only the Phase 9 re-parse
+    // splits back into lines the liveness oracles read.
+    // `CCC_PEEPHOLE_SKIP=cond_tail_call` disables it for bisection.
+    // Phase 8e also hoists identical arm heads above their `jcc` first
+    // (`CCC_PEEPHOLE_SKIP=arm_head_hoist`): it turns `jcc .L; .LF: mov; jmp
+    // f; .L: mov; jmp g` into a relay the conditional tail call can absorb.
+    if !sk("arm_head_hoist") {
+        jump_thread::hoist_common_arm_heads(&mut store, &mut infos);
+    }
+    if !sk("cond_tail_call") {
+        jump_thread::fold_conditional_tail_calls(&mut store, &mut infos);
     }
 
     // Phase 9: Re-run the always-on text passes on the FINAL text. The early

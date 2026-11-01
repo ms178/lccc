@@ -37,7 +37,13 @@ use super::*;
 /// no lowering, and on a 32-bit target neither does a 64-bit operation (its
 /// "native" width is a register pair the bit emitters do not handle) -- the
 /// same legality rule `simplify`'s `BitTest` producer applies, kept here in one
-/// place for the three shapes below.
+/// place for the four shapes below.
+///
+/// The backends also lower 8/16-bit bit operations (the C frontend never asks
+/// for one, because the integer promotions widen both operands to `int`, but
+/// the IR contract allows them and the ARM/RISC-V narrow paths are tested
+/// directly).  This recognizer only creates what its own shapes produce, so the
+/// narrow widths are simply out of reach here.
 fn native_bit_width(ty: IrType) -> bool {
     ty.is_integer()
         && !ty.is_128bit()

@@ -32,7 +32,7 @@ grep -qE 'movl[[:space:]]+\$250000,' <<<"$on" || {
 grep -qE 'subl[[:space:]]+\$1,' <<<"$on" || {
     echo "downcount did not emit the decrement" >&2; echo "$on" >&2; exit 1;
 }
-grep -qE '^jne[[:space:]]' <<<"$on" || {
+grep -qE '^[[:space:]]*jne[[:space:]]' <<<"$on" || {
     echo "downcount did not reuse decrement flags for the latch" >&2; echo "$on" >&2; exit 1;
 }
 if grep -qE 'cmpl[[:space:]]+\$250000,' <<<"$on"; then

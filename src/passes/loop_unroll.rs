@@ -922,14 +922,12 @@ fn coalesce_linear_chain(func: &mut IrFunction, labels: &[BlockId]) {
         }
     }
     let last_term = func.blocks[indices[indices.len() - 1]].terminator.clone();
-    let mut merged = std::mem::take(&mut func.blocks[indices[0]].instructions);
     for &bi in &indices[1..] {
         let insts = std::mem::take(&mut func.blocks[bi].instructions);
-        merged.extend(insts);
+        let spans = std::mem::take(&mut func.blocks[bi].source_spans);
+        func.blocks[indices[0]].append_spanned(insts, spans);
         func.blocks[bi].terminator = Terminator::Branch(labels[0]);
-        func.blocks[bi].instructions.clear();
     }
-    func.blocks[indices[0]].instructions = merged;
     func.blocks[indices[0]].terminator = last_term;
 }
 
@@ -4740,13 +4738,14 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
             for fp in &foreign_preds {
                 incoming.push((entry_op.clone(), *fp));
             }
-            func.blocks[exit_idx].instructions.insert(
+            func.blocks[exit_idx].insert_inst(
                 0,
                 Instruction::Phi {
                     dest: new_phi,
                     incoming,
                     ty: pty.clone(),
                 },
+                crate::common::source::Span::dummy(),
             );
 
             // Rewrite readers of `dest` in the post-exit region: every block

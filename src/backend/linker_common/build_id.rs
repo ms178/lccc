@@ -402,6 +402,7 @@ pub fn synthetic_note_object_styled(style: &BuildIdStyle) -> super::Elf64Object 
         section_data,
         relocations: vec![Vec::new(); 2],
         source_name: "<build-id>".into(),
+        e_flags: 0,
     }
 }
 

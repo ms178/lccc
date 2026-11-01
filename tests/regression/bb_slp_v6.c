@@ -49,16 +49,25 @@ static void chkf(float got, float want, const char *n) {
 /* ── Section 1: the 128-bit VEX memory fold ─────────────────────────── */
 
 /* Commutative, both operand orders (the fold sits in the r/m slot). */
-void v6_mf_add(const int32_t *restrict a, int32_t *restrict q) {
-    q[0] = a[0] + 3; q[1] = a[1] + 3; q[2] = a[2] + 3; q[3] = a[3] + 3;
+void v6_mf_add(const uint32_t *restrict a, uint32_t *restrict q) {
+    q[0] = a[0] + 3u; q[1] = a[1] + 3u; q[2] = a[2] + 3u; q[3] = a[3] + 3u;
+}
+/* A runtime broadcast cannot itself occupy the memory operand; this keeps
+ * the stream-fold mechanism load-bearing independently of literal pooling. */
+__attribute__((noinline))
+void v6_mf_add_dynamic(const uint32_t *restrict a, uint32_t *restrict q, uint32_t c) {
+    q[0] = a[0] + c;
+    q[1] = a[1] + c;
+    q[2] = a[2] + c;
+    q[3] = a[3] + c;
 }
 void v6_mf_xor(const uint32_t *restrict a, uint32_t *restrict q) {
     q[0] = a[0] ^ 0xdeadbeefu; q[1] = a[1] ^ 0xdeadbeefu;
     q[2] = a[2] ^ 0xdeadbeefu; q[3] = a[3] ^ 0xdeadbeefu;
 }
 /* Non-commutative: the load folds in the src2 position only. */
-void v6_mf_sub(const int32_t *restrict a, int32_t *restrict q) {
-    q[0] = 100 - a[0]; q[1] = 100 - a[1]; q[2] = 100 - a[2]; q[3] = 100 - a[3];
+void v6_mf_sub(const uint32_t *restrict a, uint32_t *restrict q) {
+    q[0] = 100u - a[0]; q[1] = 100u - a[1]; q[2] = 100u - a[2]; q[3] = 100u - a[3];
 }
 /* Two-stream fold: the farther load folds, the nearer streams. */
 void v6_mf_two(const int32_t *restrict a, const int32_t *restrict b,
@@ -66,9 +75,9 @@ void v6_mf_two(const int32_t *restrict a, const int32_t *restrict b,
     q[0] = a[0] + b[0]; q[1] = a[1] + b[1]; q[2] = a[2] + b[2]; q[3] = a[3] + b[3];
 }
 /* 256-bit twin. */
-void v6_mf_add8(const int32_t *restrict a, int32_t *restrict q) {
-    q[0] = a[0] + 7; q[1] = a[1] + 7; q[2] = a[2] + 7; q[3] = a[3] + 7;
-    q[4] = a[4] + 7; q[5] = a[5] + 7; q[6] = a[6] + 7; q[7] = a[7] + 7;
+void v6_mf_add8(const uint32_t *restrict a, uint32_t *restrict q) {
+    q[0] = a[0] + 7u; q[1] = a[1] + 7u; q[2] = a[2] + 7u; q[3] = a[3] + 7u;
+    q[4] = a[4] + 7u; q[5] = a[5] + 7u; q[6] = a[6] + 7u; q[7] = a[7] + 7u;
 }
 
 /* ── Section 2: FP negation (the -0.0 sign-mask composite) ──────────── */
@@ -139,8 +148,8 @@ void v6_sel_uge(const uint32_t *restrict a, const uint32_t *restrict b,
     q[2] = a[2] >= b[2] ? a[2] * 3u : b[2] + 11u;
     q[3] = a[3] >= b[3] ? a[3] * 3u : b[3] + 11u;
 }
-void v6_sel_eq(const int32_t *restrict a, const int32_t *restrict b,
-               int32_t *restrict q) {
+void v6_sel_eq(const uint32_t *restrict a, const uint32_t *restrict b,
+               uint32_t *restrict q) {
     q[0] = a[0] == b[0] ? a[0] * 5 : b[0] - 7;
     q[1] = a[1] == b[1] ? a[1] * 5 : b[1] - 7;
     q[2] = a[2] == b[2] ? a[2] * 5 : b[2] - 7;
@@ -261,24 +270,31 @@ int main(void) {
     {
         const int32_t a[8] = {INT32_MIN, -1, 0, INT32_MAX, 7, -7, 123456789, -123456789};
         int32_t q[8];
-        v6_mf_add(a, q);
+        v6_mf_add((const uint32_t *)a, (uint32_t *)q);
         /* INT32_MAX + 3 wraps: spelled as the defined unsigned wraparound
          * (the battery must never hinge on signed-overflow UB — gcc and
          * lccc agree bit-for-bit on the wrapped value). */
         CHECK(q[0] == INT32_MIN + 3 && q[1] == 2 && q[2] == 3
                   && q[3] == (int32_t)((uint32_t)INT32_MAX + 3u),
               "mf_add wrap edges");
+        for (unsigned trial = 0; trial < 1000; ++trial) {
+            uint32_t c = trial * 1664525u + 1013904223u;
+            v6_mf_add_dynamic((const uint32_t *)a, (uint32_t *)q, c);
+            for (unsigned lane = 0; lane < 4; ++lane)
+                CHECK((uint32_t)q[lane] == (uint32_t)a[lane] + c,
+                      "mf_add dynamic modular lanes");
+        }
         v6_mf_xor((const uint32_t *)a, (uint32_t *)q);
-        CHECK((uint32_t)q[0] == 0x80000000u ^ 0xdeadbeefu && (uint32_t)q[3] == 0x7fffffffu ^ 0xdeadbeefu,
+        CHECK((uint32_t)q[0] == (0x80000000u ^ 0xdeadbeefu) && (uint32_t)q[3] == (0x7fffffffu ^ 0xdeadbeefu),
               "mf_xor");
-        v6_mf_sub(a, q);
-        CHECK(q[0] == 100 - INT32_MIN && q[3] == 100 - INT32_MAX, "mf_sub order");
+        v6_mf_sub((const uint32_t *)a, (uint32_t *)q);
+        CHECK(q[0] == (int32_t)(100u - (uint32_t)INT32_MIN) && q[3] == 100 - INT32_MAX, "mf_sub order");
         const int32_t b[8] = {1, -1, 100, -100, 5, 6, 7, 8};
         v6_mf_two(a, b, q);
         /* v6_mf_two is the 4-lane fold shape: only q[0..3] are written
          * (the 8-lane twin is checked separately below). */
         CHECK(q[0] == INT32_MIN + 1 && q[3] == INT32_MAX - 100, "mf_two streams");
-        v6_mf_add8(a, q);
+        v6_mf_add8((const uint32_t *)a, (uint32_t *)q);
         CHECK(q[7] == -123456789 + 7, "mf_add8 256-bit");
     }
     /* Section 2: FP negation — bit-exact over the hazard lanes. */
@@ -354,8 +370,9 @@ int main(void) {
         /* lane 0: >= TRUE → a*3 (wraps); lane 2: 0xffffffff >= 0xfffffffe
          * TRUE → a*3 (wraps). */
         CHECK(qu[0] == 0x80000000u * 3u && qu[2] == 0xffffffffu * 3u, "sel_uge");
-        v6_sel_eq(a, b, q);
-        CHECK(q[0] == INT32_MAX - 7 && q[2] == 0 * 5, "sel_eq");
+        v6_sel_eq((const uint32_t *)a, (const uint32_t *)b, (uint32_t *)q);
+        CHECK(q[0] == INT32_MAX - 7 && q[1] == -6 && q[2] == 0
+                  && (uint32_t)q[3] == (uint32_t)INT32_MIN - 7u, "sel_eq");
         v6_sel_ne(a, b, q);
         CHECK(q[0] == (INT32_MIN ^ 9) && q[2] == (0 ^ 21), "sel_ne");
         v6_fsel_le(af, bf, qf);

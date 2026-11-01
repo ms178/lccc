@@ -81,6 +81,13 @@ pub struct Elf64Object {
     /// Relocations indexed by the section they apply to.
     pub relocations: Vec<Vec<Elf64Rela>>,
     pub source_name: String,
+    /// The input's ELF header `e_flags`. Per-object, because the processor
+    /// flags it carries are per-object facts the linker must merge or honour
+    /// object by object: RISC-V `EF_RISCV_RVC` decides whether relaxation may
+    /// shrink THIS object's code to a compressed form (bfd reads
+    /// `elf_elfheader (abfd)->e_flags` per input), and the float-ABI/RVE bits
+    /// must agree across inputs before the output header can carry them.
+    pub e_flags: u32,
 }
 
 /// Dynamic symbol from a shared library (.so).

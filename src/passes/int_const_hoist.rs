@@ -238,10 +238,13 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             } else {
                 let vid = func.next_value_id;
                 func.next_value_id += 1;
-                func.blocks[preheader].instructions.push(Instruction::Copy {
-                    dest: Value(vid),
-                    src: Operand::Const(IrConst::I64(bits as i64)),
-                });
+                func.blocks[preheader].push_inst(
+                    Instruction::Copy {
+                        dest: Value(vid),
+                        src: Operand::Const(IrConst::I64(bits as i64)),
+                    },
+                    crate::common::source::Span::dummy(),
+                );
                 hoisted.insert(bits, (vid, lp.body.clone()));
                 count += 1;
                 vid

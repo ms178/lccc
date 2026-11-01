@@ -1989,8 +1989,14 @@ fn apply_block_splits(
     // Rename map per ORIGINAL instruction index: an instruction at original
     // index `i` reads the reloaded name of every split whose reload sits at
     // or before `i`.
+    let old_spans = func.blocks[bi].take_parallel_spans();
+    let tracked = !old_spans.is_empty();
     let old = std::mem::take(&mut func.blocks[bi].instructions);
     let mut out: Vec<Instruction> = Vec::with_capacity(old.len() + 2 * mats.len());
+    // Spill stores and reloads are synthesized (dummy span); every original
+    // instruction keeps its own.  `out_spans` is pushed in lockstep below.
+    let mut out_spans = Vec::with_capacity(if tracked { out.capacity() } else { 0 });
+    let dummy = crate::common::source::Span::dummy();
     let mut active: FxHashMap<u32, u32> = FxHashMap::default();
 
     for (i, mut inst) in old.into_iter().enumerate() {
@@ -2021,6 +2027,10 @@ fn apply_block_splits(
             replace_values_in_inst_phi_aware(&mut inst, &active, false);
         }
         out.push(inst);
+        if tracked {
+            out_spans.resize(out.len() - 1, dummy);
+            out_spans.push(old_spans[i]);
+        }
     }
     // Trailing stores/reloads that belong just before the terminator.
     for m in mats.iter().filter(|m| m.store_at == n) {
@@ -2042,7 +2052,10 @@ fn apply_block_splits(
         });
         active.insert(m.vid, m.new_val.0);
     }
-    func.blocks[bi].instructions = out;
+    if tracked {
+        out_spans.resize(out.len(), dummy);
+    }
+    func.blocks[bi].replace_insts(out, out_spans);
     if !active.is_empty() {
         replace_values_in_terminator_phi_aware(&mut func.blocks[bi].terminator, &active);
     }

@@ -76,6 +76,29 @@ def _linker_runner_module():
     return module
 
 
+class SeverityStartupAnnotations(unittest.TestCase):
+    def test_missing_compiler_is_annotated_before_temp_setup(self):
+        result = subprocess.run(
+            ["bash", str(ROOT / "tests/regression/check_gcc162_diagnostic_severity.sh")],
+            env={**os.environ, "CCC": "/nonexistent/lccc-severity-compiler"},
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::severity gate exited 1;", result.stdout)
+
+    def test_temp_setup_failure_preserves_status_and_names_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mktemp = Path(directory) / "mktemp"
+            mktemp.write_text("#!/bin/sh\nexit 7\n")
+            mktemp.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(ROOT / "tests/regression/check_gcc162_diagnostic_severity.sh")],
+                env={**os.environ, "CCC": "/bin/true", "PATH": directory + os.pathsep + os.environ["PATH"]},
+                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 7)
+        self.assertIn("::error::severity gate exited 7;", result.stdout)
+        self.assertIn("mktemp", result.stdout)
+
+
 class FailureAnnotationContracts(unittest.TestCase):
     def run_provisioning(self, actions=True):
         directory = Path(tempfile.mkdtemp(prefix="lccc-ci-annotation-"))
@@ -165,7 +188,7 @@ class FailureAnnotationContracts(unittest.TestCase):
         self.assertEqual(sorted(lanes), sorted([
             "build", "debug", "corpus",
             "frontend-a", "frontend-b", "frontend-c", "codegen-a", "codegen-b",
-            "backend", "backend-contracts-a", "backend-contracts-b", "unit"]))
+            "backend", "backend-contracts-a", "backend-contracts-b", "icx-oracle", "unit"]))
 
 
 if __name__ == "__main__":

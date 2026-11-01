@@ -103,3 +103,32 @@ vectorization gap remains. GitHub reported LLVM 23.1.4 as latest and returned
 404 for `llvmorg-23.1.5` during this session. Remote Godbolt and Intel's PPA
 are outside this sandbox's network allowlist; ICX execution is delegated to
 its authenticated hosted lane, not claimed as locally performed.
+
+## LightPixel / unsigned dword min/max
+
+```sh
+python3 tests/simd/check_lightpixel.py --require-native \
+  --lccc target/fastbuild/lccc --reference gcc-16 --json /tmp/lightpixel.json
+python3 tests/simd/check_lightpixel.py --require-native \
+  --lccc target/fastbuild/lccc --reference clang-23
+python3 tests/simd/benchmark_lightpixel.py --reference gcc-16 --rounds 24 \
+  --compiler candidate=target/fastbuild/lccc --compiler gcc16=gcc-16 \
+  --compiler clang23=clang-23 --json /tmp/lightpixel-timing.json
+```
+
+The independent reference-built O0 harness checks 65,536 cases / 12 kernels
+at O2/O3 with SSE2-only, SSE4.1-only and AVX2 targets. It exercises arbitrary
+uint32 wrapping scale multiplication, exact three-byte guarded sources,
+four-byte guarded destinations, overlapping outputs, interfering aliases,
+volatile byte accesses, scattered sinks and full-width unsigned min/max.
+Compilation/runtime failure, incomplete receipts and missing native codegen
+fail the gate. Timings do not decide correctness. `benchmark_lightpixel.py`
+uses a common reference-built driver, checks hashes against O0 kernels, pins
+to one available CPU and reverses arm order on alternate rounds; it measures
+external-call microkernels, **not Firefox/rasterflood-svg**. CPU frequency and
+other virtual-host tenants remain uncontrolled.
+
+See `engineering/LIGHTPIXEL-AUDIT-2026-11-01.md` and its raw JSON receipts.
+The native U32 min/max component improves, but lccc's exact three-channel
+RGB/alpha graph remains scalar. Do not describe this gate as proof that the
+LLVM PR227303 profitability optimization is implemented.

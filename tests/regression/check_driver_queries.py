@@ -51,9 +51,25 @@ def main() -> int:
 
     failures: list[str] = []
 
+    def refused_options(line: str) -> list[str]:
+        """The options of a `-print-multi-lib` line (`dir;@opt@opt`) that
+        lccc refuses to compile with, proven by asking lccc each time."""
+        opts = [o for o in line.partition(";")[2].split("@") if o]
+        return [o for o in opts if run(lccc, f"-{o}", "-E", "-x", "c", "/dev/null").returncode != 0]
+
+    def multilibs_lccc_builds(out: str) -> str:
+        """GCC's multilib list minus the variants lccc cannot build. A GCC
+        configured with x32 (`x32;@mx32`, e.g. the Compiler Explorer build)
+        lists it; lccc rejects -mx32, and advertising it would send
+        multilib-probing build systems into a guaranteed failure."""
+        kept = [ln for ln in out.splitlines(keepends=True) if not refused_options(ln.rstrip("\n"))]
+        return "".join(kept)
+
     def exact(label: str, argv: list[str]) -> None:
         g = run(gcc, *argv)
         lc = run(lccc, *argv)
+        if "-print-multi-lib" in argv and g.returncode == 0:
+            g = subprocess.CompletedProcess(g.args, 0, multilibs_lccc_builds(g.stdout), g.stderr)
         if g.returncode or lc.returncode:
             failures.append(
                 f"{label}: nonzero rc gcc={g.returncode} lccc={lc.returncode} "

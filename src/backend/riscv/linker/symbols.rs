@@ -207,6 +207,8 @@ fn allocate_common_symbol(
             sh_flags: SHF_ALLOC | SHF_WRITE,
             data: Vec::new(),
             vaddr: 0,
+            entsize: 0,
+            script_write: false,
             align: 8,
         });
         idx
@@ -410,6 +412,7 @@ mod tests {
                 section_data: vec![],
                 relocations: vec![],
                 source_name: name.to_string(),
+                e_flags: 0,
             };
             (name.to_string(), obj)
         };

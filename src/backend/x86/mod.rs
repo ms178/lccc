@@ -8,6 +8,7 @@ pub(crate) mod isa;
 #[cfg_attr(feature = "gcc_linker", allow(dead_code))]
 // Built-in linker unused when gcc handles linking
 pub mod linker;
+pub(crate) mod ret_dup;
 pub(crate) mod shift_count;
 
 pub(crate) use codegen::emit::X86Codegen;

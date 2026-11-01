@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/compiler-research.yml'
+      - 'scripts/ci_build_llvm_slp_oracles.sh'
+      - 'scripts/test_llvm_slp_oracle_builder.py'
       - 'src/passes/vec_ssa.rs'
       - 'src/passes/slp_vectorizer.rs'
       - 'src/passes/vectorize.rs'
@@ -23,6 +25,10 @@ on:
         description: Also publish Rust 1.99.1 and Clang 23.1.4 hash-cache assets
         type: boolean
         default: false
+      patched_llvm_slp:
+        description: Build LLVM PR 227303 and its exact base for paired LightPixel timings (slow, opt-in)
+        type: boolean
+        default: false
       baseline_ref:
         description: Baseline commit or main ref to archive and build (never checked out over the candidate)
         required: true
@@ -39,10 +45,12 @@ on:
 permissions:
   contents: read
 
-# Keep a running measurement experiment when a follow-up commit is pushed.
+# PR evidence for a superseded tree must not occupy runners for another
+# 45+ minutes while the replacement waits. Explicit manual experiments keep
+# their own group so a PR push cannot cancel a requested measurement.
 concurrency:
-  group: compiler-research-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: true
+  group: compiler-research-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   cache-contract:
@@ -51,6 +59,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - name: Test controlled LLVM builder and cache refusal paths
+        run: python3 scripts/test_llvm_slp_oracle_builder.py
       - name: Verify archive hashes, secure extraction and exact tool identities
         run: python3 scripts/restore_toolchain_cache.py --prefix "$RUNNER_TEMP/reviewed-oracles"
   toolchain-cache:
@@ -131,12 +141,20 @@ jobs:
           git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/research-main"
           cargo build --profile fastbuild --locked --bin lccc -j 2 \
             --config 'target.x86_64-unknown-linux-gnu.linker="gcc-16"'
-          (
+          # A paired comparison needs a "before" compiler. When the base
+          # commit itself does not build (a merge skew on main, as with the
+          # base of #1025), fail with that diagnosis instead of a bare cargo
+          # exit status that reads like a candidate failure.
+          if ! (
             cd "$RUNNER_TEMP/research-main"
             CARGO_TARGET_DIR="$RUNNER_TEMP/research-main-target" \
               cargo build --profile fastbuild --locked --bin lccc -j 2 \
               --config 'target.x86_64-unknown-linux-gnu.linker="gcc-16"'
-          )
+          ); then
+            base=$(cat results/research/baseline.sha)
+            echo "::error title=Research baseline does not compile::baseline $base ($BASELINE_REF) failed to build while the candidate built; the paired before/after comparison cannot run until the base compiles (repair main or rebase)."
+            exit 1
+          fi
           sha256sum target/fastbuild/lccc "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
             > results/research/compiler-binaries.sha256
       - name: Dual-mode native AVX API contracts with exact current tools
@@ -557,4 +575,77 @@ jobs:
         with:
           name: compiler-research
           path: results/research/
+          if-no-files-found: warn
+
+  patched-llvm-slp:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.patched_llvm_slp }}
+    name: Pinned LLVM SLP PR and exact-base comparison
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Cache the provisioned oracle toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-toolchain
+          key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+      - name: Provision oracle toolchain (cached bundle, else apt)
+        run: bash scripts/ci_provision_toolchain.sh --multilib
+      - name: Verify Ninja build dependency
+        run: ninja --version
+      - name: Enable bounded swap for source compilation
+        run: bash scripts/ci_enable_swap.sh
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/lccc/gcc-oracle/16.2
+            ~/.cache/lccc/clang-oracle/23.1.4
+          key: llvm-slp-companions-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc_oracle.sh', 'scripts/ci_install_clang_oracle.sh') }}
+      - name: Install exact GCC 16.2
+        run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
+      - name: Install exact Clang 23.1.4
+        run: bash scripts/ci_install_clang_oracle.sh --version 23.1.4
+      - name: Select modern unversioned C and C++ commands
+        run: |
+          mkdir -p "$RUNNER_TEMP/modern-oracles"
+          for name in gcc cc; do ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/modern-oracles/$name"; done
+          for name in g++ c++; do ln -s "$(command -v g++-16)" "$RUNNER_TEMP/modern-oracles/$name"; done
+          ln -s "$CLANG" "$RUNNER_TEMP/modern-oracles/clang"
+          ln -s "${CLANG%/clang}/clang++" "$RUNNER_TEMP/modern-oracles/clang++"
+          echo "$RUNNER_TEMP/modern-oracles" >> "$GITHUB_PATH"
+      - name: Verify the lane's oracle toolchain
+        run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/llvm-slp-oracles
+          key: llvm-slp-a1d36a0-a8eea17-${{ runner.os }}-${{ hashFiles('scripts/ci_build_llvm_slp_oracles.sh') }}
+      - name: Build hash-pinned LLVM base and PR head, serially
+        run: bash scripts/ci_build_llvm_slp_oracles.sh "$RUNNER_TEMP/llvm-slp-oracles" "$RUNNER_TEMP/llvm-slp-build"
+      - name: Build current LCCC with fastbuild and bounded jobs
+        env:
+          CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+        run: bash scripts/build_lccc_fast.sh
+      - name: Compare defaults and explicit non-power-of-two SLP on one host
+        run: |
+          mkdir -p results/llvm-slp
+          python3 tests/simd/benchmark_lightpixel.py \
+            --compiler "lccc=$PWD/target/fastbuild/lccc" \
+            --compiler "gcc16=$(command -v gcc-16)" \
+            --compiler "clang23=$CLANG" \
+            --compiler "llvm-base=$RUNNER_TEMP/llvm-slp-oracles/clang-base -resource-dir=$RUNNER_TEMP/llvm-slp-oracles/resource" \
+            --compiler "llvm-pr=$RUNNER_TEMP/llvm-slp-oracles/clang-patched -resource-dir=$RUNNER_TEMP/llvm-slp-oracles/resource" \
+            --compiler "llvm-base-npot=$RUNNER_TEMP/llvm-slp-oracles/clang-base -resource-dir=$RUNNER_TEMP/llvm-slp-oracles/resource -mllvm -slp-vectorize-non-power-of-2" \
+            --compiler "llvm-pr-npot=$RUNNER_TEMP/llvm-slp-oracles/clang-patched -resource-dir=$RUNNER_TEMP/llvm-slp-oracles/resource -mllvm -slp-vectorize-non-power-of-2" \
+            --rounds 12 --json results/llvm-slp/timings.json
+          cp "$RUNNER_TEMP/llvm-slp-oracles/"{build.json,SHA256SUMS,version-base.txt,version-patched.txt} results/llvm-slp/
+      - name: Retain timings, exact build identities and failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: llvm-slp-pr227303-comparison
+          path: |
+            results/llvm-slp/
+            ${{ runner.temp }}/llvm-slp-oracles/*.log
+            ${{ runner.temp }}/llvm-slp-oracles/build.json
           if-no-files-found: warn

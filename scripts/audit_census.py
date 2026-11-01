@@ -41,9 +41,11 @@ Metric definitions (this docstring is the contract):
   ``;`` in return types are handled, and an unclosed signature or body is a
   hard failure (exit 1) rather than a span measured to end of file.
 * ``knob_literals`` -- distinct ``CCC_*``/``LCCC_*`` identifiers appearing in
-  ``src/`` (a name ending in ``_`` is a prefix, not a knob); ``knobs_undocumented`` -- those not named in any ``*.md`` in git's
+  ``src/`` (a name ending in ``_`` is a prefix, not a knob); internal assembly
+  annotation ``LCCC_TAIL_CALL`` is excluded because it is not a configuration
+  option. ``knobs_undocumented`` -- those not named in any ``*.md`` in git's
   index (``git ls-files``; untracked notes never count, and a tree without git
-  metadata fails).  Rust sources are scanned by directory walk, so an untracked
+  metadata fails). Rust sources are scanned by directory walk, so an untracked
   ``.rs`` can only add sites, never hide them.
 * ``ignored_tests`` -- occurrences of ``#[ignore`` in code (comments and
   literals excluded), *including* test code, which is where they live
@@ -85,6 +87,15 @@ IGNORE_PAT = re.compile(r"#\[ignore")
 # A knob name ends in a letter or digit: `CCC_NO_` (a `starts_with` prefix) or
 # `CCC_NO_INLINE_*` (prose for a family) names no variable.
 KNOB_PAT = re.compile(r"\b(?:CCC|LCCC)_[A-Z0-9_]*[A-Z0-9]\b")
+NON_KNOB_SOURCE_MARKERS = frozenset({"LCCC_TAIL_CALL"})
+
+
+def source_knob_literals(text: str) -> list[str]:
+    return [
+        name for name in KNOB_PAT.findall(text) if name not in NON_KNOB_SOURCE_MARKERS
+    ]
+
+
 FN_PAT = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
 # One character literal: a plain character (any Unicode scalar), a simple
 # escape, `\x7f`, or `\u{...}`.  Anything else after a quote is a lifetime or
@@ -530,7 +541,7 @@ def census() -> dict[str, object]:
         metrics["ignored_tests"] += len(IGNORE_PAT.findall(code))
         # Knobs name string literals (`env::var("CCC_...")`), so they must be
         # counted on the raw text, not the stripped one.
-        for knob in KNOB_PAT.findall(raw):
+        for knob in source_knob_literals(raw):
             knobs.add(knob)
             knob_sites[knob] = knob_sites.get(knob, 0) + 1
         if path in test_files:
@@ -794,7 +805,9 @@ def _selftest_lexer() -> list[tuple[str, bool]]:
          and scan_functions(signatures)[0][1:] == (2, 4)),
         ("unclosed body, parameter list and generics are hard failures", raised == [True, True, True]),
         ("knob names exclude prefixes and families",
-         KNOB_PAT.findall('starts_with("CCC_NO_") CCC_NO_INLINE_* CCC_NO_X LCCC_A1 CCC_')
+         source_knob_literals(
+             'starts_with("CCC_NO_") CCC_NO_INLINE_* CCC_NO_X LCCC_A1 CCC_ LCCC_TAIL_CALL'
+         )
          == ["CCC_NO_X", "LCCC_A1"]),
     ]
 

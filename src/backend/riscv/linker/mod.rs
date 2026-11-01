@@ -25,6 +25,7 @@
 //! - `emit_shared`: Shared library (.so) emission
 
 mod align;
+mod attributes;
 mod debug;
 mod displacement;
 mod elf_read;
@@ -33,6 +34,7 @@ mod emit_shared;
 mod got;
 mod input;
 mod link;
+mod relax;
 mod reloc;
 mod relocations;
 mod sections;

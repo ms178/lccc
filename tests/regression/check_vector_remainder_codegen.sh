@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Structural regression for the AVX2 vector transitions that divide a 64-bit
-# byte induction variable back into a scalar index, and for the strided-2 i32
-# sum-reduction vectorizer, whose scalar remainder starts from that same divide.
+# byte induction variable back into a scalar index, for the strided-2 i32
+# sum-reduction vectorizer, whose scalar remainder starts from that same divide,
+# and for the vector-fill pre-loop, whose remainder is the original scalar loop.
 # Both are shape contracts: a scalar fallback would satisfy every arithmetic
 # comparison in the corpus while leaving the transform dead.
 set -euo pipefail
@@ -120,10 +121,16 @@ for name in ("sum_global_full", "sum_global_unaligned", "sum_dynamic_tail", "sum
     if name.startswith("sum_global_"):
         if "shufps" not in body or "pand" in body:
             raise SystemExit(f"{name}: proven window did not use compact full lanes")
-    elif "pslldq" not in body or "por" not in body:
-        raise SystemExit(f"{name}: dynamic stream lost the exact two-dword load")
-if "movd" not in watch or "pslldq" not in watch or "movdqu" in watch:
-    raise SystemExit("SSE2 watch kernel is not using exact dword loads")
+    else:
+        # Unproven pointer: the four-lane exact gather (four `movd` element
+        # reads joined by `punpckldq`/`punpcklqdq`), so no wide load, no
+        # gap-reading `shufps` compaction and no odd-lane mask.
+        if "punpckldq" not in body or "punpcklqdq" not in body:
+            raise SystemExit(f"{name}: dynamic stream lost the four-lane exact gather")
+        if re.search(r"\b(movdqu|shufps|pand)\b", body):
+            raise SystemExit(f"{name}: dynamic stream reads a gap or masks lanes")
+if "punpcklqdq" not in watch or re.search(r"\b(movdqu|shufps)\b", watch):
+    raise SystemExit("SSE2 watch kernel is not using the exact four-lane gather")
 PY_SSE2
 python3 - "$tmp/strided.s" <<'PY2'
 import re
@@ -170,6 +177,89 @@ for name in ("sum_global_full", "sum_global_unaligned", "sum_dynamic_tail", "sum
         if len(re.findall(r"\bvpinsrd\b", body)) < 2 or "vinserti128" not in body:
             reject("shared/dynamic stream lacks the exact four-dword load")
 PY2
+
+# Boundary stress: every trip count around the admission floor, the unroll
+# factors and the scalar remainder, global and run-time-pointer bases, four
+# lane expressions -- at the SSE2 baseline and with AVX2, against GCC.
+python3 "$dir/lib/strided_reduce_stress.py" "$tmp/stress.c"
+${GCC_BIN:-gcc} -O2 "$tmp/stress.c" -o "$tmp/stress-ref"
+"$tmp/stress-ref" > "$tmp/stress-ref.txt"
+for stress_flags in "-O2" "-O2 -march=x86-64-v3"; do
+    # shellcheck disable=SC2086 # the flag string is a word list on purpose
+    "$CCC" $stress_flags "$tmp/stress.c" -o "$tmp/stress"
+    if ! timeout 60 "$tmp/stress" | cmp -s - "$tmp/stress-ref.txt"; then
+        fail "strided i32 reduction stress ($stress_flags)" \
+            "output differs from GCC on $tmp/stress.c"
+    fi
+done
+# The stress must exercise the vector path, not just the scalar loop: at the
+# largest trip count every family -- including displaced (`b + i + 4`) and
+# mixed global/pointer streams -- carries packed dword adds at both widths.
+for stress_flags in "-O2" "-O2 -march=x86-64-v3"; do
+    # shellcheck disable=SC2086 # the flag string is a word list on purpose
+    "$CCC" $stress_flags -S "$tmp/stress.c" -o "$tmp/stress.s"
+    python3 - "$tmp/stress.s" "$stress_flags" <<'PY_STRESS'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+names = [f"f{base}{tag}513" for base in "gp" for tag in "xmsah"] + ["fm513"]
+scalar = []
+for name in names:
+    match = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text)
+    if not match or not re.search(r"\bv?paddd\b", match.group(1)):
+        scalar.append(name)
+if scalar:
+    raise SystemExit(f"strided stress ({sys.argv[2]}): not vectorized: {' '.join(scalar)}")
+# `* 3u` is a shift and an add, never the SSE2 pmuludq emulation or vpmulld.
+for name in ("fgm513", "fpm513"):
+    body = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text).group(1)
+    if re.search(r"\bv?pmul(udq|ld)\b", body):
+        raise SystemExit(f"strided stress ({sys.argv[2]}): {name} multiplies by 3")
+PY_STRESS
+done
+
+# Vector fill (src/passes/vector_fill.rs): the fills loop_memset cannot turn
+# into memset -- a 16/32/64-bit element that is not one repeated byte, a float
+# constant, a run-time value -- strip-mine into 16-byte stores plus the
+# original scalar loop as the remainder.  The stress program hashes a whole
+# guard-filled arena after every fill (over-/under-run, wrong lane pattern,
+# skipped tail, negative signed bound), at the SSE2 baseline and with AVX2,
+# against GCC; the shape check pins gzip's `head[i] = NIL` hash-chain setup.
+python3 "$dir/lib/vector_fill_stress.py" "$tmp/fill.c"
+${GCC_BIN:-gcc} -O2 -fno-strict-aliasing "$tmp/fill.c" -o "$tmp/fill-ref"
+"$tmp/fill-ref" > "$tmp/fill-ref.txt"
+for fill_flags in "-O2" "-O2 -march=x86-64-v3"; do
+    # shellcheck disable=SC2086 # the flag string is a word list on purpose
+    "$CCC" $fill_flags -fno-strict-aliasing "$tmp/fill.c" -o "$tmp/fill"
+    if ! timeout 60 "$tmp/fill" | cmp -s - "$tmp/fill-ref.txt"; then
+        fail "vector fill stress ($fill_flags)" "output differs from GCC on $tmp/fill.c"
+    fi
+done
+printf '%s\n' 'unsigned int head[32768];' \
+    'void init_head(void) { for (unsigned i = 0; i < 32768; i++) head[i] = 0xFFFF; }' \
+    > "$tmp/fill-shape.c"
+"$CCC" -O2 -S "$tmp/fill-shape.c" -o "$tmp/fill-shape.s"
+python3 - "$tmp/fill-shape.s" <<'PY4'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r"(?ms)^init_head:\n(.*?)^\.size init_head,", text)
+if not match:
+    raise SystemExit("init_head: missing assembly body")
+body = match.group(1)
+detail = body[:1500].replace("%", "%25").replace("\n", "%0A")
+stores = re.findall(r"\bmovdqu %xmm\d+, (-?\d*)\(%r\w+,%r\w+\)", body)
+if sorted(stores, key=lambda d: int(d or 0)) != ["", "16"]:
+    print(f"::error title=vector fill shape::no 16-byte store pair --- {detail}", file=sys.stderr)
+    raise SystemExit("init_head: fill was not vectorized into a movdqu store pair")
+if re.search(r"\bmovl \$65535, ", body):
+    # 32768 is a multiple of the 8-element step: the scalar loop is dead.
+    print(f"::error title=vector fill shape::dead scalar remainder kept --- {detail}",
+          file=sys.stderr)
+    raise SystemExit("init_head: scalar remainder survived an exact-multiple fill")
+PY4
 
 python3 - "$tmp/matmul.s" "$tmp/reduction.s" "$dir/lib" <<'PY'
 import re

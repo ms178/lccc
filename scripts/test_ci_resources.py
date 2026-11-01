@@ -108,6 +108,19 @@ exit "$rc"
             self.assertEqual(rc, 2)
             self.assertEqual(runs, [])
 
+    def test_modern_selection_never_runs_the_floor_or_issues_a_full_stamp(self):
+        gate = re.search(r"^gate\(\) \{\n.*?^\}", SOURCE, re.M | re.S).group()
+        for skip in (0, 1):
+            script = (f'SKIP_MSRV={skip}; ONLY=""; FAST=0; SLOW_ONLY=0; SKIPPED=0; FAILED=()\n'
+                      'ci_gate_submit() { echo "RUN:$1"; }\n' + gate +
+                      '\ngate msrv-check fast true; gate compiler-contract fast true; echo SKIPPED:$SKIPPED')
+            result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual('RUN:msrv-check' in result.stdout, not skip)
+            self.assertIn('RUN:compiler-contract', result.stdout)
+            self.assertIn(f'SKIPPED:{skip}', result.stdout)
+        self.assertIn('if [ -n "$ONLY" ] || [ "$SKIP_MSRV" = 1 ]; then', SOURCE)
+
     def test_repeats_and_empty_caller_values(self):
         rc, runs = self.run_gates("cargo_test_repeated", overrides={"LCCC_TEST_REPEATS": "3", "CARGO_PROFILE_FASTBUILD_DEBUG": "", "CARGO_INCREMENTAL": ""})
         self.assertEqual(rc, 0)

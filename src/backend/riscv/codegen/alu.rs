@@ -127,7 +127,7 @@ impl RiscvCodegen {
             // needs no sign-extension normalization: bit 31 is the highest bit
             // a 32-bit mask can carry, and `or`/`and` preserve the operand's
             // own normalization.
-            let mask_bits = if use_32bit { 31 } else { 63 };
+            let mask_bits = ty.size() * 8 - 1;
             self.state
                 .emit_fmt(format_args!("    andi t2, t2, {mask_bits}"));
             self.state.emit("    li t0, 1");
@@ -224,5 +224,53 @@ impl RiscvCodegen {
     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
         self.operand_to_t0_t1(src);
         self.store_t0_t1_to(dest);
+    }
+}
+
+#[cfg(test)]
+mod narrow_bit_modify_backend_tests {
+    use super::*;
+    use crate::ir::reexports::IrConst;
+
+    #[test]
+    fn narrow_bit_modify_backend_emission() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ] {
+            let bits = ty.size() * 8;
+            for op in [IrBinOp::BitSet, IrBinOp::BitClear, IrBinOp::BitToggle] {
+                for index in [0, bits - 1, bits, bits + 1, u64::MAX as usize] {
+                    let mut cg = RiscvCodegen::new();
+                    let base = if op == IrBinOp::BitSet { 0 } else { -1 };
+                    cg.emit_int_binop_impl(
+                        &Value(100),
+                        op,
+                        &Operand::Const(IrConst::I64(base)),
+                        &Operand::Const(IrConst::I64(index as i64)),
+                        ty,
+                    );
+                    let body = &cg.state.out.buf;
+                    assert!(
+                        body.contains(&format!("andi t2, t2, {}", bits - 1)),
+                        "{ty:?}: {body}"
+                    );
+                    println!(
+                        "BIT_MODIFY_RV|{bits}|{}|{index}\n{body}END_BIT_MODIFY",
+                        match op {
+                            IrBinOp::BitSet => "set",
+                            IrBinOp::BitClear => "clear",
+                            _ => "toggle",
+                        }
+                    );
+                }
+            }
+        }
     }
 }

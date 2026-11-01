@@ -400,7 +400,40 @@ impl Lowerer {
             self.globals.insert(declarator.name.clone(), ginfo);
         }
         self.emit_extern_tls_global(decl, declarator);
+        self.record_extern_data_size(decl, declarator);
         true
+    }
+
+    /// Record the declared size of an `extern` data object in
+    /// [`IrModule::extern_data_sizes`]: a non-weak object symbol resolves to a
+    /// real object at least that large once the program links, so LICM may
+    /// read it speculatively (GCC's `tree_could_trap_p` makes the same
+    /// argument for non-weak `DECL_EXTERNAL` variables). Shared by the
+    /// file-scope and block-scope `extern` paths.
+    pub(super) fn record_extern_data_size(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) {
+        // `extern int U[];` has no size this unit can vouch for (the lowered
+        // allocation size of an unsized array is not the object's size).
+        if decl.is_thread_local()
+            || declarator.name.is_empty()
+            || DerivedDeclarator::declares_function(&declarator.derived)
+            || self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+        {
+            return;
+        }
+        let da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        if da.actual_alloc_size == 0 || matches!(da.c_type, Some(CType::Function(_))) {
+            return;
+        }
+        let size = self
+            .module
+            .extern_data_sizes
+            .entry(declarator.name.clone())
+            .or_insert(0);
+        *size = (*size).max(da.actual_alloc_size);
     }
 
     /// Emit the `extern` IrGlobal of a TLS object this unit declares but does

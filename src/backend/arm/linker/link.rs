@@ -101,7 +101,10 @@ pub fn link_builtin(
     }
 
     // Parse user_args for -l, -L, bare files, etc.
-    let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
+    // One `-Wl,` stream, as GNU ld sees it: `-Wl,-L -Wl,DIR` and
+    // `-Wl,--version-script -Wl,v.map` keep the value with its option.
+    let joined = linker_common::join_split_wl_values(user_args);
+    let args: Vec<&str> = joined.iter().map(|s| s.as_str()).collect();
     let mut defsym_defs: Vec<(String, String)> = Vec::new();
     let mut extra_lib_paths: Vec<String> = Vec::new();
     let mut gc_sections = false;
@@ -146,9 +149,13 @@ pub fn link_builtin(
             let mut j = 0;
             while j < parts.len() {
                 let part = parts[j];
-                if let Some(lpath) = part.strip_prefix("-L") {
+                let search = linker_common::search_option(part, parts.get(j + 1).copied());
+                if let Some((_, true)) = search {
+                    j += 1;
+                }
+                if let Some((linker_common::SearchOption::Dir(lpath), _)) = search {
                     extra_lib_paths.push(lpath.to_string());
-                } else if let Some(lib) = part.strip_prefix("-l") {
+                } else if let Some((linker_common::SearchOption::Lib(lib), _)) = search {
                     let resolver = if is_static {
                         resolve_lib
                     } else {
@@ -190,6 +197,25 @@ pub fn link_builtin(
                     gc_sections = true;
                 } else if part == "--no-gc-sections" {
                     gc_sections = false;
+                } else if linker_common::VALUE_TAKING.contains(&part)
+                    || linker_common::binary_input::VALUE_WORDS.contains(&part)
+                {
+                    // The next word is this option's value, not a file.
+                    j += 1;
+                } else if !part.starts_with('-') && Path::new(part).exists() {
+                    // A file operand inside `-Wl,` (`-Wl,extra.o`, the
+                    // wrapper object of `-Wl,-b,binary,F`) is linked in
+                    // place, like one outside it (`parse_linker_args` does
+                    // the same for the other paths).
+                    load_file_as_needed(
+                        part,
+                        &mut objects,
+                        &mut globals,
+                        &mut needed_sonames,
+                        &all_lib_paths,
+                        is_static,
+                        as_needed_for(part),
+                    )?;
                 }
                 j += 1;
             }

@@ -945,6 +945,8 @@ impl ArmCodegen {
             | IntrinsicOp::VecMulF32x4
             | IntrinsicOp::VecAddI32x4
             | IntrinsicOp::VecSmaxI32x4
+            | IntrinsicOp::VecMinU32x4
+            | IntrinsicOp::VecMaxU32x4
             | IntrinsicOp::VecSminI32x4
             | IntrinsicOp::VecSubF64x2
             | IntrinsicOp::VecDivF64x2
@@ -966,6 +968,8 @@ impl ArmCodegen {
                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
                         IntrinsicOp::VecSmaxI32x4 => ("smax", "4s"),
                         IntrinsicOp::VecSminI32x4 => ("smin", "4s"),
+                        IntrinsicOp::VecMinU32x4 => ("umin", "4s"),
+                        IntrinsicOp::VecMaxU32x4 => ("umax", "4s"),
                         _ => ("mul", "4s"),
                     };
                     if let Some(name) = self.assigned_vector_reg(d.0) {
@@ -1277,6 +1281,8 @@ fn unsupported_arm_vector_intrinsic(op: &IntrinsicOp) -> bool {
             | IntrinsicOp::VecMaddF64x4
             | IntrinsicOp::VecMaddF64x4Signed(..)
             | IntrinsicOp::VecMaxI32x8
+            | IntrinsicOp::VecMinU32x8
+            | IntrinsicOp::VecMaxU32x8
             | IntrinsicOp::VecMinI32x8
             | IntrinsicOp::VecMulF32x8
             | IntrinsicOp::VecMulI32x8

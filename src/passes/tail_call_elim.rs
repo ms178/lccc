@@ -44,8 +44,9 @@
 //! - The tail call is not in the entry block (would create duplicate predecessors)
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
     replace_values_in_inst_map, replace_values_in_terminator_map,
 };
 
@@ -333,6 +334,92 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
 /// Run tail-call-to-loop on a single function.
 /// Returns the number of tail calls eliminated (0 = no change).
 pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
+    calls_to_loops(func, false)
+}
+
+/// Accumulator recursion elimination: a self-call whose result reaches
+/// `return` only through a chain of one associative, commutative integer
+/// operation (`return 1 + check(l) + check(r)`) becomes a back edge too.
+/// An accumulator phi starts at the operation's identity, each such site
+/// folds its other operands in (`acc' = acc + (1 + check(l))`), and every
+/// remaining `return x` returns `acc + x`.  Only the pure combining step is
+/// reassociated -- the operands were computed before the call, so their
+/// side effects keep their order -- and wrapping integer `+ * & | ^` are
+/// associative and commutative.  Floating point is never touched.
+///
+/// `binary_trees`' `check` drops one call per node, and its leaf test
+/// becomes a loop branch (GCC 16 does the same in tree-tailcall).  Runs
+/// after `rec2iter`, whose O(n) rewrite of `f(n - 1) + f(n - 2)` must win.
+pub(crate) fn accumulator_calls_to_loops(func: &mut IrFunction) -> usize {
+    calls_to_loops(func, true)
+}
+
+/// The accumulating chain after a self-call: `rest` (everything after the
+/// call) must be exactly `cur = cur op o` steps with one `op`, starting at
+/// the call result, whose last result the block returns.  Returns the
+/// operation and the other operands `o`.
+fn accumulator_chain(
+    rest: &[Instruction],
+    call_dest: Option<Value>,
+    terminator: &Terminator,
+    ret_ty: IrType,
+) -> Option<(IrBinOp, Vec<Operand>)> {
+    use IrType::*;
+    if !matches!(ret_ty, I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64) {
+        return None;
+    }
+    let defined: FxHashSet<u32> = rest.iter().filter_map(|i| i.dest()).map(|v| v.0).collect();
+    let mut cur = call_dest?;
+    let mut op0: Option<IrBinOp> = None;
+    let mut others = Vec::new();
+    for inst in rest {
+        let Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } = inst
+        else {
+            return None;
+        };
+        if *ty != ret_ty
+            || !matches!(
+                op,
+                IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+            )
+            || op0.is_some_and(|o| o != *op)
+        {
+            return None;
+        }
+        op0 = Some(*op);
+        let other = match (lhs, rhs) {
+            (Operand::Value(l), o) if *l == cur => *o,
+            (o, Operand::Value(r)) if *r == cur => *o,
+            _ => return None,
+        };
+        if matches!(other, Operand::Value(v) if v == cur || defined.contains(&v.0)) {
+            return None;
+        }
+        others.push(other);
+        cur = *dest;
+    }
+    match terminator {
+        Terminator::Return(Some(Operand::Value(r))) if *r == cur => Some((op0?, others)),
+        _ => None,
+    }
+}
+
+/// Identity of an accumulating operation.
+fn accumulator_identity(op: IrBinOp, ty: IrType) -> IrConst {
+    match op {
+        IrBinOp::Mul => IrConst::one(ty),
+        IrBinOp::And => IrConst::from_i64(-1, ty),
+        _ => IrConst::zero(ty),
+    }
+}
+
+fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
     if func.is_variadic || func.is_declaration || func.uses_sret {
         return 0;
     }
@@ -445,9 +532,13 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
         block_label: BlockId,
         /// Raw (pre-rename) args from the call site.
         args: Vec<Operand>,
+        /// Operands an accumulating site folds into the accumulator.
+        acc_operands: Vec<Operand>,
     }
 
     let mut tail_calls: Vec<TailCall> = Vec::new();
+    let ret_ty = func.return_type;
+    let mut acc_op: Option<IrBinOp> = None;
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         // Tail calls cannot be in the entry block: redirecting entry → loop_header
@@ -502,8 +593,8 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
         }
 
         // Verify no instruction after the call uses the call result.
-        if let Some(result_val) = call_dest {
-            let later_use = block.instructions[call_idx + 1..].iter().any(|inst| {
+        let later_use = call_dest.is_some_and(|result_val| {
+            block.instructions[call_idx + 1..].iter().any(|inst| {
                 let mut used = false;
                 inst.for_each_used_value(|v| {
                     if v == result_val.0 {
@@ -511,20 +602,36 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
                     }
                 });
                 used
-            });
-            if later_use {
-                continue;
-            }
-        }
+            })
+        });
 
         // Verify the block's terminator is Return(call_result) or Return(None).
-        let is_tail = match &block.terminator {
-            Terminator::Return(None) => call_dest.is_none(),
-            Terminator::Return(Some(Operand::Value(rv))) => call_dest.map(|d| d.0) == Some(rv.0),
-            _ => false,
-        };
+        let is_tail = !later_use
+            && match &block.terminator {
+                Terminator::Return(None) => call_dest.is_none(),
+                Terminator::Return(Some(Operand::Value(rv))) => {
+                    call_dest.map(|d| d.0) == Some(rv.0)
+                }
+                _ => false,
+            };
+        let mut acc_operands = Vec::new();
         if !is_tail {
-            continue;
+            if !accumulate {
+                continue;
+            }
+            let Some((op, operands)) = accumulator_chain(
+                &block.instructions[call_idx + 1..],
+                call_dest,
+                &block.terminator,
+                ret_ty,
+            ) else {
+                continue;
+            };
+            if acc_op.is_some_and(|o| o != op) {
+                continue;
+            }
+            acc_op = Some(op);
+            acc_operands = operands;
         }
 
         tail_calls.push(TailCall {
@@ -532,6 +639,7 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
             call_inst_idx: call_idx,
             block_label: block.label,
             args,
+            acc_operands,
         });
     }
 
@@ -550,6 +658,19 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
 
     let loop_header_label = BlockId(func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1);
     let entry_label = func.blocks[0].label;
+    // The accumulator phi and its incoming values (accumulating mode only).
+    let acc_phi = acc_op.map(|_| {
+        let v = Value(func.next_value_id);
+        func.next_value_id += 1;
+        v
+    });
+    let mut acc_incoming: Vec<(Operand, BlockId)> = Vec::new();
+    if let (Some(op), Some(_)) = (acc_op, acc_phi) {
+        acc_incoming.push((
+            Operand::Const(accumulator_identity(op, ret_ty)),
+            entry_label,
+        ));
+    }
 
     // ── 4. Build replacement map: paramref Value → phi Value ───────────────
     let mut replace_map: FxHashMap<u32, u32> = FxHashMap::default();
@@ -621,10 +742,38 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
     // ── 8. Patch tail-call sites: remove call, replace Return with Branch ──
     for tc in &tail_calls {
         let block = &mut func.blocks[tc.block_idx];
-        // Remove the Call instruction (call result is now dead; DCE will clean up).
-        block.instructions.remove(tc.call_inst_idx);
-        if has_spans && tc.call_inst_idx < block.source_spans.len() {
-            block.source_spans.remove(tc.call_inst_idx);
+        if let (Some(op), Some(phi)) = (acc_op, acc_phi) {
+            // Drop the call and its accumulating chain (the chain reads the
+            // call result, so it cannot stay), then fold the chain's other
+            // operands into the accumulator.
+            block.instructions.truncate(tc.call_inst_idx);
+            let spans = !block.source_spans.is_empty();
+            block.source_spans.truncate(tc.call_inst_idx);
+            let mut acc = phi;
+            for &o in &tc.acc_operands {
+                let next = Value(func.next_value_id);
+                func.next_value_id += 1;
+                block.instructions.push(Instruction::BinOp {
+                    dest: next,
+                    op,
+                    lhs: Operand::Value(acc),
+                    rhs: o,
+                    ty: ret_ty,
+                });
+                if spans {
+                    block
+                        .source_spans
+                        .push(crate::common::source::Span::dummy());
+                }
+                acc = next;
+            }
+            acc_incoming.push((Operand::Value(acc), tc.block_label));
+        } else {
+            // Remove the Call instruction (call result is now dead; DCE will clean up).
+            block.instructions.remove(tc.call_inst_idx);
+            if has_spans && tc.call_inst_idx < block.source_spans.len() {
+                block.source_spans.remove(tc.call_inst_idx);
+            }
         }
         block.terminator = Terminator::Branch(loop_header_label);
     }
@@ -676,6 +825,14 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
             incoming: phi_incoming[i].clone(),
         });
     }
+    // Accumulator operands were renamed with their blocks in step 9.
+    if let Some(phi) = acc_phi {
+        header_instructions.push(Instruction::Phi {
+            dest: phi,
+            ty: ret_ty,
+            incoming: acc_incoming,
+        });
+    }
 
     // Moved entry instructions: apply renaming.
     for mut inst in move_to_header {
@@ -690,7 +847,8 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
     // Span list: dummy spans for phi nodes, original spans for moved instructions.
     let header_source_spans: Vec<crate::common::source::Span> = if has_spans {
         let dummy = crate::common::source::Span::dummy();
-        let mut spans: Vec<_> = (0..phi_vals.len()).map(|_| dummy).collect();
+        let phis = phi_vals.len() + usize::from(acc_phi.is_some());
+        let mut spans: Vec<_> = (0..phis).map(|_| dummy).collect();
         spans.extend(header_spans);
         spans
     } else {
@@ -707,6 +865,30 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
     // it so later passes cannot collide (`.max()` never regresses a healthy
     // already-ahead counter).
     func.next_label = func.next_label.max(loop_header_label.0.saturating_add(1));
+
+    // ── 11. Every remaining return completes the accumulation ──────────────
+    if let (Some(op), Some(phi)) = (acc_op, acc_phi) {
+        for block in &mut func.blocks {
+            let Terminator::Return(Some(x)) = block.terminator else {
+                continue;
+            };
+            let total = Value(func.next_value_id);
+            func.next_value_id += 1;
+            block.instructions.push(Instruction::BinOp {
+                dest: total,
+                op,
+                lhs: Operand::Value(phi),
+                rhs: x,
+                ty: ret_ty,
+            });
+            if !block.source_spans.is_empty() {
+                block
+                    .source_spans
+                    .push(crate::common::source::Span::dummy());
+            }
+            block.terminator = Terminator::Return(Some(Operand::Value(total)));
+        }
+    }
 
     tail_calls.len()
 }
@@ -734,6 +916,397 @@ mod tests {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, IrConst, IrParam};
+
+    fn self_call(name: &str, dest: u32, arg: Operand) -> Instruction {
+        Instruction::Call {
+            func: name.to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: Some(Value(dest)),
+                args: vec![arg],
+                arg_types: vec![IrType::I64],
+                return_type: IrType::I64,
+                is_variadic: false,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![None],
+                struct_arg_aligns: vec![None],
+                struct_arg_classes: vec![vec![]],
+                struct_arg_riscv_float_classes: vec![None],
+                struct_arg_is_f128_sse: Vec::new(),
+                is_sret: false,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                assume_library: false,
+                ret_eightbyte_classes: vec![],
+                ret_is_f128_sse: false,
+                cold: false,
+            },
+        }
+    }
+
+    fn bb(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn bin(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty: IrType::I64,
+        }
+    }
+
+    fn val(v: u32) -> Operand {
+        Operand::Value(Value(v))
+    }
+
+    fn k64(x: i64) -> Operand {
+        Operand::Const(IrConst::I64(x))
+    }
+
+    /// Reference interpreter for the single-`i64`-parameter subset these
+    /// tests use, self-calls included; `memory` counts loads in slot 0.
+    fn run_ref(f: &IrFunction, arg: i64, memory: &FxHashMap<i64, i64>, depth: u32) -> Option<i64> {
+        if depth > 64 {
+            return None;
+        }
+        let mut env: FxHashMap<u32, i64> = FxHashMap::default();
+        let get = |env: &FxHashMap<u32, i64>, o: &Operand| match o {
+            Operand::Value(v) => env.get(&v.0).copied(),
+            Operand::Const(c) => c.to_i64(),
+        };
+        let mut prev: Option<BlockId> = None;
+        let mut at = 0usize;
+        for _ in 0..10_000 {
+            let block = &f.blocks[at];
+            let phis: Vec<(u32, i64)> = block
+                .instructions
+                .iter()
+                .filter_map(|i| match i {
+                    Instruction::Phi { dest, incoming, .. } => incoming
+                        .iter()
+                        .find(|(_, b)| Some(*b) == prev)
+                        .and_then(|(o, _)| get(&env, o))
+                        .map(|x| (dest.0, x)),
+                    _ => None,
+                })
+                .collect();
+            env.extend(phis);
+            for inst in &block.instructions {
+                let (d, x) = match inst {
+                    Instruction::Phi { .. } => continue,
+                    Instruction::ParamRef { dest, .. } => (dest.0, arg),
+                    Instruction::BinOp {
+                        dest, op, lhs, rhs, ..
+                    } => {
+                        let (l, r) = (get(&env, lhs)?, get(&env, rhs)?);
+                        let x = match op {
+                            IrBinOp::Add => l.wrapping_add(r),
+                            IrBinOp::Sub => l.wrapping_sub(r),
+                            IrBinOp::Mul => l.wrapping_mul(r),
+                            IrBinOp::And => l & r,
+                            IrBinOp::Or => l | r,
+                            IrBinOp::Xor => l ^ r,
+                            _ => return None,
+                        };
+                        (dest.0, x)
+                    }
+                    Instruction::Cmp {
+                        dest, op, lhs, rhs, ..
+                    } => (
+                        dest.0,
+                        i64::from(op.eval_i64(get(&env, lhs)?, get(&env, rhs)?)),
+                    ),
+                    Instruction::Load { dest, ptr, .. } => {
+                        (dest.0, *memory.get(env.get(&ptr.0)?).unwrap_or(&0))
+                    }
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => (dest.0, env.get(&base.0)?.wrapping_add(get(&env, offset)?)),
+                    Instruction::Call { func: callee, info } if *callee == f.name => {
+                        let a = get(&env, &info.args[0])?;
+                        (info.dest?.0, run_ref(f, a, memory, depth + 1)?)
+                    }
+                    _ => return None,
+                };
+                env.insert(d, x);
+            }
+            let next = match &block.terminator {
+                Terminator::Return(Some(o)) => return get(&env, o),
+                Terminator::Branch(t) => *t,
+                Terminator::CondBranch {
+                    cond,
+                    true_label,
+                    false_label,
+                } => {
+                    if get(&env, cond)? != 0 {
+                        *true_label
+                    } else {
+                        *false_label
+                    }
+                }
+                _ => return None,
+            };
+            prev = Some(block.label);
+            at = f.blocks.iter().position(|b| b.label == next)?;
+        }
+        None
+    }
+
+    fn self_calls(f: &IrFunction) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i, Instruction::Call { func, .. } if *func == f.name))
+            .count()
+    }
+
+    /// `binary_trees`' `check`: `n->left == 0 ? 1 : 1 + check(left) +
+    /// check(right)`, nodes `[left, right]` in memory.
+    fn tree_check(combine: IrBinOp) -> IrFunction {
+        let mut f = make_func("check", vec![IrType::I64]);
+        f.blocks = vec![
+            bb(
+                0,
+                vec![Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I64,
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            bb(
+                1,
+                vec![
+                    Instruction::Load {
+                        dest: Value(1),
+                        ptr: Value(0),
+                        ty: IrType::I64,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: IrCmpOp::Eq,
+                        lhs: val(1),
+                        rhs: k64(0),
+                        ty: IrType::I64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: val(2),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            bb(2, vec![], Terminator::Return(Some(k64(1)))),
+            bb(
+                3,
+                vec![
+                    self_call("check", 3, val(1)),
+                    bin(4, combine, k64(1), val(3)),
+                    Instruction::GetElementPtr {
+                        dest: Value(5),
+                        base: Value(0),
+                        offset: k64(8),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::Load {
+                        dest: Value(6),
+                        ptr: Value(5),
+                        ty: IrType::I64,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    self_call("check", 7, val(6)),
+                    bin(8, combine, val(4), val(7)),
+                ],
+                Terminator::Return(Some(val(8))),
+            ),
+        ];
+        f.next_value_id = 9;
+        f
+    }
+
+    /// A complete tree of `depth` at 1000.., plus a lopsided right spine.
+    fn trees() -> Vec<(i64, FxHashMap<i64, i64>)> {
+        fn build(m: &mut FxHashMap<i64, i64>, next: &mut i64, depth: u32) -> i64 {
+            let at = *next;
+            *next += 16;
+            if depth > 0 {
+                let l = build(m, next, depth - 1);
+                let r = build(m, next, depth - 1);
+                m.insert(at, l);
+                m.insert(at + 8, r);
+            }
+            at
+        }
+        let mut out = Vec::new();
+        for depth in 0..5 {
+            let mut m = FxHashMap::default();
+            let mut next = 1000;
+            let root = build(&mut m, &mut next, depth);
+            out.push((root, m));
+        }
+        let mut m = FxHashMap::default();
+        for i in 0..6 {
+            let at = 5000 + 32 * i;
+            m.insert(at, 9000 + 16 * i);
+            m.insert(at + 8, at + 32);
+        }
+        m.insert(5000 + 32 * 6, 0);
+        out.push((5000, m));
+        out
+    }
+
+    #[test]
+    fn accumulator_recursion_becomes_a_loop_with_the_same_results() {
+        for op in [
+            IrBinOp::Add,
+            IrBinOp::Mul,
+            IrBinOp::Xor,
+            IrBinOp::Or,
+            IrBinOp::And,
+        ] {
+            let f = tree_check(op);
+            let mut g = f.clone();
+            assert_eq!(accumulator_calls_to_loops(&mut g), 1, "{op:?}");
+            assert_eq!(self_calls(&g), 1, "{op:?}: only the left call stays");
+            for (root, m) in trees() {
+                let want = run_ref(&f, root, &m, 0);
+                assert!(want.is_some());
+                assert_eq!(want, run_ref(&g, root, &m, 0), "{op:?} on tree {root}");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_tce_leaves_accumulator_recursion_alone() {
+        let mut f = tree_check(IrBinOp::Add);
+        assert_eq!(tail_calls_to_loops(&mut f), 0);
+        assert_eq!(self_calls(&f), 2);
+    }
+
+    #[test]
+    fn non_reassociable_chains_are_refused() {
+        // `1 - check(l) - check(r)`: subtraction does not commute.
+        let mut f = tree_check(IrBinOp::Sub);
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+        // `t + t`: the call result feeds the chain twice.
+        let mut f = tree_check(IrBinOp::Add);
+        f.blocks[3].instructions[5] = bin(8, IrBinOp::Add, val(7), val(7));
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+        // Mixed operations in one chain.
+        let mut f = tree_check(IrBinOp::Add);
+        f.blocks[3]
+            .instructions
+            .push(bin(9, IrBinOp::Mul, val(8), k64(3)));
+        f.blocks[3].terminator = Terminator::Return(Some(val(9)));
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+        // A store after the call is a side effect the loop would reorder.
+        let mut f = tree_check(IrBinOp::Add);
+        f.blocks[3].instructions.insert(
+            5,
+            Instruction::Store {
+                val: val(7),
+                ptr: Value(0),
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        );
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+        // Floating point never reassociates.
+        let mut f = tree_check(IrBinOp::Add);
+        f.return_type = IrType::F64;
+        for inst in &mut f.blocks[3].instructions {
+            if let Instruction::BinOp { ty, .. } = inst {
+                *ty = IrType::F64;
+            }
+        }
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+    }
+
+    /// `n <= 1 ? 1 : n * fact(n - 1)` beside a plain `return fact(n - 2)`
+    /// site (odd `n` above 10): both become back edges of one loop.
+    #[test]
+    fn accumulating_and_plain_sites_share_the_loop() {
+        let mut f = make_func("fact", vec![IrType::I64]);
+        let cmp = |d: u32, op: IrCmpOp, l: Operand, r: Operand| Instruction::Cmp {
+            dest: Value(d),
+            op,
+            lhs: l,
+            rhs: r,
+            ty: IrType::I64,
+        };
+        f.blocks = vec![
+            bb(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I64,
+                    },
+                    cmp(1, IrCmpOp::Sle, val(0), k64(1)),
+                ],
+                Terminator::CondBranch {
+                    cond: val(1),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            bb(1, vec![], Terminator::Return(Some(k64(1)))),
+            bb(
+                2,
+                vec![
+                    bin(2, IrBinOp::And, val(0), k64(1)),
+                    cmp(3, IrCmpOp::Sgt, val(0), k64(10)),
+                    bin(4, IrBinOp::And, val(2), val(3)),
+                ],
+                Terminator::CondBranch {
+                    cond: val(4),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+            ),
+            bb(
+                3,
+                vec![
+                    bin(5, IrBinOp::Sub, val(0), k64(2)),
+                    self_call("fact", 6, val(5)),
+                ],
+                Terminator::Return(Some(val(6))),
+            ),
+            bb(
+                4,
+                vec![
+                    bin(7, IrBinOp::Sub, val(0), k64(1)),
+                    self_call("fact", 8, val(7)),
+                    bin(9, IrBinOp::Mul, val(0), val(8)),
+                ],
+                Terminator::Return(Some(val(9))),
+            ),
+        ];
+        f.next_value_id = 10;
+        let mut g = f.clone();
+        assert_eq!(accumulator_calls_to_loops(&mut g), 2);
+        assert_eq!(self_calls(&g), 0);
+        let m = FxHashMap::default();
+        for n in [-3, 0, 1, 2, 5, 10, 11, 13, 20, 25] {
+            let want = run_ref(&f, n, &m, 0);
+            assert!(want.is_some());
+            assert_eq!(want, run_ref(&g, n, &m, 0), "fact({n})");
+        }
+    }
 
     /// Build a minimal IrFunction skeleton (no blocks) for testing.
     fn make_func(name: &str, params: Vec<IrType>) -> IrFunction {

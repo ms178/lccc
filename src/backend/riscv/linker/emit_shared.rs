@@ -12,10 +12,14 @@ use super::got::{
     GotKind, GotLayout, R_RISCV_TLS_DTPMOD64, R_RISCV_TLS_DTPREL64, R_RISCV_TLS_TPREL64,
     TLS_DTV_OFFSET,
 };
+use super::relax::{LayoutProbe, RelaxProbeLayout, fill_relax_probe};
 use super::relocations::{
-    GlobalSym, MergedSection, R_RISCV_64, R_RISCV_CALL_PLT, align_up, section_order, write_phdr_at,
+    GlobalSym, MergedSection, R_RISCV_64, R_RISCV_CALL, R_RISCV_CALL_PLT, R_RISCV_JAL,
+    R_RISCV_RVC_JUMP, align_up, section_order, write_phdr_at,
 };
 use super::{debug, reloc, symbols};
+use crate::backend::linker_common::build_id::BuildIdStyle;
+use crate::backend::linker_common::eh_frame_gnu::EhFrameLayout;
 use crate::backend::linker_common::shdr::{self, ShdrSpec};
 use crate::backend::linker_common::{self, DynStrTab};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -24,8 +28,8 @@ use crate::backend::elf::{
     DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_NEEDED,
     DT_NULL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERNEED,
     DT_VERNEEDNUM, DT_VERSYM, EM_RISCV as EM_RISCV_ELF, ET_DYN, PF_R, PF_W, PF_X, PT_DYNAMIC,
-    PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_LOAD, PT_TLS, SHT_GNU_VERNEED, SHT_GNU_VERSYM,
-    STT_TLS,
+    PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_LOAD, PT_NOTE, PT_TLS, SHT_GNU_VERNEED,
+    SHT_GNU_VERSYM, SHT_NOTE, STT_TLS,
 };
 
 const R_RISCV_RELATIVE: u64 = 3;
@@ -42,6 +46,28 @@ const PT_RISCV_ATTRIBUTES: u32 = 0x70000003;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
+
+/// A call to an import that needs a PLT entry in a shared object: GNU ld
+/// counts `R_RISCV_CALL` and `R_RISCV_CALL_PLT` (`riscv_elf_check_relocs`);
+/// `R_RISCV_JAL` and `R_RISCV_RVC_JUMP` are what relaxation turns those into.
+fn is_plt_call(rela_type: u32) -> bool {
+    matches!(
+        rela_type,
+        R_RISCV_CALL | R_RISCV_CALL_PLT | R_RISCV_JAL | R_RISCV_RVC_JUMP
+    )
+}
+
+/// Whether a call to `sym` from a shared object goes through a PLT entry:
+/// an import, or a default-visibility definition another object may
+/// preempt (ELF interposition; GNU ld's `SYMBOL_CALLS_LOCAL` is false).
+/// `-Bsymbolic` binds every definition locally, `-Bsymbolic-functions` the
+/// functions; protected and hidden definitions always bind locally.
+fn needs_shared_plt(sym: &GlobalSym, symbolic: linker_common::Symbolic) -> bool {
+    if sym.visibility != STV_DEFAULT {
+        return false;
+    }
+    !sym.defined || (sym.binding != STB_LOCAL && !symbolic.binds_locally(sym.sym_type))
+}
 
 /// Emit a RISC-V shared library (.so) from pre-resolved linking state.
 ///
@@ -62,23 +88,33 @@ pub fn emit_shared_library(
     debug_sections: &mut debug::DebugSections,
     keep_symtab: bool,
     output_path: &str,
+    eh_frame: &EhFrameLayout,
+    build_id: &BuildIdStyle,
+    gnu_stack: Option<u32>,
+    symbolic: linker_common::Symbolic,
+    new_dtags: bool,
+    probe: Option<&mut LayoutProbe>,
 ) -> Result<(), String> {
     // ── Phase 3c: Identify PLT entries needed for external function calls ──
+    // Relaxation rewrites calls in place before the final emit, so a call
+    // that became `jal`/`c.j` must keep its PLT entry: GNU ld sizes the PLT
+    // before relaxing (`size_dynamic_sections`) and the relaxed jump still
+    // targets the stub. Without this, every relaxed import call in a shared
+    // object jumped to address 0.
     let mut plt_symbols: Vec<String> = Vec::new();
     {
         let mut plt_set: FxHashSet<String> = FxHashSet::default();
         for (_, obj) in input_objs.iter() {
             for relocs in &obj.relocations {
                 for reloc in relocs {
-                    if reloc.rela_type == R_RISCV_CALL_PLT {
+                    if is_plt_call(reloc.rela_type) {
                         let sym = &obj.symbols[reloc.sym_idx as usize];
                         if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
                             if let Some(gsym) = global_syms.get(sym.name.as_str()) {
                                 // A non-default-visible unresolved weak is
                                 // local zero, not an import. It has no dynsym
                                 // entry and must never produce JUMP_SLOT(0).
-                                if !gsym.defined
-                                    && gsym.visibility == STV_DEFAULT
+                                if needs_shared_plt(gsym, symbolic)
                                     && !plt_set.contains(sym.name.as_str())
                                 {
                                     plt_set.insert(sym.name.to_string());
@@ -117,15 +153,18 @@ pub fn emit_shared_library(
         .get(".eh_frame")
         .map(|&i| linker_common::count_eh_frame_fdes(&merged_sections[i].data))
         .unwrap_or(0);
-    let eh_frame_hdr_idx = (eh_frame_fde_count > 0).then(|| {
+    let eh_frame_hdr_size = eh_frame.hdr_size(eh_frame_fde_count);
+    let eh_frame_hdr_idx = (eh_frame_hdr_size > 0).then(|| {
         let idx = merged_sections.len();
         merged_map.insert(".eh_frame_hdr".into(), idx);
         merged_sections.push(MergedSection {
             name: ".eh_frame_hdr".into(),
             sh_type: SHT_PROGBITS,
             sh_flags: SHF_ALLOC,
-            data: vec![0u8; 12 + 8 * eh_frame_fde_count],
+            data: vec![0u8; eh_frame_hdr_size],
             vaddr: 0,
+            entsize: 0,
+            script_write: false,
             align: 4,
         });
         idx
@@ -182,6 +221,10 @@ pub fn emit_shared_library(
     if rpath.is_some() {
         dyn_count += 1;
     }
+    let dt_symbolic = symbolic == linker_common::Symbolic::All;
+    // GNU ld writes DT_FLAGS only with new dtags (`bfd_elf_size_dynamic_sections`).
+    let dt_flags = dt_symbolic && new_dtags;
+    dyn_count += u64::from(dt_symbolic) + u64::from(dt_flags);
     if has_init_array {
         dyn_count += 2;
     }
@@ -195,8 +238,28 @@ pub fn emit_shared_library(
 
     let has_riscv_attrs = merged_sections
         .iter()
-        .any(|ms| ms.name == ".riscv.attributes");
-    let mut phdr_count: u64 = 8;
+        .any(|ms| ms.name == ".riscv.attributes" && !ms.data.is_empty());
+    // PT_NOTE segments as GNU ld forms them: one per run of adjacent loaded
+    // SHT_NOTE sections sharing an alignment (the notes sort last among the
+    // read-only sections, so a run is never split by the layout).
+    let mut note_groups: Vec<Vec<usize>> = Vec::new();
+    let mut prev_note = false;
+    for &si in &sec_indices {
+        let ms = &merged_sections[si];
+        if ms.sh_flags & SHF_ALLOC == 0 || ms.data.is_empty() || ms.name == ".riscv.attributes" {
+            continue;
+        }
+        let is_note = ms.sh_type == SHT_NOTE;
+        match note_groups.last_mut() {
+            Some(group) if is_note && prev_note && merged_sections[group[0]].align == ms.align => {
+                group.push(si);
+            }
+            _ if is_note => note_groups.push(vec![si]),
+            _ => {}
+        }
+        prev_note = is_note;
+    }
+    let mut phdr_count: u64 = 7 + u64::from(gnu_stack.is_some()) + note_groups.len() as u64;
     if eh_frame_hdr_idx.is_some() {
         phdr_count += 1;
     }
@@ -211,6 +274,13 @@ pub fn emit_shared_library(
     // ── Layout ──
     let base_addr: u64 = 0;
     let mut offset = 64 + phdr_total_size;
+    // `.note.gnu.build-id` heads the image in GNU ld's default script.
+    let build_id_idx = merged_map.get(".note.gnu.build-id").copied();
+    if let Some(bi) = build_id_idx {
+        offset = align_up(offset, merged_sections[bi].align.max(1));
+        merged_sections[bi].vaddr = base_addr + offset;
+        offset += merged_sections[bi].data.len() as u64;
+    }
 
     // Collect exported symbol names for .dynsym
     let mut dyn_sym_names: Vec<String> = Vec::new();
@@ -397,6 +467,7 @@ pub fn emit_shared_library(
             && flags & SHF_WRITE == 0
             && sh_type != SHT_NOBITS
             && !is_riscv_attr
+            && Some(si) != build_id_idx
         {
             offset = align_up(offset, a);
             merged_sections[si].vaddr = base_addr + offset;
@@ -432,6 +503,16 @@ pub fn emit_shared_library(
             merged_sections[si].vaddr = base_addr + offset;
             fini_array_addr = merged_sections[si].vaddr;
             fini_array_size = merged_sections[si].data.len() as u64;
+            offset += merged_sections[si].data.len() as u64;
+        }
+    }
+
+    // .data.rel.ro: written by dynamic relocations, read-only after them,
+    // so inside the RELRO region with the arrays.
+    for &si in &sec_indices {
+        if merged_sections[si].name == ".data.rel.ro" {
+            offset = align_up(offset, merged_sections[si].align.max(1));
+            merged_sections[si].vaddr = base_addr + offset;
             offset += merged_sections[si].data.len() as u64;
         }
     }
@@ -480,6 +561,7 @@ pub fn emit_shared_library(
             && (ms.sh_flags & SHF_WRITE != 0 || ms.sh_flags & SHF_TLS != 0)
             && ms.name != ".init_array"
             && ms.name != ".fini_array"
+            && ms.name != ".data.rel.ro"
     });
     if got_plt_size == 0 && any_writable_tail {
         offset = align_up(offset, PAGE_SIZE);
@@ -491,6 +573,7 @@ pub fn emit_shared_library(
         let sh_type = merged_sections[si].sh_type;
         let is_init = merged_sections[si].name == ".init_array";
         let is_fini = merged_sections[si].name == ".fini_array";
+        let is_relro_data = merged_sections[si].name == ".data.rel.ro";
         let a = merged_sections[si].align.max(1);
         let dlen = merged_sections[si].data.len() as u64;
         if flags & SHF_ALLOC != 0
@@ -498,6 +581,7 @@ pub fn emit_shared_library(
             && sh_type != SHT_NOBITS
             && !is_init
             && !is_fini
+            && !is_relro_data
             && flags & SHF_TLS == 0
         {
             offset = align_up(offset, a);
@@ -575,6 +659,62 @@ pub fn emit_shared_library(
         }
     }
 
+    // A relaxation trip needs the layout, not the image (`relax.rs`).
+    if let Some(probe) = probe {
+        let plt_addrs: FxHashMap<String, u64> = plt_symbols
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (
+                    name.clone(),
+                    plt_vaddr + plt_header_size + i as u64 * plt_entry_size,
+                )
+            })
+            .collect();
+        let synthetic = [
+            (gnu_hash_addr, gnu_hash_size, 8),
+            (dynsym_addr, dynsym_size, 8),
+            (dynstr_addr, dynstr_size, 1),
+            (base_addr + versym_offset, versym_size, 2),
+            (base_addr + verneed_offset, verneed_data.len() as u64, 8),
+            (rela_dyn_addr, rela_dyn_max_size, 8),
+            (rela_plt_addr, rela_plt_size, 8),
+            (plt_vaddr, plt_size, 16),
+            (dynamic_addr, dynamic_size, 8),
+            (got_vaddr, got_size, 8),
+            (got_plt_vaddr, got_plt_size, 8),
+        ];
+        let rx_seq: Vec<usize> = sec_indices
+            .iter()
+            .copied()
+            .filter(|&si| {
+                let flags = merged_sections[si].sh_flags;
+                flags & SHF_EXECINSTR != 0 && flags & SHF_ALLOC != 0
+            })
+            .collect();
+        let no_copies = FxHashMap::default();
+        fill_relax_probe(
+            probe,
+            &RelaxProbeLayout {
+                input_objs,
+                merged_sections,
+                section_vaddrs: &section_vaddrs,
+                layout_order: &sec_indices,
+                rx_seq,
+                plt_addrs: Some(&plt_addrs),
+                // The writable segment follows the read-only data, not the
+                // code: only the RX segment is modelled as moving in a trip.
+                rw_start: 0,
+                synthetic: &synthetic,
+                global_syms,
+                copy_sym_addrs: &no_copies,
+                tls_start: has_tls.then_some(tls_vaddr),
+                plt: (plt_vaddr, plt_size),
+            },
+        );
+        return Ok(());
+    }
+
     let local_sym_vaddrs =
         symbols::build_local_sym_vaddrs(input_objs, sec_mapping, &section_vaddrs, global_syms);
 
@@ -594,7 +734,7 @@ pub fn emit_shared_library(
     elf[24..32].copy_from_slice(&0u64.to_le_bytes()); // e_entry = 0
     elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
     elf[40..48].copy_from_slice(&0u64.to_le_bytes()); // e_shoff placeholder
-    elf[48..52].copy_from_slice(&0x5u32.to_le_bytes()); // e_flags
+    elf[48..52].copy_from_slice(&super::relocations::merged_e_flags(input_objs)?.to_le_bytes());
     elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
     elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
     elf[56..58].copy_from_slice(&(phdr_count as u16).to_le_bytes());
@@ -604,6 +744,8 @@ pub fn emit_shared_library(
 
     // Program headers
     let mut ph = 64usize;
+    // Program headers in GNU ld's order: PHDR, RISCV_ATTRIBUTES, the
+    // LOADs, DYNAMIC, NOTE..., TLS, GNU_EH_FRAME, GNU_STACK, RELRO.
     // PT_PHDR
     write_phdr_at(
         &mut elf,
@@ -618,6 +760,13 @@ pub fn emit_shared_library(
         8,
     );
     ph += 56;
+    // PT_RISCV_ATTRIBUTES: offset and size are patched once the section
+    // is written (it is not loaded).
+    if has_riscv_attrs {
+        write_phdr_at(&mut elf, ph, PT_RISCV_ATTRIBUTES, PF_R, 0, 0, 0, 0, 0, 1);
+        ph += 56;
+    }
+
     // PT_LOAD (RO)
     write_phdr_at(
         &mut elf, ph, PT_LOAD, PF_R, 0, base_addr, base_addr, ro_seg_end, ro_seg_end, PAGE_SIZE,
@@ -685,6 +834,65 @@ pub fn emit_shared_library(
         8,
     );
     ph += 56;
+    // PT_NOTE
+    for group in &note_groups {
+        let (first, last) = (group[0], group[group.len() - 1]);
+        let vaddr = merged_sections[first].vaddr;
+        let size = merged_sections[last].vaddr + merged_sections[last].data.len() as u64 - vaddr;
+        write_phdr_at(
+            &mut elf,
+            ph,
+            PT_NOTE,
+            PF_R,
+            vaddr - base_addr,
+            vaddr,
+            vaddr,
+            size,
+            size,
+            merged_sections[first].align,
+        );
+        ph += 56;
+    }
+    // PT_TLS (optional)
+    if has_tls {
+        write_phdr_at(
+            &mut elf,
+            ph,
+            PT_TLS,
+            PF_R,
+            tls_file_offset,
+            tls_vaddr,
+            tls_vaddr,
+            tls_file_size,
+            tls_mem_size,
+            tls_align,
+        );
+        ph += 56;
+    }
+    // PT_GNU_EH_FRAME (when there is unwind info)
+    if let Some(hi) = eh_frame_hdr_idx {
+        let (vaddr, size) = (
+            merged_sections[hi].vaddr,
+            merged_sections[hi].data.len() as u64,
+        );
+        write_phdr_at(
+            &mut elf,
+            ph,
+            PT_GNU_EH_FRAME,
+            PF_R,
+            vaddr - base_addr,
+            vaddr,
+            vaddr,
+            size,
+            size,
+            4,
+        );
+        ph += 56;
+    }
+    if let Some(flags) = gnu_stack {
+        write_phdr_at(&mut elf, ph, PT_GNU_STACK, flags, 0, 0, 0, 0, 0, 0x10);
+        ph += 56;
+    }
     // PT_GNU_RELRO
     {
         let relro_start_offset = rw_page_offset;
@@ -712,57 +920,10 @@ pub fn emit_shared_library(
             relro_memsz,
             1,
         );
-    }
-    ph += 56;
-    // PT_GNU_STACK
-    write_phdr_at(&mut elf, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0, 0x10);
-    ph += 56;
-    // PT_GNU_EH_FRAME (when there is unwind info)
-    if let Some(hi) = eh_frame_hdr_idx {
-        let (vaddr, size) = (
-            merged_sections[hi].vaddr,
-            merged_sections[hi].data.len() as u64,
-        );
-        write_phdr_at(
-            &mut elf,
-            ph,
-            PT_GNU_EH_FRAME,
-            PF_R,
-            vaddr - base_addr,
-            vaddr,
-            vaddr,
-            size,
-            size,
-            4,
-        );
         ph += 56;
     }
-    // PT_TLS (optional)
-    if has_tls {
-        write_phdr_at(
-            &mut elf,
-            ph,
-            PT_TLS,
-            PF_R,
-            tls_file_offset,
-            tls_vaddr,
-            tls_vaddr,
-            tls_file_size,
-            tls_mem_size,
-            tls_align,
-        );
-        ph += 56;
-    }
-    // PT_RISCV_ATTRIBUTES (optional)
-    if has_riscv_attrs {
-        if let Some(_ms) = merged_sections
-            .iter()
-            .find(|ms| ms.name == ".riscv.attributes")
-        {
-            write_phdr_at(&mut elf, ph, PT_RISCV_ATTRIBUTES, PF_R, 0, 0, 0, 0, 0, 1);
-        }
-    }
-
+    // Every counted header was written, and nothing past the table.
+    debug_assert_eq!(Some(ph as u64), phdr_count.checked_mul(56).map(|n| n + 64));
     // Write .gnu.hash
     {
         let gh = gnu_hash_offset as usize;
@@ -957,6 +1118,7 @@ pub fn emit_shared_library(
     let empty_relax = FxHashMap::default();
     let empty_nop = FxHashSet::default();
     let ctx = reloc::RelocContext {
+        symbolic,
         sec_mapping,
         section_vaddrs: &section_vaddrs,
         local_sym_vaddrs: &local_sym_vaddrs,
@@ -969,6 +1131,10 @@ pub fn emit_shared_library(
         gd_tls_call_nop: &empty_nop,
         collect_relatives: true,
         plt_sym_addrs: &plt_sym_addrs,
+        gp: global_syms
+            .get("__global_pointer$")
+            .filter(|g| g.defined)
+            .map_or(0, |g| g.value),
     };
     let reloc_result = reloc::apply_relocations(input_objs, merged_sections, &ctx)?;
     rela_dyn_entries.extend(reloc_result.relative_entries);
@@ -977,13 +1143,12 @@ pub fn emit_shared_library(
     // The binary-search table over the relocated `.eh_frame`.
     if let (Some(hi), Some(&ef)) = (eh_frame_hdr_idx, merged_map.get(".eh_frame")) {
         let mut slot = std::mem::take(&mut merged_sections[hi].data);
-        linker_common::write_eh_frame_hdr(
+        eh_frame.write_hdr(
             &mut slot,
             &merged_sections[ef].data,
             merged_sections[ef].vaddr,
             merged_sections[hi].vaddr,
-            true,
-        );
+        )?;
         merged_sections[hi].data = slot;
     }
 
@@ -1101,6 +1266,19 @@ pub fn emit_shared_library(
             elf[dd + 8..dd + 16].copy_from_slice(&off.to_le_bytes());
             dd += 16;
         }
+        // `-Bsymbolic` (not `-Bsymbolic-functions`), as GNU ld marks it:
+        // DT_SYMBOLIC, and DF_SYMBOLIC in DT_FLAGS with new dtags.
+        const DT_SYMBOLIC: u64 = 16;
+        const DT_FLAGS: u64 = 30;
+        let symbolic_tags = [
+            (dt_symbolic, DT_SYMBOLIC, 0),
+            (dt_flags, DT_FLAGS, linker_common::dyn_flags::DF_SYMBOLIC),
+        ];
+        for (_, tag, val) in symbolic_tags.into_iter().filter(|&(on, _, _)| on) {
+            elf[dd..dd + 8].copy_from_slice(&tag.to_le_bytes());
+            elf[dd + 8..dd + 16].copy_from_slice(&val.to_le_bytes());
+            dd += 16;
+        }
         let dyn_entries: Vec<(u64, u64)> = vec![
             (DT_STRTAB as u64, dynstr_addr),
             (DT_SYMTAB as u64, dynsym_addr),
@@ -1183,7 +1361,7 @@ pub fn emit_shared_library(
     };
     debug::write_debug_sections(&mut elf, debug_sections, &syms)?;
     // Offsets equal addresses in this layout (base 0).
-    let mut specs = debug::merged_headers(merged_sections, &section_vaddrs, &section_vaddrs, false);
+    let mut specs = debug::merged_headers(merged_sections, &section_vaddrs, &section_vaddrs);
     specs.extend(shdr::dynamic_headers(&shdr::DynamicSections {
         gnu_hash: (gnu_hash_addr, gnu_hash_offset, gnu_hash_size),
         dynsym: (dynsym_addr, dynsym_offset, dynsym_size),
@@ -1293,6 +1471,16 @@ pub fn emit_shared_library(
         }
     }
 
+    // The build id hashes the finished image, as GNU ld's does.
+    if let Some(bi) = build_id_idx.filter(|_| build_id.is_enabled()) {
+        let ms = &merged_sections[bi];
+        // The section is exactly the synthetic note: input notes are discarded.
+        let note = ms.vaddr - base_addr;
+        if !linker_common::build_id::patch_output_build_id_styled(&mut elf, Some(note), build_id) {
+            return Err("internal error: the build-id note is outside the image".into());
+        }
+    }
+
     // Write output
     std::fs::write(output_path, &elf)
         .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;
@@ -1303,4 +1491,63 @@ pub fn emit_shared_library(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::elf::{STV_HIDDEN, STV_PROTECTED};
+    use crate::backend::linker_common::Symbolic;
+
+    fn sym(defined: bool, binding: u8, visibility: u8, sym_type: u8) -> GlobalSym {
+        GlobalSym {
+            value: 0,
+            size: 0,
+            binding,
+            sym_type,
+            visibility,
+            defined,
+            needs_plt: false,
+            plt_idx: 0,
+            section_idx: None,
+            placeholder: false,
+        }
+    }
+
+    #[test]
+    fn preemptible_definitions_and_imports_call_through_the_plt() {
+        let import = sym(false, STB_GLOBAL, STV_DEFAULT, STT_FUNC);
+        let own = sym(true, STB_GLOBAL, STV_DEFAULT, STT_FUNC);
+        assert!(needs_shared_plt(&import, Symbolic::None));
+        assert!(needs_shared_plt(&own, Symbolic::None));
+        // -Bsymbolic binds the library's own definitions, never imports.
+        assert!(!needs_shared_plt(&own, Symbolic::All));
+        assert!(!needs_shared_plt(&own, Symbolic::Functions));
+        assert!(needs_shared_plt(&import, Symbolic::All));
+    }
+
+    #[test]
+    fn local_binding_definitions_and_hidden_symbols_call_directly() {
+        let protected = sym(true, STB_GLOBAL, STV_PROTECTED, STT_FUNC);
+        let hidden_weak_undef = sym(false, STB_WEAK, STV_HIDDEN, STT_FUNC);
+        // -Bsymbolic-functions binds functions only; a data object stays
+        // preemptible.
+        let object = sym(true, STB_GLOBAL, STV_DEFAULT, STT_OBJECT);
+        assert!(!needs_shared_plt(&protected, Symbolic::None));
+        assert!(!needs_shared_plt(&hidden_weak_undef, Symbolic::None));
+        assert!(needs_shared_plt(&object, Symbolic::Functions));
+    }
+
+    #[test]
+    fn relaxed_call_forms_keep_their_plt_entry() {
+        for t in [
+            R_RISCV_CALL,
+            R_RISCV_CALL_PLT,
+            R_RISCV_JAL,
+            R_RISCV_RVC_JUMP,
+        ] {
+            assert!(is_plt_call(t), "{t}");
+        }
+        assert!(!is_plt_call(R_RISCV_64));
+    }
 }

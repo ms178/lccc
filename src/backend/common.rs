@@ -1207,6 +1207,18 @@ fn link_builtin_native(
 ) -> Result<(), String> {
     use crate::backend::{arm, i686, riscv, x86};
 
+    // `-b binary` / `--format=binary` inputs named in the linker options
+    // become wrapper objects before anything parses those options
+    // (`binary_input`); `binary_objects` removes them when the link returns.
+    let mut binary_objects = crate::backend::linker_common::binary_input::BinaryObjects::default();
+    let rewritten = crate::backend::linker_common::binary_input::rewrite_driver_args(
+        user_args,
+        arch.elf_machine,
+        crate::backend::linker_common::VALUE_TAKING,
+        &mut binary_objects,
+    )?;
+    let user_args: &[String] = rewritten.as_deref().unwrap_or(user_args);
+
     // `--oformat`: `binary` is implemented (the same flat-image conversion
     // `lccc-ld --oformat=binary` uses), and every other spelling must name the
     // encoding this backend actually writes. The driver used to accept
@@ -2521,6 +2533,10 @@ impl AsmOutput {
     /// Emit: `    {jcc} .LBB{block_id}` (conditional jump to block label)
     #[inline]
     pub fn emit_jcc_block(&mut self, jcc: &str, block_id: u32) {
+        // Callers pass the bare condition mnemonic (`jne`, `Self::invert_jcc`
+        // results), unlike the pre-indented `mnemonic` arguments of the
+        // other helpers here.
+        self.buf.push_str("    ");
         self.buf.push_str(jcc);
         self.buf.push_str(" .LBB");
         write_u64_fast(&mut self.buf, block_id as u64);

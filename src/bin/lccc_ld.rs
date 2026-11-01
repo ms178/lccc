@@ -18,6 +18,8 @@
 //! (`make LD=lccc-ld`) and lets the differential benchmark compare the same
 //! CLI against bfd/mold instead of routing through the compiler driver.
 
+use lccc::backend::linker_common::binary_input::{self, InputFormat};
+
 /// Expand `@file` response-file arguments (GNU ld convention).
 /// Each `@path` argument is replaced by the file's contents split on
 /// whitespace (respecting simple single/double quoting and backslash
@@ -286,11 +288,15 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "--no-warn-search-mismatch"
         | "--no-warn-execstack"
         | "--warn-execstack"
+        // No backend currently emits RWX LOAD-segment warnings. Explicitly
+        // disabling that diagnostic is therefore already honored; do not
+        // promote a spurious "not implemented" warning under --fatal-warnings.
+        // This does NOT implement --warn-rwx-segments, which remains diagnosed.
+        | "--no-warn-rwx-segments"
         // GNU's `--warn-textrel` turns the text-relocation check to "warn",
         // which is already lccc-ld's default (`TextrelPolicy::Warn`).
         | "--warn-textrel"
         | "--disable-linker-version"
-        | "--no-relax"
         // Driver-level flags that reach a standalone linker when a build system
         // hands the same list to both. A linker never adds default libraries on
         // its own -- that is the driver's job; for ld, -nostdlib only drops the
@@ -375,6 +381,10 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut warn_rwx_segments = true;
     let mut print_memory_usage = false;
     let mut oformat_binary = false;
+    // `-b FORMAT` / `--format FORMAT`: the format of the inputs that follow
+    // (`binary_input`); indices of `inputs` named under `-b binary`.
+    let mut input_format = InputFormat::Native;
+    let mut binary_inputs: Vec<usize> = Vec::new();
     let mut top_warnings: Vec<String> = Vec::new();
     // Options accepted but not implemented are diagnosed after parsing so
     // --fatal-warnings applies regardless of their position in argv.
@@ -476,6 +486,21 @@ fn run(args: &[String]) -> Result<(), String> {
             // dispatch instead — falling through to "unknown option" would
             // be factually wrong.)
             "--no-emit-relocs" | "--no-threads" | "--threads" => passthrough.push(a.to_string()),
+            // RISC-V linker relaxation is on by default, as in GNU ld;
+            // `--no-relax` keeps only the mandatory `R_RISCV_ALIGN` handling.
+            // Other targets accept both and ignore them (no relaxation to
+            // switch), which is also what bfd does on x86 for code that has
+            // no relaxable sequences left.
+            "--relax" | "--no-relax" => passthrough.push(a.to_string()),
+            // GNU ld's executable-stack report switches (`stack_note`): they
+            // decide whether a forcing input is named and whether the link
+            // fails (`--error-execstack`, or a warning under
+            // `--fatal-warnings`), so they are forwarded, never ignored.
+            "--warn-execstack"
+            | "--no-warn-execstack"
+            | "--warn-execstack-objects"
+            | "--error-execstack"
+            | "--no-error-execstack" => passthrough.push(a.to_string()),
             a if a.starts_with("--threads=") => {
                 passthrough.push(a.to_string());
             }
@@ -672,7 +697,18 @@ fn run(args: &[String]) -> Result<(), String> {
             | "-X"
             | "-x" => {}
             _ => {
-                if let Some(v) = a.strip_prefix("--script=") {
+                if let Some(word) = binary_input::format_switch(a) {
+                    let word = match word {
+                        Some(w) => w.to_string(),
+                        None => {
+                            i += 1;
+                            args.get(i)
+                                .cloned()
+                                .ok_or_else(|| format!("{a}: missing input format"))?
+                        }
+                    };
+                    input_format = binary_input::parse_input_format(&word)?;
+                } else if let Some(v) = a.strip_prefix("--script=") {
                     script_path = Some(v.to_string());
                 } else if let Some(v) = a.strip_prefix("-T") {
                     if !v.is_empty() {
@@ -698,6 +734,12 @@ fn run(args: &[String]) -> Result<(), String> {
                         passthrough.push(a.to_string());
                     }
                 } else if a.starts_with("-l") {
+                    if input_format == InputFormat::Binary {
+                        return Err(format!(
+                            "{a}: a library searched under -b binary would be read as raw \
+                             data; end the binary inputs with -b default first"
+                        ));
+                    }
                     if a == "-l" {
                         i += 1;
                         if let Some(l) = args.get(i) {
@@ -806,7 +848,7 @@ fn run(args: &[String]) -> Result<(), String> {
                         return Err("--pack-dyn-relocs needs a value".into());
                     }
                     passthrough.push(format!("-Wl,--pack-dyn-relocs={val}"));
-                } else if a.starts_with("--oformat") || a == "-b" {
+                } else if a.starts_with("--oformat") {
                     let val = two_arg(a, args, &mut i);
                     match val.as_str() {
                         "binary" => {
@@ -901,6 +943,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     // Unknown flag: warn (or error under --fatal-warnings).
                     top_warnings.push(format!("ignoring unknown option '{a}'"));
                 } else {
+                    if input_format == InputFormat::Binary {
+                        binary_inputs.push(inputs.len());
+                    }
                     inputs.push((a.to_string(), whole_archive));
                     positional_files.push((passthrough.len(), a.to_string()));
                 }
@@ -927,6 +972,23 @@ fn run(args: &[String]) -> Result<(), String> {
 
     if inputs.is_empty() {
         return Err("no input files".into());
+    }
+    // `-b binary` inputs become wrapper objects for the final emulation
+    // (`-m` may follow them); `binary_objects` removes them when `run`
+    // returns.  `inputs` and `positional_files` are pushed together.
+    let mut binary_objects = binary_input::BinaryObjects::default();
+    if !binary_inputs.is_empty() {
+        let machine = match emulation {
+            Emulation::X86_64 => binary_input::machine::X86_64,
+            Emulation::I386 => binary_input::machine::I386,
+            Emulation::Aarch64 => binary_input::machine::AARCH64,
+            Emulation::Riscv64 => binary_input::machine::RISCV,
+        };
+        for &k in &binary_inputs {
+            let path = binary_objects.materialize(&inputs[k].0, machine)?;
+            positional_files[k].1.clone_from(&path);
+            inputs[k].0 = path;
+        }
     }
     let elf_i386 = emulation == Emulation::I386;
 

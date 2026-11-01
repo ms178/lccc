@@ -389,7 +389,8 @@ impl Lowerer {
                 self.lower_pointer_member_access(base_expr, field_name)
             }
             Expr::Comma(lhs, rhs, _) => {
-                self.lower_expr(lhs);
+                // The left operand is a void expression (C23 6.5.18p2).
+                self.lower_expr_discarded(lhs);
                 let value = self.lower_expr(rhs);
                 self.spill_packed_vector_wrapper(expr, value)
             }
