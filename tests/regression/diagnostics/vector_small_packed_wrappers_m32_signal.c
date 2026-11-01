@@ -35,6 +35,12 @@ static void report_fault(int sig, siginfo_t *info, void *context)
     for (unsigned i = 0; i < 5; ++i)
         append_hex(stack_message, 6 + 9 * i, sp[16 + i]);
     (void)write(STDERR_FILENO, stack_message, sizeof(stack_message));
+    const char return_prefix[] = "RETADDR=0x00000000\n";
+    char return_message[sizeof(return_prefix) - 1];
+    for (unsigned i = 0; i < sizeof(return_message); ++i)
+        return_message[i] = return_prefix[i];
+    append_hex(return_message, 10, sp[15]);
+    (void)write(STDERR_FILENO, return_message, sizeof(return_message));
     _exit(128 + sig);
 }
 
