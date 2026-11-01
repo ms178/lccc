@@ -167,9 +167,22 @@ pub struct Driver {
     /// (`-fPIC`/`-fpic`, or `-shared`).
     pub(super) pic: bool,
     /// Whether to generate a position-independent executable (`-fPIE`/
-    /// `-fpie`, the x86-64 Linux default). PIE permits direct references to
-    /// ordinary executable data where full PIC requires the GOT.
+    /// `-fpie`, or a `-pie` link). PIE permits direct references to ordinary
+    /// executable data where full PIC requires the GOT.
+    ///
+    /// The *codegen* mode is narrower than this flag: an image that is really
+    /// position-fixed (a FULL invocation that final-links ET_EXEC) needs no
+    /// position independence at all, and `pie_codegen` in
+    /// `compile_translation_unit` answers what codegen will actually do. This
+    /// flag stays what the command line said, because the preprocessor macros
+    /// (`__PIE__`, `__PIC__`) are defined by the `-f` options and must not
+    /// follow the link mode.
     pub(super) pie: bool,
+    /// Whether `-fPIE`/`-fpie` appeared explicitly, as opposed to `pie`'s
+    /// default. An explicit request is honoured even when the image will be
+    /// position-fixed: the user asked for position-independent code, not for a
+    /// position-independent executable.
+    pub(super) pie_explicit: bool,
     /// `-ftls-model=` floor (GCC `flag_tls_default`); see common::tls.
     pub(super) tls_model_floor: Option<crate::common::tls::TlsModel>,
     /// Last `-mtls-dialect=` value, validated against the final target.
@@ -654,11 +667,20 @@ impl Driver {
             nostartfiles: false,
             nodefaultlibs: false,
             relocatable: false,
-            // Debian x86-64 defaults to PIE, not full PIC. Keeping these modes
-            // distinct lets executable data use direct RIP-relative accesses
-            // while explicit -fPIC/-shared remains interposition-safe.
+            // The `-f` flag defaults to PIE codegen, not full PIC, so a
+            // compile-only invocation (`-c`/`-S`) produces an object a later
+            // `-pie` link can use. Keeping the two modes distinct lets
+            // executable data use direct RIP-relative accesses while an
+            // explicit -fPIC/-shared remains interposition-safe.
+            //
+            // This is the FLAG default, not the codegen decision: a FULL
+            // invocation that final-links ET_EXEC drops to position-fixed
+            // codegen (`pie_codegen` in `compile_translation_unit`) because
+            // the image cannot be relocated. `pie_explicit` is what keeps an
+            // explicit `-fPIE` from being overridden by that.
             pic: false,
             pie: true,
+            pie_explicit: false,
             tls_model_floor: None,
             tls_dialect: None,
             force_includes: Vec::new(),
@@ -3692,26 +3714,40 @@ impl Driver {
         }
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
+        // The codegen mode and the link mode are one decision. A FULL
+        // invocation that final-links ET_EXEC produces a position-FIXED image:
+        // absolute symbol forms are legal, no `%rip` base has to be
+        // materialized for a symbol+index access, and none of the registers
+        // those bases occupied has to be saved across the loop that used them.
+        // Paying position-independent prices there bought nothing — the image
+        // cannot be relocated.
+        //
+        // Everything that can still move keeps the position-independent path:
+        // `-c`/`-S`/`-r` output (a later link may be `-pie`), `-shared`,
+        // `-fPIC`, an explicit `-fPIE`, and a `-pie` link (an ET_DYN cannot
+        // hold the R_X86_64_32S the absolute forms need).
+        //
+        // The PIE decision must match the linker's exactly — the same
+        // last-`-pie`/`-no-pie`-wins scan over the same argument list the link
+        // receives — so codegen and link can never disagree.
+        let link_pie = crate::backend::common::linker_pie_effective(&self.build_linker_args());
+        let fixed_exec_link = matches!(self.mode, CompileMode::Full)
+            && !self.shared_lib
+            && !self.relocatable
+            && !link_pie;
+        let pic_codegen = self.pic || self.shared_lib;
+        let pie_codegen = (self.pie && (!fixed_exec_link || self.pie_explicit)) || link_pie;
         let opts = crate::backend::CodegenOptions {
             ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
             // scan assumes one definition and miscompiled 125/200 CFG seeds;
             // use canonical stack homes until an SSA-aware O0 allocator exists.
             disable_regalloc: self.opt_level == 0,
-            pic: self.pic || self.shared_lib,
+            pic: pic_codegen,
             shared_lib: self.shared_lib,
-            pie: self.pie && !self.pic && !self.shared_lib,
+            pie: pie_codegen && !pic_codegen,
             no_plt: self.no_plt,
-            // Only a FULL invocation that final-links in position-fixed
-            // ET_EXEC may emit the absolute switch-table form (its jump
-            // instruction's R_X86_64_32S is unresolvable in ET_DYN). The
-            // PIE decision must match the linker's exactly — same
-            // last-`-pie`/`-no-pie`-wins scan over the same argument list
-            // the link receives — so the codegen and link never disagree.
-            fixed_exec_link: matches!(self.mode, CompileMode::Full)
-                && !self.shared_lib
-                && !self.relocatable
-                && !crate::backend::common::linker_pie_effective(&self.build_linker_args()),
+            fixed_exec_link,
             tls_model_floor: self.tls_model_floor,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,

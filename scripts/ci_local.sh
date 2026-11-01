@@ -1731,6 +1731,29 @@ gate "cfi-unwind" fast \
 gate "narrow-int-codegen" fast \
     env CCC=target/fastbuild/lccc python3 tests/regression/check_narrow_int_codegen.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23
 
+# The codegen mode and the link mode are one decision: a position-fixed
+# ET_EXEC pays no position-independent price, while -pie, -fpie, -c, -S and
+# -fPIC stay position independent.
+gate "default-codegen-mode" fast \
+    bash tests/regression/check_default_codegen_mode.sh
+
+# A call-free leaf pays no callee-saved register: the volatile pool carries its
+# loop state, the kill switch restores the old shape, and a call the compiler
+# cannot summarize still preserves its state.
+gate "leaf-caller-homes" fast \
+    bash tests/regression/check_leaf_caller_homes.sh
+
+# Narrow arithmetic: wrapped values, sign extension and comparisons over the
+# whole u8 grid and a sampled i16 grid, at -O0..-Os.
+gate "narrow-alu-arithmetic" fast \
+    bash tests/regression/check_narrow_alu_arithmetic.sh
+
+# A symbol+index SIB consumes the index's full register, so a narrow index must
+# be sign- or zero-extended before the SIB uses it. Four folds obey the law;
+# the LEA arm did not, so the same `base + i` lowered two different ways.
+gate "symbol-index-widths" fast \
+    bash tests/regression/check_symbol_index_widths.sh
+
 # The builtin linkers against gcc's link semantics: -shared startup files and
 # default libraries, user -l before the defaults, -rpath, as-needed libm.
 gate "builtin-dso-link" fast \
