@@ -211,7 +211,7 @@ for opt in -O0 -O2 -O3; do
         ref="$tmp/out$opt"
     elif ! cmp -s "$ref" "$tmp/out$opt"; then
         echo "-O0 and $opt disagree on the folded answers:" >&2
-        diff "$ref" "$tmp/out$opt" | head -10 >&2
+        diff "$ref" "$tmp/out$opt" | sed -n '1,10p' >&2
         exit 1
     fi
 done
@@ -222,7 +222,7 @@ for knob in CCC_NO_LOWEST_SET_BIT=1 CCC_SIMPLIFY_SKIP=zeroneg; do
     "$tmp/ek" > "$tmp/outk"
     if ! cmp -s "$ref" "$tmp/outk"; then
         echo "$knob changes the answers:" >&2
-        diff "$ref" "$tmp/outk" | head -10 >&2
+        diff "$ref" "$tmp/outk" | sed -n '1,10p' >&2
         exit 1
     fi
 done

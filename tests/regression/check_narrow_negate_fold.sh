@@ -231,7 +231,7 @@ for opt in -O0 -O1 -O2 -O3; do
         ref="$tmp/out$opt"
     elif ! cmp -s "$ref" "$tmp/out$opt"; then
         echo "-O0 and $opt disagree on the narrow-negate answers:" >&2
-        diff "$ref" "$tmp/out$opt" | head -10 >&2
+        diff "$ref" "$tmp/out$opt" | sed -n '1,10p' >&2
         exit 1
     fi
 done
@@ -244,7 +244,7 @@ for knob in CCC_SIMPLIFY_SKIP=negcast CCC_SIMPLIFY_SKIP=zeroneg; do
     "$tmp/ek" > "$tmp/outk"
     if ! cmp -s "$ref" "$tmp/outk"; then
         echo "$knob changes the answers:" >&2
-        diff "$ref" "$tmp/outk" | head -10 >&2
+        diff "$ref" "$tmp/outk" | sed -n '1,10p' >&2
         exit 1
     fi
 done
@@ -255,7 +255,7 @@ if command -v "${GCC_ORACLE:-gcc-16}" >/dev/null 2>&1; then
     "$tmp/egcc" > "$tmp/outgcc"
     if ! cmp -s "$ref" "$tmp/outgcc"; then
         echo "lccc and GCC disagree on the narrow-negate answers:" >&2
-        diff "$ref" "$tmp/outgcc" | head -10 >&2
+        diff "$ref" "$tmp/outgcc" | sed -n '1,10p' >&2
         exit 1
     fi
 fi

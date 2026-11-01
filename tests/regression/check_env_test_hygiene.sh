@@ -96,7 +96,12 @@ MARKER='FIX''ME'
 #        set_strided_reduce_enabled, so no pass site reads them at all -- the
 #        three inline.rs reads and the strided-reduce read leave the count.
 #        Tightened to the new measurement, per the rule above.
-ENV_READ_BUDGET=143
+#   144  2026-11-01: the lowest-set-bit kill switch (CCC_NO_LOWEST_SET_BIT,
+#        resolved once in src/passes/bit_idioms_facts.rs next to the boolean
+#        algebra's, so the matcher pays one read per process, not per site).
+#        Raised to the measurement, exactly -- a fold that needs no switch gets
+#        no budget.
+ENV_READ_BUDGET=144
 
 fail=0
 report() { # report <label> <offending lines>

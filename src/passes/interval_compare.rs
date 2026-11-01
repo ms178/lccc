@@ -82,6 +82,15 @@ fn signed_of(ty: IrType) -> bool {
     matches!(ty, IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64)
 }
 
+/// Sign-extend a ring value of `bits` width to an `i64`.
+fn extend_to_i64(value: u64, bits: u32) -> i64 {
+    if bits == 64 {
+        return value as i64;
+    }
+    let shift = 64 - bits;
+    ((value << shift) as i64) >> shift
+}
+
 /// A comparison of one value against a constant, with the constant on the
 /// right.
 struct Predicate {
@@ -166,25 +175,44 @@ struct Interval {
 }
 
 impl Interval {
-    /// Number of values in the window, computed IN THE OPERAND RING.
+    /// Number of values in the window, ordered in the COMPARISON's domain.
     ///
-    /// Bounds are stored the way `predicate` normalised them (`ring`, i.e.
-    /// masked to the type's width), so a window that starts below zero stores
-    /// its lower bound as a large unsigned value: `[-7, 7]` at 32 bits is
-    /// `[0xFFFF_FFF9, 7]`. A plain 64-bit subtraction reads that as a window of
-    /// ~2^64 values and refuses it, which is why `x > -8 && x < 8` used to keep
-    /// its two compares and a select while `x > 3 && x < 10` folded. Masking
-    /// the span at the operand width gives the true count (15 there), and the
-    /// empty and inverted windows still fall out: `[10, 5]` spans `0xFFFF_FFFB`
-    /// and `[7, 7]` spans 1.
+    /// The bounds are stored masked into the operand ring (`ring`), so the
+    /// width cannot be read off the raw bits: `[-7, 7]` at 32 bits is stored
+    /// `[0xFFFF_FFF9, 7]`, and a 64-bit subtraction calls that ~2^64 values
+    /// wide -- which is why `x > -8 && x < 8` used to keep its two compares
+    /// while `x > 3 && x < 10` folded.
+    ///
+    /// The fix is NOT to count the span around the ring, because the same
+    /// masked bounds mean different things in the two domains:
+    ///
+    /// ```text
+    /// signed    x > -8 && x < 8        stored [0xFFFF_FFF9, 7]   15 values
+    /// unsigned  x >= 0xFFFFFFF7&&x<=10 stored [0xFFFFFFF7, 10]    0 values
+    /// ```
+    ///
+    /// A signed window that crosses zero is contiguous in the ring, so ordering
+    /// the SIGN-EXTENDED bounds gives both the count and (through `emit`'s
+    /// `(x - L) < width`) the right test. An unsigned window is ordered
+    /// unsigned, where an inverted pair is empty -- folding it as a ring span
+    /// would accept both `0..10` and `0xFFFFFFF7..0xFFFFFFFF`, the phantom
+    /// window `range_fold_branch.c` A11 exists to catch.
     fn width(&self) -> u64 {
         let bits = bits_of(self.ty);
-        let mask = if bits == 64 {
-            u64::MAX
-        } else {
-            (1u64 << bits) - 1
-        };
-        self.upper.wrapping_sub(self.lower_bound).wrapping_add(1) & mask
+        if signed_of(self.ty) {
+            let (low, high) = (
+                extend_to_i64(self.lower_bound, bits),
+                extend_to_i64(self.upper, bits),
+            );
+            if low > high {
+                return 0;
+            }
+            return (high as u64).wrapping_sub(low as u64).wrapping_add(1);
+        }
+        if self.lower_bound > self.upper {
+            return 0;
+        }
+        self.upper.wrapping_sub(self.lower_bound).wrapping_add(1)
     }
 }
 
@@ -215,10 +243,12 @@ fn interval(logic: IrBinOp, lhs: Predicate, rhs: Predicate) -> Option<Interval> 
             let upper = upper_bounds(&hi_pred)?;
             // No `lower > upper` test here: the bounds live in the operand
             // ring, where a window that legitimately starts below zero stores
-            // its lower bound above its upper one. `Interval::width` performs
-            // the ring-correct emptiness test, and `emit` refuses an empty or
-            // too-wide window (0 or > 2^31-1 values), so an inverted window
-            // (`x >= 10 && x <= 5`) still declines.
+            // its lower bound above its upper one. `Interval::width` decides
+            // emptiness in the comparison's own domain, and `emit` refuses an
+            // empty or too-wide window (0 or > 2^31-1 values), so both a
+            // signed crossing window (`x > -8 && x < 8`) and an inverted one
+            // (`x >= 10 && x <= 5`, `x >= 0xFFFFFFF7u && x <= 10u`) are
+            // handled correctly.
             (lo_pred.value, (lower, upper, true))
         }
         IrBinOp::Or => {
@@ -760,6 +790,42 @@ mod tests {
                     } if c.to_i64() == Some(15) && *t == unsigned
                 ),
                 "{ty:?}: expected `(unsigned)(x - L) < 15`, got {last:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_inverted_window_stays_empty() {
+        // `x >= 0xFFFFFFF7u && x <= 10u` is EMPTY in unsigned order, and its
+        // stored bounds are the same pair that a signed crossing window has
+        // (`[-9, 10]` is `[0xFFFFFFF7, 10]`). Ordering the mask around the
+        // ring instead of in the compare's domain fabricates a 20-value window
+        // that accepts both `0..10` and `0xFFFFFFF7..0xFFFFFFFF` -- the
+        // phantom window `range_fold_branch.c` A11 reproduces live, at u32 and
+        // u64 width.
+        for (ty, constant) in [
+            (IrType::U32, IrConst::from_i64(0xFFFF_FFF7, IrType::U32)),
+            (IrType::U64, IrConst::from_i64(-9, IrType::U64)),
+        ] {
+            let mut wrap = and_fixture(ty);
+            wrap.blocks[0].instructions[1] = Instruction::Cmp {
+                dest: Value(1),
+                op: IrCmpOp::Uge,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(constant),
+                ty,
+            };
+            wrap.blocks[0].instructions[2] = Instruction::Cmp {
+                dest: Value(2),
+                op: IrCmpOp::Ule,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::from_i64(10, ty)),
+                ty,
+            };
+            assert_eq!(
+                run(&mut wrap),
+                0,
+                "{ty:?}: a wrapping unsigned window is empty, not a range test"
             );
         }
     }
