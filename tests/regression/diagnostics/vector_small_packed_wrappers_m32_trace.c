@@ -17,14 +17,21 @@ static void report_fault(int sig, siginfo_t *info, void *context)
 {
     (void)info;
     const char digits[] = "0123456789abcdef";
-    const char prefix[] = "SIGSEGV EIP=0x00000000\n";
+    const char prefix[] =
+        "SIGSEGV EIP=0x00000000 ESP=0x00000000 EBP=0x00000000\n";
     char message[sizeof(prefix) - 1];
     for (unsigned i = 0; i < sizeof(message); ++i)
         message[i] = prefix[i];
     const ucontext_t *uc = (const ucontext_t *)context;
-    unsigned long ip = (unsigned long)uc->uc_mcontext.gregs[REG_EIP];
-    for (unsigned i = 0; i < 8; ++i)
-        message[14 + i] = digits[(ip >> (28 - 4 * i)) & 15];
+    const unsigned long regs[] = {
+        (unsigned long)uc->uc_mcontext.gregs[REG_EIP],
+        (unsigned long)uc->uc_mcontext.gregs[REG_ESP],
+        (unsigned long)uc->uc_mcontext.gregs[REG_EBP],
+    };
+    const unsigned offsets[] = {14, 29, 44};
+    for (unsigned r = 0; r < 3; ++r)
+        for (unsigned i = 0; i < 8; ++i)
+            message[offsets[r] + i] = digits[(regs[r] >> (28 - 4 * i)) & 15];
     (void)write(STDERR_FILENO, message, sizeof(message));
     _exit(128 + sig);
 }
