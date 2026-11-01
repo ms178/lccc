@@ -1,7 +1,8 @@
 //! Production-matcher tests for [`super::bit_select::fold_bit_select`].
 //!
-//! `x | 1 << n`, `x & ~(1 << n)` and `(x & 1 << n) != 0` are the shapes
-//! accepted here; the fold answers with `BitSet`, `BitClear` and `BitTest`.
+//! `x | 1 << n`, `x & ~(1 << n)`, `x ^ 1 << n` and `(x & 1 << n) != 0` are
+//! the shapes accepted here; the fold answers with `BitSet`, `BitClear`,
+//! `BitToggle` and `BitTest`.
 //!
 //! Every semantic check evaluates the ORIGINAL instructions and the
 //! REPLACEMENT over the whole ring of each width the fold can create, plus
@@ -61,6 +62,29 @@ fn or_fixture(
     uses[1] = 1;
     uses[2] = 2;
     uses[3] = 1;
+    (defs, uses, inst)
+}
+
+/// `x ^ (1 << n)` with every producer used once.  Same shape as
+/// [`or_fixture`] with the join swapped, which is the whole point: the two
+/// idioms differ only in the operator.
+fn xor_fixture(
+    ty: IrType,
+    shifted_first: bool,
+) -> (Vec<Option<Instruction>>, Vec<u32>, Instruction) {
+    let (defs, uses, _) = or_fixture(ty, shifted_first);
+    let (lhs, rhs) = if shifted_first {
+        (v(3), v(1))
+    } else {
+        (v(1), v(3))
+    };
+    let inst = Instruction::BinOp {
+        dest: Value(4),
+        op: IrBinOp::Xor,
+        lhs,
+        rhs,
+        ty,
+    };
     (defs, uses, inst)
 }
 
@@ -171,6 +195,11 @@ fn original_set(x: u64, n: u64, bits: u32, set: bool) -> u64 {
     value & mask_of(bits)
 }
 
+/// The original `x ^ (1 << n)` value, evaluated the same way.
+fn original_toggle(x: u64, n: u64, bits: u32) -> u64 {
+    (x ^ (1u64 << (n % u64::from(bits)))) & mask_of(bits)
+}
+
 #[test]
 fn bit_set_and_clear_match_the_original_over_the_whole_ring() {
     for ty in [
@@ -219,8 +248,12 @@ fn bit_set_and_clear_match_the_original_over_the_whole_ring() {
                 assert_eq!(op, IrBinOp::BitSet);
                 assert_eq!(out_ty, ty);
                 assert_eq!((lhs, rhs), (v(1), v(2)), "base and index are kept");
-                let got =
-                    crate::ir::ops::bit_op_within_bits(x as u128, n as u128, bits, true) as u64;
+                let got = crate::ir::ops::bit_op_within_bits(
+                    x as u128,
+                    n as u128,
+                    bits,
+                    crate::ir::ops::BitMode::Set,
+                ) as u64;
                 assert_eq!(
                     got,
                     original_set(x, n, bits, true),
@@ -233,13 +266,82 @@ fn bit_set_and_clear_match_the_original_over_the_whole_ring() {
                     panic!("x & ~(1 << n) did not fold at {ty:?}");
                 };
                 assert_eq!(op, IrBinOp::BitClear);
-                let got =
-                    crate::ir::ops::bit_op_within_bits(x as u128, n as u128, bits, false) as u64;
+                let got = crate::ir::ops::bit_op_within_bits(
+                    x as u128,
+                    n as u128,
+                    bits,
+                    crate::ir::ops::BitMode::Clear,
+                ) as u64;
                 assert_eq!(
                     got,
                     original_set(x, n, bits, false),
                     "BitClear {x:#x} bit {n} at {ty:?}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn bit_toggle_matches_the_original_over_the_whole_ring() {
+    for ty in [
+        IrType::U8,
+        IrType::I8,
+        IrType::U16,
+        IrType::I16,
+        IrType::U32,
+        IrType::I32,
+        IrType::U64,
+        IrType::I64,
+    ] {
+        let bits = bits_of(ty);
+        let mut indices: Vec<u64> = (0..=u64::from(bits) + 1).collect();
+        indices.push(u64::from(bits) * 3 + 5);
+        indices.push(u64::MAX);
+        let patterns: Vec<u64> = if bits <= 8 {
+            (0..=mask_of(bits)).collect()
+        } else if bits == 16 {
+            (0..=mask_of(bits)).step_by(97).collect()
+        } else {
+            vec![
+                0,
+                1,
+                mask_of(bits),
+                mask_of(bits) / 3,
+                0x8000_0000,
+                0x0123_4567_89AB_CDEF & mask_of(bits),
+            ]
+        };
+        for &x in &patterns {
+            for &n in &indices {
+                for shifted_first in [false, true] {
+                    let (defs, uses, inst) = xor_fixture(ty, shifted_first);
+                    let Some(Instruction::BinOp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty: out_ty,
+                    }) = fold_bit_select(&inst, &defs, &uses)
+                    else {
+                        panic!("x ^ 1 << n did not fold at {ty:?}");
+                    };
+                    assert_eq!(dest, Value(4), "the XOR's dest is kept");
+                    assert_eq!(op, IrBinOp::BitToggle);
+                    assert_eq!(out_ty, ty);
+                    assert_eq!((lhs, rhs), (v(1), v(2)), "base and index are kept");
+                    let got = crate::ir::ops::bit_op_within_bits(
+                        x as u128,
+                        n as u128,
+                        bits,
+                        crate::ir::ops::BitMode::Toggle,
+                    ) as u64;
+                    assert_eq!(
+                        got,
+                        original_toggle(x, n, bits),
+                        "BitToggle {x:#x} bit {n} at {ty:?}"
+                    );
+                }
             }
         }
     }
@@ -268,8 +370,12 @@ fn bit_test_matches_the_original_under_both_operand_orders() {
                     assert_eq!(out_ty, ty);
                     assert_eq!((lhs, rhs), (v(1), v(2)));
                     let want = original_set(x, n, bits, true) != 0;
-                    let got = crate::ir::ops::bit_op_within_bits(x as u128, n as u128, bits, true)
-                        as u64
+                    let got = crate::ir::ops::bit_op_within_bits(
+                        x as u128,
+                        n as u128,
+                        bits,
+                        crate::ir::ops::BitMode::Set,
+                    ) as u64
                         != 0;
                     assert_eq!(got, want, "BitTest {x:#x} bit {n} at {ty:?}");
                 }
@@ -313,6 +419,59 @@ fn a_shared_producer_is_not_duplicated() {
     // ... and for a shared complement in the bit-clear shape.
     let (defs, mut uses, inst) = and_fixture(IrType::U32, false, false);
     uses[4] = 2;
+    assert!(fold_bit_select(&inst, &defs, &uses).is_none());
+
+    // ... and for the toggle, which uses the same fixture as the OR.
+    let (defs, mut uses, inst) = xor_fixture(IrType::U32, false);
+    uses[3] = 2;
+    assert!(fold_bit_select(&inst, &defs, &uses).is_none());
+}
+
+#[test]
+fn the_toggle_involution_becomes_a_copy_not_a_second_toggle() {
+    // `(x ^ 1 << n) ^ 1 << n`: the inner XOR has already been folded to
+    // `BitToggle(x, n)` by the time the outer one is visited, so the outer must
+    // answer with a copy of `x` -- folding it into a second `BitToggle` is
+    // correct but costs two `btc`s where the shape used to cancel outright.
+    let (mut defs, mut uses, outer) = xor_fixture(IrType::U32, false);
+    // Value(4) = inner toggle, Value(5) = the outer XOR.
+    defs[4] = Some(Instruction::BinOp {
+        dest: Value(4),
+        op: IrBinOp::BitToggle,
+        lhs: v(1),
+        rhs: v(2),
+        ty: IrType::U32,
+    });
+    let outer = match outer {
+        Instruction::BinOp { dest, .. } => Instruction::BinOp {
+            dest,
+            op: IrBinOp::Xor,
+            lhs: v(4),
+            rhs: v(3),
+            ty: IrType::U32,
+        },
+        other => other,
+    };
+    uses[4] = 1;
+    let folded = fold_bit_select(&outer, &defs, &uses);
+    // The dest is the outer XOR's own value (Value(4) in the fixture), so the
+    // copy must re-point that value at `x`.
+    match folded {
+        Some(Instruction::Copy { src, .. }) => assert_eq!(src, v(1), "the copy is of x"),
+        other => panic!("expected a Copy of x, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_toggle_does_not_capture_a_shift_of_a_wider_value() {
+    // `1ul << n` at 64 bits feeding a 32-bit XOR: the shift's width is not the
+    // xor's, exactly the refusal `BitSet` makes, so the toggle must refuse it
+    // too rather than fold and silently change which index bits matter.
+    let (defs, uses, inst) = xor_fixture(IrType::U32, false);
+    let mut defs = defs;
+    if let Some(Instruction::BinOp { ty, .. }) = defs[3].as_mut() {
+        *ty = IrType::U64;
+    }
     assert!(fold_bit_select(&inst, &defs, &uses).is_none());
 }
 
@@ -418,9 +577,18 @@ fn an_index_above_the_width_wraps_to_the_same_bit() {
             };
             let wrapped = n % u64::from(bits);
             for &x in &[0u64, 1, mask_of(bits)] {
-                let a = crate::ir::ops::bit_op_within_bits(x as u128, n as u128, bits, true) as u64;
-                let b = crate::ir::ops::bit_op_within_bits(x as u128, wrapped as u128, bits, true)
-                    as u64;
+                let a = crate::ir::ops::bit_op_within_bits(
+                    x as u128,
+                    n as u128,
+                    bits,
+                    crate::ir::ops::BitMode::Set,
+                ) as u64;
+                let b = crate::ir::ops::bit_op_within_bits(
+                    x as u128,
+                    wrapped as u128,
+                    bits,
+                    crate::ir::ops::BitMode::Set,
+                ) as u64;
                 assert_eq!(a, b, "index {n} must read bit {wrapped} at {ty:?}");
             }
         }
