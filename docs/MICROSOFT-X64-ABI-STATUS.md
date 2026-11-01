@@ -96,9 +96,12 @@ review obligations, and measured non-kernel variadic-home-save improvements.
 - Further kernel compiler/linker defects and unsupported-option warnings must
   be resolved. The previous full build failed at i915; a clean, content-identified
   rebuild with the validated fix is required, not a successful kernel yet.
-- Latest main (`4494df45b`) has been merged into the draft branch. The running
-  full build still uses the identified pre-merge executable; merged-source
-  compiler rebuilding and kernel validation remain necessary.
+- Latest main (`2503b046e`) has been merged into the draft branch. The new
+  boot-first rebuild uses compiler SHA256 `6cce8a32fa17c14fd17608ede004a617d802c8ceb30d6922fd57d404f9218b39`
+  and rebuilt linker SHA256 `6a2ac22794120f984caf8a71ec7bc0a1858ce4c52a3244c691831c3c821399d3`.
+  Preparation and the 31,024-byte boot-only gate pass again, including all
+  24 ISA scans and byte-identical GNU-linker parity. The clean full build
+  has restarted; its final link and QEMU result remain outstanding.
 - A complete kernel link, QEMU boot and green hosted CI remain required before
   production readiness. No full-kernel success or performance improvement is
   asserted by the scalar tests.
