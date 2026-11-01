@@ -47,10 +47,14 @@ The source snapshot remains `UNGATED` until such a stamp exists.
   PMU, including actual `perf stat` event naming/CSV/running percentages and
   permission-denied failure paths. The VM has no hardware PMU. The automated
   perf transport test uses a fake tool and is not performance evidence.
-* Fix and test the mixed-GCC include-next search-provenance defect, rather than
-  depending on a single matching `gcc` version in PATH. The correctness and
-  benchmark oracle must not loop between GCC wrapper headers or silently fall
-  back to a different include path after the next-search is exhausted.
+* **Mixed-GCC include-next provenance — locally validated on 2026-11-01.**
+  The existing resolver retains the supplying search-chain slot and advances
+  from it. `tests/regression/check_include_next_search.py` now exercises real
+  GCC 12 and GCC 16.2 wrapper headers in both orders, for `-m64`/`-m32`, with
+  LCCC, GCC 16.2 and Clang 23.1.4; all 12 cells reached the libc endpoint and
+  expanded the sentinel macros. This closes the specific local follow-up, not
+  every GCC layout. GCC 14 headers and ICX were unavailable here; hosted CI
+  on the committed tree remains required before calling the PR green.
 * Measure real whole-application workloads and evaluate cache/TLB/top-down
   events separately only when the actual PMU supports them. Do not infer such
   results from the 63 synthetic/workload-derived kernel correctness cases.
