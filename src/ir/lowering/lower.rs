@@ -878,6 +878,76 @@ impl Lowerer {
         }
     }
 
+    /// Record the `.init_array`/`.fini_array` entries this translation unit owes
+    /// the loader.
+    ///
+    /// An init/fini entry names a FUNCTION the loader calls. Two gates follow
+    /// from that, both measured against GCC 16.2:
+    ///  - the declarator must declare a function. GCC ignores the attribute on
+    ///    anything else (`'constructor' attribute ignored`), and honouring it on
+    ///    `void (*fp)(void) __attribute__((constructor)) = c;` put the address of
+    ///    a DATA object into `.init_array`; the loader called it and the program
+    ///    died with SIGSEGV before reaching main.
+    ///  - the function must be DEFINED in this translation unit: the entry
+    ///    belongs to the TU that defines the function, and a declaration alone
+    ///    must not leave a dangling `.quad f` behind. GCC emits no entry for
+    ///    `void f(void) __attribute__((constructor));` without a definition, and
+    ///    one when the definition follows the declaration.
+    ///
+    /// Entries are appended in declaration order and deduplicated, so a
+    /// declaration followed by its definition yields exactly one entry.
+    fn collect_init_fini_entries(&mut self, tu: &TranslationUnit) {
+        let defined_functions: crate::common::fx_hash::FxHashSet<&str> = tu
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                ExternalDecl::FunctionDef(func) => Some(func.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        for decl in &tu.decls {
+            if let ExternalDecl::FunctionDef(func) = decl {
+                if func.attrs.is_constructor() && !self.module.constructors.contains(&func.name) {
+                    self.module.constructors.push(func.name.clone());
+                }
+                if func.attrs.is_destructor() && !self.module.destructors.contains(&func.name) {
+                    self.module.destructors.push(func.name.clone());
+                }
+                continue;
+            }
+            let ExternalDecl::Declaration(decl) = decl else {
+                continue;
+            };
+            for declarator in &decl.declarators {
+                // A function *type*, as opposed to an object of function-pointer
+                // type (see `declares_function`).
+                let declares_fn = DerivedDeclarator::declares_function(&declarator.derived)
+                    || (declarator.derived.is_empty()
+                        && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
+                            if self.types.function_typedefs.contains_key(name)));
+                // A declaration of the function is not the function: the entry
+                // must be emitted by the TU that DEFINES it, or the loader jumps
+                // through a `.quad` that no definition ever arrives for.
+                let init_entry_target = declares_fn
+                    && !decl.is_typedef()
+                    && !declarator.name.is_empty()
+                    && defined_functions.contains(declarator.name.as_str());
+                if declarator.attrs.is_constructor()
+                    && init_entry_target
+                    && !self.module.constructors.contains(&declarator.name)
+                {
+                    self.module.constructors.push(declarator.name.clone());
+                }
+                if declarator.attrs.is_destructor()
+                    && init_entry_target
+                    && !self.module.destructors.contains(&declarator.name)
+                {
+                    self.module.destructors.push(declarator.name.clone());
+                }
+            }
+        }
+    }
+
     pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine) {
         // Sema has already populated TypeContext with typedefs, enum constants,
         // struct/union layouts, function typedefs, and function pointer typedefs.
@@ -1138,27 +1208,7 @@ impl Lowerer {
         }
 
         // Collect constructor/destructor/alias attributes from function definitions and declarations
-        //
-        // An init/fini entry names a FUNCTION the loader calls. Two gates follow
-        // from that, both measured against GCC 16.2:
-        //  - the declarator must declare a function. GCC ignores the attribute
-        //    on anything else (`'constructor' attribute ignored`), and honouring
-        //    it on `void (*fp)(void) __attribute__((constructor)) = c;` put the
-        //    address of a DATA object into `.init_array`; the loader called it
-        //    and the program died with SIGSEGV before reaching main.
-        //  - the function must be DEFINED in this translation unit: the entry
-        //    belongs to the TU that defines the function, and a declaration
-        //    alone must not leave a dangling `.quad f` behind. GCC emits no
-        //    entry for `void f(void) __attribute__((constructor));` without a
-        //    definition, and one when the definition follows the declaration.
-        let defined_functions: crate::common::fx_hash::FxHashSet<&str> = tu
-            .decls
-            .iter()
-            .filter_map(|decl| match decl {
-                ExternalDecl::FunctionDef(func) => Some(func.name.as_str()),
-                _ => None,
-            })
-            .collect();
+        self.collect_init_fini_entries(tu);
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
@@ -1172,13 +1222,6 @@ impl Lowerer {
                             .entry(func.name.clone())
                             .or_insert_with(|| da.clone());
                     }
-                    if func.attrs.is_constructor() && !self.module.constructors.contains(&func.name)
-                    {
-                        self.module.constructors.push(func.name.clone());
-                    }
-                    if func.attrs.is_destructor() && !self.module.destructors.contains(&func.name) {
-                        self.module.destructors.push(func.name.clone());
-                    }
                     if func.attrs.is_fastcall() {
                         self.fastcall_functions.insert(func.name.clone());
                     }
@@ -1188,28 +1231,6 @@ impl Lowerer {
                 }
                 ExternalDecl::Declaration(decl) => {
                     for declarator in &decl.declarators {
-                        // A function *type*, as opposed to an object of
-                        // function-pointer type (see `declares_function`).
-                        let declares_fn = DerivedDeclarator::declares_function(&declarator.derived)
-                            || (declarator.derived.is_empty()
-                                && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
-                                    if self.types.function_typedefs.contains_key(name)));
-                        let init_entry_target = declares_fn
-                            && !decl.is_typedef()
-                            && !declarator.name.is_empty()
-                            && defined_functions.contains(declarator.name.as_str());
-                        if declarator.attrs.is_constructor()
-                            && init_entry_target
-                            && !self.module.constructors.contains(&declarator.name)
-                        {
-                            self.module.constructors.push(declarator.name.clone());
-                        }
-                        if declarator.attrs.is_destructor()
-                            && init_entry_target
-                            && !self.module.destructors.contains(&declarator.name)
-                        {
-                            self.module.destructors.push(declarator.name.clone());
-                        }
                         // Collect __attribute__((alias("target"))) declarations.
                         // The alias name must honour the declaration's asm label
                         // (`extern int foo __asm("xyzzy") __attribute__((alias("bar")))`
