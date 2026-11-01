@@ -562,47 +562,23 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 44 of 138 gate steps of the `frontend` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (273 s of
-    # lane-split: 817 s). The preamble above is byte-identical in every
+    # lane-split: 45 of 143 gate steps of the `frontend` lane, assigned
+    # lane-split: by longest-processing-time over measured cost (284 s of
+    # lane-split: 852 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
-    - name: Signed affine-step and signed index home contracts
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_signed_affine_step.sh
     - name: IVSR vecaddr struct-walk shape and contracts
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
-    - name: Relocation and PGO harness red-team tests
-      run: python3 tests/linker/test_pr826_redteam.py
     - name: Memory value forwarding and predicate effect contracts
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_memory_value_contracts.sh
     - name: Shuffle builtin diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
-    # 49 of 101 gate steps of the `frontend` lane, assigned
-    # by longest-processing-time over measured cost (188 s of
-    # 376 s). The preamble above is byte-identical in every
-    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
-    # is duplicated, or a shard drifts from this record.
-    - name: Scalar logic against GCC 16 and Clang 23.1.4
-      run: python3 tests/regression/check_llvm_scalar_logic.py
     - name: ISA-sensitive intrinsic feature gate
       run: python3 scripts/ci_test_report.py -- env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
     - name: Check GOT-slot references to local symbols
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
-    - name: Attribute diagnostics match the GCC 16.2 classes
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_attribute_diagnostics.sh
     - name: Verify GCC provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
-    - name: Reproducer replay (pinned ISA, both legs)
-      run: |
-        set -euo pipefail
-        python3 scripts/check_repro_replay.py --self-test
-        env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
-    - name: Builtin floor float narrowing contracts
-      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_builtin_floor_narrowing.sh
-    - name: Check 16-byte CAS lowering (libatomic by default, cmpxchg16b under -mcx16)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_cas16_lowering.sh
-    - name: IV-widen exposed-latch trajectory gates
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivwiden_exposed_latch.sh
     - name: Debug knobs are neutral
       run: env CCC=target/fastbuild/lccc python3 tests/regression/check_debug_knobs_neutral.py
     - name: Verify the two-wide matmul lowering on the x86-64 baseline
@@ -611,30 +587,10 @@ jobs:
       run: bash tests/regression/check_matmul_sse2_fallback.sh
     - name: ext_vector_type target widths and invalid element diagnostics
       run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_size.sh
-    # The two-wide matmul arm and its guards arrived with the synthesized
-    # SIMD work; each gate below pins one property that a scalar fallback
-    # would otherwise hide (see the gate headers for the measured costs).
-    - name: Check signed matmul bounds across AVX2 and two-wide paths
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_matmul_negative_bound.sh
-    - name: Verify 16-byte XMM slot forwarding end to end
-      env:
-        CCC: target/fastbuild/lccc
-        GCC: gcc-16
-      run: bash tests/regression/check_sse2_slot_forwarding.sh
-    - name: Variadic pack count inlining contracts
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_va_arg_pack_len.sh
-    - name: Audit loop branch and must-execute contracts
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_audit_loop_contracts.sh
-    - name: Empty-aggregate cross-compiler ABI contracts
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_empty_aggregate_abi.sh
-    - name: Check temporary-file symlink isolation
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
     - name: Verify benchmark harness oracle and timing contracts
       run: |
         python3 tests/benchmark/test_benchmark_harness.py
         python3 scripts/test_benchmark_hybrid_perf.py
-    - name: Verify zlib-ng match kernel across optimization levels and ABIs
-      run: python3 tests/regression/check_zlib_compare256.py --lccc target/fastbuild/lccc --gcc gcc-16 --m32
     - name: Verify benchmark codegen registry and evidence (mock only)
       run: python3 tests/regression/check_benchmark_codegen_registry.py
     - name: Compound literal as a designated aggregate element
@@ -648,53 +604,99 @@ jobs:
         # be spelled `vcvtps2pd %ymm0, %ymm0`) that a compile-only gate cannot.
         env LCCC_BIN=target/fastbuild/lccc CC=gcc \
           python3 tests/intrinsics/run_intrin_tests.py
-    - name: Verify binary-equivalence attribution contracts
-      run: python3 tests/corpus/test_binary_equivalence.py
-    - name: IV-widen paired-counter mirror proof (gcc-16 parity and proof-firing assertion)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivw_paired_counter.sh
-    - name: RISC-V shared-binding mutation controls
-      run: python3 tests/linker/test_riscv_shared_binding.py
-    - name: Check -ftrapv boundary matrix (m64)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64
-    - name: Check FP-contraction parity with GCC
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
-    - name: Verify W2 load->cast fold structure and runtime
-      run: bash tests/regression/check_load_cast_fold.sh
-    - name: Verify ANDQ narrow-width facts and boundaries
-      run: bash tests/regression/check_andq_narrow_width.sh
     - name: Verify exact shift and byte sign-extension fold
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_shift_signext_fold.sh
-    - name: ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle
-      run: |
-        set -o pipefail
-        env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_abi_avx.sh 2>&1 |
-          tee "$RUNNER_TEMP/ext-vector-abi-avx.log"
-    - name: Surface ext-vector ABI failures in annotations
-      if: failure()
-      run: |
-        for log in ext-vector-abi ext-vector-abi-grid ext-vector-abi-avx; do
-          [ -s "$RUNNER_TEMP/$log.log" ] || continue
-          python3 scripts/ci_annotate_log.py --title "ext-vector ABI ($log)" "$RUNNER_TEMP/$log.log"
-        done
-    - name: C23 inventory and warning parity against GCC 16.2
-      run: |
-        set -euo pipefail
-        python3 scripts/check_ill_typed_builtins.py --self-test
-        env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
     - name: Standard-output contract for -o -
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
-    - name: Subscript constraint diagnostics
-      run: env CCC=target/fastbuild/lccc python3 tests/regression/check_subscript_diagnostics.py
-    - name: Check hot-loop register homes survive an in-loop call
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_hot_loop_register_homes.sh
     - name: PGO buffered I/O lock lifetime and injected failures
       run: python3 tests/regression/check_pgo_io.py --lccc target/fastbuild/lccc
-    - name: Named-space typedef code generation
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
     - name: Static-local constant initializers
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_static_local_init.sh
-    - name: Multiline comment and splice translation phases
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_multiline_comment_splice.sh
+    - name: Vector arguments and returns at the compiler boundary
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
+    - name: Narrow one-lane ext_vector arithmetic and small-slot A/B
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_narrow_arith.sh
+    - name: Check bundled scalar x86 intrinsics (BMI1/BMI2/LZCNT/ia32) against GCC
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 sh tests/regression/check_x86_scalar_intrinsics.sh
+    - name: Scalar lane types, stack boundaries and opt-in homes
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_extract_homes.sh
+    - name: Cross-target intrinsic trap
+      run: |
+        env CCC=target/fastbuild/lccc \
+            CCC_ARM=target/fastbuild/lccc-arm \
+            CCC_RISCV=target/fastbuild/lccc-riscv \
+            CCC_I686=target/fastbuild/lccc-i686 \
+            bash tests/regression/check_cross_target_intrinsic_trap.sh
+    - name: Check the recursion-to-iteration pass
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
+    - name: Predicate relations against supplemental GCC 16 snapshot and Clang 23.1.4
+      run: python3 tests/regression/check_llvm_predicate_relations.py --allow-gcc16-snapshot
+    - name: File-scope constant initializers
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_file_scope_init.sh
+    # The provisioner is the only thing between the differential harness
+    # and a generator that silently does not exist.  Its contract test is
+    # offline (git/cmake are PATH shims), so it costs seconds here; the
+    # real generator is exercised by the yarpgen job below.
+    - name: Verify the YARPGen provisioner contract (offline, no network)
+      run: bash tests/regression/check_ensure_yarpgen.sh
+    - name: Verify generator-map vectorizer (fires, matches gcc-16, kill switch)
+      run: |
+        python3 tests/regression/test_generator_map_gate.py
+        bash tests/regression/check_generator_map.sh
+    - name: Incoming MEMORY parameter homes and cross-compiler ABI
+      run: |
+        set -euo pipefail
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_incoming_byval_homes.sh
+        env CCC=target/fastbuild/lccc ORACLE_CC="${CLANG:-clang-23}" bash tests/regression/check_incoming_byval_homes.sh
+    - name: No merge conflict markers
+      run: python3 scripts/check_no_conflict_markers.py
+    - name: Verify label-reference cost experiment contracts
+      run: python3 scripts/test_measure_label_ref_cost.py
+    - name: Check default ISA policy (x86-64 default emits no post-baseline instruction)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_default_isa_policy.sh
+    - name: GAS character literals and quoted macro defaults across assemblers
+      run: |
+        env CCC=target/fastbuild/lccc \
+            CCC_I686=target/fastbuild/lccc-i686 \
+            CCC_ARM=target/fastbuild/lccc-arm \
+            CCC_RISCV=target/fastbuild/lccc-riscv \
+            python3 tests/regression/check_asm_char_and_macro_defaults.py
+    - name: Check -ftrapv boundary matrix (m32)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_trapv_boundary_matrix.sh --bits -m32
+    - name: Inline-asm operand and template diagnostics match GCC 16.2
+      run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
+    - name: One-lane ext_vector FP/int carrier correctness
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_lane1_abi.sh
+    - name: RISC-V shared-binding relocation algebra
+      run: python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
+    - name: Cargo gate resource isolation
+      run: python3 scripts/test_ci_resources.py
+    - name: Named-space brace-elided initializers
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_seg_init_brace_elision.sh
+    - name: Vector argument operand forms against GCC 16
+      run: python3 tests/regression/check_vector_arg_forms.py --lccc target/fastbuild/lccc --cc gcc-16
+    - name: Diagnostic positions survive the preprocessor
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_diagnostic_positions.sh
+    - name: x86 execute regression fixes on both ABIs
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_x86_torture_execute_fixes.sh
+    - name: Verify _mm_cvtts*_si32 truncation under every MXCSR rounding mode
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_sse2_truncating_convert.sh
+    - name: Check -fno-builtin constant-fold withdrawal (F1)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fno_builtin_folds.sh
+    # A character constant's TYPE decides what its text means (`u'\U0001F600'`
+    # is the UTF-16 low surrogate, not the low 16 bits of the code point), so
+    # this compiles and runs every case under both compilers and compares the
+    # value, sizeof and the ordered diagnostic stream. The curated table holds
+    # 146 distinct literals over three dialects; `--sweep 400` adds 400
+    # generated literals, so the combinations nobody wrote down are covered too
+    # (1,208 checks, with the pinned deviations reported separately).
+    - name: Character-constant encoding and diagnostics match GCC 16.2
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_char_literal_encoding.py --sweep 400
+    - name: Ext-vector rvalue subscript cross-ABI
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
     needs:
     - build
   frontend-b:
@@ -794,106 +796,64 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 45 of 138 gate steps of the `frontend` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (270 s of
-    # lane-split: 817 s). The preamble above is byte-identical in every
+    # lane-split: 47 of 143 gate steps of the `frontend` lane, assigned
+    # lane-split: by longest-processing-time over measured cost (284 s of
+    # lane-split: 852 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
-    - name: Vector arguments and returns at the compiler boundary
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
-    - name: i686 execution capability policy
-      run: bash tests/regression/check_i386_run_policy.sh
+    - name: Signed affine-step and signed index home contracts
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_signed_affine_step.sh
+    - name: Relocation and PGO harness red-team tests
+      run: python3 tests/linker/test_pr826_redteam.py
+    # 49 of 101 gate steps of the `frontend` lane, assigned
+    # by longest-processing-time over measured cost (188 s of
+    # 376 s). The preamble above is byte-identical in every
+    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
+    # is duplicated, or a shard drifts from this record.
+    - name: Scalar logic against GCC 16 and Clang 23.1.4
+      run: python3 tests/regression/check_llvm_scalar_logic.py
+    - name: Check 16-byte CAS lowering (libatomic by default, cmpxchg16b under -mcx16)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_cas16_lowering.sh
+    # The two-wide matmul arm and its guards arrived with the synthesized
+    # SIMD work; each gate below pins one property that a scalar fallback
+    # would otherwise hide (see the gate headers for the measured costs).
+    - name: Check signed matmul bounds across AVX2 and two-wide paths
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_matmul_negative_bound.sh
+    - name: Empty-aggregate cross-compiler ABI contracts
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_empty_aggregate_abi.sh
+    - name: Check temporary-file symlink isolation
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
+    - name: Verify zlib-ng match kernel across optimization levels and ABIs
+      run: python3 tests/regression/check_zlib_compare256.py --lccc target/fastbuild/lccc --gcc gcc-16 --m32
+    - name: IV-widen paired-counter mirror proof (gcc-16 parity and proof-firing assertion)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivw_paired_counter.sh
+    - name: RISC-V shared-binding mutation controls
+      run: python3 tests/linker/test_riscv_shared_binding.py
+    - name: Verify W2 load->cast fold structure and runtime
+      run: bash tests/regression/check_load_cast_fold.sh
+    - name: C23 inventory and warning parity against GCC 16.2
+      run: |
+        set -euo pipefail
+        python3 scripts/check_ill_typed_builtins.py --self-test
+        env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
+    - name: Named-space typedef code generation
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
+    - name: Multiline comment and splice translation phases
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_multiline_comment_splice.sh
     - name: vector scalar conversion diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_scalar_conversions.sh
-    - name: Narrow one-lane ext_vector arithmetic and small-slot A/B
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_narrow_arith.sh
-    - name: Check bundled scalar x86 intrinsics (BMI1/BMI2/LZCNT/ia32) against GCC
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 sh tests/regression/check_x86_scalar_intrinsics.sh
     - name: Check per-function target("...") ISA scoping and inline refusal
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_target_attribute_isa.sh
     - name: Named-space conversion parity
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
-    - name: Scalar lane types, stack boundaries and opt-in homes
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_extract_homes.sh
-    - name: Typedef-volatile code generation
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_typedef_volatile_codegen.sh
-    - name: ext_vector_type and vector_size varargs ABI (GCC cross oracle)
-      run: |
-        set -o pipefail
-        env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_varargs_abi.sh 2>&1 |
-          tee "$RUNNER_TEMP/ext-vector-varargs-abi.log"
     - name: Verify manifest Rust-toolchain selection
       run: bash tests/regression/check_rust_toolchain_selector.sh
-    - name: Cross-target intrinsic trap
-      run: |
-        env CCC=target/fastbuild/lccc \
-            CCC_ARM=target/fastbuild/lccc-arm \
-            CCC_RISCV=target/fastbuild/lccc-riscv \
-            CCC_I686=target/fastbuild/lccc-i686 \
-            bash tests/regression/check_cross_target_intrinsic_trap.sh
-    - name: Check the recursion-to-iteration pass
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
-    # The oracle toolchain is a per-pipeline cache now, so its contract is
-    # load-bearing: a bundle that restores without verifying its digest, or a
-    # provisioning path that silently installs into a prefix, would turn into
-    # green lanes with the wrong compiler. Compiler-free and ~1 s.
-    - name: Verify toolchain bundle and shard-partition contracts (mock only)
-      run: |
-        set -Eeuo pipefail
-        # One `::notice` per command, before it runs.  The hosted job log is not
-        # reachable from the Checks API (the results receiver is a blob host the
-        # review environment cannot read), so a step that dies on its generic
-        # "exit code 1" names nothing at all -- and a compound step that fails
-        # silently costs a whole CI round to bisect.  The last notice printed is
-        # the command that was running when the step died.
-        printf '::notice title=Mock gate 1/7::toolchain bundle export/restore/verify\n'
-        python3 tests/regression/check_ci_toolchain_bundle.py
-        # Both halves of a split lane are checked, and both checkers' own
-        # rules are exercised: a partition audit that cannot fail is
-        # decoration, so the self-test runs beside the audit in the same step.
-        printf '::notice title=Mock gate 2/7::shard-partition self-test\n'
-        python3 tests/regression/check_ci_shard_partition.py --self-test
-        printf '::notice title=Mock gate 3/7::shard-partition audit\n'
-        python3 tests/regression/check_ci_shard_partition.py
-        printf '::notice title=Mock gate 4/7::lane-plan self-test\n'
-        python3 tests/regression/check_ci_lane_plan.py --self-test
-        printf '::notice title=Mock gate 5/7::lane-plan audit\n'
-        python3 tests/regression/check_ci_lane_plan.py
-        # The oracle verifier and the tag-cache installer are the two scripts
-        # that decide whether a lane's toolchain is the one its gates pin.
-        # Their fixture tables are compiler-free, so they run here too: a
-        # verifier that cannot fail, or an installer that accepts a doctored
-        # archive, must be caught before a lane spends nine minutes finding out.
-        printf '::notice title=Mock gate 6/7::oracle verifier self-test\n'
-        bash scripts/ci_verify_oracles.sh --self-test
-        printf '::notice title=Mock gate 7/7::tag-cache installer self-test\n'
-        bash scripts/ci_install_gcc_oracle.sh --self-test
-        printf '::notice title=Mock gates::all seven pass\n'
     - name: zlib-ng complete Huffman table (late constant GEP)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_zlib_maketrees.sh
-    - name: __builtin_types_compatible_p answers about the type
-      run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_types_compatible_p.py
-    - name: Sema constraints (incl. lvalue constraints)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_sema_constraints.sh
-    - name: Wide-vector (%ymm/%zmm) ABI at the compiler boundary
-      run: |
-        set -o pipefail
-        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_abi_wide.sh 2>&1 |
-          tee "$RUNNER_TEMP/vector-abi-wide.log"
-    - name: Surface wide-vector ABI failures in annotations
-      if: failure()
-      run: |
-        if [ -s "$RUNNER_TEMP/vector-abi-wide.log" ]; then
-          python3 scripts/ci_annotate_log.py --title "wide-vector ABI" "$RUNNER_TEMP/vector-abi-wide.log"
-        fi
-    - name: Check builtin_cpu_is runtime semantics
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_is_runtime.sh
     - name: Archived bulk evidence stays archived
       run: |
         python3 scripts/check_archived_bulk_absent.py --self-test
         python3 scripts/check_archived_bulk_absent.py
-    - name: Predicate relations against supplemental GCC 16 snapshot and Clang 23.1.4
-      run: python3 tests/regression/check_llvm_predicate_relations.py --allow-gcc16-snapshot
     - name: Packed vector relations against GCC 16 and Clang 23.1.4
       run: |
         python3 tests/regression/check_packed_vector_relations.py --allow-gcc16-snapshot
@@ -905,10 +865,6 @@ jobs:
         python3 scripts/slice_superopt.py --self-test
         python3 scripts/yarpgen_mutpair.py --self-test
         python3 -m unittest scripts.test_mutpair scripts.test_slice_superopt scripts.test_yarpgen_mutpair scripts.test_aarch64_execute_suite
-    - name: File-scope constant initializers
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_file_scope_init.sh
-    - name: Native packed FP helper runtime and mixed compiler ABI
-      run: python3 tests/regression/check_legacy_sse_native.py --lccc target/fastbuild/lccc --gcc gcc-16 --source tests/regression/native_packed_fp_helpers.c --check-codegen
     - name: Aggregate-call byte boundaries and cross-compiler ABI
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_aggregate_call_abi.sh
     - name: ext_vector_type by-value ABI grid vs the Clang 23.1.4 oracle
@@ -916,56 +872,79 @@ jobs:
         set -o pipefail
         env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_abi_grid.sh 2>&1 |
           tee "$RUNNER_TEMP/ext-vector-abi-grid.log"
-    # The provisioner is the only thing between the differential harness
-    # and a generator that silently does not exist.  Its contract test is
-    # offline (git/cmake are PATH shims), so it costs seconds here; the
-    # real generator is exercised by the yarpgen job below.
-    - name: Verify the YARPGen provisioner contract (offline, no network)
-      run: bash tests/regression/check_ensure_yarpgen.sh
-    - name: Verify generator-map vectorizer (fires, matches gcc-16, kill switch)
-      run: |
-        python3 tests/regression/test_generator_map_gate.py
-        bash tests/regression/check_generator_map.sh
-    - name: Volatile member code generation
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_volatile_member_codegen.sh
     - name: IVSR/univsr loop-strength-reduction probe contracts
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_reproducers.sh
-    - name: Incoming MEMORY parameter homes and cross-compiler ABI
-      run: |
-        set -euo pipefail
-        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_incoming_byval_homes.sh
-        env CCC=target/fastbuild/lccc ORACLE_CC="${CLANG:-clang-23}" bash tests/regression/check_incoming_byval_homes.sh
-    - name: ext_vector_type layout/lane matrix vs the pinned Clang 23.1.4 oracle
-      run: |
-        set -o pipefail
-        env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout_matrix.sh 2>&1 |
-          tee "$RUNNER_TEMP/ext-vector-layout-matrix.log"
-
     - name: ext_vector_type cross-compiler by-value ABI
       run: |
         set -o pipefail
         env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_abi.sh 2>&1 |
           tee "$RUNNER_TEMP/ext-vector-abi.log"
-    - name: Check 16-byte atomic load/store/RMW semantics (full 128 bits, vs GCC oracle)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_atomic16_runtime.sh
     - name: Check SSE2 4-lane widening sums (plain + masked) and AVX2 composite
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_widening_4lane_sum.sh
-    - name: No merge conflict markers
-      run: python3 scripts/check_no_conflict_markers.py
     - name: Verify swap provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_swap_provisioning.py
-    - name: Verify label-reference cost experiment contracts
-      run: python3 scripts/test_measure_label_ref_cost.py
     - name: ext_vector_type padded layout vs the compiler oracle
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout.sh
-    - name: Designated initializer validity
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_designator_init.sh
     - name: Check builtin_cpu_supports runtime semantics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
-    - name: LCCC vs GCC compatibility suite
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
     - name: Verify restored linker oracle versions
       run: bash tests/regression/check_linker_oracle_versions.sh
+    - name: GNU retain section flags and linker garbage collection
+      run: python3 tests/regression/check_gnu_retain_sections.py --lccc target/fastbuild/lccc --gcc gcc-16
+    - name: Check a value live across a 16-byte atomic survives the libatomic call
+      run: env CCC=target/fastbuild/lccc GCC16=gcc-16 bash tests/regression/check_i128_atomic_call_clobber.sh
+    - name: a9987 salvage and SWAR cast soundness
+      run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_a9987_salvage.sh
+    - name: SSE AVX public API inventory and parser controls
+      run: |
+        python3 scripts/audit_sse_avx_public_api.py --self-test
+        python3 scripts/audit_sse_avx_public_api.py --check
+    - name: GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc bash tests/regression/check_gnu_vector_align_abi.sh 2>&1 |
+          tee "$RUNNER_TEMP/gnu-vector-align-abi.log"
+    - name: Surface GNU vector alignment ABI failures in annotations
+      if: failure()
+      run: |
+        [ -s "$RUNNER_TEMP/gnu-vector-align-abi.log" ] &&
+          python3 scripts/ci_annotate_log.py --title "GNU vector alignment ABI" "$RUNNER_TEMP/gnu-vector-align-abi.log" || true
+    - name: Ill-typed builtin acceptance
+      run: |
+        set -euo pipefail
+        python3 scripts/check_ill_typed_builtins.py --self-test
+        env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
+    - name: Verify local oracle identity and ICX provisioning (offline, mock only)
+      run: |
+        python3 scripts/test_local_oracles.py
+        python3 scripts/test_icx_provision.py
+        python3 tests/corpus/test_godbolt_explicit_local.py
+    - name: Const-volatile object reads are not folded
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_const_volatile_objects.sh
+    # 52 of 101 gate steps of the `frontend` lane, assigned
+    # by longest-processing-time over measured cost (188 s of
+    # 376 s). The preamble above is byte-identical in every
+    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
+    # is duplicated, or a shard drifts from this record.
+    - name: Integer order and bit-reversal networks
+      run: python3 tests/regression/check_integer_order_networks.py --allow-gcc16-snapshot --arm target/fastbuild/lccc-arm
+    - name: Verify benchmark ranking contracts
+      run: python3 -m unittest discover -s scripts -p test_bench_rank.py
+    - name: SIMD helper operand and alias permission contracts
+      run: python3 tests/regression/check_simd_helper_contract.py --lccc target/fastbuild/lccc
+    - name: Ring identities against GCC 16 and Clang 23.1.4
+      run: python3 tests/regression/check_llvm_ring_identities.py
+    - name: Lexer extensions and their diagnostics match GCC 16.2
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_lexer_extensions.sh
+    - name: Identifier UCN/UTF-8 character classes match GCC 16.2
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_ucn_identifier_table.sh
+    - name: Check baseline-SSE2 packed multiply-add codegen
+      run: |
+        env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_matmul_vectorization.sh
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse2_i32_product.py
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_i32_map_unroll.py
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_fp_map_unroll.py
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse1_f32_map.py
     needs:
     - build
   frontend-c:
@@ -1065,63 +1044,143 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 49 of 138 gate steps of the `frontend` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (273 s of
-    # lane-split: 817 s). The preamble above is byte-identical in every
+    # lane-split: 51 of 143 gate steps of the `frontend` lane, assigned
+    # lane-split: by longest-processing-time over measured cost (284 s of
+    # lane-split: 852 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
+    - name: Attribute diagnostics match the GCC 16.2 classes
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_attribute_diagnostics.sh
+    - name: Reproducer replay (pinned ISA, both legs)
+      run: |
+        set -euo pipefail
+        python3 scripts/check_repro_replay.py --self-test
+        env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
+    - name: Builtin floor float narrowing contracts
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_builtin_floor_narrowing.sh
+    - name: IV-widen exposed-latch trajectory gates
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivwiden_exposed_latch.sh
+    - name: Verify 16-byte XMM slot forwarding end to end
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_sse2_slot_forwarding.sh
+    - name: Variadic pack count inlining contracts
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_va_arg_pack_len.sh
+    - name: Audit loop branch and must-execute contracts
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_audit_loop_contracts.sh
+    - name: Verify binary-equivalence attribution contracts
+      run: python3 tests/corpus/test_binary_equivalence.py
+    - name: Check -ftrapv boundary matrix (m64)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64
+    - name: Check FP-contraction parity with GCC
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
+    - name: Verify ANDQ narrow-width facts and boundaries
+      run: bash tests/regression/check_andq_narrow_width.sh
+    - name: ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_abi_avx.sh 2>&1 |
+          tee "$RUNNER_TEMP/ext-vector-abi-avx.log"
+    - name: Surface ext-vector ABI failures in annotations
+      if: failure()
+      run: |
+        for log in ext-vector-abi ext-vector-abi-grid ext-vector-abi-avx; do
+          [ -s "$RUNNER_TEMP/$log.log" ] || continue
+          python3 scripts/ci_annotate_log.py --title "ext-vector ABI ($log)" "$RUNNER_TEMP/$log.log"
+        done
+    - name: Subscript constraint diagnostics
+      run: env CCC=target/fastbuild/lccc python3 tests/regression/check_subscript_diagnostics.py
+    - name: Check hot-loop register homes survive an in-loop call
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_hot_loop_register_homes.sh
+    - name: i686 execution capability policy
+      run: bash tests/regression/check_i386_run_policy.sh
+    - name: Typedef-volatile code generation
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_typedef_volatile_codegen.sh
+    - name: ext_vector_type and vector_size varargs ABI (GCC cross oracle)
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_varargs_abi.sh 2>&1 |
+          tee "$RUNNER_TEMP/ext-vector-varargs-abi.log"
+    # The oracle toolchain is a per-pipeline cache now, so its contract is
+    # load-bearing: a bundle that restores without verifying its digest, or a
+    # provisioning path that silently installs into a prefix, would turn into
+    # green lanes with the wrong compiler. Compiler-free and ~1 s.
+    - name: Verify toolchain bundle and shard-partition contracts (mock only)
+      run: |
+        set -Eeuo pipefail
+        # One `::notice` per command, before it runs.  The hosted job log is not
+        # reachable from the Checks API (the results receiver is a blob host the
+        # review environment cannot read), so a step that dies on its generic
+        # "exit code 1" names nothing at all -- and a compound step that fails
+        # silently costs a whole CI round to bisect.  The last notice printed is
+        # the command that was running when the step died.
+        printf '::notice title=Mock gate 1/7::toolchain bundle export/restore/verify\n'
+        python3 tests/regression/check_ci_toolchain_bundle.py
+        # Both halves of a split lane are checked, and both checkers' own
+        # rules are exercised: a partition audit that cannot fail is
+        # decoration, so the self-test runs beside the audit in the same step.
+        printf '::notice title=Mock gate 2/7::shard-partition self-test\n'
+        python3 tests/regression/check_ci_shard_partition.py --self-test
+        printf '::notice title=Mock gate 3/7::shard-partition audit\n'
+        python3 tests/regression/check_ci_shard_partition.py
+        printf '::notice title=Mock gate 4/7::lane-plan self-test\n'
+        python3 tests/regression/check_ci_lane_plan.py --self-test
+        printf '::notice title=Mock gate 5/7::lane-plan audit\n'
+        python3 tests/regression/check_ci_lane_plan.py
+        # The oracle verifier and the tag-cache installer are the two scripts
+        # that decide whether a lane's toolchain is the one its gates pin.
+        # Their fixture tables are compiler-free, so they run here too: a
+        # verifier that cannot fail, or an installer that accepts a doctored
+        # archive, must be caught before a lane spends nine minutes finding out.
+        printf '::notice title=Mock gate 6/7::oracle verifier self-test\n'
+        bash scripts/ci_verify_oracles.sh --self-test
+        printf '::notice title=Mock gate 7/7::tag-cache installer self-test\n'
+        bash scripts/ci_install_gcc_oracle.sh --self-test
+        printf '::notice title=Mock gates::all seven pass\n'
+    - name: __builtin_types_compatible_p answers about the type
+      run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_types_compatible_p.py
+    - name: Sema constraints (incl. lvalue constraints)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_sema_constraints.sh
+    - name: Wide-vector (%ymm/%zmm) ABI at the compiler boundary
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_abi_wide.sh 2>&1 |
+          tee "$RUNNER_TEMP/vector-abi-wide.log"
+    - name: Surface wide-vector ABI failures in annotations
+      if: failure()
+      run: |
+        if [ -s "$RUNNER_TEMP/vector-abi-wide.log" ]; then
+          python3 scripts/ci_annotate_log.py --title "wide-vector ABI" "$RUNNER_TEMP/vector-abi-wide.log"
+        fi
+    - name: Check builtin_cpu_is runtime semantics
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_is_runtime.sh
+    - name: Native packed FP helper runtime and mixed compiler ABI
+      run: python3 tests/regression/check_legacy_sse_native.py --lccc target/fastbuild/lccc --gcc gcc-16 --source tests/regression/native_packed_fp_helpers.c --check-codegen
+    - name: Volatile member code generation
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_volatile_member_codegen.sh
+    - name: ext_vector_type layout/lane matrix vs the pinned Clang 23.1.4 oracle
+      run: |
+        set -o pipefail
+        env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout_matrix.sh 2>&1 |
+          tee "$RUNNER_TEMP/ext-vector-layout-matrix.log"
+
+    - name: Check 16-byte atomic load/store/RMW semantics (full 128 bits, vs GCC oracle)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_atomic16_runtime.sh
+    - name: Designated initializer validity
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_designator_init.sh
+    - name: LCCC vs GCC compatibility suite
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
     - name: Named-space pointer declarator levels
       run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_seg_pointer_declarators.py
-    - name: Check default ISA policy (x86-64 default emits no post-baseline instruction)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_default_isa_policy.sh
-    - name: GAS character literals and quoted macro defaults across assemblers
-      run: |
-        env CCC=target/fastbuild/lccc \
-            CCC_I686=target/fastbuild/lccc-i686 \
-            CCC_ARM=target/fastbuild/lccc-arm \
-            CCC_RISCV=target/fastbuild/lccc-riscv \
-            python3 tests/regression/check_asm_char_and_macro_defaults.py
-    - name: GNU retain section flags and linker garbage collection
-      run: python3 tests/regression/check_gnu_retain_sections.py --lccc target/fastbuild/lccc --gcc gcc-16
     - name: C digraph token, macro and directive parity
       run: python3 tests/regression/check_c_digraphs.py --lccc target/fastbuild/lccc --gcc gcc-16 --m32
-    - name: Check -ftrapv boundary matrix (m32)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_trapv_boundary_matrix.sh --bits -m32
     - name: RISC-V relocation rejection and positive controls
       run: python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
     - name: Vector initializers inside aggregates
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_static_init.sh
-    - name: Check a value live across a 16-byte atomic survives the libatomic call
-      run: env CCC=target/fastbuild/lccc GCC16=gcc-16 bash tests/regression/check_i128_atomic_call_clobber.sh
-    - name: a9987 salvage and SWAR cast soundness
-      run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_a9987_salvage.sh
-    - name: SSE AVX public API inventory and parser controls
-      run: |
-        python3 scripts/audit_sse_avx_public_api.py --self-test
-        python3 scripts/audit_sse_avx_public_api.py --check
-    - name: GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16
-      run: |
-        set -o pipefail
-        env CCC=target/fastbuild/lccc bash tests/regression/check_gnu_vector_align_abi.sh 2>&1 |
-          tee "$RUNNER_TEMP/gnu-vector-align-abi.log"
-    - name: Surface GNU vector alignment ABI failures in annotations
-      if: failure()
-      run: |
-        [ -s "$RUNNER_TEMP/gnu-vector-align-abi.log" ] &&
-          python3 scripts/ci_annotate_log.py --title "GNU vector alignment ABI" "$RUNNER_TEMP/gnu-vector-align-abi.log" || true
     - name: Inline-asm memory operands always carry an address
       run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_rmwcc_mem_operand.py
-    - name: Inline-asm operand and template diagnostics match GCC 16.2
-      run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
-    - name: One-lane ext_vector FP/int carrier correctness
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_lane1_abi.sh
-    - name: Ill-typed builtin acceptance
-      run: |
-        set -euo pipefail
-        python3 scripts/check_ill_typed_builtins.py --self-test
-        env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
-    - name: RISC-V shared-binding relocation algebra
-      run: python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     - name: One-lane ext_vector caller-side marshalling (-O0/-O1/-O2)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_callsite_abi.sh
     - name: GCC 16.2 diagnostic severity parity
@@ -1184,56 +1243,19 @@ jobs:
         --lccc target/fastbuild/lccc --lccc target/fastbuild/lccc-i686 \
         --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
         --gcc gcc-16
-    - name: Cargo gate resource isolation
-      run: python3 scripts/test_ci_resources.py
-    - name: Verify local oracle identity and ICX provisioning (offline, mock only)
-      run: |
-        python3 scripts/test_local_oracles.py
-        python3 scripts/test_icx_provision.py
-        python3 tests/corpus/test_godbolt_explicit_local.py
-    - name: Const-volatile object reads are not folded
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_const_volatile_objects.sh
-    - name: Named-space brace-elided initializers
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_seg_init_brace_elision.sh
-    - name: Vector argument operand forms against GCC 16
-      run: python3 tests/regression/check_vector_arg_forms.py --lccc target/fastbuild/lccc --cc gcc-16
     - name: Store-forwarding DWORD self-reload contracts
       run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_store_forwarding_dword_reload.sh
     - name: ext-vector swizzle diagnostics
       run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
-    - name: Diagnostic positions survive the preprocessor
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_diagnostic_positions.sh
     - name: Verify native VEX flag-read architectural controls
       run: bash tests/regression/check_vex_flag_reads.sh
-    # 52 of 101 gate steps of the `frontend` lane, assigned
-    # by longest-processing-time over measured cost (188 s of
-    # 376 s). The preamble above is byte-identical in every
-    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
-    # is duplicated, or a shard drifts from this record.
-    - name: Integer order and bit-reversal networks
-      run: python3 tests/regression/check_integer_order_networks.py --allow-gcc16-snapshot --arm target/fastbuild/lccc-arm
-    - name: Verify benchmark ranking contracts
-      run: python3 -m unittest discover -s scripts -p test_bench_rank.py
-    - name: x86 execute regression fixes on both ABIs
-      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_x86_torture_execute_fixes.sh
     - name: Const-object read folding
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_const_object_fold.sh
-    - name: Verify _mm_cvtts*_si32 truncation under every MXCSR rounding mode
-      env:
-        CCC: target/fastbuild/lccc
-        GCC: gcc-16
-      run: bash tests/regression/check_sse2_truncating_convert.sh
-    - name: SIMD helper operand and alias permission contracts
-      run: python3 tests/regression/check_simd_helper_contract.py --lccc target/fastbuild/lccc
     - name: Intrinsic arity table matches the headers
       run: |
         set -euo pipefail
         python3 scripts/check_intrinsic_arity.py --self-test
         python3 scripts/check_intrinsic_arity.py --check
-    - name: Ring identities against GCC 16 and Clang 23.1.4
-      run: python3 tests/regression/check_llvm_ring_identities.py
-    - name: Check -fno-builtin constant-fold withdrawal (F1)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fno_builtin_folds.sh
     - name: SysV by-value aggregate and vector ABI against GCC 16
       run: |
         emitted=$(mktemp -d)
@@ -1247,10 +1269,6 @@ jobs:
     # check_trapv_boundary_matrix.sh); this step is the rest of the contract.
     - name: Check driver option contracts (core)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix
-    - name: Lexer extensions and their diagnostics match GCC 16.2
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_lexer_extensions.sh
-    - name: Identifier UCN/UTF-8 character classes match GCC 16.2
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_ucn_identifier_table.sh
     - name: Void declarators and initializers
       run: |
         set -o pipefail
@@ -1261,15 +1279,6 @@ jobs:
       run: |
         [ -s "$RUNNER_TEMP/void-declarators.log" ] || exit 0
         python3 scripts/ci_annotate_log.py --title "void declarators" "$RUNNER_TEMP/void-declarators.log"
-    - name: Ext-vector rvalue subscript cross-ABI
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
-    - name: Check baseline-SSE2 packed multiply-add codegen
-      run: |
-        env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_matmul_vectorization.sh
-        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse2_i32_product.py
-        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_i32_map_unroll.py
-        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_fp_map_unroll.py
-        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse1_f32_map.py
     - name: GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)
       run: |
         set -o pipefail

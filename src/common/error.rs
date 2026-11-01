@@ -186,6 +186,14 @@ pub enum WarningKind {
     /// `sema::analysis::return_local_addr`).
     /// GCC flag: -Wreturn-local-addr
     ReturnLocalAddr,
+    /// `multi-character character constant`.
+    ///
+    /// GCC 16.2 enables it by default and it is a leaf option: `-Wno-multichar`
+    /// silences it and `-Werror=multichar` promotes it, while a literal of five
+    /// or more characters is reported as an unconditional warning instead
+    /// (`multi-character literal with N characters exceeds 'int' size of 4
+    /// bytes`, which `-Wno-multichar` does NOT silence — both measured).
+    Multichar,
 }
 
 /// Supported warning groups. `-Wall` and `-Wextra` are broad groups;
@@ -425,6 +433,14 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "return of the address of a local variable, parameter or label"
+    ),
+    warning!(
+        Multichar,
+        "multichar",
+        true,
+        [],
+        false,
+        "multi-character character constant"
     ),
 ];
 
@@ -1767,6 +1783,7 @@ mod dialect_severity_redteam_tests {
             WarningKind::CompareDistinctPointerTypes,
             WarningKind::Pedantic,
             WarningKind::Vla,
+            WarningKind::Multichar,
             WarningKind::DivByZero,
             WarningKind::StrictPrototypes,
             WarningKind::ReturnLocalAddr,
@@ -1871,6 +1888,9 @@ mod dialect_severity_redteam_tests {
             "discarded-array-qualifiers",
             "div-by-zero",
             "return-local-addr",
+            // `-Wmultichar` is on by default in GCC 16.2: `'ab'` warns with no
+            // flag at all, `-Wno-multichar` silences it (measured).
+            "multichar",
             "undeclared",
         ];
         expected_defaults.sort_unstable();
