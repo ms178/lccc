@@ -6731,7 +6731,9 @@ mod prefetch_isa_tests {
             // vectorizer ceiling; the resolved SSE3 level must agree with
             // the predefines.
             let mut pp = crate::frontend::preprocessor::Preprocessor::new();
-            driver.configure_preprocessor(&mut pp);
+            driver
+                .configure_preprocessor(&mut pp)
+                .expect("valid preprocessor configuration");
             let probe: String = [
                 "__SSE2__",
                 "__SSE3__",

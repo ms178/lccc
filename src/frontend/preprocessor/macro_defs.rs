@@ -65,6 +65,8 @@ fn would_paste_tokens(last: u8, first: u8) -> bool {
 /// Represents a macro definition.
 #[derive(Debug, Clone)]
 pub struct MacroDef {
+    /// Preserve builtin origin across macro saves; textual redefinitions are not builtin uses.
+    pub is_time_builtin: bool,
     /// Name of the macro
     pub name: String,
     /// Whether this is a function-like macro
@@ -162,11 +164,24 @@ fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'
     }
 }
 
+/// Expansion effects must replay in lexical order, including diagnostics
+/// between two _Pragma operators on the same source line.
+#[derive(Debug, Clone)]
+pub(super) enum ExpansionEffect {
+    Pragma(String, usize),
+    DateTime {
+        name: String,
+        file: String,
+        line: usize,
+    },
+}
+
 /// Stores all macro definitions and handles expansion.
 #[derive(Debug, Clone)]
 pub struct MacroTable {
     macros: FxHashMap<String, MacroDef>,
     pub(super) source_filename: String,
+    pub(super) timestamp_body: String,
     /// Counter for the __COUNTER__ built-in macro. Increments on each expansion.
     counter: Cell<usize>,
     /// Per-line __LINE__ resolver: maps a byte offset within the line being
@@ -213,7 +228,7 @@ pub struct MacroTable {
     /// had appeared at that point, with diagnostics attributed to that
     /// line (corpus pins exact lines for `#pragma GCC dependency`
     /// reached via `_Pragma`).
-    pending_pragmas: std::cell::RefCell<Vec<(String, usize)>>,
+    pending_effects: std::cell::RefCell<Vec<ExpansionEffect>>,
 }
 
 impl MacroTable {
@@ -221,6 +236,7 @@ impl MacroTable {
         Self {
             macros: FxHashMap::default(),
             source_filename: "\"<stdin>\"".to_string(),
+            timestamp_body: "\"??? ??? ?? ??:??:?? ????\"".to_string(),
             counter: Cell::new(0),
             line_resolver: std::cell::RefCell::new(super::text_processing::LineResolver::Flat(1)),
             line_offset_base: Cell::new(0),
@@ -230,14 +246,14 @@ impl MacroTable {
             expanded_macros: std::cell::RefCell::new(Vec::new()),
             track_expansions: Cell::new(false),
             asm_mode: false,
-            pending_pragmas: std::cell::RefCell::new(Vec::new()),
+            pending_effects: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     /// Take the `_Pragma` string contents queued by the last expansion,
     /// each paired with the 1-based source line of its operator.
-    pub fn take_pending_pragmas(&self) -> Vec<(String, usize)> {
-        std::mem::take(&mut *self.pending_pragmas.borrow_mut())
+    pub(super) fn take_pending_effects(&self) -> Vec<ExpansionEffect> {
+        std::mem::take(&mut *self.pending_effects.borrow_mut())
     }
 
     /// Define a new macro.
@@ -323,6 +339,7 @@ impl MacroTable {
             self.macros.insert(
                 "__FILE__".to_string(),
                 MacroDef {
+                    is_time_builtin: false,
                     name: "__FILE__".to_string(),
                     is_function_like: false,
                     params: Vec::new(),
@@ -951,7 +968,9 @@ impl MacroTable {
             }
             result.push_str(&format!("\n# {line} {}\n", self.source_filename));
         }
-        self.pending_pragmas.borrow_mut().push((content, line));
+        self.pending_effects
+            .borrow_mut()
+            .push(ExpansionEffect::Pragma(content, line));
         k + 1
     }
 
@@ -966,6 +985,20 @@ impl MacroTable {
         result: &mut String,
         expanding: &mut FxHashSet<String>,
     ) -> usize {
+        if mac.is_time_builtin {
+            let line = self.resolve_line(i.saturating_sub(ident.len()));
+            self.pending_effects
+                .borrow_mut()
+                .push(ExpansionEffect::DateTime {
+                    name: ident.to_string(),
+                    file: self.source_filename.trim_matches('"').to_string(),
+                    line,
+                });
+            if ident == "__TIMESTAMP__" {
+                result.push_str(&self.timestamp_body);
+                return i;
+            }
+        }
         // Record this macro expansion for diagnostic tracing
         if self.track_expansions.get() {
             self.expanded_macros.borrow_mut().push(ident.to_string());
@@ -1296,38 +1329,18 @@ impl MacroTable {
         arg_starts: Option<&[usize]>,
         expanding: &mut FxHashSet<String>,
     ) -> (String, bool) {
-        // Step 1-2: Prescan - expand ALL arguments (C11 §6.10.3.1).
-        // Per the standard, arguments adjacent to # or ## use the RAW (unexpanded)
-        // form, but that is handled separately by handle_stringify_and_paste (Step 3)
-        // which receives the original raw `args`. The expanded_args are used only by
-        // substitute_params (Step 4) for non-## occurrences.
-        //
-        // A parameter can appear both with ## and without ## in the same body
-        // (e.g., `#define bitfs(bf, s) __bitf(bf, bf##_##s)`). In that case, the
-        // non-## occurrence needs the expanded argument so that commas from macro
-        // expansion create additional arguments during rescanning.
-        let expanded_args: Vec<String> = args
-            .iter()
-            .enumerate()
-            .map(
-                |(k, arg)| match arg_starts.and_then(|starts| starts.get(k)) {
-                    Some(&start) => self.expand_source_slice(arg, start, expanding),
-                    None => self.expand_text(arg, expanding),
-                },
-            )
+        let expanded_args: Vec<std::cell::OnceCell<String>> = (0..args.len())
+            .map(|_| std::cell::OnceCell::new())
             .collect();
-
-        // C2x __VA_OPT__: include its balanced token sequence iff the variadic
-        // argument is non-empty. This must happen before #/## processing so
-        // commas and paste operators inside the selected sequence participate
-        // in the normal replacement algorithm.
-        let va_body = self.expand_va_opt(
-            &mac.body,
-            &mac.params,
-            args,
-            mac.is_variadic,
-            mac.has_named_variadic,
-        );
+        let mut argument = |index: usize| {
+            expanded_args[index]
+                .get_or_init(|| match arg_starts.and_then(|starts| starts.get(index)) {
+                    Some(&start) => self.expand_source_slice(&args[index], start, expanding),
+                    None => self.expand_text(&args[index], expanding),
+                })
+                .as_str()
+        };
+        let va_body = self.expand_va_opt(&mac.body, mac, args, &mut argument);
 
         // Step 3: Handle stringification (#param) and token pasting (##).
         let body = self.handle_stringify_and_paste(
@@ -1338,13 +1351,18 @@ impl MacroTable {
             mac.has_named_variadic,
         );
 
-        // Step 4: Substitute parameters with expanded arguments
+        // Prescan only when an ordinary substituted occurrence needs the
+        // argument. Unused, stringified and paste-only arguments must not
+        // consume __COUNTER__, execute _Pragma or diagnose date builtins.
+        // Cache each expansion once; GCC evaluates these effects in first
+        // replacement-use order (REV(__COUNTER__, __COUNTER__) pins it).
         let body = self.substitute_params(
             &body,
             &mac.params,
-            &expanded_args,
+            args.len(),
             mac.is_variadic,
             mac.has_named_variadic,
+            &mut argument,
         );
 
         // Check if the substituted body (before rescan) ends with a function-like
@@ -1628,13 +1646,14 @@ impl MacroTable {
     }
 
     /// Substitute parameter names with argument values in macro body.
-    fn substitute_params(
+    fn substitute_params<'a>(
         &self,
         body: &str,
         params: &[String],
-        args: &[String],
+        arg_count: usize,
         is_variadic: bool,
         has_named_variadic: bool,
+        mut argument: impl FnMut(usize) -> &'a str,
     ) -> String {
         let mut result = String::with_capacity(body.len() + 32);
         let bytes = body.as_bytes();
@@ -1700,16 +1719,22 @@ impl MacroTable {
                 }
 
                 if ident == "__VA_ARGS__" && is_variadic {
-                    let va_args = self.get_va_args(params, args);
+                    let va_args = (params.len()..arg_count)
+                        .map(&mut argument)
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     let next = if i < len { Some(bytes[i]) } else { None };
                     Self::append_with_paste_guard(&mut result, &va_args, next);
                 } else if let Some(idx) = params.iter().position(|p| p == ident) {
                     if is_variadic && has_named_variadic && idx == params.len() - 1 {
-                        let va_args = self.get_named_va_args(idx, args);
+                        let va_args = (idx..arg_count)
+                            .map(&mut argument)
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         let next = if i < len { Some(bytes[i]) } else { None };
                         Self::append_with_paste_guard(&mut result, &va_args, next);
                     } else {
-                        let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
+                        let arg = if idx < arg_count { argument(idx) } else { "" };
                         let next = if i < len { Some(bytes[i]) } else { None };
                         Self::append_with_paste_guard(&mut result, arg, next);
                     }
@@ -1747,25 +1772,21 @@ impl MacroTable {
     }
 
     /// Expand balanced `__VA_OPT__(tokens)` groups for a variadic macro.
-    fn expand_va_opt(
+    fn expand_va_opt<'a>(
         &self,
         body: &str,
-        params: &[String],
+        mac: &MacroDef,
         args: &[String],
-        is_variadic: bool,
-        has_named_variadic: bool,
+        mut argument: impl FnMut(usize) -> &'a str,
     ) -> String {
-        if !is_variadic || !body.contains("__VA_OPT__") {
+        if !mac.is_variadic || !body.contains("__VA_OPT__") {
             return body.to_string();
         }
-        let first_va = if has_named_variadic {
-            params.len().saturating_sub(1)
+        let first_va = if mac.has_named_variadic {
+            mac.params.len().saturating_sub(1)
         } else {
-            params.len()
+            mac.params.len()
         };
-        let has_tokens = args
-            .get(first_va..)
-            .is_some_and(|tail| tail.iter().any(|arg| !arg.trim().is_empty()));
         let bytes = body.as_bytes();
         let mut out = String::with_capacity(body.len());
         let mut i = 0usize;
@@ -1796,6 +1817,30 @@ impl MacroTable {
                         j += 1;
                     }
                     if depth == 0 {
+                        // Preserve GCC's first-use expansion order: ordinary
+                        // parameters preceding this VA_OPT are prescanned first.
+                        // Raw paste/stringify operands stay protected.
+                        let prefix = self.handle_stringify_and_paste(
+                            &out,
+                            &mac.params,
+                            args,
+                            mac.is_variadic,
+                            mac.has_named_variadic,
+                        );
+                        self.substitute_params(
+                            &prefix,
+                            &mac.params,
+                            args.len(),
+                            mac.is_variadic,
+                            mac.has_named_variadic,
+                            &mut argument,
+                        );
+                        // Presence is based on EXPANDED tokens; multiple empty
+                        // variadic operands still contain separating commas.
+                        let mut has_tokens = args.len() > first_va + 1;
+                        for index in first_va..args.len() {
+                            has_tokens |= !argument(index).trim().is_empty();
+                        }
                         if has_tokens {
                             out.push_str(&body[inner..j - 1]);
                         }
@@ -2072,6 +2117,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
         };
 
         Some(MacroDef {
+            is_time_builtin: false,
             name,
             is_function_like: true,
             params,
@@ -2088,6 +2134,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
         };
 
         Some(MacroDef {
+            is_time_builtin: false,
             name,
             is_function_like: false,
             params: Vec::new(),
@@ -2176,6 +2223,7 @@ mod token_boundary_tests {
             ("XCAT", Some("x,y"), "CAT(x,y)"),
         ] {
             t.define(MacroDef {
+                is_time_builtin: false,
                 name: name.into(),
                 is_function_like: params.is_some(),
                 params: params

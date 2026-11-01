@@ -13,7 +13,7 @@ individually-justified budgets:
 * ``LCCC_ONLY``   - names LCCC predefines and GCC does not: keyword-vs-macro
                     mechanisms GCC spells differently (`__extension__`,
                     `offsetof`, `__int8` ...), `-dM`-listing quirks
-                    (`__FILE__`/`__DATE__` are expanded by GCC but not
+                    (`__FILE__` is expanded by GCC but not
                     listed), the documented PIC/PIE and C23 decimal/width
                     claims, and `_FloatN` spellings.
 * ``VALUE_DIFFS`` - common names whose replacement bodies differ (GCC's
@@ -58,7 +58,6 @@ LCCC_ONLY = (
     '_Float64x',
     '__BASE_FILE__',
     '__CHAR_WIDTH__',
-    '__DATE__',
     '__DEC128_DIG__',
     '__DEC32_DIG__',
     '__DEC64_DIG__',
@@ -74,7 +73,6 @@ LCCC_ONLY = (
     '__SIZEOF_DECIMAL64__',
     '__STDC_DEC_FP__',
     '__STDC_IEC_60559_TYPES_EXT__',
-    '__TIME__',
     '__builtin_offsetof(type,member)',
     '__extension__',
     '__int16',

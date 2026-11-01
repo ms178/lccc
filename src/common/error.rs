@@ -106,6 +106,12 @@ pub enum WarningKind {
     MissingDeclarations,
     /// A function-pointer cast changes significant return/parameter types.
     CastFunctionType,
+    /// A definition uses an empty pre-C23 list or K&R identifier list.
+    OldStyleDefinition,
+    /// Expansion of a builtin date/time macro prevents reproducible output.
+    DateTime,
+    /// An explicitly supplied include search directory does not exist.
+    MissingIncludeDirs,
     /// Control reaches end of non-void function, or non-void function does
     /// not return a value in all control paths.
     /// GCC flag: -Wreturn-type
@@ -305,6 +311,30 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "external function definition without a prior declaration"
+    ),
+    warning!(
+        DateTime,
+        "date-time",
+        false,
+        [],
+        false,
+        "builtin date or time macro expansion"
+    ),
+    warning!(
+        OldStyleDefinition,
+        "old-style-definition",
+        false,
+        [],
+        false,
+        "old-style function definition"
+    ),
+    warning!(
+        MissingIncludeDirs,
+        "missing-include-dirs",
+        false,
+        [],
+        false,
+        "nonexistent explicit include search directory"
     ),
     warning!(
         ReturnType,
@@ -1897,6 +1927,9 @@ mod dialect_severity_redteam_tests {
             WarningKind::UnusedVariable,
             WarningKind::SignCompare,
             WarningKind::CastFunctionType,
+            WarningKind::OldStyleDefinition,
+            WarningKind::DateTime,
+            WarningKind::MissingIncludeDirs,
             WarningKind::DivByZero,
             WarningKind::StrictPrototypes,
             WarningKind::Format,

@@ -708,6 +708,13 @@ impl SemanticAnalyzer {
 
     fn analyze_function_def_inner(&mut self, func: &FunctionDef) {
         use crate::common::error::WarningKind;
+        if !func.has_prototype {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                "old-style function definition".to_string(),
+                func.span,
+                WarningKind::OldStyleDefinition,
+            );
+        }
         let prior = self.prior_file_function_decls.get(&func.name).copied();
         if func.name != "main" && !func.attrs.is_static() && !func.attrs.is_inline() {
             let mut diagnostics = self.diagnostics.borrow_mut();

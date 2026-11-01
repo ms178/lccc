@@ -995,7 +995,7 @@ impl Driver {
             if self.dep_only {
                 let source = Self::read_source(input_file)?;
                 let mut preprocessor = Preprocessor::new();
-                self.configure_preprocessor(&mut preprocessor);
+                self.configure_preprocessor(&mut preprocessor)?;
                 let filename = if input_file == "-" {
                     "<stdin>"
                 } else {
@@ -1066,7 +1066,7 @@ impl Driver {
             let source = Self::read_source(input_file)?;
 
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             let filename = if input_file == "-" {
                 "<stdin>"
             } else {
@@ -1266,7 +1266,7 @@ impl Driver {
 
             let source = Self::read_source(input_file)?;
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             preprocessor.set_filename(filename);
             self.process_force_includes(&mut preprocessor)?;
             let preprocessed = preprocessor.preprocess(&source);
@@ -1389,7 +1389,7 @@ impl Driver {
         {
             let source = Self::read_source(input_file)?;
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             preprocessor.define_macro("__ASSEMBLER__", "1");
             preprocessor.define_macro("_CET_H_INCLUDED", "1");
             if self.target == crate::backend::Target::X86_64 {
@@ -1827,7 +1827,10 @@ impl Driver {
     }
 
     /// Configure the preprocessor with CLI-defined macros and target.
-    pub(super) fn configure_preprocessor(&self, preprocessor: &mut Preprocessor) {
+    pub(super) fn configure_preprocessor(
+        &self,
+        preprocessor: &mut Preprocessor,
+    ) -> Result<(), String> {
         preprocessor.set_warning_config(self.effective_warning_config());
         // Set target architecture macros
         match self.target {
@@ -2076,18 +2079,57 @@ impl Driver {
                 path.to_string()
             }
         }
+        let mut include_diagnostics = DiagnosticEngine::new();
+        include_diagnostics.set_warning_config(self.effective_warning_config());
+        include_diagnostics.set_color_mode(self.color_mode);
+        let mut check_directory = |path: &str| {
+            // GCC suppresses search-path diagnostics for dependency-only and
+            // macro-dump preprocessing, even under explicit -Werror=.
+            if self.dep_only || self.dump_defines {
+                return;
+            }
+            let mut diag = match std::fs::metadata(path) {
+                Ok(meta) if meta.is_dir() => return,
+                Ok(_) => {
+                    crate::common::error::Diagnostic::warning(format!("{path}: not a directory"))
+                }
+                Err(error) => {
+                    // Match GCC's OS diagnostic without Rust's extra errno suffix.
+                    let text = error.to_string();
+                    let text = text.split(" (os error ").next().unwrap_or(&text);
+                    crate::common::error::Diagnostic::warning_with_kind(
+                        format!("{path}: {text}"),
+                        crate::common::error::WarningKind::MissingIncludeDirs,
+                    )
+                }
+            };
+            diag.explicit_location = Some("cc1:".to_string());
+            include_diagnostics.emit(&diag);
+        };
         for path in &self.include_paths {
-            preprocessor.add_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_include_path(&path);
         }
         for path in &self.quote_include_paths {
-            preprocessor.add_quote_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_quote_include_path(&path);
         }
         for path in &self.isystem_include_paths {
-            preprocessor.add_system_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_system_include_path(&path);
         }
         for path in &self.after_include_paths {
-            preprocessor.add_after_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_after_include_path(&path);
         }
+        if include_diagnostics.has_errors() {
+            return Err("include search path warning(s) promoted to errors".to_string());
+        }
+        Ok(())
     }
 
     /// Process force-included files (-include flag) through the preprocessor before
@@ -2262,7 +2304,7 @@ impl Driver {
 
         // Preprocess
         let mut preprocessor = Preprocessor::new();
-        self.configure_preprocessor(&mut preprocessor);
+        self.configure_preprocessor(&mut preprocessor)?;
         let filename = if input_file == "-" {
             "<stdin>"
         } else {

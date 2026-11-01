@@ -251,6 +251,10 @@ impl Preprocessor {
     /// - Does not emit pending_injections (those only apply to top-level)
     /// - Only processes directives when no multi-line accumulation is pending
     fn preprocess_source(&mut self, source: &str, is_include: bool) -> String {
+        // Timestamp uses the physical input's mtime, not #line/__FILE__ spelling
+        // and not SOURCE_DATE_EPOCH (matching GCC's nonstandard builtin).
+        let timestamp = self.current_file_timestamp();
+        let saved_timestamp = std::mem::replace(&mut self.macros.timestamp_body, timestamp);
         // Per C standard (C11 5.1.1.2), translation phases are:
         // Phase 2: Line splicing (backslash-newline removal)
         // Phase 3: Comment replacement
@@ -339,7 +343,7 @@ impl Preprocessor {
             // Execute `_Pragma` operators queued by the previous line's macro
             // expansion BEFORE processing this line, so their effects (C99
             // §6.10.9) apply in source order relative to directives.
-            self.drain_expansion_pragmas();
+            self.drain_expansion_effects();
             let trimmed = line.trim();
             // A directive is introduced by the `#` token, which the C95 digraph
             // `%:` also denotes (`%:include <stdio.h>`), so `hash_token_len`
@@ -496,7 +500,7 @@ impl Preprocessor {
                             0,
                         );
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-                        self.drain_expansion_pragmas();
+                        self.drain_expansion_effects();
                         pending_line.clear();
                         pending_line.push_str(&expanded);
                         // Already expanded: positions no longer matter.
@@ -516,7 +520,7 @@ impl Preprocessor {
                             0,
                         );
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-                        self.drain_expansion_pragmas();
+                        self.drain_expansion_effects();
                         let expanded =
                             self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
                         Self::push_accumulated(&mut output, &expanded, pending_newlines);
@@ -657,7 +661,7 @@ impl Preprocessor {
         }
 
         // Pragmas queued by the final line's expansion.
-        self.drain_expansion_pragmas();
+        self.drain_expansion_effects();
 
         // Flush any remaining pending line
         if !pending_line.is_empty() {
@@ -667,7 +671,7 @@ impl Preprocessor {
                 0,
             );
             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
-            self.drain_expansion_pragmas();
+            self.drain_expansion_effects();
             let expanded = self.resolve_has_macros_in_code(&expanded, last_source_line_num + 1);
             output.push_str(&expanded);
             output.push('\n');
@@ -699,6 +703,7 @@ impl Preprocessor {
             self.line_marker_due = saved_line_marker_due;
         }
 
+        self.macros.timestamp_body = saved_timestamp;
         output
     }
 
@@ -1045,6 +1050,7 @@ impl Preprocessor {
         // __BASE_FILE__ always expands to the main input file name,
         // unlike __FILE__ which changes during #include processing.
         self.macros.define(MacroDef {
+            is_time_builtin: false,
             name: "__BASE_FILE__".to_string(),
             is_function_like: false,
             params: Vec::new(),
@@ -1120,6 +1126,9 @@ impl Preprocessor {
         let mut defs: Vec<String> = self
             .macros
             .iter()
+            // GCC does not list volatile builtin macros in -dM, but does
+            // list ordinary user redefinitions of those same names.
+            .filter(|def| !def.is_time_builtin)
             .map(|def| {
                 if def.is_function_like {
                     let params = def.params.join(",");
@@ -1155,6 +1164,7 @@ impl Preprocessor {
             }
         }
         self.macros.define(MacroDef {
+            is_time_builtin: false,
             name: name.to_string(),
             is_function_like: false,
             params: Vec::new(),
@@ -1283,16 +1293,24 @@ impl Preprocessor {
     /// (C99 §6.10.9: `_Pragma("foo")` behaves like `#pragma foo` at that
     /// point). Called after every expansion pass so pragma effects
     /// (push_macro/pop_macro, weak, visibility, ...) apply in source order.
-    fn drain_expansion_pragmas(&mut self) {
-        for (content, line) in self.macros.take_pending_pragmas() {
-            let content = content.trim().to_string();
-            if content.is_empty() {
-                continue;
+    fn drain_expansion_effects(&mut self) {
+        for effect in self.macros.take_pending_effects() {
+            match effect {
+                super::macro_defs::ExpansionEffect::Pragma(content, line) => {
+                    if !content.trim().is_empty() {
+                        self.handle_pragma(content.trim(), line, 0);
+                    }
+                }
+                super::macro_defs::ExpansionEffect::DateTime { name, file, line } => {
+                    self.push_warning(PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::DateTime,
+                        file,
+                        line,
+                        col: 1,
+                        message: format!("macro '{name}' might prevent reproducible builds"),
+                    });
+                }
             }
-            // The line was resolved at enqueue time against the expansion
-            // site's own line resolver (C99 §6.10.9: the pragma behaves
-            // as if written where the `_Pragma` operator appears).
-            self.handle_pragma(&content, line, 0);
         }
     }
 

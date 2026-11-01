@@ -555,13 +555,15 @@ impl Preprocessor {
         }
 
         let (date_macro, time_macro) = Self::current_date_time_macros();
-        self.define_simple_macro("__DATE__", &date_macro);
-        self.define_simple_macro("__TIME__", &time_macro);
+        self.define_time_macro("__DATE__", &date_macro);
+        self.define_time_macro("__TIME__", &time_macro);
+        self.define_time_macro("__TIMESTAMP__", "\"??? ??? ?? ??:??:?? ????\"");
 
         // Note: __builtin_expect is handled as a real builtin (not a macro)
         // to properly evaluate side effects in the second argument.
         for &(name, params, body) in PREDEFINED_FUNC_MACROS {
             self.macros.define(MacroDef {
+                is_time_builtin: false,
                 name: name.to_string(),
                 is_function_like: true,
                 params: params.iter().map(|s| s.to_string()).collect(),
@@ -572,9 +574,52 @@ impl Preprocessor {
         }
     }
 
+    fn define_time_macro(&mut self, name: &str, body: &str) {
+        self.macros.define(MacroDef {
+            is_time_builtin: true,
+            name: name.to_string(),
+            is_function_like: false,
+            params: Vec::new(),
+            is_variadic: false,
+            has_named_variadic: false,
+            body: body.to_string(),
+        });
+    }
+
+    pub(super) fn current_file_timestamp(&self) -> String {
+        let physical = self.current_file();
+        let time = std::fs::metadata(&physical)
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|_| std::time::SystemTime::now());
+        let secs = match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs() as i64,
+            Err(error) => {
+                let duration = error.duration();
+                -(duration.as_secs() as i64) - i64::from(duration.subsec_nanos() != 0)
+            }
+        };
+        let (year, month, day, hour, min, sec) = Self::unix_utc_to_ymdhms(secs);
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        let weekday = (secs.div_euclid(86400) + 4).rem_euclid(7) as usize;
+        format!(
+            "\"{} {} {:>2} {:02}:{:02}:{:02} {}\"",
+            DAYS[weekday],
+            MONTHS[(month - 1) as usize],
+            day,
+            hour,
+            min,
+            sec,
+            year
+        )
+    }
+
     /// Helper to define a simple object-like macro.
     pub(super) fn define_simple_macro(&mut self, name: &str, body: &str) {
         self.macros.define(MacroDef {
+            is_time_builtin: false,
             name: name.to_string(),
             is_function_like: false,
             params: Vec::new(),
@@ -588,6 +633,7 @@ impl Preprocessor {
     /// integer model differs from the x86-64 table above.
     pub(super) fn define_function_macro(&mut self, name: &str, params: &[&str], body: &str) {
         self.macros.define(MacroDef {
+            is_time_builtin: false,
             name: name.to_string(),
             is_function_like: true,
             params: params.iter().map(|p| p.to_string()).collect(),
@@ -1637,6 +1683,7 @@ pub(crate) fn apply_sse_macro_levels(
     let mut set = |name: &str, on: bool| {
         if on {
             macros.define(MacroDef {
+                is_time_builtin: false,
                 name: name.to_string(),
                 is_function_like: false,
                 params: Vec::new(),
@@ -1679,6 +1726,7 @@ mod sse_macro_tests {
     fn i386_table() -> MacroTable {
         let mut macros = MacroTable::new();
         macros.define(MacroDef {
+            is_time_builtin: false,
             name: "__i386__".to_string(),
             is_function_like: false,
             params: Vec::new(),

@@ -622,3 +622,25 @@ i686, and i386.
 - **Expression evaluator does not support floating-point** -- `#if`
   expressions are evaluated using integer arithmetic only (standard-compliant,
   since preprocessor expressions are integer constant expressions).
+
+### Expansion effects and reproducibility diagnostics
+
+`-Wdate-time` diagnoses evaluated expansions of builtin `__DATE__`, `__TIME__`,
+and `__TIMESTAMP__`. Builtin origin survives `push_macro`/`pop_macro`; ordinary
+user redefinitions are not builtin expansions. Date/time diagnostics and
+`_Pragma` effects share an ordered queue, preserving same-line diagnostic scopes.
+Volatile time builtins are omitted from `-dM`, matching GCC; ordinary user
+redefinitions remain listed.
+
+Function macro arguments are expanded lazily, once per ordinary parameter, in
+first replacement-use order. Unused, stringified, and paste-only arguments do
+not trigger effects. `__VA_OPT__` presence checks expanded variadic tokens,
+including separating commas between empty operands. This is covered by the
+GCC-backed `tests/regression/check_date_time_warnings.py`, also invoked by the
+regular warning-precedence runner. This does not establish every C23 macro edge
+case (for example, stringification of `__VA_OPT__`).
+
+`__TIMESTAMP__` uses the physical input file's modification time, independent of
+`#line`, an overridden `__FILE__`, and `SOURCE_DATE_EPOCH`. Formatting currently
+uses UTC, like the existing date/time formatter. Differential timestamp-value
+checks force `TZ=UTC`; arbitrary local-timezone GCC parity is **not** claimed.

@@ -72,7 +72,34 @@ FIXTURES = {
     'conversion': 'int *f(void) { return 3; }\n',
 }
 # name, source, dialect, options, leaf label, expected classification
+FIXTURES.update({
+    'old_empty': 'int f() { return 0; }\n',
+    'old_prior': 'int f(void); int f() { return 0; }\n',
+    'old_static': 'static int f() { return 0; }\n',
+    'old_kr': 'int f(x) int x; { return x; }\n',
+    'old_prototype': 'int f(int x) { return x; }\n',
+    'old_decl': 'int f();\n',
+    'old_ignored': '#pragma GCC diagnostic ignored "-Wold-style-definition"\nint f() {return 0;}\n',
+    'old_promoted': '#pragma GCC diagnostic error "-Wold-style-definition"\nint f() {return 0;}\n',
+})
+
 CASES = (
+    ('old_empty', 'old_empty', 'gnu18', ('-Wold-style-definition',), 'old-style-definition', 'W'),
+    ('old_prior', 'old_prior', 'gnu18', ('-Wold-style-definition',), 'old-style-definition', 'W'),
+    ('old_static', 'old_static', 'gnu18', ('-Wold-style-definition',), 'old-style-definition', 'W'),
+    ('old_kr', 'old_kr', 'gnu18', ('-Wold-style-definition',), 'old-style-definition', 'W'),
+    ('old_prototype', 'old_prototype', 'gnu18', ('-Wold-style-definition',), 'old-style-definition', '-'),
+    ('old_decl', 'old_decl', 'gnu18', ('-Wold-style-definition',), 'old-style-definition', '-'),
+    ('old_ignored', 'old_ignored', 'gnu18', ('-Wold-style-definition',), 'old-style-definition', '-'),
+    ('old_promoted', 'old_promoted', 'gnu18', ('-Wold-style-definition',), 'old-style-definition', 'E'),
+    ('old-style-default', 'old_empty', 'gnu18', (), 'old-style-definition', '-'),
+    ('old-style-wall', 'old_empty', 'gnu18', ('-Wall',), 'old-style-definition', '-'),
+    ('old-style-extra', 'old_empty', 'gnu18', ('-Wextra',), 'old-style-definition', '-'),
+    ('old-style-c23-empty', 'old_empty', 'gnu23', ('-Wold-style-definition',), 'old-style-definition', '-'),
+    ('old-style-error', 'old_empty', 'gnu18', ('-Werror=old-style-definition',), 'old-style-definition', 'E'),
+    ('old-style-demote', 'old_empty', 'gnu18', ('-Werror=old-style-definition', '-Wno-error=old-style-definition'), 'old-style-definition', 'W'),
+    ('old-style-off', 'old_empty', 'gnu18', ('-Wold-style-definition', '-Wno-old-style-definition'), 'old-style-definition', '-'),
+    ('old-style-quiet', 'old_empty', 'gnu18', ('-w', '-Werror=old-style-definition'), 'old-style-definition', '-'),
     ('cast-function-0', 'cast_fn_0', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
     ('cast-function-1', 'cast_fn_1', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
     ('cast-function-2', 'cast_fn_2', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
@@ -246,7 +273,7 @@ def main() -> int:
         src=Path(tmp)/'probe.c'
         obj=Path(tmp)/'probe.o'
         for label, fixture, dialect, flags, leaf, expected in CASES:
-            modes = ('-c', '-E', '-fsyntax-only') if leaf == 'undef' else (('-c', '-fsyntax-only') if leaf.startswith('missing-') or leaf == 'cast-function-type' else ('-c',))
+            modes = ('-c', '-E', '-fsyntax-only') if leaf == 'undef' else (('-c', '-fsyntax-only') if leaf.startswith('missing-') or leaf in ('cast-function-type', 'old-style-definition') else ('-c',))
             for mode in modes:
                 src.write_text(FIXTURES[fixture], encoding='utf-8')
                 results={}
@@ -269,6 +296,10 @@ def main() -> int:
     print(f'warning precedence: PASS ({len(CASES)} cases against GCC {version})')
     from check_diagnostic_pragmas import run as check_scopes
     check_scopes(lccc, gcc)
+    from check_include_path_warnings import run as check_include_paths
+    check_include_paths(lccc, gcc)
+    from check_date_time_warnings import run as check_dates
+    check_dates(lccc, gcc)
     return 0
 
 
