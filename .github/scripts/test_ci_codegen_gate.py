@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for ci-codegen-gate.py's stackmem accounting.
+"""Unit tests for ci-codegen-gate.py's instruction and stackmem accounting.
 
 The gate must count `N(%rbp)` as stack traffic only when rbp is the frame
 pointer. In FPO functions rbp is a GPR (often homing a pointer parameter),
@@ -126,6 +126,41 @@ class RbpAccountingTests(unittest.TestCase):
         )
         m = gate.function_body_metrics(asm)
         self.assertEqual(m["stackmem"], 1)
+
+
+class InstructionCountTests(unittest.TestCase):
+    """`insns` counts instructions, independent of the emitter's layout."""
+
+    def test_column_zero_and_indented_instructions_count_alike(self):
+        indented = func_asm("\tcmpl %esi, %edi\n    jae .L1\n\tret\n.L1:\n\tret\n")
+        column0 = func_asm("\tcmpl %esi, %edi\njae .L1\n\tret\n.L1:\n\tret\n")
+        self.assertEqual(gate.function_body_metrics(indented)["insns"], 4)
+        self.assertEqual(gate.function_body_metrics(column0)["insns"], 4)
+
+    def test_operand_less_instructions_count(self):
+        asm = func_asm("\tcltq\n\tcqto\n\tleave\n\tret\n")
+        self.assertEqual(gate.function_body_metrics(asm)["insns"], 4)
+
+    def test_labels_directives_and_comments_never_count(self):
+        asm = func_asm(
+            "f_inner:\n.LBB7:\n\t.p2align 4\n\t.cfi_def_cfa_offset 16\n"
+            "# movl %eax, %ebx\n\tnop\n"
+        )
+        self.assertEqual(gate.function_body_metrics(asm)["insns"], 1)
+
+    def test_column_zero_vector_and_push_metrics(self):
+        asm = func_asm(
+            "pushq %rbx\n"
+            "vfmadd231pd %ymm1, %ymm2, %ymm0\n"
+            "movq %rdi, %rbp\n"
+            "movq 8(%rbp), %rax\n"
+            "popq %rbx\n"
+            "ret\n"
+        )
+        m = gate.function_body_metrics(asm)
+        self.assertEqual((m["insns"], m["pushes"], m["ymm"], m["fma"]), (6, 1, 1, 1))
+        # The column-0 GPR write still proves rbp is not the frame pointer.
+        self.assertEqual(m["stackmem"], 0)
 
 
 class BaselinePublicationTests(unittest.TestCase):

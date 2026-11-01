@@ -1023,6 +1023,12 @@ pub struct X86Codegen {
     /// pad so %rsp is 16-byte aligned at each call (entry %rsp ≡ 8 mod 16).
     /// Set by calculate_stack_space_impl, read by aligned_frame_size_impl.
     pub(super) func_has_calls: bool,
+    /// `func_has_calls` minus the calls that become sibling calls
+    /// (`<epilogue>; jmp`): no `call` instruction then runs on this frame,
+    /// so the frame planner owes no call-alignment pad. Only the two frame
+    /// decisions read it (`aligned_frame_size_impl`, the empty-frame
+    /// elision); red-zone and register policy keep `func_has_calls`.
+    pub(super) func_has_non_tail_calls: bool,
     /// Module-scoped interprocedural register allocation state (summaries,
     /// caller records); see `ipa_ra`.
     pub(crate) ipa: super::ipa_ra::IpaRaState,
@@ -1673,6 +1679,7 @@ impl X86Codegen {
             function_alignment: 0,
             skip_rax_setup: false,
             func_has_calls: false,
+            func_has_non_tail_calls: false,
             ipa: super::ipa_ra::IpaRaState::default(),
             ipa_keep: 0,
             ipa_keep_spans: Vec::new(),

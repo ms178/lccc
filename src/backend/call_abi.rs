@@ -1176,7 +1176,19 @@ fn classify_args_core(
                 int_idx += 2;
             } else {
                 result.push(CoreArgClass::I128Stack);
-                int_idx = config.max_int_regs;
+                // AAPCS64 (C.9/C.11) and the i686 regparm model close the GP
+                // file once a 128-bit integer misses it. The AMD64 psABI
+                // (§3.2.3) instead passes an argument that does not fit in
+                // the remaining registers in memory WITHOUT consuming them:
+                // later INTEGER arguments still take what is left. GCC 16.2
+                // and Clang 23.1.4 read `x` of
+                // `q_after(long, long, long, long, long, __int128 q, long x)`
+                // from %r9; closing the file here read it from the stack, on
+                // both sides of every such call (caller and callee agreed
+                // with each other but not with any other compiler).
+                if !config.use_sysv_struct_classification {
+                    int_idx = config.max_int_regs;
+                }
             }
         } else if info.is_long_double {
             if config.f128_in_fp_regs {

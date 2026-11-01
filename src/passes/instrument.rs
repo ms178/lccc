@@ -94,9 +94,7 @@ fn instrument_function(func: &mut IrFunction) {
             .iter()
             .take_while(|inst| matches!(inst, Instruction::ParamRef { .. }))
             .count();
-        let tail = entry.instructions.split_off(insert_at);
-        entry.instructions.extend(enter_insts);
-        entry.instructions.extend(tail);
+        entry.insert_insts(insert_at, enter_insts, crate::common::source::Span::dummy());
     }
 
     // Exit hooks: immediately before every Return terminator.
@@ -124,7 +122,7 @@ fn instrument_function(func: &mut IrFunction) {
         });
         // Append: the hook must run AFTER the block's effects, immediately
         // before the Return terminator (which lives in `block.terminator`).
-        block.instructions.extend(insts);
+        block.extend_insts(insts, crate::common::source::Span::dummy());
     }
 
     func.next_value_id = id;

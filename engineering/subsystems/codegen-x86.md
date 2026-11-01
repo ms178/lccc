@@ -14,6 +14,34 @@ Peephole call-site liveness has ONE authority, `passes/liveness.rs::call_site_re
 
 Return liveness reaches the text peephole the same way, as prologue marker comments that are authoritative when present (tail-block inference otherwise): `# LCCC_RET_XMM <mask>` (bit 0 `%xmm0`, bit 1 `%xmm1` read by `ret`), `# LCCC_RET_XMM_BITS <n>` (the widest read, in bits from bit 0, of those registers: 32/64 for scalar `float`/`double`, 128/256/512 for vectors, 512 when the width cannot be bounded; `fp_liveness.rs::ret_xmm_read_bits` lets a rewrite change bits above an element only where no `ret` reads them), `# LCCC_RET_RDX 0|1` and `# LCCC_RET_RAX 0|1` (`prologue.rs::emit_gp_return_liveness_markers`). They are compiler-internal protocol, not environment knobs.
 
+## Sibling calls in branch arms and the tail-call marker
+
+`backend::x86::ret_dup` (an IR pass after the PGO fingerprint) hands each
+call arm of a shared return block its own `Return`, so `if (c) f(); else g();`
+and `return c ? f(x) : g(x);` end in two sibling `jmp`s, as with GCC 16.2,
+Clang 23.1.4 and ICX 2026.2. `CCC_DISABLE_PASSES=ret_dup` keeps the shared
+return block and `CCC_NO_SIBCALL` disables sibling-call conversion entirely;
+both serve bisection and A/B measurement. A function whose every call converts owes no
+call-alignment pad (`prologue::every_call_is_sibling`). The pad is kept with
+i128 helper calls, and codegen asserts the rule at every real call.
+
+The codegen publishes each sibling call as `jmp sym` followed by the
+`# LCCC_TAIL_CALL` marker and the suppressed call's own `LCCC_CALL_ARGS` /
+`LCCC_CALL_FP` markers. Both liveness oracles read that block. A marked `jmp`
+reads the call's arguments plus the callee-saved set and has no successor;
+in particular it gets no `ret` live-out, so a dead `%rax` staging copy dies.
+The flag-consumer walk ends at it exactly as at a `call`. An unmarked
+`jmp` to a foreign symbol stays unknown. The peephole's terminal
+`fold_conditional_tail_calls` turns `jcc .L` into `jcc sym` when `.L` holds
+only a marked sibling `jmp`; this is Clang's form and one instruction shorter
+than GCC's. The marker block moves behind the `jcc`, so the oracles model
+the taken edge as that tail call.
+
+`fold_load_mask_into_memory_test` folds a load plus `and`/`test` immediate,
+whose register is dead afterwards, into `test $imm, mem`. It narrows to the
+smallest byte window, matching GCC's `testb $3, G+2(%rip)`, only when every
+flag consumer reads ZF; otherwise it keeps the flag-exact and-width form.
+
 ## Incoming MEMORY parameter homes
 
 x86-64 complete `StructStack` / `LargeStructStack` arguments can directly

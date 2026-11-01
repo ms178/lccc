@@ -369,10 +369,10 @@ pub enum IntrinsicOp {
     /// 0, 2, 4 and 6 of an I32x8 result; the odd lanes are zero. Unlike a
     /// full-width load, this does not touch the intervening objects.
     VecLoadStrided2I32x8,
-    /// Read exactly two dwords at offsets 0 and 8 from
+    /// Read exactly four dwords at offsets 0, 8, 16 and 24 from
     /// `base + byte_offset + optional_displacement`, placing them in lanes
-    /// 0 and 2 of an I32x4 result; the odd lanes are zero. The intervening
-    /// bytes are not accessed.
+    /// 0, 1, 2 and 3 of an I32x4 result. The intervening bytes are not
+    /// accessed.
     VecLoadStrided2I32x4,
     /// Compact four stride-8B dwords from a proven contiguous 32-byte window
     /// into lanes 0, 1, 2 and 3 of an I32x4 result. Unlike the exact strided

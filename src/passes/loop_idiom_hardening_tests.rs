@@ -220,7 +220,8 @@ fn native_permission_is_explicit_and_does_not_leak_between_invocations() {
                 &mut f,
                 &ModuleSymbolFacts::default(),
                 Capabilities {
-                    native_popcount: enabled
+                    native_popcount: enabled,
+                    i686_sse: false,
                 }
             ),
             usize::from(enabled)

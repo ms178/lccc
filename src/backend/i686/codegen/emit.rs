@@ -88,6 +88,8 @@ pub(super) enum CopySrc {
     Slot(StackSlot),
     /// `%ecx` already holds the source address.
     Ecx,
+    /// `off(%reg)`: a source pointer that is already in a register.
+    Register(&'static str),
 }
 
 /// Destination of a by-value argument copy.
@@ -97,16 +99,8 @@ pub(super) enum CopyDst {
     OutgoingArea(usize),
     /// `off(%reg)`: a destination pointer that is already in a register.
     Register(&'static str, usize),
-}
-
-impl CopyDst {
-    /// The memory operand naming byte `off` of the destination.
-    fn at(self, off: usize) -> String {
-        match self {
-            CopyDst::OutgoingArea(base) => format!("{}(%esp)", base + off),
-            CopyDst::Register(reg, base) => format!("{}({})", base + off, reg),
-        }
-    }
+    /// A frame object, resolved through `slot_ref_offset` like `CopySrc::Slot`.
+    Slot(StackSlot),
 }
 
 /// The general-purpose register a scalar tail may use as its scratch.
@@ -209,13 +203,14 @@ pub struct I686Codegen {
     /// the home. GCC instead reads and writes the caller's argument slot
     /// directly — the i386 psABI gives the callee ownership of incoming
     /// stack-argument slots, so no copy is needed. This map records
-    /// `slot id -> incoming ebp-relative offset` for redirected slots;
-    /// `slot_ref`/`slot_ref_offset` translate through `param_ref`, so every
-    /// load, store, spill and coalesced alias transparently hits the
-    /// caller's slot. Eligibility (see emit_store_params_impl): plain
-    /// StackScalar, no over-alignment, <= 4-byte scalar type. Kill switch:
+    /// `slot id -> (incoming ebp-relative offset, extent)` for redirected
+    /// slots. Every frame operand is formed by [`Self::slot_base_disp`],
+    /// which translates any byte inside `[slot, slot + extent)` -- so every
+    /// load, store, spill, coalesced alias, constant-offset alias and indexed
+    /// (SIB) access transparently hits the caller's slot. Eligibility and the
+    /// extent: `stack_param_direct_home_eligible`. Kill switch:
     /// CCC_NO_PARAM_DIRECT_HOME=1.
-    pub(super) param_direct_homes: FxHashMap<i64, i64>,
+    pub(super) param_direct_homes: FxHashMap<i64, (i64, i64)>,
     /// Whether %ebx holds the PIC GOT base for the function being emitted.
     ///
     /// Set per function by `function_needs_got`. When false the GOT setup is
@@ -360,6 +355,66 @@ pub(super) fn pair_const_bits(c: &IrConst) -> Option<u64> {
         IrConst::Zero => 0,
         _ => return None,
     })
+}
+
+/// `%reg` for a bare i686 GPR name as returned by [`phys_reg_name`].
+fn base_name(reg: &str) -> &'static str {
+    match reg {
+        "ebx" => "%ebx",
+        "esi" => "%esi",
+        "edi" => "%edi",
+        "ebp" => "%ebp",
+        "ecx" => "%ecx",
+        "edx" => "%edx",
+        "eax" => "%eax",
+        _ => panic!("invalid i686 base register: {reg}"),
+    }
+}
+
+/// Largest `Memcpy` the i686 backend copies straight-line at speed levels;
+/// the library-call rewrite (`builtin_policy::library_memcpy_inline_max`)
+/// uses the same number, so a `memcpy` call is turned into an IR `Memcpy`
+/// exactly when the emitter will expand it this way.
+///
+/// Measured on the host CPU in the `memcpy` regime (copy, then read the
+/// copy's last dword; min of 301 rounds, L1-hot), cycles per copy:
+///
+/// ```text
+///   bytes   rep movsb   movups+overlap   movl pairs   call memcpy@PLT
+///    8..64      21.76             4.60    4.60-7.64          6.9-8.5
+///      128      21.76             5.25   13.03-13.88             9.7
+///      256      25.25             9.58        26.58             17.1
+///      512      31.37            17.50        52.06             25.4
+/// ```
+///
+/// `rep movsb` pays a ~20-cycle start-up at every size this window covers,
+/// which makes it slower than even the library call. The budget is 16 chunk
+/// pairs: 256 bytes of `movups` (2.6x faster than `rep movsb` at the edge,
+/// 1.8x faster than the call) and 64 bytes of `movl` (2.8x; past 64 the
+/// scalar copy loses to the library call too). Under `-Os` this is only the
+/// candidate window: the emitter keeps whichever of the straight-line copy
+/// and the `rep movsb` sequence encodes to fewer bytes.
+pub(crate) fn straight_memcpy_max(sse: bool) -> usize {
+    if sse { 256 } else { 64 }
+}
+
+/// Bytes the in-tree i686 assembler encodes `text` to, or `None` when any
+/// line is not a plain instruction it can encode. Used to compare emission
+/// candidates by size with the same encoder that produces the object file
+/// (GAS-identical encodings for these forms), not with a hand model that
+/// could drift from it.
+fn encoded_len(text: &str) -> Option<usize> {
+    use crate::backend::i686::assembler::encoder::InstructionEncoder;
+    use crate::backend::x86::assembler::parser::AsmItem;
+    let mut enc = InstructionEncoder::new();
+    for item in crate::backend::i686::assembler::parse_asm(text).ok()? {
+        match item {
+            AsmItem::Instruction(instr) => enc.encode(&instr).ok()?,
+            AsmItem::Empty => {}
+            _ => return None,
+        }
+    }
+    Some(enc.bytes.len())
 }
 
 pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
@@ -758,33 +813,53 @@ impl I686Codegen {
     /// When frame pointer is omitted, converts EBP-relative offsets to ESP-relative
     /// by adding frame_base_offset + esp_adjust.
     pub(super) fn slot_ref(&self, slot: StackSlot) -> String {
-        // Directly-homed stack parameter: the slot *is* the caller's argument
-        // slot (see `param_direct_homes`). Translating here keeps every
-        // consumer — ParamRef loads, spill/reload, coalesced aliases,
-        // peephole-emitted folds — on the single authoritative location.
-        if let Some(&src) = self.param_direct_homes.get(&slot.0) {
-            return self.param_ref(src);
-        }
-        if self.omit_frame_pointer {
-            let esp_off = slot.0 + self.frame_base_offset + self.esp_adjust;
-            format!("{}(%esp)", esp_off)
-        } else {
-            format!("{}(%ebp)", slot.0)
-        }
+        self.slot_ref_offset(slot, 0)
     }
 
     /// Format a stack slot reference with an additional byte offset.
     /// Used for accessing sub-fields of multi-byte slots (e.g., upper 4 bytes of i64).
     pub(super) fn slot_ref_offset(&self, slot: StackSlot, extra: i64) -> String {
-        if let Some(&src) = self.param_direct_homes.get(&slot.0) {
-            return self.param_ref(src + extra);
+        let (base, disp) = self.slot_base_disp(slot, extra);
+        format!("{}(%{})", disp, base)
+    }
+
+    /// Base register and displacement of byte `extra` of `slot`: the single
+    /// place a frame operand is formed, for plain (`slot_ref*`) and indexed
+    /// (`frame_sib_for_alloca_base`) operands alike.
+    ///
+    /// A directly-homed stack parameter's slot *is* the caller's argument
+    /// slot (see `param_direct_homes`), and so is every byte inside its
+    /// extent: `slot` may be the home itself or a constant-offset alias into
+    /// it (`resolve_slot_addr` yields `Direct(home + k)` for
+    /// `(char *)&param + k`). Translating only the exact home -- as this used
+    /// to -- sent `((unsigned char *)&a)[1]` and the register-indexed
+    /// `p[i]` to the parameter's never-written frame slot.
+    pub(super) fn slot_base_disp(&self, slot: StackSlot, extra: i64) -> (&'static str, i64) {
+        if let Some(src) = self.direct_home_offset(slot.0) {
+            return self.param_base_disp(src + extra);
         }
         if self.omit_frame_pointer {
-            let esp_off = slot.0 + extra + self.frame_base_offset + self.esp_adjust;
-            format!("{}(%esp)", esp_off)
+            (
+                "esp",
+                slot.0 + extra + self.frame_base_offset + self.esp_adjust,
+            )
         } else {
-            format!("{}(%ebp)", slot.0 + extra)
+            ("ebp", slot.0 + extra)
         }
+    }
+
+    /// The incoming ebp-relative offset frame byte `at` is redirected to, if
+    /// it lies inside a directly-homed parameter's extent. Extents never
+    /// overlap (each is the frame object the home owns), so at most one
+    /// entry matches; the map holds one entry per homed parameter.
+    fn direct_home_offset(&self, at: i64) -> Option<i64> {
+        if let Some(&(src, _)) = self.param_direct_homes.get(&at) {
+            return Some(src);
+        }
+        self.param_direct_homes
+            .iter()
+            .find(|&(&home, &(_, extent))| home < at && at < home + extent)
+            .map(|(&home, &(src, _))| src + (at - home))
     }
 
     /// Format a parameter reference from the caller's stack frame.
@@ -793,16 +868,25 @@ impl I686Codegen {
     /// but we need to subtract 4 because there's no pushed EBP taking up space.
     /// The param_offset is the EBP-relative offset (e.g., 8 for first param).
     pub(super) fn param_ref(&self, ebp_offset: i64) -> String {
+        let (base, disp) = self.param_base_disp(ebp_offset);
+        format!("{}(%{})", disp, base)
+    }
+
+    /// Base register and displacement of the incoming argument byte at
+    /// `ebp_offset(%ebp)`.
+    fn param_base_disp(&self, ebp_offset: i64) -> (&'static str, i64) {
         if self.omit_frame_pointer {
             // Without pushed EBP, params are 4 bytes closer to the frame.
             // EBP would have been at original_esp - 4 (after push ebp).
             // Without push ebp, the return address is at original_esp.
             // So param at ebp_offset(%ebp) = (ebp_offset - 4) relative to original_esp.
             // And relative to current ESP: ebp_offset - 4 + frame_base_offset + esp_adjust.
-            let esp_off = ebp_offset - 4 + self.frame_base_offset + self.esp_adjust;
-            format!("{}(%esp)", esp_off)
+            (
+                "esp",
+                ebp_offset - 4 + self.frame_base_offset + self.esp_adjust,
+            )
         } else {
-            format!("{}(%ebp)", ebp_offset)
+            ("ebp", ebp_offset)
         }
     }
 
@@ -878,6 +962,57 @@ impl I686Codegen {
                 emit!(self.state, "    movl {}, %edx", sr);
             }
         }
+    }
+
+    /// Write a copy source straight into the GPR home `dest` (never %eax),
+    /// with exactly the bits and flag effects of `operand_to_eax(src)`
+    /// followed by `movl %eax, %dest`: constants use the accumulator path's
+    /// immediate and zero-idiom choice (`const_stack_arg_imm`,
+    /// `const_zero_uses_xorl`), slot values the same `movl`/`leal`. Returns
+    /// false, emitting nothing, for every source the detour handles better
+    /// or differently: register-homed values (the caller's reg-to-reg path
+    /// owns those), a value already verified in %eax (one `movl %eax` and
+    /// no memory access), home-less accumulator temporaries, wide and x87
+    /// values, and over-aligned allocas.
+    fn emit_copy_direct_to_home(&mut self, src: &Operand, dest: PhysReg) -> bool {
+        let d = phys_reg_name(dest);
+        match src {
+            Operand::Const(c) => {
+                let imm = const_stack_arg_imm(c);
+                if imm == 0 && const_zero_uses_xorl(c) {
+                    emit!(self.state, "    xorl %{}, %{}", d, d);
+                } else {
+                    emit!(self.state, "    movl ${}, %{}", imm, d);
+                }
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.reg_assignments.contains_key(&v.0)
+                    || self.state.acc_has_verified(v.0, is_alloca)
+                    || self.state.is_wide_value(v.0)
+                    || self.state.f128_direct_slots.contains(&v.0)
+                {
+                    return false;
+                }
+                let Some(slot) = self.state.get_slot(v.0) else {
+                    return false;
+                };
+                let sr = self.slot_ref(slot);
+                if is_alloca {
+                    if self.state.alloca_over_align(v.0).is_some() {
+                        return false;
+                    }
+                    emit!(self.state, "    leal {}, %{}", sr, d);
+                } else {
+                    emit!(self.state, "    movl {}, %{}", sr, d);
+                }
+            }
+        }
+        if dest.0 == 4 {
+            // %ecx doubles as the secondary staging register.
+            self.state.reg_cache.invalidate_sec();
+        }
+        true
     }
 
     /// Load an operand into %eax.
@@ -2396,7 +2531,7 @@ impl I686Codegen {
             while copied + 16 <= n_bytes {
                 let sr = self.copy_src_ref(src, copied);
                 emit!(self.state, "    movups {}, %xmm0", sr);
-                let dr = dst.at(copied);
+                let dr = self.copy_dst_ref(dst, copied);
                 emit!(self.state, "    movups %xmm0, {}", dr);
                 copied += 16;
             }
@@ -2408,28 +2543,28 @@ impl I686Codegen {
                 let tail = n_bytes - 16;
                 let sr = self.copy_src_ref(src, tail);
                 emit!(self.state, "    movups {}, %xmm0", sr);
-                let dr = dst.at(tail);
+                let dr = self.copy_dst_ref(dst, tail);
                 emit!(self.state, "    movups %xmm0, {}", dr);
             }
         } else {
             while copied + 4 <= n_bytes {
                 let sr = self.copy_src_ref(src, copied);
                 emit!(self.state, "    movl {}, {}", sr, scratch.r32());
-                let dr = dst.at(copied);
+                let dr = self.copy_dst_ref(dst, copied);
                 emit!(self.state, "    movl {}, {}", scratch.r32(), dr);
                 copied += 4;
             }
             while copied + 2 <= n_bytes {
                 let sr = self.copy_src_ref(src, copied);
                 emit!(self.state, "    movzwl {}, {}", sr, scratch.r32());
-                let dr = dst.at(copied);
+                let dr = self.copy_dst_ref(dst, copied);
                 emit!(self.state, "    movw {}, {}", scratch.r16(), dr);
                 copied += 2;
             }
             while copied < n_bytes {
                 let sr = self.copy_src_ref(src, copied);
                 emit!(self.state, "    movb {}, {}", sr, scratch.r8());
-                let dr = dst.at(copied);
+                let dr = self.copy_dst_ref(dst, copied);
                 emit!(self.state, "    movb {}, {}", scratch.r8(), dr);
                 copied += 1;
             }
@@ -2442,7 +2577,228 @@ impl I686Codegen {
         match src {
             CopySrc::Slot(slot) => self.slot_ref_offset(slot, off as i64),
             CopySrc::Ecx => format!("{}(%ecx)", off),
+            CopySrc::Register(reg) => format!("{}({})", off, reg),
         }
+    }
+
+    /// Name byte `off` of `dst` for the copy policy above.
+    fn copy_dst_ref(&self, dst: CopyDst, off: usize) -> String {
+        match dst {
+            CopyDst::OutgoingArea(base) => format!("{}(%esp)", base + off),
+            CopyDst::Register(reg, base) => format!("{}({})", base + off, reg),
+            CopyDst::Slot(slot) => self.slot_ref_offset(slot, off as i64),
+        }
+    }
+
+    /// Copy `size` bytes between the objects `src` and `dest` point to,
+    /// straight-line, without `rep movsb` and without borrowing a
+    /// callee-saved register. Returns false (nothing emitted) when an
+    /// endpoint has no resolvable address; the caller keeps the general path.
+    ///
+    /// `Memcpy` is a call point for liveness and register allocation, so no
+    /// value lives *across* it in `%eax`, `%ecx` or `%edx`; only the copy's
+    /// own pointer operands may still be there. Each endpoint is therefore
+    /// addressed in the cheapest way that cannot clobber the other:
+    ///
+    /// * a frame object (alloca or constant-offset alias of one) directly as
+    ///   a frame operand, with no address register at all;
+    /// * a pointer in a register other than `%eax` in place, as the base;
+    /// * anything else (a pointer in a slot, an over-aligned alloca, a
+    ///   pointer in `%eax`) materialized into whichever of `%ecx`/`%edx` the
+    ///   other endpoint does not use as its base.
+    ///
+    /// Materializations read only frame memory or `%eax` and write only
+    /// their own target, so there is no ordering cycle; `%eax` (or `%xmm0`
+    /// with SSE) is then free for the data. A source and destination that
+    /// are the same object (C's exact-overlap struct self-assignment) copy
+    /// correctly too: every chunk, including the overlapping tail, is loaded
+    /// and stored back unchanged.
+    fn emit_small_memcpy(&mut self, dest: &Value, src: &Value, size: usize) -> bool {
+        use crate::backend::state::SlotAddr;
+        #[derive(Clone, Copy)]
+        enum End {
+            Frame(StackSlot),
+            Base(&'static str),
+            Load(StackSlot),
+            Aligned(StackSlot, u32),
+            FromEax,
+        }
+        let end_of = |cg: &Self, v: &Value| -> Option<End> {
+            Some(match cg.state.resolve_slot_addr(v.0)? {
+                SlotAddr::Direct(slot) => End::Frame(slot),
+                SlotAddr::OverAligned(slot, id) => End::Aligned(slot, id),
+                SlotAddr::Reg(reg) => match phys_reg_name(reg) {
+                    "eax" => End::FromEax,
+                    r => End::Base(r),
+                },
+                SlotAddr::Indirect(slot) => match cg.reg_assignments.get(&v.0) {
+                    Some(&phys) => match phys_reg_name(phys) {
+                        "eax" => End::FromEax,
+                        r => End::Base(r),
+                    },
+                    None => End::Load(slot),
+                },
+            })
+        };
+        let (Some(d), Some(s)) = (end_of(self, dest), end_of(self, src)) else {
+            return false;
+        };
+        let base_of = |e: End| match e {
+            End::Base(r) => Some(r),
+            _ => None,
+        };
+        // The register an endpoint is materialized into: `%ecx` for the
+        // source and `%edx` for the destination unless the other endpoint
+        // already uses that one as its base. Both need one only when neither
+        // has a base, and then they are `%ecx`/`%edx`: distinct.
+        let pick = |preferred: &'static str, other: Option<&'static str>| {
+            if other == Some(preferred) {
+                if preferred == "ecx" { "edx" } else { "ecx" }
+            } else {
+                preferred
+            }
+        };
+        let s_reg = pick("ecx", base_of(d));
+        let d_reg = pick("edx", base_of(s));
+        let materialize = |cg: &mut Self, e: End, reg: &'static str| match e {
+            End::Load(slot) => {
+                let sr = cg.slot_ref(slot);
+                emit!(cg.state, "    movl {}, %{}", sr, reg);
+            }
+            End::Aligned(slot, id) => cg.emit_alloca_addr_to(reg, id, slot),
+            End::FromEax => emit!(cg.state, "    movl %eax, %{}", reg),
+            End::Frame(_) | End::Base(_) => {}
+        };
+        materialize(self, s, s_reg);
+        materialize(self, d, d_reg);
+        let copy_src = match s {
+            End::Frame(slot) => CopySrc::Slot(slot),
+            End::Base(r) => CopySrc::Register(base_name(r)),
+            _ => CopySrc::Register(base_name(s_reg)),
+        };
+        let copy_dst = match d {
+            End::Frame(slot) => CopyDst::Slot(slot),
+            End::Base(r) => CopyDst::Register(base_name(r), 0),
+            _ => CopyDst::Register(base_name(d_reg), 0),
+        };
+        self.emit_copy_bytes(copy_src, copy_dst, CopyScratch::Eax, size);
+        self.state.reg_cache.invalidate_sec();
+        true
+    }
+
+    /// `-Os`: whether the straight-line copy encodes to no more bytes than
+    /// the `rep movsb` sequence, both measured by the in-tree encoder on the
+    /// exact text each would emit here (frame displacements, SIB bytes and
+    /// address materializations included). A tie keeps the straight-line
+    /// copy, which is also the faster one. Unmeasurable text or an endpoint
+    /// the straight-line form cannot address keeps `rep movsb`.
+    ///
+    /// The trials are emitted and cut off again. Neither allocates labels or
+    /// moves the net stack adjustment; the only state they can leave behind
+    /// is register-cache facts about text that no longer exists, so both
+    /// cached registers are invalidated afterwards -- facts can only be lost
+    /// (a missed reuse), never wrongly gained.
+    fn small_memcpy_is_no_larger(&mut self, dest: &Value, src: &Value, size: usize) -> bool {
+        let esp = self.esp_adjust;
+        let mark = self.state.out.buf.len();
+        let straight = self.emit_small_memcpy(dest, src, size);
+        let straight_text = self.state.out.buf.split_off(mark);
+        self.emit_rep_memcpy(dest, src, size);
+        let rep_text = self.state.out.buf.split_off(mark);
+        debug_assert_eq!(
+            self.esp_adjust, esp,
+            "a memcpy trial moved the stack adjustment"
+        );
+        self.state.reg_cache.invalidate_acc();
+        self.state.reg_cache.invalidate_sec();
+        straight
+            && matches!(
+                (encoded_len(&straight_text), encoded_len(&rep_text)),
+                (Some(s), Some(r)) if s <= r
+            )
+    }
+
+    /// The register a `Memcpy` pointer operand is read from, if it lives in
+    /// one.
+    fn memcpy_ptr_reg(&self, v: &Value) -> Option<&'static str> {
+        use crate::backend::state::SlotAddr;
+        match self.state.resolve_slot_addr(v.0)? {
+            SlotAddr::Reg(reg) => Some(phys_reg_name(reg)),
+            SlotAddr::Indirect(_) => self.reg_assignments.get(&v.0).map(|&p| phys_reg_name(p)),
+            SlotAddr::Direct(_) | SlotAddr::OverAligned(..) => None,
+        }
+    }
+
+    /// Load the address `v` denotes into `%edi`/`%esi` for `rep movsb`.
+    /// Nothing when it is already there: no self-move for the peephole to
+    /// delete, and none to inflate the `-Os` size comparison.
+    fn emit_rep_memcpy_addr(&mut self, v: &Value, to: &'static str) {
+        use crate::backend::state::SlotAddr;
+        if self.memcpy_ptr_reg(v) == Some(to) {
+            return;
+        }
+        let Some(addr) = self.state.resolve_slot_addr(v.0) else {
+            return;
+        };
+        let to_edi = to == "edi";
+        match addr {
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr_to_acc(slot, id);
+                emit!(self.state, "    movl %eax, %{}", to);
+            }
+            SlotAddr::Direct(slot) if to_edi => self.emit_memcpy_load_dest_addr(slot, true, v.0),
+            SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot, true, v.0),
+            SlotAddr::Indirect(slot) if to_edi => self.emit_memcpy_load_dest_addr(slot, false, v.0),
+            SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot, false, v.0),
+            SlotAddr::Reg(reg) => emit!(self.state, "    movl %{}, %{}", phys_reg_name(reg), to),
+        }
+    }
+
+    /// `rep movsb` with `%esi`/`%edi` saved around it (callee-saved in the
+    /// System V i386 ABI, so preserved even when the allocator assigned
+    /// nothing to them).
+    ///
+    /// The two address loads are a parallel move: `%edi <- dest`,
+    /// `%esi <- src`. Each writes its target (and `%eax` too when the address
+    /// is an over-aligned alloca) and reads the pointer's home register, if
+    /// any. They are emitted in an order in which no load clobbers a register
+    /// a later one reads; the only cycle is the exchange (source homed in
+    /// `%edi`, destination in `%esi`), done with one `xchgl`. Loading the
+    /// destination first unconditionally copied the destination onto itself
+    /// whenever the source pointer was homed in `%edi`.
+    fn emit_rep_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        use crate::backend::state::SlotAddr;
+        self.state.emit("    pushl %esi");
+        self.esp_adjust += 4;
+        self.state.emit("    pushl %edi");
+        self.esp_adjust += 4;
+        let clobbers = |cg: &Self, v: &Value, to: &'static str, r: Option<&'static str>| {
+            let over_aligned = matches!(
+                cg.state.resolve_slot_addr(v.0),
+                Some(SlotAddr::OverAligned(..))
+            );
+            r.is_some_and(|r| r == to || (over_aligned && r == "eax"))
+        };
+        let src_reads = self.memcpy_ptr_reg(src);
+        let dest_reads = self.memcpy_ptr_reg(dest);
+        if !clobbers(self, dest, "edi", src_reads) {
+            self.emit_rep_memcpy_addr(dest, "edi");
+            self.emit_rep_memcpy_addr(src, "esi");
+        } else if !clobbers(self, src, "esi", dest_reads) {
+            self.emit_rep_memcpy_addr(src, "esi");
+            self.emit_rep_memcpy_addr(dest, "edi");
+        } else {
+            // A register-homed source is not over-aligned, so the source load
+            // clobbers only %esi: the destination reads %esi and the source
+            // %edi.
+            debug_assert_eq!((src_reads, dest_reads), (Some("edi"), Some("esi")));
+            self.state.emit("    xchgl %esi, %edi");
+        }
+        self.emit_memcpy_impl(size);
+        self.state.emit("    popl %edi");
+        self.esp_adjust -= 4;
+        self.state.emit("    popl %esi");
+        self.esp_adjust -= 4;
     }
 
     /// Copy `n_bytes` from a frame slot to the outgoing argument area.
@@ -2987,51 +3343,21 @@ impl ArchCodegen for I686Codegen {
         }
     }
 
-    /// Override emit_memcpy for i686: uses rep movsb with esi/edi.
+    /// Override emit_memcpy for i686: straight-line up to
+    /// [`Self::straight_memcpy_max`], `rep movsb` with esi/edi above it.
     fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
-        use crate::backend::state::SlotAddr;
-        // Always save esi and edi around rep movsb.
-        // These are callee-saved registers in the System V i386 ABI, so we must
-        // preserve them even if the register allocator didn't assign any values
-        // to them in this function. A caller may be relying on their preservation
-        // across a call to this function.
-        self.state.emit("    pushl %esi");
-        self.esp_adjust += 4;
-        self.state.emit("    pushl %edi");
-        self.esp_adjust += 4;
-
-        // Load dest address into edi
-        if let Some(addr) = self.state.resolve_slot_addr(dest.0) {
-            match addr {
-                SlotAddr::OverAligned(slot, id) => {
-                    self.emit_alloca_aligned_addr_to_acc(slot, id);
-                    self.state.emit("    movl %eax, %edi");
+        if size <= straight_memcpy_max(self.sse_enabled) {
+            if !self.optimize_for_size {
+                if self.emit_small_memcpy(dest, src, size) {
+                    return;
                 }
-                SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr(slot, true, dest.0),
-                SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr(slot, false, dest.0),
-                SlotAddr::Reg(reg) => emit!(self.state, "    movl %{}, %edi", phys_reg_name(reg)),
+            } else if self.small_memcpy_is_no_larger(dest, src, size) {
+                let emitted = self.emit_small_memcpy(dest, src, size);
+                debug_assert!(emitted, "the size trial emitted this copy");
+                return;
             }
         }
-        // Load src address into esi
-        if let Some(addr) = self.state.resolve_slot_addr(src.0) {
-            match addr {
-                SlotAddr::OverAligned(slot, id) => {
-                    self.emit_alloca_aligned_addr_to_acc(slot, id);
-                    self.state.emit("    movl %eax, %esi");
-                }
-                SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot, true, src.0),
-                SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot, false, src.0),
-                SlotAddr::Reg(reg) => emit!(self.state, "    movl %{}, %esi", phys_reg_name(reg)),
-            }
-        }
-        // Perform the copy
-        self.emit_memcpy_impl(size);
-
-        // Restore edi and esi (reverse order of push)
-        self.state.emit("    popl %edi");
-        self.esp_adjust -= 4;
-        self.state.emit("    popl %esi");
-        self.esp_adjust -= 4;
+        self.emit_rep_memcpy(dest, src, size);
     }
 
     /// Override emit_binop to route I64/U64 through register-pair (eax:edx) arithmetic.
@@ -4027,6 +4353,23 @@ impl ArchCodegen for I686Codegen {
                     // Same home: the copy is a no-op.
                     return;
                 }
+            }
+        }
+
+        // Constant or memory-homed source landing in a non-accumulator GPR
+        // home: materialize straight into the home instead of the
+        // `movl src, %eax; movl %eax, %reg` detour (one instruction, %eax and
+        // its cache untouched). The detour cannot be repaired afterwards: phi
+        // copies end their block, so the peephole's accumulator deadness scan
+        // stops at the next label and the dead staging survives (a zero-
+        // initialized induction variable left `xorl %eax, %eax` before every
+        // such -m32 loop).
+        if let Some(dphys) = self.reg_assignments.get(&dest.0).copied() {
+            if dphys.0 != 6
+                && !self.state.is_wide_value(dest.0)
+                && self.emit_copy_direct_to_home(src, dphys)
+            {
+                return;
             }
         }
 
@@ -5228,6 +5571,371 @@ mod tests {
         assert!(gp_only_lines.iter().all(|l| !l.contains("xmm")), "gp-only");
     }
 
+    /// A codegen for `Memcpy` tests: value 1 is the destination, 2 the source.
+    fn memcpy_cg(sse: bool, size_opt: bool, setup: impl FnOnce(&mut I686Codegen)) -> I686Codegen {
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.no_sse = !sse;
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&opts);
+        cg.optimize_for_size = size_opt;
+        setup(&mut cg);
+        cg
+    }
+
+    fn memcpy_lines(cg: &mut I686Codegen, size: usize) -> Vec<String> {
+        cg.emit_memcpy(&Value(1), &Value(2), size);
+        emitted(cg)
+    }
+
+    /// Pointer value `v` spilled in a frame slot (`Indirect`).
+    fn ptr_in_slot(cg: &mut I686Codegen, v: u32, slot: i64) {
+        cg.state.value_locations.insert(v, StackSlot(slot));
+    }
+
+    /// Pointer value `v` in GPR `reg` (`Indirect` + register home).
+    fn ptr_in_reg(cg: &mut I686Codegen, v: u32, reg: u8) {
+        cg.state
+            .value_locations
+            .insert(v, StackSlot(-200 - 4 * v as i64));
+        cg.reg_assignments.insert(v, PhysReg(reg));
+    }
+
+    /// Alloca `v` at frame slot `slot` (`Direct`).
+    fn frame_object(cg: &mut I686Codegen, v: u32, slot: i64) {
+        cg.state.value_locations.insert(v, StackSlot(slot));
+        cg.state.alloca_values.insert(v);
+    }
+
+    /// Frame object to frame object: addressed as frame operands, no address
+    /// register, no callee-saved register borrowed, no `rep`.
+    #[test]
+    fn memcpy_between_frame_objects_needs_no_address_register() {
+        let mut cg = memcpy_cg(true, false, |cg| {
+            frame_object(cg, 1, -64);
+            frame_object(cg, 2, -32);
+        });
+        let lines = memcpy_lines(&mut cg, 24);
+        let s = |slot, off| cg.slot_ref_offset(StackSlot(slot), off);
+        assert_eq!(
+            lines,
+            vec![
+                format!("movups {}, %xmm0", s(-32, 0)),
+                format!("movups %xmm0, {}", s(-64, 0)),
+                format!("movups {}, %xmm0", s(-32, 8)),
+                format!("movups %xmm0, {}", s(-64, 8)),
+            ]
+        );
+    }
+
+    /// Pointers spilled in slots go to `%ecx` (source) and `%edx` (dest).
+    #[test]
+    fn memcpy_materializes_spilled_pointers_into_ecx_and_edx() {
+        let mut cg = memcpy_cg(false, false, |cg| {
+            ptr_in_slot(cg, 1, -8);
+            ptr_in_slot(cg, 2, -12);
+        });
+        let lines = memcpy_lines(&mut cg, 6);
+        let s = |slot| cg.slot_ref(StackSlot(slot));
+        assert_eq!(
+            lines,
+            vec![
+                format!("movl {}, %ecx", s(-12)),
+                format!("movl {}, %edx", s(-8)),
+                "movl 0(%ecx), %eax".to_string(),
+                "movl %eax, 0(%edx)".to_string(),
+                "movzwl 4(%ecx), %eax".to_string(),
+                "movw %ax, 4(%edx)".to_string(),
+            ]
+        );
+    }
+
+    /// A register-held pointer is used in place; a materialized endpoint
+    /// never targets the register the other endpoint uses as its base, in
+    /// either direction, and two register endpoints (even crossed) move
+    /// nothing.
+    #[test]
+    fn memcpy_register_endpoints_never_clobber_each_other() {
+        // Source in %edx: the spilled destination must avoid %edx.
+        let mut cg = memcpy_cg(true, false, |cg| {
+            ptr_in_slot(cg, 1, -8);
+            ptr_in_reg(cg, 2, 5);
+        });
+        let lines = memcpy_lines(&mut cg, 16);
+        assert_eq!(
+            lines[0],
+            format!("movl {}, %ecx", cg.slot_ref(StackSlot(-8)))
+        );
+        assert_eq!(
+            &lines[1..],
+            ["movups 0(%edx), %xmm0", "movups %xmm0, 0(%ecx)"]
+        );
+        // Destination in %ecx: the spilled source must avoid %ecx.
+        let mut cg = memcpy_cg(true, false, |cg| {
+            ptr_in_reg(cg, 1, 4);
+            ptr_in_slot(cg, 2, -12);
+        });
+        let lines = memcpy_lines(&mut cg, 16);
+        assert_eq!(
+            lines[0],
+            format!("movl {}, %edx", cg.slot_ref(StackSlot(-12)))
+        );
+        assert_eq!(
+            &lines[1..],
+            ["movups 0(%edx), %xmm0", "movups %xmm0, 0(%ecx)"]
+        );
+        // Crossed registers (source %edx, destination %ecx) and callee-saved
+        // homes: no moves at all.
+        for (d, s, dn, sn) in [(4u8, 5u8, "%ecx", "%edx"), (0, 1, "%ebx", "%esi")] {
+            let mut cg = memcpy_cg(true, false, |cg| {
+                ptr_in_reg(cg, 1, d);
+                ptr_in_reg(cg, 2, s);
+            });
+            let lines = memcpy_lines(&mut cg, 16);
+            assert_eq!(
+                lines,
+                [
+                    format!("movups 0({sn}), %xmm0"),
+                    format!("movups %xmm0, 0({dn})")
+                ]
+            );
+        }
+    }
+
+    /// A pointer homed in %eax is moved out before %eax carries data.
+    #[test]
+    fn memcpy_moves_an_eax_pointer_out_before_the_scalar_copy() {
+        let mut cg = memcpy_cg(false, false, |cg| {
+            ptr_in_slot(cg, 1, -8);
+            ptr_in_reg(cg, 2, 6);
+        });
+        let lines = memcpy_lines(&mut cg, 8);
+        assert_eq!(lines[0], "movl %eax, %ecx");
+        assert_eq!(
+            lines[1],
+            format!("movl {}, %edx", cg.slot_ref(StackSlot(-8)))
+        );
+        assert!(
+            lines[2..].iter().all(|l| !l.contains("(%eax)")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 6);
+    }
+
+    /// The speed windows, at their edges: straight-line inside (no borrowed
+    /// %esi/%edi), `rep movsb` one byte past.
+    #[test]
+    fn memcpy_straight_line_windows_follow_the_measured_policy() {
+        for (sse, max) in [(true, 256), (false, 64)] {
+            assert_eq!(straight_memcpy_max(sse), max);
+            for (size, straight) in [(max, true), (max + 1, false)] {
+                let mut cg = memcpy_cg(sse, false, |cg| {
+                    ptr_in_slot(cg, 1, -8);
+                    ptr_in_slot(cg, 2, -12);
+                });
+                let lines = memcpy_lines(&mut cg, size);
+                let rep = lines.iter().any(|l| l == "rep movsb");
+                assert_eq!(!rep, straight, "sse={sse} size={size}");
+                if straight {
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|l| !l.contains("%esi") && !l.contains("%edi"))
+                    );
+                    assert_eq!(lines.iter().any(|l| l.contains("xmm")), sse);
+                }
+            }
+        }
+    }
+
+    /// `-Os` keeps exactly the smaller encoding of the two candidates (a tie
+    /// keeps the straight-line copy), for every size in the window, frame
+    /// operands near and far (disp8 / disp32) and register bases.
+    #[test]
+    fn memcpy_under_os_keeps_the_smaller_encoding() {
+        type Setup = fn(&mut I686Codegen);
+        let layouts: [(&str, Setup); 3] = [
+            ("frame-near", |cg| {
+                frame_object(cg, 1, -40);
+                frame_object(cg, 2, -80);
+            }),
+            ("frame-far", |cg| {
+                frame_object(cg, 1, -400);
+                frame_object(cg, 2, -800);
+            }),
+            ("registers", |cg| {
+                ptr_in_reg(cg, 1, 0);
+                ptr_in_reg(cg, 2, 1);
+            }),
+        ];
+        let mut straight_won = 0;
+        let mut rep_won = 0;
+        for sse in [false, true] {
+            for (name, setup) in layouts {
+                for size in 1..=64 {
+                    let text = |cg: &I686Codegen| emitted(cg).join("\n");
+                    let mut s = memcpy_cg(sse, false, setup);
+                    assert!(s.emit_small_memcpy(&Value(1), &Value(2), size));
+                    let straight = encoded_len(&text(&s)).expect("straight-line text encodes");
+                    let mut r = memcpy_cg(sse, true, setup);
+                    r.emit_rep_memcpy(&Value(1), &Value(2), size);
+                    let rep = encoded_len(&text(&r)).expect("rep text encodes");
+                    let mut os = memcpy_cg(sse, true, setup);
+                    let chosen = memcpy_lines(&mut os, size).join("\n");
+                    let want = if straight <= rep { text(&s) } else { text(&r) };
+                    assert_eq!(
+                        chosen, want,
+                        "sse={sse} {name} size={size}: {straight} vs {rep} bytes"
+                    );
+                    if straight <= rep {
+                        straight_won += 1
+                    } else {
+                        rep_won += 1
+                    }
+                }
+            }
+        }
+        // Both outcomes occur, so the comparison is exercised, not vacuous.
+        assert!(straight_won > 0 && rep_won > 0, "{straight_won}/{rep_won}");
+    }
+
+    /// The `rep movsb` address loads are a parallel move: no load clobbers a
+    /// register a later load reads.
+    #[test]
+    fn rep_memcpy_address_loads_never_clobber_each_other() {
+        let rep_lines = |setup: fn(&mut I686Codegen)| {
+            let mut cg = memcpy_cg(true, false, setup);
+            cg.emit_rep_memcpy(&Value(1), &Value(2), 300);
+            let lines = emitted(&cg);
+            assert_eq!(&lines[..2], ["pushl %esi", "pushl %edi"]);
+            assert_eq!(
+                &lines[lines.len() - 4..],
+                ["movl $300, %ecx", "rep movsb", "popl %edi", "popl %esi"]
+            );
+            lines[2..lines.len() - 4].to_vec()
+        };
+        // Default order: destination first.
+        assert_eq!(
+            rep_lines(|cg| {
+                ptr_in_reg(cg, 1, 1);
+                ptr_in_reg(cg, 2, 0);
+            }),
+            ["movl %esi, %edi", "movl %ebx, %esi"]
+        );
+        // Source homed in %edi: it is read before %edi is written.
+        assert_eq!(
+            rep_lines(|cg| {
+                ptr_in_reg(cg, 1, 0);
+                ptr_in_reg(cg, 2, 2);
+            }),
+            ["movl %edi, %esi", "movl %ebx, %edi"]
+        );
+        // The exchange: source in %edi, destination in %esi.
+        assert_eq!(
+            rep_lines(|cg| {
+                ptr_in_reg(cg, 1, 1);
+                ptr_in_reg(cg, 2, 2);
+            }),
+            ["xchgl %esi, %edi"]
+        );
+        // Already in place: no moves at all.
+        assert!(
+            rep_lines(|cg| {
+                ptr_in_reg(cg, 1, 2);
+                ptr_in_reg(cg, 2, 1);
+            })
+            .is_empty()
+        );
+        // A pointer homed in %eax is read before an over-aligned alloca's
+        // address is formed through %eax, in either role.
+        for (src_in_eax, first) in [(true, "movl %eax, %esi"), (false, "movl %eax, %edi")] {
+            let mut cg = memcpy_cg(true, false, |cg| {
+                cg.state.value_locations.insert(1, StackSlot(-64));
+                cg.state.value_locations.insert(2, StackSlot(-128));
+                cg.state.alloca_values.insert(1);
+                cg.state.alloca_values.insert(2);
+            });
+            let (eax_v, aligned_v) = if src_in_eax { (2u32, 1u32) } else { (1, 2) };
+            cg.state.alloca_values.remove(&eax_v);
+            cg.reg_assignments.insert(eax_v, PhysReg(6));
+            cg.state.alloca_alignments.insert(aligned_v, 64);
+            assert!(matches!(
+                cg.state.resolve_slot_addr(aligned_v),
+                Some(crate::backend::state::SlotAddr::OverAligned(..))
+            ));
+            cg.emit_rep_memcpy(&Value(1), &Value(2), 300);
+            let lines = emitted(&cg);
+            assert_eq!(lines[2], first, "src_in_eax={src_in_eax}: {lines:?}");
+        }
+    }
+
+    /// Exhaustive safety and completeness of the straight-line copy: every
+    /// access lies inside `[0, size)` of both objects, and every byte of the
+    /// destination is written.
+    #[test]
+    fn memcpy_straight_line_copy_is_in_bounds_and_complete() {
+        fn width(mn: &str) -> usize {
+            match mn {
+                "movb" => 1,
+                "movw" | "movzwl" => 2,
+                "movl" => 4,
+                "movups" => 16,
+                other => panic!("unmodelled mnemonic {other}"),
+            }
+        }
+        for sse in [false, true] {
+            let max = if sse { 256 } else { 64 };
+            for size in 1..=max {
+                let mut cg = memcpy_cg(sse, false, |cg| {
+                    ptr_in_reg(cg, 1, 0);
+                    ptr_in_reg(cg, 2, 1);
+                });
+                let mut written = vec![false; size];
+                for line in memcpy_lines(&mut cg, size) {
+                    let (mn, ops) = line.split_once(' ').expect("instruction");
+                    let w = width(mn);
+                    for op in ops.split(", ").filter(|o| o.contains('(')) {
+                        let off: usize = op[..op.find('(').unwrap()].parse().unwrap();
+                        assert!(off + w <= size, "sse={sse} size={size}: `{line}`");
+                        if op.ends_with("(%ebx)") {
+                            written[off..off + w].iter_mut().for_each(|b| *b = true);
+                        }
+                    }
+                }
+                assert!(
+                    written.iter().all(|&b| b),
+                    "sse={sse} size={size}: bytes left unwritten"
+                );
+            }
+        }
+    }
+
+    /// A directly-homed parameter's whole extent is redirected, exact home
+    /// and interior bytes alike; bytes past the extent, and every byte of a
+    /// home whose extent is 1, keep their own frame location.
+    #[test]
+    fn direct_home_translation_covers_the_extent_and_nothing_else() {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.omit_frame_pointer = false;
+        cg.param_direct_homes.insert(-8, (12, 4));
+        cg.param_direct_homes.insert(-16, (16, 1));
+        assert_eq!(cg.slot_ref(StackSlot(-8)), "12(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-7)), "13(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-5)), "15(%ebp)");
+        assert_eq!(cg.slot_ref_offset(StackSlot(-7), 1), "14(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-4)), "-4(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-9)), "-9(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-16)), "16(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-15)), "-15(%ebp)");
+        // -fomit-frame-pointer: the same bytes, %esp-relative.
+        cg.omit_frame_pointer = true;
+        cg.frame_base_offset = 40;
+        cg.esp_adjust = 8;
+        assert_eq!(cg.slot_ref(StackSlot(-7)), cg.param_ref(13));
+        assert_eq!(cg.param_ref(13), format!("{}(%esp)", 13 - 4 + 40 + 8));
+        assert_eq!(cg.slot_ref(StackSlot(-4)), format!("{}(%esp)", -4 + 40 + 8));
+    }
+
     fn emitted(cg: &I686Codegen) -> Vec<String> {
         cg.state
             .out
@@ -5517,6 +6225,119 @@ mod tests {
     }
 
     /// A `CopyDst::Register` destination is named off the register, and the
+    /// Copy `src` into value 10 homed in `home`, after `setup`; the emitted
+    /// lines and the codegen (for cache inspection).
+    fn copy_into_home(
+        home: u8,
+        src: Operand,
+        setup: impl FnOnce(&mut I686Codegen),
+    ) -> (Vec<String>, I686Codegen) {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.reg_assignments.insert(10, PhysReg(home));
+        setup(&mut cg);
+        cg.emit_copy_value(&Value(10), &src);
+        (emitted(&cg), cg)
+    }
+
+    /// A constant copied into a GPR home is ONE instruction writing the home,
+    /// and it is the accumulator detour's materialization retargeted: same
+    /// immediate, same zero idiom (so the same flag effect), for every
+    /// constant kind. The reference is the detour itself, emitted by the
+    /// primitives the fallback path calls.
+    #[test]
+    fn constant_copy_into_a_home_is_the_detour_retargeted() {
+        let mut checked = 0;
+        for (name, c, _, _) in arms() {
+            // Pair constants (the copy path's own width rule) take the pair
+            // branch before the direct path is considered.
+            let pair = matches!(c, IrConst::F64(_) | IrConst::D64(_))
+                || matches!(c, IrConst::I64(v) if v < i32::MIN as i64 || v > u32::MAX as i64);
+            if pair {
+                continue;
+            }
+            let mut reference = I686Codegen::new();
+            reference.apply_options(&crate::backend::CodegenOptions::default());
+            reference.reg_assignments.insert(10, PhysReg(0));
+            reference.operand_to_eax(&Operand::Const(c));
+            reference.store_eax_to(&Value(10));
+            let detour = emitted(&reference);
+            assert_eq!(detour.len(), 2, "{name}: {detour:?}");
+            assert_eq!(detour[1], "movl %eax, %ebx", "{name}");
+            let (lines, _) = copy_into_home(0, Operand::Const(c), |_| {});
+            assert_eq!(lines, vec![detour[0].replace("%eax", "%ebx")], "{name}");
+            checked += 1;
+        }
+        assert!(checked >= 12, "only {checked} single-word arms exercised");
+    }
+
+    #[test]
+    fn slot_sources_load_straight_into_the_home() {
+        let (lines, cg) = copy_into_home(1, Operand::Value(Value(20)), |cg| {
+            cg.state.value_locations.insert(20, StackSlot(-32));
+        });
+        assert_eq!(
+            lines,
+            vec![format!("movl {}, %esi", cg.slot_ref(StackSlot(-32)))]
+        );
+        // An alloca's value is its address.
+        let (lines, cg) = copy_into_home(1, Operand::Value(Value(20)), |cg| {
+            cg.state.value_locations.insert(20, StackSlot(-32));
+            cg.state.alloca_values.insert(20);
+        });
+        assert_eq!(
+            lines,
+            vec![format!("leal {}, %esi", cg.slot_ref(StackSlot(-32)))]
+        );
+    }
+
+    /// Each refusal keeps the accumulator path, whose output differs from the
+    /// direct form: the controls above take the direct path.
+    #[test]
+    fn direct_home_copy_refusals_keep_the_accumulator_path() {
+        // Destination homed in %eax: materializing there IS the direct form.
+        let (lines, _) = copy_into_home(6, Operand::Const(IrConst::I32(0)), |_| {});
+        assert_eq!(lines, vec!["xorl %eax, %eax"]);
+        // Source already verified in %eax: one register move, no memory read.
+        let (lines, _) = copy_into_home(0, Operand::Value(Value(20)), |cg| {
+            cg.state.value_locations.insert(20, StackSlot(-32));
+            cg.state.park_acc(20, false);
+        });
+        assert_eq!(lines, vec!["movl %eax, %ebx"]);
+        // Source homed in %eax (the reg-to-reg path excludes it).
+        let (lines, _) = copy_into_home(0, Operand::Value(Value(20)), |cg| {
+            cg.reg_assignments.insert(20, PhysReg(6));
+        });
+        assert_eq!(lines, vec!["movl %eax, %ebx"]);
+        // Home-less accumulator temporary: the consumer reads %eax as-is.
+        let (lines, _) = copy_into_home(0, Operand::Value(Value(20)), |_| {});
+        assert_eq!(lines, vec!["movl %eax, %ebx"]);
+        // Over-aligned alloca: needs the lea+add+and sequence.
+        let (lines, _) = copy_into_home(0, Operand::Value(Value(20)), |cg| {
+            cg.state.value_locations.insert(20, StackSlot(-64));
+            cg.state.alloca_values.insert(20);
+            cg.state.alloca_alignments.insert(20, 32);
+        });
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[3], "movl %eax, %ebx");
+    }
+
+    /// %ecx is also the secondary staging register: writing an %ecx home
+    /// directly must drop the secondary cache entry; other homes keep it.
+    #[test]
+    fn direct_copy_into_ecx_drops_the_secondary_cache() {
+        let (lines, cg) = copy_into_home(4, Operand::Const(IrConst::I32(5)), |cg| {
+            cg.state.park_sec(30, false);
+        });
+        assert_eq!(lines, vec!["movl $5, %ecx"]);
+        assert!(!cg.state.reg_cache.sec_has(30, false));
+        let (lines, cg) = copy_into_home(0, Operand::Const(IrConst::I32(5)), |cg| {
+            cg.state.park_sec(30, false);
+        });
+        assert_eq!(lines, vec!["movl $5, %ebx"]);
+        assert!(cg.state.reg_cache.sec_has(30, false));
+    }
+
     /// `%edx` scratch spellings keep their widths consistent -- the `va_arg`
     /// copier depends on both, and a `%dl`/`%dx`/`%edx` mismatch would store
     /// the wrong width.

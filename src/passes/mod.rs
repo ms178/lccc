@@ -56,6 +56,7 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
 mod join_store_forward;
+pub(crate) mod jump_thread;
 pub(crate) mod licm;
 pub(crate) mod live_range_shrinkage;
 pub(crate) mod load_forward;
@@ -75,6 +76,7 @@ mod module_symbol_facts;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
 mod pair_load_carry;
+pub(crate) mod phi_relay_fold;
 pub(crate) mod ptr_iv_collapse;
 pub(crate) mod quadratic_sr;
 pub(crate) mod range_check;
@@ -103,6 +105,7 @@ pub(crate) mod vec_interleave;
 pub(crate) mod vec_load_sink;
 mod vec_relations;
 pub(crate) mod vec_ssa;
+pub(crate) mod vector_fill;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
@@ -593,6 +596,11 @@ fn run_gvn_licm_ivsr_shared(
     let mut licm_total = 0usize;
     let mut ivsr_total = 0usize;
     let gvn_context = gvn::GvnContext::for_module(module);
+    let licm_safe_globals = if run_licm {
+        licm::speculation_safe_globals(module)
+    } else {
+        licm::SpeculationSafeGlobals::default()
+    };
 
     for (i, func) in module.functions.iter_mut().enumerate() {
         if func.is_declaration {
@@ -659,7 +667,7 @@ fn run_gvn_licm_ivsr_shared(
             } else {
                 None
             };
-            let n = licm::licm_with_analysis(func, &cfg);
+            let n = licm::licm_with_analysis(func, &cfg, &licm_safe_globals);
             verify::verify_after_func_pass(func, "licm");
             if let Some(t0) = t0 {
                 eprintln!(
@@ -1597,7 +1605,12 @@ pub(crate) fn run_passes(
     // keeps the kill-switch unit test from racing its siblings (see
     // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
     loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
-    inline::set_self_recursion_clone_enabled(std::env::var("CCC_NO_SELF_RECURSION_CLONE").is_err());
+    let self_recursion_clone = std::env::var("CCC_NO_SELF_RECURSION_CLONE").is_err();
+    inline::set_self_recursion_clone_enabled(self_recursion_clone);
+    // Resolve this diagnostic toggle once per translation unit, alongside the
+    // other pass configuration, rather than rescanning the process environment
+    // during parameter remapping.
+    inline::set_paramref_debug_enabled(std::env::var_os("CCC_INLINE_PARAMREF_DEBUG").is_some());
     loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
     loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
     // Every remaining pass switch, resolved here for the same reason.  No pass
@@ -1864,7 +1877,14 @@ pub(crate) fn run_passes(
         copy_prop::run(module);
         o1_checkpoint!("constfold+copyprop");
         if !pass_disabled(&disabled, "libmemcpy") {
-            builtin_policy::canonicalize_library_memcpy(module, target);
+            builtin_policy::canonicalize_library_memcpy(
+                module,
+                builtin_policy::library_memcpy_inline_max(
+                    target,
+                    loop_idiom_capabilities.i686_sse,
+                    opt_level >= 4,
+                ),
+            );
         }
         o1_checkpoint!("libmemcpy");
         // Local simplifier at -O1: shift identity folds (x>>0 -> x, 0<<x -> 0,
@@ -1990,6 +2010,7 @@ pub(crate) fn run_passes(
         resolve_asm::resolve_inline_asm_symbols(module);
         // Unreachable internal-linkage functions go, as at -O0 and -O2+.
         dead_statics::eliminate_dead_static_functions(module);
+        restore_entry_param_prefix(module);
         if time_passes {
             round_cap::report();
         }
@@ -2021,6 +2042,15 @@ pub(crate) fn run_passes(
     }
     let allow_inline = opt_level != 4 && opt_level != 5;
     preloop_dump!("lowering(pre-O2)");
+    // The one-level self-recursion clone waits for the post-structural
+    // inliner below. Run here, it would expand recursion that rec2iter and
+    // tce_acc rewrite into loops -- `return 1 + f(l) + f(r)` became four real
+    // calls instead of one call plus a loop -- and it would leave
+    // `self_inline` (which owns small frame-neutral bodies, three levels)
+    // nothing to see: Callgrind, binary_trees -O2, clone-first 15.160G Ir /
+    // 43.9M mispredicts against 14.571G / 42.1M with self_inline owning the
+    // tree walks. -O1 has neither rewrite and keeps the clone in its inliner.
+    inline::suspend_self_recursion_clone(true, self_recursion_clone);
     run_inline_phase(
         module,
         &disabled,
@@ -2030,6 +2060,7 @@ pub(crate) fn run_passes(
         pic,
         ra_config,
     );
+    inline::suspend_self_recursion_clone(false, self_recursion_clone);
     preloop_dump!("inline_phase");
     // The regular simplify loop folds math libcalls at -O2+, but strict
     // -frounding-math/-ftrapping-math functions bypass that transform.  The
@@ -2052,7 +2083,14 @@ pub(crate) fn run_passes(
     // the `__builtin_` spelling already lowers to (see the pass doc); again
     // after the post-inline fold below, which makes more lengths literal.
     if !pass_disabled(&disabled, "libmemcpy") {
-        builtin_policy::canonicalize_library_memcpy(module, target);
+        builtin_policy::canonicalize_library_memcpy(
+            module,
+            builtin_policy::library_memcpy_inline_max(
+                target,
+                loop_idiom_capabilities.i686_sse,
+                opt_level >= 4,
+            ),
+        );
         preloop_dump!("libmemcpy");
     }
 
@@ -2090,6 +2128,20 @@ pub(crate) fn run_passes(
         module.for_each_function(recursion_to_iter::recursion_to_iteration);
     }
     preloop_dump!("rec2iter");
+
+    // Accumulator recursion elimination (`return 1 + f(l) + f(r)`): after
+    // rec2iter, whose closed loop for `f(n - 1) + f(n - 2)` is better.
+    if !pass_disabled(&disabled, "tce_acc") {
+        module.for_each_function(tail_call_elim::accumulator_calls_to_loops);
+    }
+    preloop_dump!("tce_acc");
+
+    // Bounded recursive self-inlining (see `inline::self_recursion`): after
+    // the recursion-to-loop rewrites, so it copies what recursion is left.
+    if allow_inline && !pass_disabled(&disabled, "self_inline") {
+        inline::inline_self_recursion(module);
+    }
+    preloop_dump!("self_inline");
 
     // Cost the compact form of byte-decoding accessors, not their expanded
     // shifts/ORs. Reuse the existing legality proof before the already-bounded
@@ -2139,7 +2191,14 @@ pub(crate) fn run_passes(
         constant_fold::run(module);
         copy_prop::run(module);
         if !pass_disabled(&disabled, "libmemcpy") {
-            builtin_policy::canonicalize_library_memcpy(module, target);
+            builtin_policy::canonicalize_library_memcpy(
+                module,
+                builtin_policy::library_memcpy_inline_max(
+                    target,
+                    loop_idiom_capabilities.i686_sse,
+                    opt_level >= 4,
+                ),
+            );
         }
         simplify::run(module);
         module.for_each_function(cfg_simplify::run_function);
@@ -2422,7 +2481,7 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
-        // The AVX2 strided-I32 reducer needs the original IV step and
+        // The strided-I32 reducer (AVX2 or SSE2) needs the original IV step and
         // guard-safe scalar remainder. Give that narrowly-scoped matcher first
         // refusal before early scalar unrolling rewrites the IV increment.
         // All other loops are unchanged and continue through the unroller.
@@ -3920,7 +3979,37 @@ pub(crate) fn run_passes(
         for function in &mut module.functions {
             let changed = loop_memset::run(function);
             if changed > 0 {
+                // A constant trip count leaves `n = bound - init` and an
+                // `n != 0` guard that no later pass folds (this runs after
+                // the last constant-fold / CFG-simplify round): fold them
+                // here, on the rewritten functions only.
+                constant_fold::fold_function(function);
+                cfg_simplify::run_function(function);
                 verify::verify_after_func_pass(function, "loop_memset");
+            }
+        }
+    }
+    // Vector fill: the fills loop_memset cannot express (a 16/32/64-bit
+    // element that is not one repeated byte, a float constant, a run-time
+    // value) get a 16-byte store pre-loop; the scalar loop finishes the tail.
+    // Same placement argument as loop_memset (settled loop shape, before
+    // redundant-load elimination); a tree-vectorizer transform, so it obeys
+    // -fno-tree-vectorize and stays off at -O1/-Os/-Oz like GCC's.
+    if target == crate::backend::Target::X86_64
+        && matches!(opt_level, 2 | 3)
+        && !disable_tree_vectorize
+        && !pass_disabled(&disabled, "vector_fill")
+    {
+        for function in &mut module.functions {
+            let feats = function.target_features.clone();
+            let changed = with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |isa| {
+                vector_fill::run(function, isa.simd)
+            });
+            if changed > 0 {
+                // A constant-multiple fill leaves its scalar loop unreachable.
+                constant_fold::fold_function(function);
+                cfg_simplify::run_function(function);
+                verify::verify_after_func_pass(function, "vector_fill");
             }
         }
     }
@@ -4021,6 +4110,30 @@ pub(crate) fn run_passes(
     // Fail-closed soundness rules in the pass header; nothing is ever
     // duplicated. Kill switches: CCC_NO_BOOL_THREAD=1,
     // CCC_DISABLE_PASSES=boolthread.
+    // Jump threading of branches a dominating test already decided (the
+    // list-merge `while (a && b)` re-test of the pointer that did not
+    // advance); see `jump_thread`. It duplicates up to a few instructions
+    // per thread, so -Os/-Oz and -O1 keep the merged shape.
+    // CCC_DISABLE_PASSES=jump_thread disables.
+    if opt_level >= 2 && !optimize_for_size && !pass_disabled(&disabled, "jump_thread") {
+        if dump_each_pass {
+            dump_ir_filtered(module, "before jump_thread");
+        }
+        let n = module.for_each_function(jump_thread::run);
+        if dump_each_pass {
+            dump_ir_filtered(module, "after jump_thread");
+        }
+        verify::verify_after_pass(module, "jump_thread");
+        if n > 0 {
+            // Clones end in jumps to single-predecessor blocks and carry
+            // phi-turned-Copy instructions: merge, propagate, collect.
+            module.for_each_function(cfg_simplify::simplify_cfg);
+            module.for_each_function(copy_prop::propagate_copies);
+            module.for_each_function(dce::eliminate_dead_code);
+            verify::verify_after_pass(module, "jump_thread_cleanup");
+        }
+    }
+
     if !pass_disabled(&disabled, "boolthread") && std::env::var("CCC_NO_BOOL_THREAD").is_err() {
         let n = module.for_each_function(bool_thread::run);
         if n > 0 {
@@ -4325,6 +4438,7 @@ pub(crate) fn run_passes(
         fma_neg_peel::run(module);
         verify::verify_after_pass(module, "fmanegpeel");
     }
+    restore_entry_param_prefix(module);
 
     // An inline asm that assembles to nothing and names no register is a
     // compiler barrier with no code behind it: `asm volatile("" : "+m"(x))`.
@@ -4352,6 +4466,70 @@ pub(crate) fn run_passes(
         eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
         eprintln!("{:#?}", module);
         eprintln!("==== END IR after all passes ====");
+    }
+}
+
+/// Move every entry-block `ParamRef` into the block's leading
+/// `Alloca`/`ParamRef` run, keeping the relative order of the moved
+/// `ParamRef`s and of everything else.
+///
+/// Lowering emits that prefix, and the x86-64 allocator grants parameters
+/// caller-saved homes only when it still holds
+/// (`regalloc::x86_param_caller_homes_safe_with_config`: a parameter read at
+/// its `ParamRef` must be read before any instruction can clobber its ABI
+/// register). Passes that insert into the entry block -- LICM placing a
+/// hoisted `GlobalAddr` into a preheader that is block 0 -- broke it, and a
+/// leaf loop such as `for (...) if (p[i]) c += E;` then pushed `%rbx` and
+/// `%r12` to copy both parameters into them (GCC 16.2, Clang 23.1.4 and ICX
+/// 2026.2 use none). Moving a `ParamRef` earlier is always sound: it has no
+/// operands and denotes the same value at every point of the function.
+/// `source_spans` (parallel to the instructions under `-g`) move with it,
+/// so the code is identical with and without debug info.
+pub(crate) fn restore_entry_param_prefix(module: &mut IrModule) {
+    for func in &mut module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let Some(entry) = func.blocks.first_mut() else {
+            continue;
+        };
+        let insts = &entry.instructions;
+        let prefix = insts
+            .iter()
+            .take_while(|i| matches!(i, Instruction::Alloca { .. } | Instruction::ParamRef { .. }))
+            .count();
+        if !insts[prefix..]
+            .iter()
+            .any(|i| matches!(i, Instruction::ParamRef { .. }))
+        {
+            continue;
+        }
+        // A stable sort on (prefix, moved ParamRef, rest) is the permutation.
+        let keys: Vec<u8> = insts
+            .iter()
+            .enumerate()
+            .map(|(k, i)| match (k < prefix, i) {
+                (true, _) => 0,
+                (false, Instruction::ParamRef { .. }) => 1,
+                _ => 2,
+            })
+            .collect();
+        let mut insts: Vec<(u8, Instruction)> = keys
+            .iter()
+            .copied()
+            .zip(std::mem::take(&mut entry.instructions))
+            .collect();
+        insts.sort_by_key(|(key, _)| *key);
+        entry.instructions = insts.into_iter().map(|(_, inst)| inst).collect();
+        if entry.source_spans.len() == keys.len() {
+            let mut spans: Vec<(u8, crate::common::source::Span)> = keys
+                .iter()
+                .copied()
+                .zip(std::mem::take(&mut entry.source_spans))
+                .collect();
+            spans.sort_by_key(|(key, _)| *key);
+            entry.source_spans = spans.into_iter().map(|(_, span)| span).collect();
+        }
     }
 }
 
@@ -4908,5 +5086,100 @@ mod signed_wrap_policy_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod entry_param_prefix_tests {
+    use super::restore_entry_param_prefix;
+    use crate::common::source::Span;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrFunction, IrModule, Operand, Terminator, Value,
+    };
+
+    fn param(dest: u32, idx: usize) -> Instruction {
+        Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx: idx,
+            ty: IrType::I32,
+        }
+    }
+
+    fn module(insts: Vec<Instruction>, spans: bool) -> IrModule {
+        let mut f = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+        let source_spans = if spans {
+            (0u32..)
+                .take(insts.len())
+                .map(|k| Span::new(k, k + 1, 0))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans,
+        }];
+        let mut m = IrModule::new();
+        m.functions = vec![f];
+        m
+    }
+
+    fn shape(m: &IrModule) -> Vec<String> {
+        m.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .map(|i| match i {
+                Instruction::ParamRef { dest, .. } => format!("p{}", dest.0),
+                Instruction::GlobalAddr { dest, .. } => format!("g{}", dest.0),
+                Instruction::Copy { dest, .. } => format!("c{}", dest.0),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn late_param_refs_rejoin_the_prefix_with_their_spans() {
+        let ga = |d| Instruction::GlobalAddr {
+            dest: Value(d),
+            name: "E".to_string(),
+        };
+        let cp = |d| Instruction::Copy {
+            dest: Value(d),
+            src: Operand::Value(Value(0)),
+        };
+        for spans in [false, true] {
+            let mut m = module(
+                vec![param(0, 0), ga(9), param(1, 1), cp(5), param(2, 2)],
+                spans,
+            );
+            restore_entry_param_prefix(&mut m);
+            assert_eq!(shape(&m), ["p0", "p1", "p2", "g9", "c5"]);
+            let got: Vec<u32> = m.functions[0].blocks[0]
+                .source_spans
+                .iter()
+                .map(|s| s.start)
+                .collect();
+            assert_eq!(got, if spans { vec![0, 2, 4, 1, 3] } else { vec![] });
+        }
+    }
+
+    #[test]
+    fn a_well_formed_prefix_is_left_alone() {
+        let mut m = module(
+            vec![
+                param(0, 0),
+                param(1, 1),
+                Instruction::GlobalAddr {
+                    dest: Value(9),
+                    name: "E".to_string(),
+                },
+            ],
+            true,
+        );
+        restore_entry_param_prefix(&mut m);
+        assert_eq!(shape(&m), ["p0", "p1", "g9"]);
     }
 }

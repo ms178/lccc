@@ -393,6 +393,8 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                 || line.starts_with("movzwq ")
                 || line.starts_with("movsbl ")
                 || line.starts_with("movzbl ")
+                || line.starts_with("movswl ")
+                || line.starts_with("movzwl ")
             {
                 // Textual fallback for sign/zero-extending loads the
                 // classifier missed; the destination is the post-comma
@@ -402,8 +404,8 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                 if let Some(comma) = line.rfind(',') {
                     let dst = line[comma + 1..].trim();
                     if !dst.contains('(') && !dst.contains(' ') {
-                        // `movsbl/movzbl` and the `*bq` forms read 1 byte,
-                        // the `*wq` forms 2 (5th mnemonic character).
+                        // The `*b*` forms read 1 byte, the `*w*` forms 2
+                        // (5th mnemonic character).
                         let bytes = if line.as_bytes()[4] == b'w' { 2 } else { 1 };
                         load_info = Some((
                             register_family_fast(dst),
@@ -545,6 +547,8 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                     || text.starts_with("movzwq ")
                     || text.starts_with("movsbl ")
                     || text.starts_with("movzbl ")
+                    || text.starts_with("movswl ")
+                    || text.starts_with("movzwl ")
                 {
                     parse_stack_operand(text, true)
                 } else {

@@ -9,9 +9,16 @@ use super::elf_read::*;
 use super::got::{
     GotKind, GotLayout, R_RISCV_TLS_DTPMOD64, R_RISCV_TLS_DTPREL64, R_RISCV_TLS_TPREL64,
 };
-use super::relocations::{GlobalSym, MergedSection, align_up, build_gnu_hash, pad_to, write_phdr};
+use super::relax::{LayoutProbe, RelaxProbeLayout, fill_relax_probe};
+use super::relocations::{
+    GlobalSym, MergedSection, R_RISCV_ALIGN, R_RISCV_CALL, R_RISCV_CALL_PLT, R_RISCV_GOT_HI20,
+    R_RISCV_JAL, R_RISCV_NONE, R_RISCV_RELAX, R_RISCV_RVC_JUMP, align_up, build_gnu_hash, pad_to,
+    write_phdr,
+};
 use super::{debug, reloc, symbols};
 use crate::backend::linker_common;
+use crate::backend::linker_common::build_id::BuildIdStyle;
+use crate::backend::linker_common::eh_frame_gnu::EhFrameLayout;
 use crate::backend::linker_common::shdr::{self, ShdrSpec};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -21,11 +28,13 @@ use crate::backend::elf::{
     DT_PREINIT_ARRAYSZ, DT_RELA, DT_RELAENT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
     DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, EM_RISCV as EM_RISCV_ELF, ET_EXEC, PF_R, PF_W, PF_X,
     PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NOTE, PT_TLS, SHF_INFO_LINK,
-    STT_FUNC, STT_GNU_IFUNC, STT_TLS,
+    SHT_NOTE, STT_FUNC, STT_GNU_IFUNC, STT_TLS,
 };
 
 const PT_GNU_EH_FRAME: u32 = 0x6474e550;
 const PT_RISCV_ATTRIBUTES: u32 = 0x70000003;
+/// `RISCV_GP_SYMBOL`.
+const GP_SYMBOL: &str = "__global_pointer$";
 
 const PAGE_SIZE: u64 = 0x1000;
 const BASE_ADDR: u64 = 0x10000;
@@ -49,6 +58,9 @@ const INTERP: &[u8] = b"/lib/ld-linux-riscv64-lp64d.so.1\0";
 /// `debug_sections`: the DWARF to append (none under `-s`/`-S`)
 /// `keep_symtab`: write `.symtab` (false under `-s`)
 /// `output_path`: output file path
+/// `z_relro`: `-z relro` (default) / `-z norelro`
+/// `probe`: lay out only, report the layout for relaxation (`relax.rs`) and
+/// return before any relocation is applied or anything is written
 pub fn emit_executable(
     input_objs: &[(String, ElfObject)],
     merged_sections: &mut Vec<MergedSection>,
@@ -68,6 +80,11 @@ pub fn emit_executable(
     debug_sections: &mut debug::DebugSections,
     keep_symtab: bool,
     output_path: &str,
+    z_relro: bool,
+    eh_frame: &EhFrameLayout,
+    build_id: &BuildIdStyle,
+    gnu_stack: Option<u32>,
+    probe: Option<&mut LayoutProbe>,
 ) -> Result<(), String> {
     // ── Phase 4: Compute generated section sizes and layout ────────────
 
@@ -122,8 +139,8 @@ pub fn emit_executable(
     // 260). (Pre-fix it was never laid out, so PT_GNU_EH_FRAME pointed at
     // address 0 and the unwinder found no FDE in any lccc-ld executable.)
     let mut layout_order: Vec<usize> = sec_indices.to_vec();
-    if eh_frame_hdr_fde_count > 0 {
-        let hdr_size = 12 + 8 * eh_frame_hdr_fde_count;
+    let hdr_size = eh_frame.hdr_size(eh_frame_hdr_fde_count);
+    if hdr_size > 0 {
         let idx = merged_sections.len();
         merged_map.insert(".eh_frame_hdr".into(), idx);
         merged_sections.push(MergedSection {
@@ -132,6 +149,8 @@ pub fn emit_executable(
             sh_flags: SHF_ALLOC,
             data: vec![0u8; hdr_size],
             vaddr: 0,
+            entsize: 0,
+            script_write: false,
             align: 4,
         });
         let ef_idx = merged_map.get(".eh_frame").copied();
@@ -146,21 +165,98 @@ pub fn emit_executable(
     // Check for TLS sections
     let has_tls = merged_sections.iter().any(|ms| ms.sh_flags & SHF_TLS != 0);
 
-    // Estimate phdr count
-    let num_phdrs = if is_static {
-        let base = 6; // LOAD(RX), LOAD(RW), NOTE, GNU_EH_FRAME, GNU_STACK, RISCV_ATTR
-        if has_tls { base + 1 } else { base }
-    } else if has_tls {
-        11
+    // RELRO as GNU ld decides it (`lang_find_relro_sections`).
+    let relro = z_relro && relro_inputs_present(input_objs, got_size, is_static);
+
+    let ifunc_names: Vec<String> = if is_static {
+        iplt_symbols(global_syms, input_objs)
     } else {
-        10
+        Vec::new()
     };
+    let ifunc_count = ifunc_names.len() as u64;
+    let relro_offset = if got_plt_size >= 16 { 16 } else { 0 };
+
+    // Two header decisions GNU ld makes from what it actually places, read
+    // off one RW layout from base 0 (the layout is a pure function of its
+    // base, and at 0 no alignment pad exists):
+    // * the RW PT_LOAD exists only for placed sections: a link with nothing
+    //   writable has none, the closing `ALIGN(. != 0 ? 8 : 1)` of an empty
+    //   `.bss` must not invent one, and `.tbss` takes no address space;
+    // * "Make a PT_GNU_RELRO segment only when it isn't empty"
+    //   (`_bfd_elf_map_sections_to_segments`): RELRO-class inputs that place
+    //   no bytes (`.tbss` alone) keep the RELRO layout but get no header.
+    let rw_probe = lay_rw(&RwInputs {
+        merged_sections,
+        sec_indices,
+        base: 0,
+        relro_adjust: false,
+        relro_offset,
+        dynamic_size: if is_static { 0 } else { dynamic_size },
+        got_size,
+        got_plt_size: if is_static { 0 } else { got_plt_size },
+        ifunc_count,
+        copy_symbols,
+    });
+    let has_rw_segment = rw_probe.end != 0;
+    let relro_phdr = relro && rw_probe.relro_end_raw != 0;
+
+    // PT_NOTE segments as GNU ld forms them (`_bfd_elf_map_sections_to_segments`):
+    // one per run of adjacent loaded SHT_NOTE sections sharing an alignment.
+    let mut note_groups: Vec<Vec<usize>> = Vec::new();
+    let mut prev_note = false;
+    for &si in sec_indices {
+        let ms = &merged_sections[si];
+        if ms.sh_flags & SHF_ALLOC == 0 || ms.data.is_empty() || ms.name == ".riscv.attributes" {
+            continue;
+        }
+        let is_note = ms.sh_type == SHT_NOTE;
+        match note_groups.last_mut() {
+            Some(group) if is_note && prev_note && merged_sections[group[0]].align == ms.align => {
+                group.push(si);
+            }
+            _ if is_note => note_groups.push(vec![si]),
+            _ => {}
+        }
+        prev_note = is_note;
+    }
+    let has_riscv_attrs = merged_map
+        .get(".riscv.attributes")
+        .is_some_and(|&i| !merged_sections[i].data.is_empty());
+    let has_eh_frame_hdr = merged_map.contains_key(".eh_frame_hdr");
+
+    // Exactly the program headers GNU ld emits: PHDR, INTERP and DYNAMIC
+    // when dynamic; RISCV_ATTRIBUTES when the section exists; the RX LOAD
+    // and, when anything is writable, the RW LOAD;
+    // the NOTE groups; TLS; GNU_EH_FRAME with a header; GNU_STACK when the
+    // inputs or the command line ask for one; RELRO.
+    let num_phdrs = 3 * u64::from(!is_static)
+        + u64::from(has_riscv_attrs)
+        + 1
+        + u64::from(has_rw_segment)
+        + note_groups.len() as u64
+        + u64::from(has_tls)
+        + u64::from(has_eh_frame_hdr)
+        + u64::from(gnu_stack.is_some())
+        + u64::from(relro_phdr);
     let phdr_size = num_phdrs * 56u64;
     let headers_size = 64 + phdr_size;
 
     // Start laying out the RX segment
     let mut file_offset = headers_size;
     let mut vaddr = BASE_ADDR + headers_size;
+
+    // `.note.gnu.build-id` heads the text segment in GNU ld's default
+    // script, ahead of `.interp` and the dynamic tables.
+    let build_id_idx = merged_map.get(".note.gnu.build-id").copied();
+    let mut build_id_at = (0u64, 0u64);
+    if let Some(bi) = build_id_idx {
+        let align = merged_sections[bi].align.max(1);
+        file_offset = align_up(file_offset, align);
+        vaddr = align_up(vaddr, align);
+        build_id_at = (file_offset, vaddr);
+        file_offset += merged_sections[bi].data.len() as u64;
+        vaddr += merged_sections[bi].data.len() as u64;
+    }
 
     // Dynamic linking section addresses (only used when !is_static)
     let mut interp_offset = 0u64;
@@ -205,6 +301,11 @@ pub fn emit_executable(
             let mut v = plt_symbols.to_vec();
             v.extend(copy_sym_names.iter().cloned());
             v.extend(tls_imports.iter().cloned());
+            // GNU ld exports the gp symbol from every dynamic non-PIC
+            // executable (`allocate_dynrelocs`, elfnn-riscv.c) so ld.so can
+            // set gp before it runs IFUNC resolvers and constructors, which
+            // may use gp-relative (relaxed) accesses.
+            v.push(GP_SYMBOL.to_owned());
             v
         };
 
@@ -272,6 +373,7 @@ pub fn emit_executable(
                     Some(lib) => {
                         plan.index_of(lib, shared_lib_syms.import_version(name).map(|v| v.1))
                     }
+                    None if name == GP_SYMBOL => 1, // defined here: VER_NDX_GLOBAL
                     None => 0, // unresolved (weak) reference: VER_NDX_LOCAL, as bfd
                 };
                 versym_data.extend_from_slice(&idx.to_le_bytes());
@@ -285,7 +387,14 @@ pub fn emit_executable(
             let mut entry = [0u8; 24];
             let name_off = dynstr_offsets.get(name).copied().unwrap_or(0);
             entry[0..4].copy_from_slice(&name_off.to_le_bytes());
-            if copy_sym_set.contains(name) {
+            if name == GP_SYMBOL {
+                // Absolute, as the script assignment defines it; the value
+                // is patched once the layout fixes gp.
+                entry[4] = (STB_GLOBAL << 4) | STT_NOTYPE;
+                entry[6..8].copy_from_slice(&SHN_ABS.to_le_bytes());
+                dynsym_data.extend_from_slice(&entry);
+                continue;
+            } else if copy_sym_set.contains(name) {
                 entry[4] = (STB_GLOBAL << 4) | STT_OBJECT;
             } else if tls_imports.contains(name) {
                 let bind = global_syms.get(name).map_or(STB_GLOBAL, |g| g.binding);
@@ -371,18 +480,6 @@ pub fn emit_executable(
     // value, glibc's memcpy/strlen pointers point into .bss, and the first
     // startup TLS-image copy fetches data as code: SIGSEGV before main in
     // every ifunc-consuming static binary (e.g. any glibc static link).
-    let ifunc_names: Vec<String> = if is_static {
-        let mut names: Vec<String> = global_syms
-            .iter()
-            .filter(|(_, g)| g.sym_type == STT_GNU_IFUNC && g.defined)
-            .map(|(n, _)| n.clone())
-            .collect();
-        names.sort();
-        names
-    } else {
-        Vec::new()
-    };
-    let ifunc_count = ifunc_names.len() as u64;
     let iplt_size = ifunc_count * 16;
 
     let mut iplt_vaddr = 0u64;
@@ -408,7 +505,11 @@ pub fn emit_executable(
         if ms.sh_flags & SHF_WRITE != 0 {
             continue;
         }
-        if ms.name == ".riscv.attributes" || ms.name.starts_with(".note.") {
+        if ms.name == ".riscv.attributes" {
+            continue;
+        }
+        if Some(si) == build_id_idx {
+            (section_offsets[si], section_vaddrs[si]) = build_id_at;
             continue;
         }
 
@@ -425,235 +526,134 @@ pub fn emit_executable(
     let rx_segment_end_vaddr = vaddr;
     let rx_segment_end_offset = file_offset;
 
-    // Start RW segment on a new page
-    file_offset = align_up(file_offset, PAGE_SIZE);
-    vaddr = align_up(vaddr, PAGE_SIZE);
-    if (vaddr % PAGE_SIZE) != (file_offset % PAGE_SIZE) {
-        vaddr = align_up(vaddr, PAGE_SIZE) + (file_offset % PAGE_SIZE);
-    }
-
-    let rw_segment_start_vaddr = vaddr;
-    let rw_segment_start_offset = file_offset;
-
-    // Layout RW sections: init/fini arrays first (for RELRO)
-    let init_array_sections = [".preinit_array", ".init_array", ".fini_array"];
-    let mut init_array_vaddrs: FxHashMap<String, (u64, u64)> = FxHashMap::default();
-
-    for sect_name in &init_array_sections {
-        if let Some(&si) = merged_map.get(*sect_name) {
-            let ms = &merged_sections[si];
-            let align = ms.align.max(8);
-            vaddr = align_up(vaddr, align);
-            file_offset = align_up(file_offset, align);
-            section_vaddrs[si] = vaddr;
-            section_offsets[si] = file_offset;
-            init_array_vaddrs.insert(sect_name.to_string(), (vaddr, ms.data.len() as u64));
-            let size = ms.data.len() as u64;
-            file_offset += size;
-            vaddr += size;
+    // ── RW segment: GNU ld's default script and DATA_SEGMENT_* arithmetic ──
+    //
+    // Order (elf64lriscv): TLS, init/fini arrays, .dynamic, .got, then
+    // DATA_SEGMENT_RELRO_END, .got.plt (+ IFUNC slots), the data (.data,
+    // orphans, .sdata), .sbss, .bss.  Where it starts follows ld's
+    // `DATA_SEGMENT_ALIGN`: with RELRO the relro sections are pushed up to end
+    // on a page boundary (`lang_size_relro_segment_1`); without, the segment
+    // continues at the RX end's page offset one page up, and moves back to
+    // the page start when that saves a page (`lang_size_segment`).  The
+    // layout itself is a pure function of its base (`lay_rw`), so the
+    // passes ld makes are just re-runs.
+    let rx_end = vaddr;
+    let rw = {
+        let lay = |base: u64, relro_adjust: bool| {
+            lay_rw(&RwInputs {
+                merged_sections,
+                sec_indices,
+                base,
+                relro_adjust,
+                relro_offset,
+                dynamic_size: if is_static { 0 } else { dynamic_size },
+                got_size,
+                got_plt_size: if is_static { 0 } else { got_plt_size },
+                ifunc_count,
+                copy_symbols,
+            })
+        };
+        let first_base = align_up(rx_end, PAGE_SIZE) + if relro { 0 } else { rx_end % PAGE_SIZE };
+        let first = lay(first_base, false);
+        if relro {
+            // lang_size_relro_segment_1: from the last relro section back,
+            // move each up so it ends where the next one starts.
+            let relro_end = align_up(first.relro_end_raw, PAGE_SIZE);
+            let mut desired = relro_end - relro_offset;
+            for &(start, size, align) in first.relro_sections.iter().rev() {
+                let bumped = start + (desired - (start + size));
+                desired = bumped & !(align.max(1) - 1);
+            }
+            let adjusted = lay(desired.max(first_base), true);
+            // Alignment can defeat the move; ld then reverts to the first base.
+            if align_up(adjusted.relro_end_raw, PAGE_SIZE) > relro_end {
+                lay(first_base, true)
+            } else {
+                adjusted
+            }
+        } else {
+            let first_part = first_base.wrapping_neg() % PAGE_SIZE;
+            let last_part = first.end % PAGE_SIZE;
+            let saves_page = first_part != 0
+                && last_part != 0
+                && first_base / PAGE_SIZE != first.end / PAGE_SIZE
+                && first_part + last_part <= PAGE_SIZE;
+            if saves_page {
+                lay(align_up(rx_end, PAGE_SIZE), false)
+            } else {
+                first
+            }
         }
+    };
+    // File offsets keep vaddr congruence mod the page size, without padding
+    // the file beyond what that needs (ld's `assign_file_positions`).
+    let rw_segment_start_vaddr = rw.base;
+    let rw_segment_start_offset = file_offset + (rw.base.wrapping_sub(file_offset) % PAGE_SIZE);
+    let offset_of = |v: u64| rw_segment_start_offset + (v - rw.base);
+    for &(si, v) in &rw.sections {
+        section_vaddrs[si] = v;
+        section_offsets[si] = offset_of(v);
     }
-
-    // .dynamic (only for dynamic binaries)
-    let mut dynamic_vaddr = 0u64;
-    let mut dynamic_offset = 0u64;
-    if !is_static {
-        vaddr = align_up(vaddr, 8);
-        file_offset = align_up(file_offset, 8);
-        dynamic_vaddr = vaddr;
-        dynamic_offset = file_offset;
-        file_offset += dynamic_size;
-        vaddr += dynamic_size;
-    }
-
-    // .got
-    vaddr = align_up(vaddr, 8);
-    file_offset = align_up(file_offset, 8);
-    let got_vaddr = vaddr;
-    let got_offset = file_offset;
-    file_offset += got_size;
-    vaddr += got_size;
-
-    // RELRO boundary — ld.so rounds [vaddr, vaddr+memsz) down to page edges
-    // before mprotect(PROT_READ), so a memsz that does not reach the next
-    // page protects NOTHING (pre-fix riscv exes shipped .dynamic/.got
-    // writable; verified against Linux glibc under qemu). bfd/lld right-size
-    // the region to the page: close the RELRO group at the page boundary so
-    // the writable tail (·data, TLS, .bss, IFUNC slots) starts on a fresh
-    // page. PT_GNU_RELRO p_align stays 1 like bfd's — glibc consumes only
-    // vaddr/memsz.
-    file_offset = align_up(file_offset, PAGE_SIZE);
-    vaddr = align_up(vaddr, PAGE_SIZE);
-    let relro_end_offset = file_offset;
-    let relro_end_vaddr = vaddr;
-
-    // IFUNC GOT slots (one 8-byte slot per ifunc, initial content = its IPLT
-    // stub address) and the R_RISCV_IRELATIVE table (.rela.iplt: Elf64_Rela
-    // { r_offset = slot VA, r_info = IRELATIVE, r_addend = resolver VA }).
-    // Kept OUTSIDE the RELRO region: glibc's startup writes the resolved
-    // implementation into each slot before main runs.
-    let mut irel_slot_vaddr = 0u64;
-    let mut irel_slot_offset = 0u64;
-    let mut irela_vaddr = 0u64;
-    let mut irela_offset = 0u64;
+    let init_array_vaddrs = rw.init_arrays.clone();
+    let (dynamic_vaddr, dynamic_offset) = if is_static {
+        (0, 0)
+    } else {
+        (rw.dynamic, offset_of(rw.dynamic))
+    };
+    let (got_vaddr, got_offset) = (rw.got, offset_of(rw.got));
+    // PT_GNU_RELRO ends at the page boundary ld rounded RELRO_END to.
+    let relro_end_vaddr = rw.relro_seg_end;
+    let relro_end_offset = offset_of(rw.relro_seg_end);
+    let (got_plt_vaddr, got_plt_offset) = if is_static {
+        (0, 0)
+    } else {
+        (rw.got_plt, offset_of(rw.got_plt))
+    };
     let irela_size = ifunc_count * 24;
-    if ifunc_count > 0 {
-        vaddr = align_up(vaddr, 8);
-        file_offset = align_up(file_offset, 8);
-        irel_slot_vaddr = vaddr;
-        irel_slot_offset = file_offset;
-        file_offset += ifunc_count * 8;
-        vaddr += ifunc_count * 8;
-
-        vaddr = align_up(vaddr, 8);
-        file_offset = align_up(file_offset, 8);
-        irela_vaddr = vaddr;
-        irela_offset = file_offset;
-        file_offset += irela_size;
-        vaddr += irela_size;
-    }
-
-    // .got.plt (only for dynamic binaries)
-    let mut got_plt_vaddr = 0u64;
-    let mut got_plt_offset = 0u64;
+    let (irel_slot_vaddr, irel_slot_offset) = if ifunc_count > 0 {
+        (rw.irel_slots, offset_of(rw.irel_slots))
+    } else {
+        (0, 0)
+    };
+    let (irela_vaddr, irela_offset) = if ifunc_count > 0 {
+        (rw.irela, offset_of(rw.irela))
+    } else {
+        (0, 0)
+    };
     if !is_static {
-        vaddr = align_up(vaddr, 8);
-        file_offset = align_up(file_offset, 8);
-        got_plt_vaddr = vaddr;
-        got_plt_offset = file_offset;
-        file_offset += got_plt_size;
-        vaddr += got_plt_size;
-
         for (i, name) in plt_symbols.iter().enumerate() {
             if let Some(sym) = global_syms.get_mut(name) {
                 sym.value = plt_vaddr + plt_header_size + i as u64 * plt_entry_size;
             }
         }
     }
-
-    // Remaining RW sections (.data, .sdata, etc.) - skip TLS
-    for &si in sec_indices {
-        let ms = &merged_sections[si];
-        if ms.sh_flags & SHF_ALLOC == 0 {
-            continue;
-        }
-        if ms.sh_flags & SHF_WRITE == 0 {
-            continue;
-        }
-        if init_array_sections.contains(&ms.name.as_str()) {
-            continue;
-        }
-        if ms.name == ".bss" || ms.name == ".sbss" {
-            continue;
-        }
-        if ms.sh_flags & SHF_TLS != 0 {
-            continue;
-        }
-
-        let align = ms.align.max(1);
-        vaddr = align_up(vaddr, align);
-        file_offset = align_up(file_offset, align);
-        section_vaddrs[si] = vaddr;
-        section_offsets[si] = file_offset;
-        let size = ms.data.len() as u64;
-        file_offset += size;
-        vaddr += size;
-    }
-
-    // TLS sections
-    let mut tls_vaddr = 0u64;
-    let mut tls_offset = 0u64;
-    let mut tls_filesz = 0u64;
-    let mut tls_memsz = 0u64;
-    let mut tls_align = 1u64;
-
-    if has_tls {
-        for &si in sec_indices {
-            let ms = &merged_sections[si];
-            if ms.sh_flags & SHF_TLS == 0 || ms.sh_type == SHT_NOBITS {
-                continue;
-            }
-            let align = ms.align.max(1);
-            vaddr = align_up(vaddr, align);
-            file_offset = align_up(file_offset, align);
-            if tls_vaddr == 0 {
-                tls_vaddr = vaddr;
-                tls_offset = file_offset;
-            }
-            tls_align = tls_align.max(align);
-            section_vaddrs[si] = vaddr;
-            section_offsets[si] = file_offset;
-            let size = ms.data.len() as u64;
-            file_offset += size;
-            vaddr += size;
-            tls_filesz += size;
-        }
-        tls_memsz = tls_filesz;
-
-        for &si in sec_indices {
-            let ms = &merged_sections[si];
-            if ms.sh_flags & SHF_TLS == 0 || ms.sh_type != SHT_NOBITS {
-                continue;
-            }
-            let align = ms.align.max(1);
-            vaddr = align_up(vaddr, align);
-            if tls_vaddr == 0 {
-                tls_vaddr = vaddr;
-                tls_offset = file_offset;
-            }
-            tls_align = tls_align.max(align);
-            section_vaddrs[si] = vaddr;
-            section_offsets[si] = file_offset;
-            let size = ms.data.len() as u64;
-            vaddr += size;
-        }
-        if tls_vaddr != 0 {
-            tls_memsz = vaddr - tls_vaddr;
-        }
-    }
-
-    // .bss and .sbss (NOBITS) - skip TLS .tbss
-    for &si in sec_indices {
-        let ms = &merged_sections[si];
-        if ms.name != ".bss" && ms.name != ".sbss" {
-            continue;
-        }
-        if ms.sh_flags & SHF_TLS != 0 {
-            continue;
-        }
-        let align = ms.align.max(1);
-        vaddr = align_up(vaddr, align);
-        section_vaddrs[si] = vaddr;
-        section_offsets[si] = file_offset;
-        vaddr += ms.data.len() as u64;
-    }
-
-    // Allocate COPY-relocated symbols in .bss
+    let (tls_vaddr, tls_offset, tls_filesz, tls_memsz, tls_align) = match rw.tls {
+        Some(t) => (t.vaddr, offset_of(t.vaddr), t.filesz, t.memsz, t.align),
+        None => (0, 0, 0, 0, 1),
+    };
+    let data_begin = rw.data_begin;
+    let sdata_begin = rw.sdata_begin;
+    let edata = rw.edata;
     let mut copy_sym_addrs: FxHashMap<String, (u64, u64)> = FxHashMap::default();
-    for (name, size) in copy_symbols {
-        let sz = if *size > 0 { *size } else { 8 };
-        let align = sz.min(8);
-        vaddr = align_up(vaddr, align);
-        copy_sym_addrs.insert(name.clone(), (vaddr, sz));
+    for (name, addr, sz) in &rw.copies {
+        copy_sym_addrs.insert(name.clone(), (*addr, *sz));
         if let Some(gs) = global_syms.get_mut(name) {
             gs.defined = true;
-            gs.value = vaddr;
-            gs.size = sz;
+            gs.value = *addr;
+            gs.size = *sz;
             gs.sym_type = STT_OBJECT;
         }
-        vaddr += sz;
     }
-
-    if !copy_symbols.is_empty() {
-        if let Some(&bss_idx) = merged_map.get(".bss") {
-            let bss_start = section_vaddrs[bss_idx];
-            let new_bss_size = vaddr - bss_start;
-            merged_sections[bss_idx]
-                .data
-                .resize(new_bss_size as usize, 0);
-        }
+    // `.bss` grows to cover the COPY slots after it and ld's closing
+    // `. = ALIGN(. != 0 ? 8 : 1)`.
+    if let (true, Some(&bss_idx), Some(bss_end)) =
+        (has_rw_segment, merged_map.get(".bss"), rw.bss_end)
+    {
+        let size = (bss_end - section_vaddrs[bss_idx]) as usize;
+        merged_sections[bss_idx].data.resize(size, 0);
     }
-
+    let vaddr = rw.end;
+    let file_offset = offset_of(rw.file_end);
     let rw_segment_end_vaddr = vaddr;
     let rw_segment_filesz = file_offset - rw_segment_start_offset;
     let rw_segment_memsz = rw_segment_end_vaddr - rw_segment_start_vaddr;
@@ -688,23 +688,19 @@ pub fn emit_executable(
         }
     }
 
-    // Define linker-provided symbols
-    let sdata_vaddr = merged_map
-        .get(".sdata")
-        .map(|&i| section_vaddrs[i])
-        .unwrap_or(0);
-    let data_vaddr = merged_map
-        .get(".data")
-        .map(|&i| section_vaddrs[i])
-        .unwrap_or(sdata_vaddr);
-    let bss_vaddr = merged_map
-        .get(".bss")
-        .map(|&i| section_vaddrs[i])
-        .unwrap_or(0);
-    let bss_end = merged_map
-        .get(".bss")
-        .map(|&i| section_vaddrs[i] + merged_sections[i].data.len() as u64)
-        .unwrap_or(bss_vaddr);
+    // Define linker-provided symbols, at the addresses GNU ld's default
+    // script gives them: `__bss_start` at the first NOBITS section (`.sbss`
+    // before `.bss`), `_end` = `__BSS_END__` = the 8-aligned end of the
+    // NOBITS tail (COPY slots included), all of them defined even when the
+    // sections they mark are empty.
+    let nobits: Vec<usize> = [".sbss", ".bss"]
+        .iter()
+        .filter_map(|n| merged_map.get(*n).copied())
+        .collect();
+    let bss_vaddr = nobits.first().map_or(edata, |&i| section_vaddrs[i]);
+    let bss_end = rw_segment_end_vaddr;
+    let data_vaddr = data_begin;
+    let sdata_vaddr = sdata_begin;
 
     let init_start = init_array_vaddrs
         .get(".init_array")
@@ -777,16 +773,20 @@ pub fn emit_executable(
             }
         };
 
+        // `_edata`/`edata` end the initialised data; `__bss_start` may sit
+        // past them, aligned for the first NOBITS section.  Defined before
+        // the standard set, which would equate them.
+        define_linker_sym("_edata", edata, STB_GLOBAL, false);
+        define_linker_sym("edata", edata, STB_GLOBAL, false);
         for sym in &get_standard_linker_symbols(&linker_addrs) {
             define_linker_sym(sym.name, sym.value, sym.binding, false);
         }
 
-        // RISC-V specific symbols
-        let gp_value = if sdata_vaddr != 0 {
-            sdata_vaddr + 0x800
-        } else {
-            data_vaddr + 0x800
-        };
+        // RISC-V specific symbols.  GNU ld 2.47 `elf64lriscv`:
+        // MIN(__SDATA_BEGIN__ + 0x800, MAX(__DATA_BEGIN__ + 0x800,
+        // __BSS_END__ - 0x800)).
+        let gp_value =
+            (sdata_vaddr + 0x800).min((data_vaddr + 0x800).max(bss_end.saturating_sub(0x800)));
         define_linker_sym("__global_pointer$", gp_value, STB_GLOBAL, false);
         define_linker_sym("__BSS_END__", bss_end, STB_GLOBAL, false);
         define_linker_sym("__SDATA_BEGIN__", sdata_vaddr, STB_GLOBAL, false);
@@ -831,14 +831,90 @@ pub fn emit_executable(
         }
     }
 
-    // Patch dynsym entries for COPY-relocated symbols
+    // Patch dynsym entries for COPY-relocated symbols and the gp export
+    let address_taken = address_taken_imports(input_objs);
     for (i, name) in dynsym_names.iter().enumerate() {
+        if name == GP_SYMBOL {
+            let gp = global_syms
+                .get(GP_SYMBOL)
+                .filter(|g| g.defined)
+                .map_or(0, |g| g.value);
+            let entry_off = (i + 1) * 24;
+            dynsym_data[entry_off + 8..entry_off + 16].copy_from_slice(&gp.to_le_bytes());
+            continue;
+        }
         if let Some(&(addr, size)) = copy_sym_addrs.get(name) {
             let entry_off = (i + 1) * 24;
             dynsym_data[entry_off + 6..entry_off + 8].copy_from_slice(&0xFFF1u16.to_le_bytes());
             dynsym_data[entry_off + 8..entry_off + 16].copy_from_slice(&addr.to_le_bytes());
             dynsym_data[entry_off + 16..entry_off + 24].copy_from_slice(&size.to_le_bytes());
+            continue;
         }
+        if let Some(value) = plt_import_value(
+            global_syms.get(name),
+            plt_symbols.contains(name),
+            address_taken.contains(name),
+        ) {
+            let entry_off = (i + 1) * 24;
+            dynsym_data[entry_off + 8..entry_off + 16].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    // A relaxation trip needs the layout, not the image: stop before any
+    // relocation is applied (an intermediate layout is never written).
+    if let Some(probe) = probe {
+        let synthetic = [
+            (interp_vaddr, interp_size, 1),
+            (gnu_hash_vaddr, gnu_hash_data.len() as u64, 8),
+            (dynsym_vaddr, dynsym_data.len() as u64, 8),
+            (dynstr_vaddr, dynstr_data.len() as u64, 1),
+            (versym_vaddr, versym_data.len() as u64, 2),
+            (verneed_vaddr, verneed_data.len() as u64, 8),
+            (rela_dyn_vaddr, rela_dyn_size, 8),
+            (rela_plt_vaddr, rela_plt_size, 8),
+            (plt_vaddr, plt_size, 16),
+            (dynamic_vaddr, dynamic_size, 8),
+            (got_vaddr, got_size, 8),
+            (got_plt_vaddr, got_plt_size, 8),
+            (iplt_vaddr, iplt_size, 16),
+            (irel_slot_vaddr, ifunc_count * 8, 8),
+            (irela_vaddr, irela_size, 8),
+        ];
+        // The RX segment exactly as the loop above lays it: these sections,
+        // in this order, back to back.
+        let rx_seq: Vec<usize> = sec_indices
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let ms = &merged_sections[i];
+                ms.sh_flags & SHF_ALLOC != 0
+                    && ms.sh_flags & SHF_WRITE == 0
+                    && ms.name != ".riscv.attributes"
+                    && Some(i) != build_id_idx
+            })
+            .collect();
+        fill_relax_probe(
+            probe,
+            &RelaxProbeLayout {
+                input_objs,
+                merged_sections,
+                section_vaddrs: &section_vaddrs,
+                layout_order: sec_indices,
+                rx_seq,
+                plt_addrs: None,
+                rw_start: rw_segment_start_vaddr,
+                synthetic: &synthetic,
+                global_syms,
+                copy_sym_addrs: &copy_sym_addrs,
+                tls_start: has_tls.then_some(tls_vaddr),
+                plt: if is_static {
+                    (iplt_vaddr, iplt_size)
+                } else {
+                    (plt_vaddr, plt_size)
+                },
+            },
+        );
+        return Ok(());
     }
 
     let local_sym_vaddrs =
@@ -861,6 +937,7 @@ pub fn emit_executable(
 
     let empty_plt_addrs = FxHashMap::default();
     let ctx = reloc::RelocContext {
+        symbolic: linker_common::Symbolic::None,
         sec_mapping,
         section_vaddrs: &section_vaddrs,
         local_sym_vaddrs: &local_sym_vaddrs,
@@ -873,6 +950,10 @@ pub fn emit_executable(
         gd_tls_call_nop: &gd_tls_call_nop,
         collect_relatives: false,
         plt_sym_addrs: &empty_plt_addrs,
+        gp: global_syms
+            .get("__global_pointer$")
+            .filter(|g| g.defined)
+            .map_or(0, |g| g.value),
     };
     reloc::apply_relocations(input_objs, merged_sections, &ctx)?;
 
@@ -1083,13 +1164,12 @@ pub fn emit_executable(
         let eh_frame_vaddr = section_vaddrs[ef_idx];
         let eh_frame_hdr_vaddr = section_vaddrs[hdr_idx];
         let mut slot = std::mem::take(&mut merged_sections[hdr_idx].data);
-        linker_common::write_eh_frame_hdr(
+        eh_frame.write_hdr(
             &mut slot,
             &merged_sections[ef_idx].data,
             eh_frame_vaddr,
             eh_frame_hdr_vaddr,
-            true,
-        );
+        )?;
         merged_sections[hdr_idx].data = slot;
     }
 
@@ -1126,7 +1206,7 @@ pub fn emit_executable(
         EM_RISCV_ELF,
         entry_point,
         num_phdrs as u16,
-        0x05,
+        super::relocations::merged_e_flags(input_objs)?,
     );
 
     // Program headers
@@ -1160,17 +1240,20 @@ pub fn emit_executable(
         );
     }
 
-    write_phdr(
-        &mut elf,
-        PT_RISCV_ATTRIBUTES,
-        PF_R,
-        riscv_attr_offset,
-        0,
-        0,
-        riscv_attr_size,
-        riscv_attr_size,
-        1,
-    );
+    if has_riscv_attrs {
+        // Not loaded: GNU ld gives it no memory size.
+        write_phdr(
+            &mut elf,
+            PT_RISCV_ATTRIBUTES,
+            PF_R,
+            riscv_attr_offset,
+            0,
+            0,
+            riscv_attr_size,
+            0,
+            1,
+        );
+    }
     write_phdr(
         &mut elf,
         PT_LOAD,
@@ -1182,17 +1265,19 @@ pub fn emit_executable(
         rx_memsz,
         PAGE_SIZE,
     );
-    write_phdr(
-        &mut elf,
-        PT_LOAD,
-        PF_R | PF_W,
-        rw_segment_start_offset,
-        rw_segment_start_vaddr,
-        rw_segment_start_vaddr,
-        rw_segment_filesz,
-        rw_segment_memsz,
-        PAGE_SIZE,
-    );
+    if has_rw_segment {
+        write_phdr(
+            &mut elf,
+            PT_LOAD,
+            PF_R | PF_W,
+            rw_segment_start_offset,
+            rw_segment_start_vaddr,
+            rw_segment_start_vaddr,
+            rw_segment_filesz,
+            rw_segment_memsz,
+            PAGE_SIZE,
+        );
+    }
 
     if !is_static {
         write_phdr(
@@ -1208,7 +1293,29 @@ pub fn emit_executable(
         );
     }
 
-    write_phdr(&mut elf, PT_NOTE, PF_R, 0, 0, 0, 0, 0, 4);
+    for group in &note_groups {
+        let (first, last) = (group[0], group[group.len() - 1]);
+        let start = section_offsets[first];
+        let size = section_offsets[last] + merged_sections[last].data.len() as u64 - start;
+        write_phdr(
+            &mut elf,
+            PT_NOTE,
+            PF_R,
+            start,
+            section_vaddrs[first],
+            section_vaddrs[first],
+            size,
+            size,
+            merged_sections[first].align,
+        );
+    }
+
+    if has_tls {
+        write_phdr(
+            &mut elf, PT_TLS, PF_R, tls_offset, tls_vaddr, tls_vaddr, tls_filesz, tls_memsz,
+            tls_align,
+        );
+    }
 
     if let Some(&hdr_idx) = merged_map.get(".eh_frame_hdr") {
         let sz = merged_sections[hdr_idx].data.len() as u64;
@@ -1223,13 +1330,13 @@ pub fn emit_executable(
             sz,
             4,
         );
-    } else {
-        write_phdr(&mut elf, PT_GNU_EH_FRAME, PF_R, 0, 0, 0, 0, 0, 4);
     }
 
-    write_phdr(&mut elf, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0, 0x10);
+    if let Some(flags) = gnu_stack {
+        write_phdr(&mut elf, PT_GNU_STACK, flags, 0, 0, 0, 0, 0, 0x10);
+    }
 
-    if !is_static {
+    if relro_phdr {
         let relro_filesz = relro_end_offset - rw_segment_start_offset;
         let relro_memsz = relro_end_vaddr - rw_segment_start_vaddr;
         write_phdr(
@@ -1245,14 +1352,18 @@ pub fn emit_executable(
         );
     }
 
-    if has_tls {
-        write_phdr(
-            &mut elf, PT_TLS, PF_R, tls_offset, tls_vaddr, tls_vaddr, tls_filesz, tls_memsz,
-            tls_align,
-        );
+    if elf.len() as u64 != headers_size {
+        return Err(format!(
+            "internal error: wrote {} bytes of ELF and program headers, planned {headers_size}",
+            elf.len()
+        ));
     }
 
     // Write section data
+    if let Some(bi) = build_id_idx {
+        pad_to(&mut elf, build_id_at.0 as usize);
+        elf.extend_from_slice(&merged_sections[bi].data);
+    }
     if !is_static {
         pad_to(&mut elf, interp_offset as usize);
         elf.extend_from_slice(INTERP);
@@ -1290,7 +1401,7 @@ pub fn emit_executable(
         if ms.sh_flags & SHF_ALLOC == 0 || ms.sh_flags & SHF_WRITE != 0 {
             continue;
         }
-        if ms.name == ".riscv.attributes" || ms.name.starts_with(".note.") {
+        if ms.name == ".riscv.attributes" || Some(si) == build_id_idx {
             continue;
         }
         if ms.data.is_empty() {
@@ -1303,54 +1414,42 @@ pub fn emit_executable(
     // RW segment
     pad_to(&mut elf, rw_segment_start_offset as usize);
 
-    for sect_name in &init_array_sections {
-        if let Some(&si) = merged_map.get(*sect_name) {
-            let ms = &merged_sections[si];
-            if !ms.data.is_empty() {
-                pad_to(&mut elf, section_offsets[si] as usize);
-                elf.extend_from_slice(&ms.data);
-            }
-        }
-    }
-
-    if !is_static {
-        pad_to(&mut elf, dynamic_offset as usize);
-        elf.extend_from_slice(&dynamic_data);
-    }
-
-    if got_size > 0 {
-        pad_to(&mut elf, got_offset as usize);
-        elf.extend_from_slice(&got_data);
-    }
-
-    if ifunc_count > 0 {
-        pad_to(&mut elf, irel_slot_offset as usize);
-        elf.extend_from_slice(&irel_slot_data);
-        pad_to(&mut elf, irela_offset as usize);
-        elf.extend_from_slice(&irela_data);
-    }
-
-    if !is_static {
-        pad_to(&mut elf, got_plt_offset as usize);
-        elf.extend_from_slice(&got_plt_data);
-    }
-
+    // Every file-backed RW piece, written in file order (the layout order is
+    // GNU ld's, not the order these tables are built in).
+    let mut rw_pieces: Vec<(u64, &[u8])> = Vec::new();
     for &si in sec_indices {
         let ms = &merged_sections[si];
-        if ms.sh_flags & SHF_ALLOC == 0 || ms.sh_flags & SHF_WRITE == 0 {
+        if ms.sh_flags & SHF_ALLOC == 0
+            || (ms.sh_flags & SHF_WRITE == 0 && ms.sh_flags & SHF_TLS == 0)
+            || ms.sh_type == SHT_NOBITS
+            || ms.name == ".bss"
+            || ms.name == ".sbss"
+            || ms.data.is_empty()
+        {
             continue;
         }
-        if init_array_sections.contains(&ms.name.as_str()) {
-            continue;
+        rw_pieces.push((section_offsets[si], &ms.data));
+    }
+    if !is_static {
+        rw_pieces.push((dynamic_offset, &dynamic_data));
+        rw_pieces.push((got_plt_offset, &got_plt_data));
+    }
+    if got_size > 0 {
+        rw_pieces.push((got_offset, &got_data));
+    }
+    if ifunc_count > 0 {
+        rw_pieces.push((irel_slot_offset, &irel_slot_data));
+        rw_pieces.push((irela_offset, &irela_data));
+    }
+    rw_pieces.sort_by_key(|&(off, _)| off);
+    for (off, bytes) in rw_pieces {
+        if elf.len() as u64 > off {
+            return Err(format!(
+                "internal: RW layout overlaps at file offset {off:#x}"
+            ));
         }
-        if ms.sh_type == SHT_NOBITS || ms.name == ".bss" || ms.name == ".sbss" {
-            continue;
-        }
-        if ms.data.is_empty() {
-            continue;
-        }
-        pad_to(&mut elf, section_offsets[si] as usize);
-        elf.extend_from_slice(&ms.data);
+        pad_to(&mut elf, off as usize);
+        elf.extend_from_slice(bytes);
     }
 
     // .riscv.attributes
@@ -1366,7 +1465,7 @@ pub fn emit_executable(
         global_syms,
     };
     debug::write_debug_sections(&mut elf, debug_sections, &syms)?;
-    let mut specs = debug::merged_headers(merged_sections, &section_vaddrs, &section_offsets, true);
+    let mut specs = debug::merged_headers(merged_sections, &section_vaddrs, &section_offsets);
     if !is_static {
         specs.extend(shdr::dynamic_headers(&shdr::DynamicSections {
             interp: (interp_vaddr, interp_offset, interp_size),
@@ -1452,6 +1551,15 @@ pub fn emit_executable(
     }
     let symtab = keep_symtab.then(|| debug::symtab(&syms, &headers));
     shdr::append_section_headers(&mut elf, &headers, symtab.as_deref())?;
+
+    // The build id hashes the finished image, as GNU ld's does.
+    if let Some(bi) = build_id_idx.filter(|_| build_id.is_enabled()) {
+        // The section is exactly the synthetic note: input notes are discarded.
+        let note = section_offsets[bi];
+        if !linker_common::build_id::patch_output_build_id_styled(&mut elf, Some(note), build_id) {
+            return Err("internal error: the build-id note is outside the image".into());
+        }
+    }
 
     // Write the file
     std::fs::write(output_path, &elf).map_err(|e| format!("Failed to write output: {}", e))?;
@@ -1560,5 +1668,538 @@ fn build_plt_stubs(
         // nop
         let insn3 = 0x00000013u32;
         plt_data[entry_off + 12..entry_off + 16].copy_from_slice(&insn3.to_le_bytes());
+    }
+}
+
+/// The defined IFUNC symbols of a static executable that get an IPLT slot,
+/// sorted by name. GNU ld allocates a slot only for an IFUNC some
+/// relocation references (`_bfd_elf_allocate_ifunc_dyn_relocs` drops
+/// symbols whose PLT and GOT refcounts are zero), so glibc's unreferenced
+/// aliases (`__libc_memcpy` beside `memcpy`) cost no stub and no
+/// `R_RISCV_IRELATIVE`; they keep their type and the resolver as value.
+/// Any relocation from an allocated input section counts as a reference.
+fn iplt_symbols(
+    global_syms: &FxHashMap<String, GlobalSym>,
+    input_objs: &[(String, ElfObject)],
+) -> Vec<String> {
+    let mut referenced: FxHashSet<&str> = FxHashSet::default();
+    for (_, obj) in input_objs {
+        for (sec, relas) in obj.sections.iter().zip(&obj.relocations) {
+            if sec.flags & SHF_ALLOC == 0 {
+                continue;
+            }
+            for rela in relas {
+                let sym = usize::try_from(rela.sym_idx)
+                    .ok()
+                    .and_then(|i| obj.symbols.get(i));
+                if let Some(sym) = sym.filter(|s| !s.is_local()) {
+                    referenced.insert(&sym.name);
+                }
+            }
+        }
+    }
+    let mut names: Vec<String> = global_syms
+        .iter()
+        .filter(|(n, g)| {
+            g.sym_type == STT_GNU_IFUNC && g.defined && referenced.contains(n.as_str())
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `st_value` of an imported function's `.dynsym` entry in an executable.
+/// An undefined symbol whose address the executable takes keeps its PLT
+/// entry address: the dynamic linker then makes that address canonical, so
+/// a function pointer taken in non-PIC code equals the one every shared
+/// object sees. A call-only import keeps 0, the rule GNU ld applies on
+/// x86-64 (`pointer_equality_needed`) and LLD on RISC-V. GNU ld 2.47's RISC-V
+/// port keeps the PLT address for every import, which binds the defining
+/// library's own GOT references to the executable's stub: each of its
+/// internal indirect calls takes the extra jump, and `&f` inside the library
+/// no longer equals the address its FDE covers (`_Unwind_GetRegionStart`;
+/// `tests/regression/check_cfi_unwind.sh` fails under GNU ld `-no-pie`).
+/// A symbol only weakly referenced from regular objects gets 0, otherwise
+/// the PLT entry would make it non-null even when no library defines it.
+/// `None` leaves the entry untouched.
+fn plt_import_value(sym: Option<&GlobalSym>, has_plt: bool, address_taken: bool) -> Option<u64> {
+    let sym = sym?;
+    if !has_plt || !address_taken || sym.binding == STB_WEAK {
+        return None;
+    }
+    Some(sym.value)
+}
+
+/// Global symbols the executable references other than by a call or
+/// through its GOT entry, from an allocated section: an absolute or
+/// PC-relative address (`R_RISCV_64`, `HI20`/`LO12`, `PCREL_HI20`, ...).
+/// Those are the references that need one canonical function address.
+/// The GOT form needs none: the entry is filled by the dynamic linker with
+/// the same value every other object resolves.
+fn address_taken_imports(input_objs: &[(String, ElfObject)]) -> FxHashSet<String> {
+    let mut taken = FxHashSet::default();
+    for (_, obj) in input_objs {
+        for (sec, relas) in obj.sections.iter().zip(&obj.relocations) {
+            if sec.flags & SHF_ALLOC == 0 {
+                continue;
+            }
+            for rela in relas {
+                if matches!(
+                    rela.rela_type,
+                    R_RISCV_NONE
+                        | R_RISCV_CALL
+                        | R_RISCV_CALL_PLT
+                        | R_RISCV_JAL
+                        | R_RISCV_RVC_JUMP
+                        | R_RISCV_GOT_HI20
+                        | R_RISCV_ALIGN
+                        | R_RISCV_RELAX
+                ) {
+                    continue;
+                }
+                let sym = usize::try_from(rela.sym_idx)
+                    .ok()
+                    .and_then(|i| obj.symbols.get(i));
+                if let Some(sym) = sym.filter(|s| !s.is_local() && !s.name.is_empty()) {
+                    taken.insert(sym.name.to_string());
+                }
+            }
+        }
+    }
+    taken
+}
+
+/// Whether GNU ld keeps RELRO on (`lang_find_relro_sections`): some
+/// non-empty allocated input section matches a statement between
+/// `DATA_SEGMENT_ALIGN` and `DATA_SEGMENT_RELRO_END` of the default script.
+/// The callback looks at the INPUT section only, so the `ONLY_IF_RW`
+/// `.eh_frame`/`.gcc_except_table` statements there count even though the
+/// read-only copies above them take those sections; `.tbss` never counts
+/// (`IGNORE_SECTION`).  A dynamic link always has `.dynamic`.
+fn relro_inputs_present(
+    input_objs: &[(String, ElfObject)],
+    got_size: u64,
+    is_static: bool,
+) -> bool {
+    const PREFIXES: [&str; 11] = [
+        ".gnu_extab",
+        ".gcc_except_table",
+        ".exception_ranges",
+        ".tdata",
+        ".init_array",
+        ".ctors",
+        ".fini_array",
+        ".dtors",
+        ".data.rel.ro",
+        ".gnu.linkonce.d.rel.ro.",
+        ".gnu.linkonce.td.",
+    ];
+    const EXACT: [&str; 7] = [
+        ".eh_frame",
+        ".sframe",
+        ".preinit_array",
+        ".jcr",
+        ".dynamic",
+        ".got",
+        ".igot",
+    ];
+    if !is_static || got_size != 0 {
+        return true;
+    }
+    input_objs.iter().any(|(_, obj)| {
+        obj.sections.iter().any(|sec| {
+            let tbss = sec.flags & SHF_TLS != 0 && sec.sh_type == SHT_NOBITS;
+            sec.flags & SHF_ALLOC != 0
+                && !tbss
+                && sec.size != 0
+                && (EXACT.contains(&sec.name.as_str())
+                    || PREFIXES.iter().any(|p| sec.name.starts_with(p)))
+        })
+    })
+}
+
+/// What [`lay_rw`] lays out.
+struct RwInputs<'a> {
+    merged_sections: &'a [MergedSection],
+    sec_indices: &'a [usize],
+    base: u64,
+    /// The pass after RELRO sizing: `DATA_SEGMENT_RELRO_END` rounds up.
+    relro_adjust: bool,
+    relro_offset: u64,
+    dynamic_size: u64,
+    got_size: u64,
+    got_plt_size: u64,
+    ifunc_count: u64,
+    copy_symbols: &'a [(String, u64)],
+}
+
+#[derive(Clone, Copy)]
+struct TlsLayout {
+    vaddr: u64,
+    filesz: u64,
+    memsz: u64,
+    align: u64,
+}
+
+/// One layout of the RW segment from `base`.
+struct RwLayout {
+    base: u64,
+    sections: Vec<(usize, u64)>,
+    /// `(start, size, alignment)` of each non-empty RELRO section in order;
+    /// `.tbss` with size 0 (it takes no address space).
+    relro_sections: Vec<(u64, u64, u64)>,
+    init_arrays: FxHashMap<String, (u64, u64)>,
+    dynamic: u64,
+    got: u64,
+    /// `.` + offset at `DATA_SEGMENT_RELRO_END`, before rounding.
+    relro_end_raw: u64,
+    /// The RELRO segment end (rounded to the page in the adjust pass).
+    relro_seg_end: u64,
+    got_plt: u64,
+    irel_slots: u64,
+    irela: u64,
+    tls: Option<TlsLayout>,
+    data_begin: u64,
+    sdata_begin: u64,
+    edata: u64,
+    copies: Vec<(String, u64, u64)>,
+    /// End of `.bss` (COPY slots and the closing 8-alignment included).
+    bss_end: Option<u64>,
+    /// `__BSS_END__` = `_end` = `DATA_SEGMENT_END`.
+    end: u64,
+    /// End of the file-backed part.
+    file_end: u64,
+}
+
+/// Lay the RW segment out from `inp.base` in GNU ld's script order.
+fn lay_rw(inp: &RwInputs) -> RwLayout {
+    let ms = inp.merged_sections;
+    let by_name = |name: &str| {
+        inp.sec_indices
+            .iter()
+            .copied()
+            .find(|&i| ms[i].name == name)
+    };
+    let size = |i: usize| ms[i].data.len() as u64;
+    let align = |i: usize| ms[i].align.max(1);
+    let mut dot = inp.base;
+    let mut sections = Vec::new();
+    let mut relro_sections = Vec::new();
+
+    // .tdata, .tbss: the template's address space ends with .tdata; .tbss
+    // only moves `.` to its own (aligned) start.
+    let mut tls: Option<TlsLayout> = None;
+    let mut grow_tls = |v: u64, filesz_end: Option<u64>, mem_end: u64, a: u64| {
+        let t = tls.get_or_insert(TlsLayout {
+            vaddr: v,
+            filesz: 0,
+            memsz: 0,
+            align: 1,
+        });
+        if let Some(e) = filesz_end {
+            t.filesz = e - t.vaddr;
+        }
+        t.memsz = t.memsz.max(mem_end - t.vaddr);
+        t.align = t.align.max(a);
+    };
+    for &i in inp.sec_indices {
+        if ms[i].sh_flags & SHF_TLS != 0 && ms[i].sh_type != SHT_NOBITS {
+            dot = align_up(dot, align(i));
+            sections.push((i, dot));
+            relro_sections.push((dot, size(i), align(i)));
+            grow_tls(dot, Some(dot + size(i)), dot + size(i), align(i));
+            dot += size(i);
+        }
+    }
+    for &i in inp.sec_indices {
+        if ms[i].sh_flags & SHF_TLS != 0 && ms[i].sh_type == SHT_NOBITS {
+            dot = align_up(dot, align(i));
+            sections.push((i, dot));
+            relro_sections.push((dot, 0, align(i)));
+            grow_tls(dot, None, dot + size(i), align(i));
+        }
+    }
+    let mut init_arrays = FxHashMap::default();
+    for name in [
+        ".preinit_array",
+        ".init_array",
+        ".fini_array",
+        ".data.rel.ro",
+    ] {
+        if let Some(i) = by_name(name) {
+            dot = align_up(dot, align(i));
+            sections.push((i, dot));
+            if size(i) != 0 {
+                relro_sections.push((dot, size(i), align(i)));
+            }
+            init_arrays.insert(name.to_string(), (dot, size(i)));
+            dot += size(i);
+        }
+    }
+    if inp.dynamic_size != 0 {
+        dot = align_up(dot, 8);
+        relro_sections.push((dot, inp.dynamic_size, 8));
+    }
+    let dynamic = dot;
+    dot += inp.dynamic_size;
+    if inp.got_size != 0 {
+        dot = align_up(dot, 8);
+        relro_sections.push((dot, inp.got_size, 8));
+    }
+    let got = dot;
+    dot += inp.got_size;
+    // DATA_SEGMENT_RELRO_END (offset, .)
+    let relro_end_raw = dot + inp.relro_offset;
+    let relro_seg_end = if inp.relro_adjust {
+        align_up(relro_end_raw, PAGE_SIZE)
+    } else {
+        relro_end_raw
+    };
+    dot = relro_seg_end - inp.relro_offset;
+    // .got.plt : { *(.got.plt) *(.igot.plt) }, then this linker's
+    // `.rela.iplt` table.
+    if inp.got_plt_size != 0 || inp.ifunc_count != 0 {
+        dot = align_up(dot, 8);
+    }
+    let got_plt = dot;
+    dot += inp.got_plt_size;
+    let irel_slots = dot;
+    dot += inp.ifunc_count * 8;
+    if inp.ifunc_count != 0 {
+        dot = align_up(dot, 8);
+    }
+    let irela = dot;
+    dot += inp.ifunc_count * 24;
+
+    // .data (+ orphans), .sdata: `__DATA_BEGIN__`/`__SDATA_BEGIN__` sit at
+    // their statements, sections present or not.
+    let mut data_begin = None;
+    let mut sdata_begin = None;
+    for &i in inp.sec_indices {
+        let m = &ms[i];
+        if m.sh_flags & SHF_ALLOC == 0
+            || m.sh_flags & SHF_WRITE == 0
+            || m.sh_flags & SHF_TLS != 0
+            || matches!(
+                m.name.as_str(),
+                ".bss"
+                    | ".sbss"
+                    | ".preinit_array"
+                    | ".init_array"
+                    | ".fini_array"
+                    | ".data.rel.ro"
+            )
+        {
+            continue;
+        }
+        dot = align_up(dot, align(i));
+        data_begin.get_or_insert(dot);
+        if m.name == ".sdata" {
+            sdata_begin = Some(dot);
+        }
+        sections.push((i, dot));
+        dot += size(i);
+    }
+    let data_begin = data_begin.unwrap_or(dot);
+    let sdata_begin = sdata_begin.unwrap_or(dot);
+    let edata = dot;
+    let file_end = dot;
+
+    // .sbss, .bss; this linker's COPY slots close .bss; then
+    // `. = ALIGN(. != 0 ? 8 : 1)` inside .bss and `. = ALIGN(8)` after.
+    for name in [".sbss", ".bss"] {
+        if let Some(i) = by_name(name) {
+            if ms[i].sh_flags & SHF_TLS == 0 {
+                dot = align_up(dot, align(i));
+                sections.push((i, dot));
+                dot += size(i);
+            }
+        }
+    }
+    let mut copies = Vec::new();
+    for (name, sz) in inp.copy_symbols {
+        let sz = if *sz > 0 { *sz } else { 8 };
+        dot = align_up(dot, sz.min(8));
+        copies.push((name.clone(), dot, sz));
+        dot += sz;
+    }
+    let bss_end = by_name(".bss").map(|_| align_up(dot, 8));
+    let end = align_up(dot, 8);
+    RwLayout {
+        base: inp.base,
+        sections,
+        relro_sections,
+        init_arrays,
+        dynamic,
+        got,
+        relro_end_raw,
+        relro_seg_end,
+        got_plt,
+        irel_slots,
+        irela,
+        tls,
+        data_begin,
+        sdata_begin,
+        edata,
+        copies,
+        bss_end,
+        end,
+        file_end,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::riscv::linker::relocations::{
+        R_RISCV_64, R_RISCV_HI20, R_RISCV_PCREL_HI20,
+    };
+
+    fn import(binding: u8, value: u64) -> GlobalSym {
+        GlobalSym {
+            value,
+            size: 0,
+            binding,
+            sym_type: STT_FUNC,
+            visibility: STV_DEFAULT,
+            defined: false,
+            needs_plt: true,
+            plt_idx: 0,
+            section_idx: None,
+            placeholder: false,
+        }
+    }
+
+    fn section(name: &str, flags: u64) -> crate::backend::linker_common::Elf64Section {
+        crate::backend::linker_common::Elf64Section {
+            name_idx: 0,
+            name: name.to_string(),
+            sh_type: SHT_PROGBITS,
+            flags,
+            addr: 0,
+            offset: 0,
+            size: 16,
+            link: 0,
+            info: 0,
+            addralign: 4,
+            entsize: 0,
+        }
+    }
+
+    fn undef(name: &str) -> crate::backend::linker_common::Elf64Symbol {
+        crate::backend::linker_common::Elf64Symbol {
+            name_idx: 0,
+            name: name.into(),
+            info: (STB_GLOBAL << 4) | STT_NOTYPE,
+            other: 0,
+            shndx: 0,
+            value: 0,
+            size: 0,
+        }
+    }
+
+    fn reloc_to(sym_idx: u32) -> crate::backend::linker_common::Elf64Rela {
+        crate::backend::linker_common::Elf64Rela {
+            offset: 0,
+            sym_idx,
+            rela_type: 19, // R_RISCV_CALL_PLT
+            addend: 0,
+        }
+    }
+
+    fn ifunc(value: u64) -> GlobalSym {
+        GlobalSym {
+            sym_type: STT_GNU_IFUNC,
+            defined: true,
+            needs_plt: false,
+            ..import(STB_GLOBAL, value)
+        }
+    }
+
+    #[test]
+    fn only_referenced_ifuncs_get_an_iplt_slot() {
+        // glibc's `memcpy` and its alias `__libc_memcpy` share one resolver;
+        // only `memcpy` is called, so GNU ld emits one stub and one
+        // R_RISCV_IRELATIVE. A reference from a non-allocated (debug)
+        // section does not count.
+        let obj = ElfObject {
+            sections: vec![
+                section(".text", SHF_ALLOC | SHF_EXECINSTR),
+                section(".debug_info", 0),
+            ],
+            symbols: vec![undef(""), undef("memcpy"), undef("strlen")],
+            section_data: Vec::new(),
+            relocations: vec![vec![reloc_to(1)], vec![reloc_to(2)]],
+            source_name: "a.o".to_string(),
+            e_flags: 0,
+        };
+        let mut globals: FxHashMap<String, GlobalSym> = FxHashMap::default();
+        globals.insert("memcpy".to_string(), ifunc(0x22d34));
+        globals.insert("__libc_memcpy".to_string(), ifunc(0x22d34));
+        globals.insert("strlen".to_string(), ifunc(0x22e00));
+        let names = iplt_symbols(&globals, &[("a.o".to_string(), obj)]);
+        assert_eq!(names, vec!["memcpy".to_string()]);
+    }
+
+    #[test]
+    fn plt_import_keeps_the_plt_address_for_pointer_equality() {
+        let strong = import(STB_GLOBAL, 0x104e0);
+        assert_eq!(plt_import_value(Some(&strong), true, true), Some(0x104e0));
+    }
+
+    #[test]
+    fn weak_only_call_only_or_plt_less_imports_stay_zero() {
+        let weak = import(STB_WEAK, 0x104e0);
+        assert_eq!(plt_import_value(Some(&weak), true, true), None);
+        let strong = import(STB_GLOBAL, 0x104e0);
+        assert_eq!(plt_import_value(Some(&strong), true, false), None);
+        assert_eq!(plt_import_value(Some(&strong), false, true), None);
+        assert_eq!(plt_import_value(None, true, true), None);
+    }
+
+    #[test]
+    fn only_address_references_need_a_canonical_plt_address() {
+        // Calls (every call form) and GOT loads do not take the address;
+        // an absolute word, a `lui`/`addi` pair and an `auipc` do. A
+        // reference from a non-allocated section never counts.
+        let typed = |sym_idx, rela_type| crate::backend::linker_common::Elf64Rela {
+            rela_type,
+            ..reloc_to(sym_idx)
+        };
+        let obj = ElfObject {
+            sections: vec![
+                section(".text", SHF_ALLOC | SHF_EXECINSTR),
+                section(".data", SHF_ALLOC | SHF_WRITE),
+                section(".debug_info", 0),
+            ],
+            symbols: [
+                "", "call", "jal", "rvc", "got", "word", "hi", "pcrel", "dbg",
+            ]
+            .into_iter()
+            .map(undef)
+            .collect(),
+            section_data: Vec::new(),
+            relocations: vec![
+                vec![
+                    typed(1, R_RISCV_CALL_PLT),
+                    typed(1, R_RISCV_RELAX),
+                    typed(2, R_RISCV_JAL),
+                    typed(3, R_RISCV_RVC_JUMP),
+                    typed(4, R_RISCV_GOT_HI20),
+                    typed(6, R_RISCV_HI20),
+                    typed(7, R_RISCV_PCREL_HI20),
+                ],
+                vec![typed(5, R_RISCV_64)],
+                vec![typed(8, R_RISCV_64)],
+            ],
+            source_name: "a.o".to_string(),
+            e_flags: 0,
+        };
+        let mut taken: Vec<String> = address_taken_imports(&[("a.o".to_string(), obj)])
+            .into_iter()
+            .collect();
+        taken.sort();
+        assert_eq!(taken, ["hi", "pcrel", "word"]);
     }
 }

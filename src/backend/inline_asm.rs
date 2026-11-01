@@ -554,6 +554,37 @@ pub fn inline_asm_template_has_no_instructions(template: &str) -> bool {
     template.chars().all(|c| c.is_whitespace() || c == ';')
 }
 
+/// True when an inline asm can neither destroy nor stage a register: no goto
+/// labels, a template that assembles to nothing after dialect expansion, and
+/// every operand constraint memory-only (`m`/`o`/`V`, modifiers aside) or
+/// immediate-only.
+///
+/// This is the single register-effect contract between liveness
+/// (`instruction_is_call_point`) and the emitter: whenever it holds, the
+/// emitter returns before staging anything, so liveness may keep values in
+/// caller-saved registers across the statement. A register operand is staged
+/// even under an empty template -- `asm("" : "+d"(y))` loads `y` into %rdx and
+/// `asm("" : "=r"(x) : "0"(x))` (OPTIMIZER_HIDE_VAR) must deliver the tied
+/// value -- so any other constraint, a register variable (`{rdx}`), a tie or a
+/// mixed class like `rm`, keeps the statement a call point. The list is a
+/// whitelist on purpose: a constraint this function does not recognise is
+/// treated as a register.
+pub fn inline_asm_is_register_inert<'a>(
+    template: &str,
+    constraints: impl IntoIterator<Item = &'a str>,
+    has_goto_labels: bool,
+) -> bool {
+    fn memory_only(constraint: &str) -> bool {
+        let class = constraint.trim_start_matches(['=', '+', '&', '%']);
+        !class.is_empty() && class.chars().all(|c| matches!(c, 'm' | 'o' | 'V'))
+    }
+    !has_goto_labels
+        && inline_asm_template_has_no_instructions(&expand_dialect_alternatives(template))
+        && constraints
+            .into_iter()
+            .all(|c| memory_only(c) || constraint_is_immediate_only(c))
+}
+
 pub fn emit_inline_asm_common_impl(
     emitter: &mut dyn InlineAsmEmitter,
     template: &str,
@@ -626,11 +657,25 @@ pub fn emit_inline_asm_common_impl(
     // when the busy set left none free, spilled the address to a frame slot and
     // reloaded it after the block — a store/load pair in the loop body (see
     // `tests/regression/check_asm_barrier_no_spill.sh`).
+    //
+    // Liveness relies on this return: `inline_asm_is_register_inert` is the
+    // condition under which it stops treating the statement as a call point,
+    // so the emitter must stage nothing whenever that predicate holds (the
+    // second disjunct makes the implication structural, not a property of
+    // each target's constraint classifier).
     if template_is_empty
         && goto_labels.is_empty()
-        && operands
+        && (operands
             .iter()
             .all(|op| matches!(op.kind, AsmOperandKind::Memory | AsmOperandKind::Immediate))
+            || inline_asm_is_register_inert(
+                template,
+                outputs
+                    .iter()
+                    .map(|(c, ..)| c.as_str())
+                    .chain(inputs.iter().map(|(c, ..)| c.as_str())),
+                false,
+            ))
     {
         return;
     }

@@ -53,6 +53,10 @@ pub struct LinkerArgs {
     pub z_now: bool,
     /// `-z relro` (default true, `-z norelro` clears): emit PT_GNU_RELRO.
     pub z_relro: bool,
+    /// `--no-relax` (last of `--relax`/`--no-relax` wins): RISC-V links keep
+    /// every instruction sequence at its assembled size, deleting only the
+    /// surplus `R_RISCV_ALIGN` padding, which no link may keep.
+    pub no_relax: bool,
     /// `-z pack-relative-relocs` / `-z nopack-relative-relocs`: pack aligned
     /// `R_*_RELATIVE` relocations into `.relr.dyn` (`SHT_RELR` / `DT_RELR`).
     pub z_pack_relative_relocs: bool,
@@ -144,6 +148,13 @@ pub struct LinkerArgs {
     /// `-z execstack` (Some(true)) / `-z noexecstack` (Some(false)); None
     /// leaves the decision to the inputs' `.note.GNU-stack` markers.
     pub z_execstack: Option<bool>,
+    /// `--warn-execstack` (Some(true)) / `--no-warn-execstack` (Some(false));
+    /// None is GNU ld's default and `--warn-execstack-objects` (warn about
+    /// executable markers only, see `stack_note::execstack_report`).
+    pub warn_execstack: Option<bool>,
+    /// `--error-execstack` / `--no-error-execstack` (last wins): an
+    /// executable-stack report fails the link with GNU ld's error text.
+    pub error_execstack: bool,
     /// `-z` keywords that only set `DF_1_*` / `DF_*` dynamic flags:
     /// origin, nodelete, nodlopen, initfirst, interpose, nodefaultlib.
     pub z_dyn_flag_keywords: Vec<String>,
@@ -536,8 +547,19 @@ fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
         "--emit-relocs" | "-q" => {
             result.emit_relocs = true;
         }
+        "--warn-execstack" => result.warn_execstack = Some(true),
+        "--no-warn-execstack" => result.warn_execstack = Some(false),
+        "--warn-execstack-objects" => result.warn_execstack = None,
+        "--error-execstack" => result.error_execstack = true,
+        "--no-error-execstack" => result.error_execstack = false,
         "--no-emit-relocs" => {
             result.emit_relocs = false;
+        }
+        "--relax" => {
+            result.no_relax = false;
+        }
+        "--no-relax" => {
+            result.no_relax = true;
         }
         "--no-undefined-version" => {
             result.no_undefined_version = true;
@@ -737,23 +759,14 @@ fn apply_kv_option(result: &mut LinkerArgs, tok: &str, next: Option<&str>) -> Op
         }
         return Some(false);
     }
-    // `-b FORMAT` is BFD's deprecated alias for `--oformat`. It reaches the
-    // linker only through `-Wl,`, so it must not be treated as an unknown
-    // token and dropped: dropping it silently produced an ELF file for a
-    // caller that asked for a flat image.
-    if let Some(v) = tok.strip_prefix("-b")
-        && !v.starts_with('-')
-    {
-        let v = v.strip_prefix('=').unwrap_or(v);
-        if !v.is_empty() {
-            result.oformat = Some(v.to_string());
-            return Some(false);
-        }
-        if let Some(v) = next {
-            result.oformat = Some(v.to_string());
-            return Some(true);
-        }
-        return Some(false);
+    // `-b FORMAT` / `--format FORMAT` name the format of the INPUT files
+    // that follow (bfd: "Specify target for following input files"); they
+    // are not `--oformat`.  The link entry points turn `binary` inputs into
+    // wrapper objects and consume the switches before parsing
+    // (`binary_input`); here the switch and its word are only kept out of
+    // the input list.
+    if let Some(word) = super::binary_input::format_switch(tok) {
+        return Some(word.is_none() && next.is_some());
     }
     if let Some(v) = tok.strip_prefix("--oformat=") {
         result.oformat = Some(v.to_string());
@@ -1055,6 +1068,129 @@ pub fn rpath_dyn_entry(args: &LinkerArgs) -> Option<(i64, String)> {
     })
 }
 
+/// GNU ld options whose value may arrive as the next word (`--opt VALUE`);
+/// see the re-join in [`parse_linker_args`].
+pub(crate) const VALUE_TAKING: &[&str] = &[
+    "--wrap",
+    "--defsym",
+    "--icf",
+    "-Map",
+    "--version-script",
+    "--dynamic-list",
+    "--exclude-libs",
+    "--image-base",
+    "--pack-dyn-relocs",
+    "--oformat",
+    // The input-format switch (`binary_input`): `-Wl,-b -Wl,binary` must
+    // be re-joined, or the format word falls through to the input list.
+    "-b",
+    "--format",
+    "-format",
+    "-rpath",
+    "-rpath-link",
+    "--rpath-link",
+    "--hash-style",
+    "-hash-style",
+    "--dynamic-linker",
+    "-dynamic-linker",
+    "-I",
+    "-soname",
+    "--entry",
+    "-e",
+    "--undefined",
+    "-u",
+    "-z",
+];
+
+/// GNU ld accepts `--opt VALUE` alongside `--opt=VALUE`.  A driver that
+/// forwards them as `-Wl,--opt -Wl,VALUE` splits the pair across two
+/// arguments, and a `-Wl,` group parser sees one group at a time, so the
+/// value would be dropped or taken as a file.  Re-join such pairs up front
+/// (`-Wl,--wrap -Wl,bv` becomes `-Wl,--wrap,bv`) for every option whose
+/// value is the next word: `VALUE_TAKING` and `binary_input::VALUE_WORDS`.
+/// Shared by `parse_linker_args` and the AArch64 static loader.
+pub(crate) fn join_split_wl_values(user_args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(user_args.len());
+    let mut k = 0;
+    while k < user_args.len() {
+        let mut cur = user_args[k].clone();
+        k += 1;
+        // Absorb following -Wl, groups while this one ends in an option
+        // that is still waiting for its value.
+        while k < user_args.len() {
+            let wl = match cur.strip_prefix("-Wl,") {
+                Some(w) => w,
+                None => break,
+            };
+            let last = match wl.split(',').next_back() {
+                Some(l) => l,
+                None => break,
+            };
+            if !VALUE_TAKING.contains(&last) && !super::binary_input::VALUE_WORDS.contains(&last) {
+                break;
+            }
+            let nxt = match user_args[k].strip_prefix("-Wl,") {
+                Some(w) => w,
+                None => break, // value is a separate argv entry; leave it
+            };
+            cur = format!("{},{}", cur, nxt);
+            k += 1;
+        }
+        out.push(cur);
+    }
+    out
+}
+
+/// A library-search option inside a `-Wl,` group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchOption<'a> {
+    /// `-L DIR`, `-LDIR`, `--library-path[=]DIR`.
+    Dir(&'a str),
+    /// `-l NAME`, `-lNAME`, `--library[=]NAME`.
+    Lib(&'a str),
+}
+
+/// Classify `tok` (with the group's next word `next`) as GNU ld's `-L` /
+/// `-l` in any of their spellings, and say whether `next` was its value.
+/// A bare `-L` or `-l` takes the next word, as in GNU ld; matching only the
+/// joined prefix made `-Wl,-L,DIR` add an empty search directory and link
+/// `DIR` as a file.  `None` for anything else, including a bare option with
+/// no value left (the caller's value-word arm consumes it).
+pub(crate) fn search_option<'a>(
+    tok: &'a str,
+    next: Option<&'a str>,
+) -> Option<(SearchOption<'a>, bool)> {
+    let value = |joined: Option<&'a str>, bare: bool| -> Option<(&'a str, bool)> {
+        match joined {
+            Some(v) if !v.is_empty() => Some((v, false)),
+            _ if bare => next.filter(|v| !v.is_empty()).map(|v| (v, true)),
+            _ => None,
+        }
+    };
+    if tok == "-L" || tok == "--library-path" {
+        return value(None, true).map(|(v, used)| (SearchOption::Dir(v), used));
+    }
+    if tok == "-l" || tok == "--library" {
+        return value(None, true).map(|(v, used)| (SearchOption::Lib(v), used));
+    }
+    if let Some(v) = tok.strip_prefix("--library-path=") {
+        return value(Some(v), false).map(|(v, used)| (SearchOption::Dir(v), used));
+    }
+    if let Some(v) = tok.strip_prefix("--library=") {
+        return value(Some(v), false).map(|(v, used)| (SearchOption::Lib(v), used));
+    }
+    if tok.starts_with("--") {
+        return None;
+    }
+    if let Some(v) = tok.strip_prefix("-L") {
+        return value(Some(v), false).map(|(v, used)| (SearchOption::Dir(v), used));
+    }
+    if let Some(v) = tok.strip_prefix("-l") {
+        return value(Some(v), false).map(|(v, used)| (SearchOption::Lib(v), used));
+    }
+    None
+}
+
 pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     let mut result = LinkerArgs::default();
     // DT_RUNPATH is the default, not DT_RPATH: bfd (as configured by every
@@ -1067,74 +1203,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     result.warn_rwx_segments = true; // GNU ld's default RWX LOAD diagnostic
     result.z_relro = true; // RELRO is on by default, like GNU ld/mold
 
-    // GNU ld accepts `--opt VALUE` alongside `--opt=VALUE`.  A driver that
-    // forwards them as `-Wl,--opt -Wl,VALUE` splits the pair across two
-    // arguments, and the `-Wl,` splitter below can only see one group at a
-    // time, so the value is silently dropped.  Re-join such a pair up front:
-    // `-Wl,--wrap -Wl,bv` becomes `-Wl,--wrap,bv`, which the group parser
-    // already handles.  This replaces the ad-hoc `pending_rpath` workaround
-    // and covers every two-argument option at once.
-    const VALUE_TAKING: &[&str] = &[
-        "--wrap",
-        "--defsym",
-        "--icf",
-        "-Map",
-        "--version-script",
-        "--dynamic-list",
-        "--exclude-libs",
-        "--image-base",
-        "--pack-dyn-relocs",
-        "--oformat",
-        // BFD's deprecated alias for `--oformat`; `-Wl,-b -Wl,binary` must be
-        // re-joined like the long spelling, or the format word falls through
-        // to the input list and is reported as a missing file.
-        "-b",
-        "-rpath",
-        "-rpath-link",
-        "--rpath-link",
-        "--hash-style",
-        "-hash-style",
-        "--dynamic-linker",
-        "-dynamic-linker",
-        "-I",
-        "-soname",
-        "--entry",
-        "-e",
-        "--undefined",
-        "-u",
-        "-z",
-    ];
-    let joined: Vec<String> = {
-        let mut out: Vec<String> = Vec::with_capacity(user_args.len());
-        let mut k = 0;
-        while k < user_args.len() {
-            let mut cur = user_args[k].clone();
-            k += 1;
-            // Absorb following -Wl, groups while this one ends in an option
-            // that is still waiting for its value.
-            while k < user_args.len() {
-                let wl = match cur.strip_prefix("-Wl,") {
-                    Some(w) => w,
-                    None => break,
-                };
-                let last = match wl.split(',').next_back() {
-                    Some(l) => l,
-                    None => break,
-                };
-                if !VALUE_TAKING.contains(&last) {
-                    break;
-                }
-                let nxt = match user_args[k].strip_prefix("-Wl,") {
-                    Some(w) => w,
-                    None => break, // value is a separate argv entry; leave it
-                };
-                cur = format!("{},{}", cur, nxt);
-                k += 1;
-            }
-            out.push(cur);
-        }
-        out
-    };
+    let joined = join_split_wl_values(user_args);
     let args: Vec<&str> = joined.iter().map(|s| s.as_str()).collect();
     // Retained for a `-Wl,-rpath` whose path arrives as a *separate argv
     // entry* (not another `-Wl,` group), which the join above deliberately
@@ -1265,11 +1334,19 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.use_runpath = true;
                 } else if part == "--disable-new-dtags" {
                     result.use_runpath = false;
-                } else if let Some(lpath) = part.strip_prefix("-L") {
-                    result.extra_lib_paths.push(lpath.to_string());
-                } else if let Some(lib) = part.strip_prefix("-l") {
-                    result.libs_to_load.push(lib.to_string());
-                    result.inputs.push(pos.item(lib, true));
+                } else if let Some((opt, used_next)) =
+                    search_option(part, parts.get(j + 1).copied())
+                {
+                    if used_next {
+                        j += 1;
+                    }
+                    match opt {
+                        SearchOption::Dir(dir) => result.extra_lib_paths.push(dir.to_string()),
+                        SearchOption::Lib(lib) => {
+                            result.libs_to_load.push(lib.to_string());
+                            result.inputs.push(pos.item(lib, true));
+                        }
+                    }
                 } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
                     if let Some(eq_pos) = defsym_arg.find('=') {
                         result.defsym_defs.push((
@@ -1308,6 +1385,12 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     // Unknown values disable ICF rather than erroring, which
                     // matches how gold/lld treat --icf=none.
                     result.icf = crate::backend::x86::linker::parse_icf_mode(v).map(str::to_string);
+                } else if part == "--icf" && j + 1 < parts.len() {
+                    // `--icf MODE`, the separated spelling the re-join above
+                    // produces for `-Wl,--icf -Wl,all`.
+                    j += 1;
+                    result.icf =
+                        crate::backend::x86::linker::parse_icf_mode(parts[j]).map(str::to_string);
                 } else if part == "--no-icf" {
                     result.icf = None;
                 } else if part == "--gc-sections" {
@@ -1403,6 +1486,22 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.build_id = true;
                 } else if part == "--no-build-id" {
                     result.build_id = false;
+                } else if super::binary_input::VALUE_WORDS.contains(&part) {
+                    // An option this parser does not act on, whose value is
+                    // the next word (`-Wl,-T,script.ld`): the value is not
+                    // an input file.
+                    j += 1;
+                } else if !part.starts_with('-') && !part.is_empty() {
+                    // A file operand inside `-Wl,` (`-Wl,extra.o`, or the
+                    // wrapper object of `-Wl,-b,binary,blob.bin`) is an input
+                    // exactly like one outside it: GNU ld links it.  It used
+                    // to be dropped, leaving its symbols undefined.
+                    if Path::new(part).exists() {
+                        result.extra_object_files.push(part.to_string());
+                        result.inputs.push(pos.item(part, false));
+                    } else {
+                        result.missing_inputs.push(part.to_string());
+                    }
                 }
                 j += 1;
             }
@@ -1920,6 +2019,9 @@ mod z_isa_level_tests {
         assert!(r.z_relro);
         let r = parse_linker_args(&args(&["-Wl,-znorelro"]));
         assert!(!r.z_relro);
+        assert!(!parse_linker_args(&args(&[])).no_relax);
+        assert!(parse_linker_args(&args(&["-Wl,--no-relax"])).no_relax);
+        assert!(!parse_linker_args(&args(&["-Wl,--no-relax", "-Wl,--relax"])).no_relax);
         let r = parse_linker_args(&args(&["-Wl,-zibt", "-Wl,-zshstk"]));
         assert!(r.z_ibt && r.z_shstk);
         let r = parse_linker_args(&args(&["-Wl,-zx86-64-v3"]));
@@ -2147,44 +2249,152 @@ mod z_isa_level_tests {
         );
     }
 
-    /// `-b FORMAT` is BFD's deprecated `--oformat` alias, and it has to be
-    /// recorded rather than dropped: the driver historically ignored both
-    /// spellings and wrote an ELF file for a request that asked for a flat
-    /// image.
+    /// `-b FORMAT` / `--format FORMAT` select the format of the INPUT files
+    /// that follow (bfd `ld --help`: "Specify target for following input
+    /// files"); bfd links `gcc main.c -Wl,-b,binary` by reading the trailing
+    /// libraries as raw data, never by writing a flat image.  The parser
+    /// keeps the switch and its word out of the input list and leaves
+    /// `--oformat` alone; and, as under GNU ld's `getopt_long_only`,
+    /// `-build-id` is not `-b uild-id`.
+    /// A file named inside `-Wl,` is linked like one outside it (GNU ld
+    /// links `gcc m.c -Wl,h.o`; lccc dropped it), while the value of every
+    /// value-taking option -- acted on or not -- never becomes an input.
     #[test]
-    fn dash_b_is_an_oformat_alias() {
+    fn wl_file_operands_are_inputs_and_option_values_are_not() {
+        let dir = std::env::temp_dir().join(format!("lccc-wl-operand-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let obj = dir.join("h.o");
+        std::fs::write(&obj, b"").expect("file");
+        let obj = obj.to_string_lossy().into_owned();
+        let parsed = parse_linker_args(&args(&[&format!("-Wl,{obj}")]));
+        assert_eq!(parsed.extra_object_files, std::slice::from_ref(&obj));
+        assert!(parsed.inputs.iter().any(|i| i.name == obj));
+        let missing = parse_linker_args(&args(&["-Wl,/nonexistent/lccc/x.o"]));
+        assert_eq!(missing.missing_inputs, ["/nonexistent/lccc/x.o"]);
+        let mut wrong = Vec::new();
+        for opt in VALUE_TAKING
+            .iter()
+            .chain(super::super::binary_input::VALUE_WORDS)
+        {
+            // `-z` takes a keyword; the rest take a value this word stands
+            // in for (a defsym needs its `=`).
+            let value = match *opt {
+                "-z" => "now",
+                "--defsym" => "sym=0",
+                "-b" | "--format" | "-format" => "default",
+                _ => "valueword",
+            };
+            // Both the in-group and the split (`-Wl,OPT -Wl,VALUE`) forms.
+            for form in [
+                vec![format!("-Wl,{opt},{value}")],
+                vec![format!("-Wl,{opt}"), format!("-Wl,{value}")],
+            ] {
+                let form: Vec<&str> = form.iter().map(String::as_str).collect();
+                let parsed = parse_linker_args(&args(&form));
+                // `-l NAME` is the one option whose value is an input: a
+                // library, never a file operand.
+                let ok = if matches!(*opt, "-l" | "--library") {
+                    parsed.libs_to_load == [value]
+                        && parsed.inputs.len() == 1
+                        && parsed.inputs[0].is_lib
+                } else {
+                    parsed.inputs.is_empty()
+                };
+                if !ok || !parsed.missing_inputs.is_empty() {
+                    wrong.push(format!("{form:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "option values taken as inputs: {wrong:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GNU ld's `-L` / `-l` in every spelling, joined or separated, in one
+    /// group or split across two.
+    #[test]
+    fn wl_search_options_take_their_value_in_every_spelling() {
+        for spelling in [
+            &["-Wl,-L,/opt/x"][..],
+            &["-Wl,-L/opt/x"],
+            &["-Wl,--library-path,/opt/x"],
+            &["-Wl,--library-path=/opt/x"],
+            &["-Wl,-L", "-Wl,/opt/x"],
+        ] {
+            let parsed = parse_linker_args(&args(spelling));
+            assert_eq!(parsed.extra_lib_paths, ["/opt/x"], "{spelling:?}");
+            assert!(
+                parsed.inputs.is_empty() && parsed.missing_inputs.is_empty(),
+                "{spelling:?}"
+            );
+        }
+        for spelling in [
+            &["-Wl,-l,m"][..],
+            &["-Wl,-lm"],
+            &["-Wl,--library,m"],
+            &["-Wl,--library=m"],
+            &["-Wl,-l", "-Wl,m"],
+        ] {
+            let parsed = parse_linker_args(&args(spelling));
+            assert_eq!(parsed.libs_to_load, ["m"], "{spelling:?}");
+            assert!(parsed.missing_inputs.is_empty(), "{spelling:?}");
+        }
+        assert_eq!(search_option("-L", None), None);
+        assert_eq!(search_option("--library-path=", Some("x")), None);
+        assert_eq!(search_option("--library-pathx", Some("x")), None);
         assert_eq!(
-            parse_linker_args(&args(&["-Wl,-b,binary"]))
-                .oformat
-                .as_deref(),
-            Some("binary")
+            search_option("-lc", Some("x")),
+            Some((SearchOption::Lib("c"), false))
         );
         assert_eq!(
-            parse_linker_args(&args(&["-Wl,-bbinary"]))
-                .oformat
-                .as_deref(),
-            Some("binary")
+            join_split_wl_values(&args(&["-Wl,-T", "-Wl,s.ld", "-Wl,-L", "x.o"])),
+            args(&["-Wl,-T,s.ld", "-Wl,-L", "x.o"])
         );
-        assert_eq!(
-            parse_linker_args(&args(&["-Wl,-b", "-Wl,binary"]))
-                .oformat
-                .as_deref(),
-            Some("binary")
-        );
+    }
+
+    #[test]
+    fn dash_b_is_the_input_format_not_oformat() {
+        for spelling in [
+            &["-Wl,-b,binary"][..],
+            &["-Wl,-bbinary"],
+            &["-Wl,-b", "-Wl,binary"],
+            &["-Wl,--format=binary"],
+            &["-Wl,--format", "-Wl,binary"],
+        ] {
+            let parsed = parse_linker_args(&args(spelling));
+            assert!(parsed.oformat.is_none(), "{spelling:?}");
+            assert!(
+                parsed.inputs.iter().all(|i| i.name != "binary"),
+                "{spelling:?}: the format word became an input"
+            );
+        }
         assert_eq!(
             parse_linker_args(&args(&["-Wl,--oformat=binary"]))
                 .oformat
                 .as_deref(),
             Some("binary")
         );
-        // `-b` with no value records nothing, and unrelated `--...` flags are
-        // untouched.
-        assert!(parse_linker_args(&args(&["-Wl,-b"])).oformat.is_none());
         assert!(
-            parse_linker_args(&args(&["-Wl,--build-id=sha1"]))
+            parse_linker_args(&args(&["-Wl,-build-id"]))
                 .oformat
                 .is_none()
         );
+    }
+
+    /// GNU ld 2.47's executable-stack switches (`ld/lexsup.c`): last wins,
+    /// and `--warn-execstack-objects` is the default (markers only).
+    #[test]
+    fn execstack_report_switches() {
+        let p = |a: &[&str]| parse_linker_args(&args(a));
+        let none = p(&[]);
+        assert_eq!((none.warn_execstack, none.error_execstack), (None, false));
+        assert_eq!(p(&["-Wl,--warn-execstack"]).warn_execstack, Some(true));
+        assert_eq!(p(&["-Wl,--no-warn-execstack"]).warn_execstack, Some(false));
+        assert_eq!(
+            p(&["-Wl,--warn-execstack", "-Wl,--warn-execstack-objects"]).warn_execstack,
+            None
+        );
+        assert!(p(&["-Wl,--error-execstack"]).error_execstack);
+        assert!(!p(&["-Wl,--error-execstack", "-Wl,--no-error-execstack"]).error_execstack);
     }
 
     #[test]

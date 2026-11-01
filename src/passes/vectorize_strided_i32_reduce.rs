@@ -22,21 +22,27 @@
 //! both dereferenceability paths below on
 //! `tests/regression/vectorize_strided_i32_reduce.c`.
 //!
-//! ### Even-lane SIMD homomorphism (zero shuffles inside the loop)
+//! ### Lane layouts
 //!
-//! A `VecLoadStrided2I32x8` places four stride-8B dwords (`+0, +8, +16,
-//! +24`) in the even 32-bit lanes `0, 2, 4, 6` of a YMM register without
-//! reading the gaps; `VecLoadStrided2I32x4` is the two-dword XMM equivalent.
-//! With a sufficient contiguous-object proof, SSE2 can instead compact two
-//! full XMM loads into four real lanes and omit the odd-lane mask. AVX2 uses
-//! a full `VecLoadI32x8` under the same proof. Because modular lane operations
-//! (`vpaddd`, `vpsubd`, `vpmulld`, `vpand`, `vpor`, `vpxor`, `vpslld`,
-//! `vpsrld`, `vpsrad`) never propagate carries or traps across lane
-//! boundaries, evaluating the entire per-element DAG across all 8 lanes in
-//! parallel computes the exact scalar values in lanes `0, 2, 4, 6` with zero
-//! in-loop shuffles or permutes on the exact-access forms. Once the vector
-//! loop exits, the even-lane accumulators mask their odd lanes before the
-//! horizontal add; the compact XMM form already contains only real elements.
+//! Modular lane operations (`paddd`, `psubd`, `pmulld`, `pand`, `por`,
+//! `pxor`, `pslld`, `psrld`, `psrad`) never propagate carries or traps across
+//! lane boundaries, so evaluating the whole per-element DAG on every lane
+//! computes the exact scalar value in each lane that holds an element.
+//!
+//! * **AVX2 (`X8`).** `VecLoadStrided2I32x8` places the four stride-8B dwords
+//!   (`+0, +8, +16, +24`) in the even lanes `0, 2, 4, 6` of a YMM register
+//!   with exact reads (odd lanes zero); with the contiguous-object proof a
+//!   full `VecLoadI32x8` puts them there directly, with no in-loop shuffle.
+//!   After the loop the odd lanes are masked off before the horizontal add.
+//! * **SSE2 (`X4`).** The four elements fill *all four* XMM lanes.
+//!   `VecLoadStrided2I32x4` gathers them with four exact dword reads
+//!   (`movd` + `punpckldq`/`punpcklqdq`, never touching a gap); with the
+//!   proof `VecLoadStrided2CompactI32x4` compacts two full loads with one
+//!   `shufps`. The layout is the same, so proven and unproven streams mix in
+//!   one expression and no lane mask exists. (A two-lane `[e0, 0, e8, 0]`
+//!   exact form was measured: half-empty vectors made it 0.84 cycles per
+//!   element against 0.50 for the four-lane gather on llvm-mca's Alder Lake
+//!   model, and slower than the scalar loop in instruction count.)
 //!
 //! ### Exact-access and guard-page contract
 //!
@@ -71,7 +77,9 @@ struct StridedI32ReducePattern {
     acc_ty: IrType,
     acc_init: Operand,
     safe_vecs: u64,
-    load_bases: Vec<Value>,
+    /// One `(base, constant byte displacement)` per stream: iteration `t`
+    /// reads the dword at `base + disp + 8t`.
+    load_bases: Vec<(Value, i64)>,
     wide_load_proven: Vec<bool>,
     expr: StridedExpr,
 }
@@ -247,6 +255,35 @@ pub(super) fn try_transform(
 ///
 /// Everything else declines and keeps the strided load, which reads only the
 /// bytes the scalar loop already reads.
+/// Largest displacement `transform` adds to a stream for an unrolled copy:
+/// `(unroll - 1) * VECTOR_BYTES` at the AVX2 4x unroll.
+const MAX_COPY_DISP: i64 = 3 * VECTOR_BYTES as i64;
+
+/// Whether a stream's constant displacement, plus any copy displacement,
+/// stays a signed 32-bit address displacement.
+fn stream_disp_fits(disp: i64) -> bool {
+    i32::try_from(disp).is_ok()
+        && disp
+            .checked_add(MAX_COPY_DISP)
+            .is_some_and(|d| i32::try_from(d).is_ok())
+}
+
+/// [`wide_load_proven`] for a displaced stream: its vector window is
+/// `[disp, disp + window)` from `base`, so the object must cover
+/// `disp + window` bytes. A negative displacement starts before the proven
+/// object start and never takes the gap-reading form.
+fn stream_wide_load_proven(
+    func: &IrFunction,
+    (base, disp): (Value, i64),
+    window: u64,
+    symbol_facts: &ModuleSymbolFacts,
+) -> bool {
+    u64::try_from(disp)
+        .ok()
+        .and_then(|d| d.checked_add(window))
+        .is_some_and(|needed| wide_load_proven(func, base, needed, symbol_facts))
+}
+
 fn wide_load_proven(
     func: &IrFunction,
     base: Value,
@@ -965,14 +1002,14 @@ fn analyze(
     // Scan `body_idx`: allow only pure non-trapping instructions and non-volatile
     // 32-bit loads (or 4-byte little-endian U8 reassemblies) at `base + iv_phi`
     // with loop-invariant `base`.
-    let mut load_bases: Vec<Value> = Vec::new();
+    let mut load_bases: Vec<(Value, i64)> = Vec::new();
     let mut load_map: FxHashMap<Value, usize> = FxHashMap::default();
     let mut u8_loads: FxHashMap<Value, Value> = FxHashMap::default();
     let mut consumed_u8_loads: FxHashSet<Value> = FxHashSet::default();
     let mut contrib_op: Option<Operand> = None;
     let mut acc_uses_in_body = 0usize;
 
-    let register_base = |base: Value, load_bases: &mut Vec<Value>| -> Option<usize> {
+    let register_base = |base: (Value, i64), load_bases: &mut Vec<(Value, i64)>| -> Option<usize> {
         if let Some(pos) = load_bases.iter().position(|&b| b == base) {
             Some(pos)
         } else if load_bases.len() < 4 {
@@ -998,12 +1035,18 @@ fn analyze(
                 seg_override: AddressSpace::Default,
                 volatile: false,
             } => {
+                // `(base + iv) + disp`: a constant displacement is part of the
+                // stream (`p[i].field` in an 8-byte stride), not a new IV form.
+                let (addr, disp) = match_ptr_const_disp(func, &loop_info.body, *ptr);
                 let Some(base) =
-                    match_base_plus_iv(func, &loop_info.body, &loop_defs, *ptr, iv_phi)
+                    match_base_plus_iv(func, &loop_info.body, &loop_defs, addr, iv_phi)
                 else {
                     decline!();
                 };
-                let Some(stream_idx) = register_base(base, &mut load_bases) else {
+                if !stream_disp_fits(disp) {
+                    decline!();
+                }
+                let Some(stream_idx) = register_base((base, disp), &mut load_bases) else {
                     decline!();
                 };
                 load_map.insert(*dest, stream_idx);
@@ -1061,7 +1104,8 @@ fn analyze(
                                     p0,
                                     iv_phi,
                                 ) {
-                                    let Some(stream_idx) = register_base(base, &mut load_bases)
+                                    let Some(stream_idx) =
+                                        register_base((base, 0), &mut load_bases)
                                     else {
                                         decline!();
                                     };
@@ -1111,7 +1155,7 @@ fn analyze(
     };
     let wide_load_proven = load_bases
         .iter()
-        .map(|&base| wide_load_proven(func, base, vector_bytes, symbol_facts))
+        .map(|&stream| stream_wide_load_proven(func, stream, vector_bytes, symbol_facts))
         .collect();
 
     Some(StridedI32ReducePattern {
@@ -1130,67 +1174,61 @@ fn analyze(
     })
 }
 
+/// The two vector forms. Both cover one four-element group (`VECTOR_BYTES`
+/// of the byte IV) per vector, so `analyze`'s group count, the resume offset
+/// and the bound proof are width-independent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StridedWidth {
+    /// SSE2: the four elements in the four lanes of an XMM register.
     X4,
-    X4Compact,
+    /// AVX2: the four elements in the even lanes of a YMM register.
     X8,
 }
 
 impl StridedWidth {
-    fn vector_bytes(self) -> u64 {
-        match self {
-            Self::X4 => 16,
-            Self::X4Compact | Self::X8 => 32,
-        }
-    }
-
-    /// `analyze` counts four-dword groups. Exact SSE2 handles the same proven
-    /// prefix as twice as many two-dword groups; compact SSE2 and AVX2 retain
-    /// the four-dword group count. Any remainder stays in the scalar loop.
-    fn safe_vecs(self, x8_vecs: u64) -> Option<u64> {
-        match self {
-            Self::X4 => x8_vecs.checked_mul(2),
-            Self::X4Compact | Self::X8 => Some(x8_vecs),
-        }
-    }
-
-    fn load(self, contiguous: bool) -> Option<IntrinsicOp> {
-        let op = match (self, contiguous) {
-            (Self::X4, true) => IntrinsicOp::VecLoadI32x4,
+    /// Load for one stream. `contiguous` is the reducer's per-stream proof
+    /// that the stream's whole 32-byte window is readable; without it the
+    /// exact-access forms read only the four elements, never a gap. The lane
+    /// layout does not depend on the proof, so proven and unproven streams
+    /// mix freely in one expression.
+    fn load(self, contiguous: bool) -> IntrinsicOp {
+        match (self, contiguous) {
+            (Self::X4, true) => IntrinsicOp::VecLoadStrided2CompactI32x4,
             (Self::X4, false) => IntrinsicOp::VecLoadStrided2I32x4,
-            (Self::X4Compact, true) => IntrinsicOp::VecLoadStrided2CompactI32x4,
-            // A compact load consumes the gap bytes. Without the contiguous
-            // window proof there is no legal compact operation to emit.
-            (Self::X4Compact, false) => return None,
             (Self::X8, true) => IntrinsicOp::VecLoadI32x8,
             (Self::X8, false) => IntrinsicOp::VecLoadStrided2I32x8,
-        };
-        Some(op)
+        }
     }
 
     fn broadcast(self) -> IntrinsicOp {
         match self {
-            Self::X4 | Self::X4Compact => IntrinsicOp::VecBroadcastI32x4,
+            Self::X4 => IntrinsicOp::VecBroadcastI32x4,
             Self::X8 => IntrinsicOp::VecBroadcastI32x8,
         }
     }
 
     fn zero(self) -> IntrinsicOp {
         match self {
-            Self::X4 | Self::X4Compact => IntrinsicOp::VecZeroI32x4,
+            Self::X4 => IntrinsicOp::VecZeroI32x4,
             Self::X8 => IntrinsicOp::VecZeroI32x8,
         }
     }
 
+    /// Lane operation for `op`, or `None` when this width has no lowering.
+    ///
+    /// The analyser builds only operations listed here, so `None` is a
+    /// decline, never an abort: `transform` mutates nothing before every
+    /// plan exists, so the scalar loop stays untouched (pinned by
+    /// `unsupported_intrinsic_forms_are_refused` and the transactional
+    /// tests; a lost vectorization fails `check_vector_remainder_codegen`).
     fn bin_op(self, op: IrBinOp) -> Option<IntrinsicOp> {
         let intrinsic = match (self, op) {
-            (Self::X4 | Self::X4Compact, IrBinOp::Add) => IntrinsicOp::VecAddI32x4,
-            (Self::X4 | Self::X4Compact, IrBinOp::Sub) => IntrinsicOp::VecSubI32x4,
-            (Self::X4 | Self::X4Compact, IrBinOp::Mul) => IntrinsicOp::VecMulI32x4,
-            (Self::X4 | Self::X4Compact, IrBinOp::And) => IntrinsicOp::VecAndI32x4,
-            (Self::X4 | Self::X4Compact, IrBinOp::Or) => IntrinsicOp::VecOrI32x4,
-            (Self::X4 | Self::X4Compact, IrBinOp::Xor) => IntrinsicOp::VecXorI32x4,
+            (Self::X4, IrBinOp::Add) => IntrinsicOp::VecAddI32x4,
+            (Self::X4, IrBinOp::Sub) => IntrinsicOp::VecSubI32x4,
+            (Self::X4, IrBinOp::Mul) => IntrinsicOp::VecMulI32x4,
+            (Self::X4, IrBinOp::And) => IntrinsicOp::VecAndI32x4,
+            (Self::X4, IrBinOp::Or) => IntrinsicOp::VecOrI32x4,
+            (Self::X4, IrBinOp::Xor) => IntrinsicOp::VecXorI32x4,
             (Self::X8, IrBinOp::Add) => IntrinsicOp::VecAddI32x8,
             (Self::X8, IrBinOp::Sub) => IntrinsicOp::VecSubI32x8,
             (Self::X8, IrBinOp::Mul) => IntrinsicOp::VecMulI32x8,
@@ -1202,11 +1240,15 @@ impl StridedWidth {
         Some(intrinsic)
     }
 
+    /// Shift operation for `op`; `None` mirrors [`Self::bin_op`]'s contract.
+    /// The analyser guarantees a *constant* shift count (`StridedExpr::Invariant`
+    /// as the right operand), which is why the vector form takes the count as
+    /// an immediate operand instead of a lane.
     fn shift_op(self, op: IrBinOp) -> Option<IntrinsicOp> {
         let intrinsic = match (self, op) {
-            (Self::X4 | Self::X4Compact, IrBinOp::Shl) => IntrinsicOp::VecShlI32x4,
-            (Self::X4 | Self::X4Compact, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x4,
-            (Self::X4 | Self::X4Compact, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x4,
+            (Self::X4, IrBinOp::Shl) => IntrinsicOp::VecShlI32x4,
+            (Self::X4, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x4,
+            (Self::X4, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x4,
             (Self::X8, IrBinOp::Shl) => IntrinsicOp::VecShlI32x8,
             (Self::X8, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x8,
             (Self::X8, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x8,
@@ -1217,7 +1259,7 @@ impl StridedWidth {
 
     fn horizontal_add(self) -> IntrinsicOp {
         match self {
-            Self::X4 | Self::X4Compact => IntrinsicOp::VecHorizontalAddI32x4,
+            Self::X4 => IntrinsicOp::VecHorizontalAddI32x4,
             Self::X8 => IntrinsicOp::VecHorizontalAddI32x8,
         }
     }
@@ -1225,7 +1267,7 @@ impl StridedWidth {
 
 struct EmitCtx<'a> {
     width: StridedWidth,
-    load_bases: &'a [Value],
+    load_bases: &'a [(Value, i64)],
     wide_load_proven: &'a [bool],
     byte_iv: Value,
     byte_disp: i64,
@@ -1248,16 +1290,19 @@ impl EmitCtx<'_> {
     fn emit(&mut self, expr: &StridedExpr) -> Option<Value> {
         match expr {
             StridedExpr::LoadEven32(idx) => {
-                let base = *self.load_bases.get(*idx)?;
+                let (base, stream_disp) = *self.load_bases.get(*idx)?;
                 let contiguous = *self.wide_load_proven.get(*idx)?;
                 let dest = self.fresh();
                 let mut args = vec![Operand::Value(base), Operand::Value(self.byte_iv)];
-                if self.byte_disp != 0 {
-                    args.push(Operand::Const(IrConst::I64(self.byte_disp)));
+                // `analyze` bounded `stream_disp` (`stream_disp_fits`) so the
+                // sum with any copy displacement stays a 32-bit displacement.
+                let disp = self.byte_disp.checked_add(stream_disp)?;
+                if disp != 0 {
+                    args.push(Operand::Const(IrConst::I64(disp)));
                 }
                 self.body_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
-                    op: self.width.load(contiguous)?,
+                    op: self.width.load(contiguous),
                     dest_ptr: None,
                     args,
                 });
@@ -1283,6 +1328,12 @@ impl EmitCtx<'_> {
                 Some(dest)
             }
             StridedExpr::BinOp(op, l, r) => {
+                if *op == IrBinOp::Mul {
+                    if let Some((x, plan)) = MulPlan::for_operands(l, r) {
+                        let xv = self.emit(x)?;
+                        return self.emit_mul_plan(xv, plan);
+                    }
+                }
                 let lv = self.emit(l)?;
                 if matches!(op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
                     let StridedExpr::Invariant(sh_op) = r.as_ref() else {
@@ -1300,15 +1351,100 @@ impl EmitCtx<'_> {
                 }
                 let rv = self.emit(r)?;
                 let vec_op = self.width.bin_op(*op)?;
-                let dest = self.fresh();
-                self.body_insts.push(Instruction::Intrinsic {
-                    dest: Some(dest),
-                    op: vec_op,
-                    dest_ptr: None,
-                    args: vec![Operand::Value(lv), Operand::Value(rv)],
-                });
-                Some(dest)
+                Some(self.push_bin(vec_op, lv, Operand::Value(rv)))
             }
+        }
+    }
+    fn push_bin(&mut self, op: IntrinsicOp, lhs: Value, rhs: Operand) -> Value {
+        let dest = self.fresh();
+        self.body_insts.push(Instruction::Intrinsic {
+            dest: Some(dest),
+            op,
+            dest_ptr: None,
+            args: vec![Operand::Value(lhs), rhs],
+        });
+        dest
+    }
+
+    /// `x * c` for a constant `c` that [`MulPlan`] covers: shifts and adds
+    /// instead of the multiply. SSE2 has no `pmulld` (its emulation is two
+    /// `pmuludq` and five shuffles per vector), and AVX2's `vpmulld` is two
+    /// uops with ten-cycle latency on Intel P-cores.
+    fn emit_mul_plan(&mut self, x: Value, plan: MulPlan) -> Option<Value> {
+        let shifted = |me: &mut Self, k: u32| -> Option<Value> {
+            let op = me.width.shift_op(IrBinOp::Shl)?;
+            Some(me.push_bin(op, x, Operand::Const(IrConst::I32(i32::try_from(k).ok()?))))
+        };
+        match plan {
+            MulPlan::Identity => Some(x),
+            MulPlan::Shl(k) => shifted(self, k),
+            MulPlan::ShlAdd(k) => {
+                let t = shifted(self, k)?;
+                let op = self.width.bin_op(IrBinOp::Add)?;
+                Some(self.push_bin(op, t, Operand::Value(x)))
+            }
+            MulPlan::ShlSub(k) => {
+                let t = shifted(self, k)?;
+                let op = self.width.bin_op(IrBinOp::Sub)?;
+                Some(self.push_bin(op, t, Operand::Value(x)))
+            }
+        }
+    }
+}
+
+/// Multiplication by a 32-bit constant as at most one shift and one add or
+/// subtract, exact modulo 2^32: `x * 1`, `x << k`, `(x << k) + x` and
+/// `(x << k) - x`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MulPlan {
+    Identity,
+    Shl(u32),
+    ShlAdd(u32),
+    ShlSub(u32),
+}
+
+impl MulPlan {
+    /// The plan for a 32-bit lane multiplier; `None` keeps the multiply
+    /// (including `0`, `-1` and every constant with more set-bit runs).
+    fn for_const(c: u32) -> Option<Self> {
+        // `0` would otherwise reach `ShlSub(0)` (`0 + 1` is a power of two):
+        // exact, but a shift and a subtract to produce a constant.
+        if c == 0 {
+            None
+        } else if c == 1 {
+            Some(Self::Identity)
+        } else if c.is_power_of_two() {
+            Some(Self::Shl(c.trailing_zeros()))
+        } else if let Some(below) = c.checked_sub(1).filter(|b| b.is_power_of_two()) {
+            Some(Self::ShlAdd(below.trailing_zeros()))
+        } else {
+            c.checked_add(1)
+                .filter(|a| a.is_power_of_two())
+                .map(|above| Self::ShlSub(above.trailing_zeros()))
+        }
+    }
+
+    /// The non-constant operand of `l * r` and the plan for the constant
+    /// one (multiplication commutes in the lane ring).
+    fn for_operands<'e>(l: &'e StridedExpr, r: &'e StridedExpr) -> Option<(&'e StridedExpr, Self)> {
+        let plan = |e: &StridedExpr| match e {
+            // The lane value is the constant's low 32 bits, as the broadcast
+            // in `EmitCtx::emit` materializes it.
+            StridedExpr::Invariant(Operand::Const(c)) => {
+                c.to_i64().and_then(|c| Self::for_const(c as u32))
+            }
+            _ => None,
+        };
+        plan(r).map(|p| (l, p)).or_else(|| plan(l).map(|p| (r, p)))
+    }
+
+    #[cfg(test)]
+    fn eval(self, x: u32) -> u32 {
+        match self {
+            Self::Identity => x,
+            Self::Shl(k) => x << k,
+            Self::ShlAdd(k) => (x << k).wrapping_add(x),
+            Self::ShlSub(k) => (x << k).wrapping_sub(x),
         }
     }
 }
@@ -1325,28 +1461,26 @@ struct VectorSchedule {
 
 impl VectorSchedule {
     fn new(p: &StridedI32ReducePattern) -> Option<Self> {
+        // Both widths share one lane meaning per stream kind (`load`), so
+        // proven and unproven streams mix and the choice is the ISA alone.
         let width = if x86_avx2_available() && !sse2_forced() {
             StridedWidth::X8
-        } else if p.wide_load_proven.iter().all(|&proven| proven) {
-            // Every stream can read its full 32-byte window: compact two XMM
-            // halves into four real lanes instead of carrying zero odd lanes.
-            StridedWidth::X4Compact
         } else {
-            // One unknown stream is enough to keep the whole expression on the
-            // exact-access representation; mixing lane meanings is not valid.
             StridedWidth::X4
         };
         if p.load_bases.is_empty() || p.wide_load_proven.len() != p.load_bases.len() {
             return None;
         }
-        let vector_bytes = width.vector_bytes();
-        let safe_vecs = width.safe_vecs(p.safe_vecs)?;
+        // Every width covers one four-element group per vector, so
+        // `analyze`'s group count is the vector count.
+        let vector_bytes = VECTOR_BYTES;
+        let safe_vecs = p.safe_vecs;
         // Preserve the proven AVX2 schedule exactly. SSE2 uses the same two
         // independent accumulator chains, but only two XMM copies per turn:
         // four copies were measured as a substantial regression.
         let unroll: u64 = if safe_vecs >= 8 {
             match width {
-                StridedWidth::X4 | StridedWidth::X4Compact => 2,
+                StridedWidth::X4 => 2,
                 StridedWidth::X8 => 4,
             }
         } else {
@@ -1367,10 +1501,10 @@ impl VectorSchedule {
             }
         }
         let needs_iv_vec = uses_iv(&p.expr);
-        // Two compact XMM streams can carry adjacent IV vectors directly. This
+        // Two XMM copies can carry adjacent IV vectors directly. This
         // replaces the second stream's per-turn register copy + offset add with
         // one in-place step, while consuming the offset constant's old register.
-        let multi_iv = width == StridedWidth::X4Compact && unroll == 2 && needs_iv_vec;
+        let multi_iv = width == StridedWidth::X4 && unroll == 2 && needs_iv_vec;
         Some(Self {
             width,
             vector_bytes,
@@ -1497,11 +1631,8 @@ fn build_preheader(schedule: &VectorSchedule, next_value: &mut u32) -> Option<Pr
             init
         } else {
             let init = fresh();
-            let lanes: [i32; 4] = if width == StridedWidth::X4Compact {
-                [0, 8, 16, 24]
-            } else {
-                [0, 0, 8, 0]
-            };
+            // The byte offsets of the four elements, one per XMM lane.
+            let lanes: [i32; 4] = [0, 8, 16, 24];
             instructions.push(Instruction::Intrinsic {
                 dest: Some(init),
                 op: IntrinsicOp::VecPackI32x4,
@@ -1526,11 +1657,11 @@ fn build_preheader(schedule: &VectorSchedule, next_value: &mut u32) -> Option<Pr
             for copy_idx in 1..schedule.unroll as i32 {
                 let byte_offset = copy_idx * schedule.vector_bytes as i32;
                 if schedule.multi_iv {
-                    // Only the compact XMM pair carries two strided streams;
-                    // these four lanes are the complete vector. Refuse an
+                    // Only the two-copy XMM schedule carries adjacent IV
+                    // vectors; these four lanes are the complete vector. Refuse an
                     // inconsistent schedule in every build, not just under
                     // debug assertions, before emitting a wrong-width pack.
-                    if schedule.width != StridedWidth::X4Compact {
+                    if schedule.width != StridedWidth::X4 {
                         return None;
                     }
                     let init = fresh();
@@ -1808,7 +1939,8 @@ fn emit_reduce(
         plan.acc0.phi
     };
     let masked_acc = match width {
-        StridedWidth::X4Compact => merged_acc,
+        // All four lanes are elements: nothing to mask.
+        StridedWidth::X4 => merged_acc,
         StridedWidth::X8 => {
             let mask_tbl = ctx.fresh();
             let mask_i16: [i16; 16] = [-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0];
@@ -1830,28 +1962,6 @@ fn emit_reduce(
                 op: IntrinsicOp::VecMaddwdI16x16,
                 dest_ptr: None,
                 args: vec![Operand::Value(mask_tbl), Operand::Value(plan.ones_tbl?)],
-            });
-            let masked = ctx.fresh();
-            instructions.push(Instruction::Intrinsic {
-                dest: Some(masked),
-                op: width.bin_op(IrBinOp::And)?,
-                dest_ptr: None,
-                args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
-            });
-            masked
-        }
-        StridedWidth::X4 => {
-            let even_mask = ctx.fresh();
-            instructions.push(Instruction::Intrinsic {
-                dest: Some(even_mask),
-                op: IntrinsicOp::VecPackI32x4,
-                dest_ptr: None,
-                args: vec![
-                    Operand::Const(IrConst::I32(-1)),
-                    Operand::Const(IrConst::I32(0)),
-                    Operand::Const(IrConst::I32(-1)),
-                    Operand::Const(IrConst::I32(0)),
-                ],
             });
             let masked = ctx.fresh();
             instructions.push(Instruction::Intrinsic {
@@ -2217,20 +2327,15 @@ mod tests {
     #[test]
     fn exact_load_groups_never_add_a_scalar_iteration() {
         for scalar_trips in MIN_SCALAR_TRIPS..=200_000 {
-            let x8_vecs = safe_vec_count(scalar_trips);
-            for width in [StridedWidth::X4, StridedWidth::X4Compact, StridedWidth::X8] {
-                let vecs = width
-                    .safe_vecs(x8_vecs)
-                    .expect("safe_vec_count is bounded by the scalar trip count");
-                let lanes = width.vector_bytes() / SCALAR_STEP_BYTES;
-                if vecs > 0 {
-                    for lane in 0..lanes {
-                        let scalar_iteration = (vecs - 1) * lanes + lane;
-                        assert!(scalar_iteration < scalar_trips, "{width:?}");
-                        let vector_address =
-                            (vecs - 1) * width.vector_bytes() + lane * SCALAR_STEP_BYTES;
-                        assert_eq!(vector_address, scalar_iteration * SCALAR_STEP_BYTES);
-                    }
+            // Both widths cover one four-element group per vector.
+            let vecs = safe_vec_count(scalar_trips);
+            let lanes = VECTOR_BYTES / SCALAR_STEP_BYTES;
+            if vecs > 0 {
+                for lane in 0..lanes {
+                    let scalar_iteration = (vecs - 1) * lanes + lane;
+                    assert!(scalar_iteration < scalar_trips);
+                    let vector_address = (vecs - 1) * VECTOR_BYTES + lane * SCALAR_STEP_BYTES;
+                    assert_eq!(vector_address, scalar_iteration * SCALAR_STEP_BYTES);
                 }
             }
         }
@@ -2352,6 +2457,103 @@ mod tests {
         ));
     }
 
+    /// Every plan equals the lane multiply modulo 2^32, and the planner covers
+    /// exactly `1`, `2^k`, `2^k + 1` and `2^k - 1`.
+    #[test]
+    fn mul_plans_are_exact_modulo_2_32() {
+        let lanes = [
+            0u32,
+            1,
+            2,
+            3,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x1234_5678,
+            0xdead_beef,
+        ];
+        let check = |c: u32| {
+            if let Some(plan) = MulPlan::for_const(c) {
+                for x in lanes {
+                    assert_eq!(plan.eval(x), x.wrapping_mul(c), "{c:#x} {plan:?}");
+                }
+            }
+        };
+        (0..=65_536).for_each(check);
+        (u32::MAX - 65_536..=u32::MAX).for_each(check);
+        for k in 0..32 {
+            let p = 1u32 << k;
+            [p, p.wrapping_add(1), p.wrapping_sub(1)]
+                .into_iter()
+                .for_each(check);
+            assert!(MulPlan::for_const(p).is_some(), "{p:#x}");
+            if k >= 1 {
+                assert!(MulPlan::for_const(p + 1).is_some(), "{:#x}", p + 1);
+            }
+            if k >= 2 {
+                assert!(MulPlan::for_const(p - 1).is_some(), "{:#x}", p - 1);
+            }
+        }
+        assert_eq!(MulPlan::for_const(0), None);
+        assert_eq!(MulPlan::for_const(u32::MAX), None);
+        assert_eq!(MulPlan::for_const(10), None);
+        assert_eq!(MulPlan::for_const(1), Some(MulPlan::Identity));
+        assert_eq!(MulPlan::for_const(3), Some(MulPlan::ShlAdd(1)));
+        assert_eq!(MulPlan::for_const(7), Some(MulPlan::ShlSub(3)));
+        assert_eq!(MulPlan::for_const(0x8000_0000), Some(MulPlan::Shl(31)));
+    }
+
+    /// A constant on either side of the multiply is planned; two lane-valued
+    /// operands are not.
+    #[test]
+    fn mul_plan_finds_the_constant_operand() {
+        let three = StridedExpr::Invariant(Operand::Const(IrConst::I32(3)));
+        let lane = StridedExpr::LoadEven32(0);
+        assert!(matches!(
+            MulPlan::for_operands(&lane, &three),
+            Some((StridedExpr::LoadEven32(0), MulPlan::ShlAdd(1)))
+        ));
+        assert!(matches!(
+            MulPlan::for_operands(&three, &lane),
+            Some((StridedExpr::LoadEven32(0), MulPlan::ShlAdd(1)))
+        ));
+        assert!(MulPlan::for_operands(&lane, &StridedExpr::IvLow32).is_none());
+    }
+
+    #[test]
+    fn stream_displacement_stays_a_32_bit_address_displacement() {
+        let largest = i64::from(i32::MAX) - MAX_COPY_DISP;
+        for disp in [0, 4, -4, 12, largest, i64::from(i32::MIN)] {
+            assert!(stream_disp_fits(disp), "{disp}");
+        }
+        for disp in [largest + 1, i64::from(i32::MIN) - 1, i64::MAX, i64::MIN] {
+            assert!(!stream_disp_fits(disp), "{disp}");
+        }
+    }
+
+    /// The emitted displacement is the stream's own plus the copy's.
+    #[test]
+    fn displaced_stream_load_adds_both_displacements() {
+        let mut ctx = EmitCtx {
+            width: StridedWidth::X4,
+            load_bases: &[(Value(0), 4)],
+            wide_load_proven: &[false],
+            byte_iv: Value(1),
+            byte_disp: 32,
+            vec_iv: Some(Value(2)),
+            bcast_cache: vec![],
+            preheader_insts: vec![],
+            body_insts: vec![],
+            next_val: 3,
+        };
+        assert!(ctx.emit(&StridedExpr::LoadEven32(0)).is_some());
+        let Instruction::Intrinsic { op, args, .. } = &ctx.body_insts[0] else {
+            panic!("expected vector load");
+        };
+        assert_eq!(*op, IntrinsicOp::VecLoadStrided2I32x4);
+        assert_eq!(args[2], Operand::Const(IrConst::I64(36)));
+    }
+
     #[test]
     fn load_emission_selects_exact_or_proven_private_access() {
         for (width, private) in [
@@ -2359,11 +2561,10 @@ mod tests {
             (StridedWidth::X8, true),
             (StridedWidth::X4, false),
             (StridedWidth::X4, true),
-            (StridedWidth::X4Compact, true),
         ] {
             let mut ctx = EmitCtx {
                 width,
-                load_bases: &[Value(0)],
+                load_bases: &[(Value(0), 0)],
                 wide_load_proven: &[private],
                 byte_iv: Value(1),
                 byte_disp: 32,
@@ -2378,25 +2579,22 @@ mod tests {
                 panic!("expected vector load");
             };
             let expected = match (width, private) {
-                (StridedWidth::X8, true) => Some(IntrinsicOp::VecLoadI32x8),
-                (StridedWidth::X8, false) => Some(IntrinsicOp::VecLoadStrided2I32x8),
-                (StridedWidth::X4, true) => Some(IntrinsicOp::VecLoadI32x4),
-                (StridedWidth::X4, false) => Some(IntrinsicOp::VecLoadStrided2I32x4),
-                (StridedWidth::X4Compact, true) => Some(IntrinsicOp::VecLoadStrided2CompactI32x4),
-                (StridedWidth::X4Compact, false) => None,
+                (StridedWidth::X8, true) => IntrinsicOp::VecLoadI32x8,
+                (StridedWidth::X8, false) => IntrinsicOp::VecLoadStrided2I32x8,
+                (StridedWidth::X4, true) => IntrinsicOp::VecLoadStrided2CompactI32x4,
+                (StridedWidth::X4, false) => IntrinsicOp::VecLoadStrided2I32x4,
             };
-            assert_eq!(Some(*op), expected, "{width:?} private={private}");
+            assert_eq!(*op, expected, "{width:?} private={private}");
             assert_eq!(args[2], Operand::Const(IrConst::I64(32)));
         }
     }
 
     #[test]
     fn unsupported_intrinsic_forms_are_refused() {
-        for width in [StridedWidth::X4, StridedWidth::X4Compact, StridedWidth::X8] {
+        for width in [StridedWidth::X4, StridedWidth::X8] {
             assert!(width.bin_op(IrBinOp::SDiv).is_none(), "{width:?}");
             assert!(width.shift_op(IrBinOp::Add).is_none(), "{width:?}");
         }
-        assert!(StridedWidth::X4Compact.load(false).is_none());
     }
 
     fn emission_test_function() -> IrFunction {
@@ -2454,7 +2652,7 @@ mod tests {
             acc_ty: IrType::I32,
             acc_init: Operand::Const(IrConst::I32(0)),
             safe_vecs: 8,
-            load_bases: vec![Value(3)],
+            load_bases: vec![(Value(3), 0)],
             wide_load_proven: vec![false],
             expr,
         }

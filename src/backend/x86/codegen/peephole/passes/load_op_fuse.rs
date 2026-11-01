@@ -13,9 +13,11 @@
 //! ```
 //!
 //! [`super::memory_fold`] only folds *stack-slot* loads whose scratch is
-//! `%rax/%rcx/%rdx`; this pass folds ANY addressing mode (SIB, RIP-relative,
-//! base+disp, stack) into ANY GP destination when the loaded register is
-//! provably dead afterwards ([`FileLiveness`]).  Supported consumers:
+//! `%rax/%rcx/%rdx`; this pass folds every other addressing mode (SIB,
+//! RIP-relative, base+disp, including `disp(%rbp)` where `%rbp` is an
+//! allocated GPR, see [`rbp_pointer_load`]) into ANY GP destination when the
+//! loaded register is provably dead afterwards ([`FileLiveness`]). Plain
+//! stack-slot reloads are left to store forwarding.  Supported consumers:
 //! `add/sub/and/or/xor/cmp/test/imul` with the load's exact width.
 //!
 //! The *copy-bridged* variant handles the loop-carried-phi relay the register
@@ -878,6 +880,89 @@ fn try_fuse_commuted_unary_load_pair(
     Some(span_end)
 }
 
+/// A `LoadRbp` line that is really a pointer dereference: the line classifier
+/// has no function context and files every `disp(%rbp)` load as a stack-slot
+/// load, but in a function that never makes `%rbp` its frame pointer, `%rbp`
+/// is an allocated GPR and `movq (%rbp), %rsi` is the same load this pass
+/// folds through any other base register (`zstd_double_fast`'s match check
+/// lost its `cmpq (%rbp), %rdi` fold the moment the allocator put the input
+/// cursor in `%rbp` instead of `%r15`). True stack slots (`disp(%rsp)`, or
+/// `disp(%rbp)` under a frame pointer) stay excluded: store forwarding turns
+/// their reloads into register copies, which a memory operand would block.
+/// The fold's soundness does not depend on this distinction -- the window
+/// admits no memory access of any kind -- only its profitability does.
+fn rbp_pointer_load(
+    store: &LineStore,
+    infos: &[LineInfo],
+    lv: &FileLiveness,
+    i: usize,
+    frame_cache: &mut Option<(usize, bool)>,
+) -> bool {
+    let t = infos[i].trimmed(store.get(i));
+    let rbp_base = t
+        .split_once(',')
+        .is_some_and(|(src, _)| src.trim_end().ends_with("(%rbp)"));
+    if !rbp_base {
+        return false;
+    }
+    let Some((start, end)) = lv.recorded_function(store, infos, i) else {
+        return false;
+    };
+    let is_frame = match *frame_cache {
+        Some((cached, frame)) if cached == start => frame,
+        _ => {
+            let frame = rbp_is_frame_pointer(store, infos, start, end);
+            *frame_cache = Some((start, frame));
+            frame
+        }
+    };
+    !is_frame
+}
+
+/// `%rbp` is (or may be) the frame pointer of the function `[start, end)`:
+/// a frame setup or restore, `leave`/`enter`, a CFA rooted at `%rbp`
+/// (x86-64 DWARF register 6), or an opaque line -- pinned or inline
+/// assembly -- naming `%rbp`, whose contract is unknowable. Callee-save
+/// `pushq/popq %rbp` of an `%rsp`-relative frame is not frame evidence.
+pub(super) fn rbp_is_frame_pointer(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+) -> bool {
+    (start..end.min(infos.len())).any(|n| {
+        if infos[n].is_nop() {
+            return false;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        let names_rbp = t.contains("%rbp") || t.contains("%ebp");
+        if !names_rbp
+            && !t.starts_with("leave")
+            && !t.starts_with("enter")
+            && !t.starts_with(".cfi_def_cfa")
+        {
+            return false;
+        }
+        let save_restore = matches!(t, "pushq %rbp" | "popq %rbp");
+        if (infos[n].pinned || infos[n].kind == LineKind::InlineAsm) && names_rbp && !save_restore {
+            return true;
+        }
+        matches!(
+            t,
+            "movq %rsp, %rbp"
+                | "mov %rsp, %rbp"
+                | "movq %rbp, %rsp"
+                | "mov %rbp, %rsp"
+                | "movl %esp, %ebp"
+                | "movl %ebp, %esp"
+        ) || t.starts_with("leave")
+            || t.starts_with("enter")
+            || (t.starts_with(".cfi_def_cfa")
+                && !t.starts_with(".cfi_def_cfa_offset")
+                && (names_rbp || t.ends_with(" 6") || t.contains(" 6,")))
+    })
+}
+
 /// Retire a proven-dead load and install its fused consumer. A volatile pin
 /// moves with the one surviving memory access; clearing it on the old carrier
 /// is deliberately confined to this post-legality-check helper.
@@ -912,9 +997,16 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
+    // `(function start, rbp is its frame pointer)` of the last function asked.
+    let mut frame_cache: Option<(usize, bool)> = None;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || !matches!(infos[i].kind, LineKind::Other { .. }) {
+        let candidate = match infos[i].kind {
+            LineKind::Other { .. } => true,
+            LineKind::LoadRbp { .. } => rbp_pointer_load(store, infos, &lv, i, &mut frame_cache),
+            _ => false,
+        };
+        if infos[i].is_nop() || !candidate {
             i += 1;
             continue;
         }
@@ -2415,6 +2507,32 @@ mod tests {
     const PRO: &str = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n";
     const EPI: &str = "    ret\n    .cfi_endproc\n    .size f, .-f\n";
 
+    /// `%rbp` as an allocated GPR (callee-saved by push/pop, no frame): a
+    /// dereference through it folds exactly like one through `%r15`.
+    #[test]
+    fn rbp_pointer_load_folds_in_a_frameless_function() {
+        let asm = format!(
+            "{PRO}    pushq %rbp\n    movq %rdi, %rbp\n    movq (%rbp), %rsi\n    cmpq %rsi, %rdx\n    sete %al\n    movzbl %al, %eax\n    popq %rbp\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "cmpq (%rbp), %rdx"), "{out:?}");
+        assert!(!has(&out, "movq (%rbp), %rsi"), "{out:?}");
+    }
+
+    /// Under a frame pointer `disp(%rbp)` is a stack slot, and so is any
+    /// `disp(%rsp)`: both stay with store forwarding.
+    #[test]
+    fn stack_slot_loads_are_left_to_store_forwarding() {
+        let framed = format!(
+            "{PRO}    pushq %rbp\n    movq %rsp, %rbp\n    movq -8(%rbp), %rsi\n    cmpq %rsi, %rdx\n    sete %al\n    movzbl %al, %eax\n    popq %rbp\n{EPI}"
+        );
+        assert_eq!(run(&framed, fuse_load_into_alu), framed);
+        let rsp_slot = format!(
+            "{PRO}    movq 8(%rsp), %rsi\n    cmpq %rsi, %rdx\n    sete %al\n    movzbl %al, %eax\n{EPI}"
+        );
+        assert_eq!(run(&rsp_slot, fuse_load_into_alu), rsp_slot);
+    }
+
     #[test]
     fn copy_commute_preserves_implicit_accumulator_reader() {
         let asm = format!(
@@ -3816,6 +3934,181 @@ pub(super) fn fuse_zero_ext_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -
         i = k + 1;
     }
     changed
+}
+
+/// Narrow `cmp{l,q} $imm, %R` to `cmpb $imm, %Rb` when `%R` provably holds a
+/// zero-extended byte -- its last write in the block is `movzb{l,q} SRC, %R`
+/// -- the immediate is in `0..=255`, and only ZF and CF select on the result.
+///
+/// This is GCC's and Clang's byte compare for `c < 0x80` on a promoted byte:
+/// `cmpb $-128, %r10b` is 4 bytes (3 with a legacy register) where
+/// `cmpl $128, %r10d` needs an imm32 and takes 7. The IR narrowing in
+/// `simplify` declines when the widening cast has other readers (narrowing
+/// there gives the byte a second live range, which spilled it in sqlite's
+/// `vdbe_serial_get`); here the extension already sits in `%R`, so reading
+/// its low byte costs nothing.
+///
+/// Flags: `R` and `imm` both lie in `0..=255`, so the wide difference
+/// `R - imm` lies in `-255..=255` and its low byte is the byte difference.
+/// ZF (`R == imm`) and CF (`R <u imm`) are identical; SF, OF, PF and AF can
+/// differ, and a consumer of any of them vetoes the rewrite -- the argument
+/// [`fuse_zero_ext_cmp`] makes above.
+pub(super) fn narrow_zero_ext_imm_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    for i in 0..store.len() {
+        if infos[i].is_nop() || infos[i].pinned || infos[i].kind != LineKind::Cmp {
+            continue;
+        }
+        let Some(("cmp", _, imm, fam)) = parse_imm_reg_flag(infos[i].trimmed(store.get(i))) else {
+            continue;
+        };
+        // `%spl` needs a REX prefix and the frame pointer families never hold
+        // a loaded byte; neither is worth a special case.
+        let Some(byte) = parse_byte_imm(imm).filter(|_| fam != 4 && fam != 5) else {
+            continue;
+        };
+        if !zero_ext_byte_reaches(store, infos, i, fam)
+            || !super::flag_peepholes::flag_consumers_are_zf_cf_only_preserving_zf_cf(
+                store,
+                infos,
+                i + 1,
+            )
+        {
+            continue;
+        }
+        let byte = i8::from_ne_bytes([byte]);
+        let reg = REG_NAMES[3][fam as usize];
+        replace_line(store, &mut infos[i], i, format!("    cmpb ${byte}, {reg}"));
+        changed = true;
+    }
+    changed
+}
+
+/// `$imm` in `0..=255` (decimal or `0x` hex, as the backend spells it).
+fn parse_byte_imm(imm: &str) -> Option<u8> {
+    let digits = imm.strip_prefix('$')?;
+    let value = match digits.strip_prefix("0x") {
+        Some(hex) => i64::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<i64>().ok()?,
+    };
+    u8::try_from(value).ok()
+}
+
+/// Whether the last write to GP family `fam` before line `at`, within its
+/// block, is a byte zero-extension into the whole family (`movzbl` into the
+/// 32-bit register clears bits 8..63, `movzbq` into the 64-bit one). A
+/// label, branch, call or opaque line ends the search unproven.
+fn zero_ext_byte_reaches(store: &LineStore, infos: &[LineInfo], at: usize, fam: RegId) -> bool {
+    for k in (0..at).rev() {
+        let info = &infos[k];
+        let t = info.trimmed(store.get(k));
+        if super::helpers::steps_over_line(info, t) {
+            continue;
+        }
+        if info.is_barrier() {
+            return false;
+        }
+        if super::helpers::writes_family(info, t, fam) {
+            let (bank, rest) = if let Some(r) = t.strip_prefix("movzbl ") {
+                (1, r)
+            } else if let Some(r) = t.strip_prefix("movzbq ") {
+                (0, r)
+            } else {
+                return false;
+            };
+            return split_two_operands(rest)
+                .is_some_and(|(_, dst)| dst == REG_NAMES[bank][fam as usize]);
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod zeic_tests {
+    use super::*;
+
+    fn run(body: &str) -> Vec<String> {
+        let asm = format!(
+            "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n{body}\n    ret\n.L16:\n    testl %eax, %eax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        narrow_zero_ext_imm_cmp(&mut store, &mut infos);
+        store
+            .build_result(|i| infos[i].is_nop())
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn has(out: &[String], needle: &str) -> bool {
+        out.iter().any(|l| l == needle)
+    }
+
+    /// sqlite's varint tail arm, verbatim from the peephole input: the byte
+    /// stays live in `%r10d` (the `andl` copy) and two `cmovb` read CF.
+    #[test]
+    fn narrows_the_varint_tail_compare() {
+        let out = run(
+            "    movzbl 2(%r8), %r10d\n    movl %r10d, %ebx\n    andl $127, %ebx\n    cmpl $128, %r10d\n    movl %r9d, %r11d\n    cmovbl %ecx, %r11d\n    movl $3, %ecx\n    cmovbl %ecx, %r10d",
+        );
+        assert!(has(&out, "cmpb $-128, %r10b"), "{out:?}");
+    }
+
+    #[test]
+    fn legacy_registers_and_64_bit_compares_narrow() {
+        let out = run("    movzbl (%rdi), %esi\n    cmpl $10, %esi\n    jae .L16");
+        assert!(has(&out, "cmpb $10, %sil"), "{out:?}");
+        let out = run("    movzbq (%rdi), %rax\n    cmpq $0xff, %rax\n    je .L16");
+        assert!(has(&out, "cmpb $-1, %al"), "{out:?}");
+    }
+
+    /// Each guard on its own: a signed or sign-flag consumer, a write that
+    /// may leave bits above 7, a label (another predecessor), an immediate
+    /// outside the byte range, and a 16-bit zero-extension.
+    #[test]
+    fn every_unproven_shape_is_left_alone() {
+        for (body, keep) in [
+            (
+                "    movzbl (%rdi), %esi\n    cmpl $128, %esi\n    jl .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n    cmpl $128, %esi\n    js .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n    addl $1, %esi\n    cmpl $128, %esi\n    jb .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n.L9:\n    cmpl $128, %esi\n    jb .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n    cmpl $256, %esi\n    jb .L16",
+                "cmpl $256, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n    cmpl $-1, %esi\n    jb .L16",
+                "cmpl $-1, %esi",
+            ),
+            (
+                "    movzwl (%rdi), %esi\n    cmpl $128, %esi\n    jb .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movl (%rdi), %esi\n    cmpl $128, %esi\n    jb .L16",
+                "cmpl $128, %esi",
+            ),
+        ] {
+            let out = run(body);
+            assert!(has(&out, keep), "must refuse:\n{body}\n{out:?}");
+        }
+    }
 }
 
 #[cfg(test)]

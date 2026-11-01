@@ -1120,7 +1120,7 @@ fn coalesce_one_forwarding_phi_copy(func: &mut IrFunction) -> usize {
             func.blocks[ji].instructions[ii],
             Instruction::Copy { .. }
         ));
-        func.blocks[ji].instructions.remove(ii);
+        func.blocks[ji].remove_inst(ii);
     }
     plan.len()
 }
@@ -1374,13 +1374,12 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
         }
         for (bi, block) in func.blocks.iter_mut().enumerate() {
             let to_drop = &per_block[bi];
-            let mut new_list: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
-            for (ii, inst) in block.instructions.drain(..).enumerate() {
-                if !to_drop.contains(&ii) {
-                    new_list.push(inst);
-                }
-            }
-            block.instructions = new_list;
+            let mut ii = 0usize;
+            block.retain_insts(|_| {
+                let keep = !to_drop.contains(&ii);
+                ii += 1;
+                keep
+            });
         }
     }
 

@@ -688,9 +688,16 @@ fn apply(func: &mut IrFunction, c: &Candidate) {
     //
     // A `Memcpy` here would be correct but opaque to that forwarding.
     let block = &mut func.blocks[c.block];
+    let old_spans = block.take_parallel_spans();
+    let tracked = !old_spans.is_empty();
     let mut rewritten = Vec::with_capacity(block.instructions.len());
+    let mut spans = Vec::with_capacity(if tracked { rewritten.capacity() } else { 0 });
     for (ii, inst) in block.instructions.iter().enumerate() {
         if ii == c.insert_at {
+            if tracked {
+                // The vector load stands in for the pair it replaces.
+                spans.push(old_spans[ii]);
+            }
             rewritten.push(Instruction::Intrinsic {
                 // `Loaddqu` writes the vector to `dest_ptr`; it has no SSA
                 // result (the backend does not define `dest`).
@@ -704,8 +711,11 @@ fn apply(func: &mut IrFunction, c: &Candidate) {
             continue;
         }
         rewritten.push(inst.clone());
+        if tracked {
+            spans.push(old_spans[ii]);
+        }
     }
-    block.instructions = rewritten;
+    block.replace_insts(rewritten, spans);
 }
 
 #[cfg(test)]

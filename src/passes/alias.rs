@@ -156,8 +156,9 @@ pub(crate) fn vec_intrinsic_access<'a>(
         // The actual accesses are four dwords at 0, 8, 16 and 24; the
         // enclosing 28-byte interval is a conservative alias footprint.
         IntrinsicOp::VecLoadStrided2I32x8 => (false, 28),
-        // Two exact dwords at 0 and 8; the enclosing interval is conservative.
-        IntrinsicOp::VecLoadStrided2I32x4 => (false, 12),
+        // Four exact dwords at 0, 8, 16 and 24; the enclosing interval is
+        // conservative.
+        IntrinsicOp::VecLoadStrided2I32x4 => (false, 28),
         // The compact form reads both full 16-byte halves of its proven window.
         IntrinsicOp::VecLoadStrided2CompactI32x4 => (false, 32),
         IntrinsicOp::VecLoadF64x4
@@ -419,7 +420,7 @@ mod tests {
         let access = vec_intrinsic_access(&IntrinsicOp::VecLoadStrided2I32x8, &args);
         assert_eq!(access, Some((false, 28, &args[0], &args[1], 32)));
         let access = vec_intrinsic_access(&IntrinsicOp::VecLoadStrided2I32x4, &args);
-        assert_eq!(access, Some((false, 12, &args[0], &args[1], 32)));
+        assert_eq!(access, Some((false, 28, &args[0], &args[1], 32)));
         let access = vec_intrinsic_access(&IntrinsicOp::VecLoadStrided2CompactI32x4, &args);
         assert_eq!(access, Some((false, 32, &args[0], &args[1], 32)));
     }

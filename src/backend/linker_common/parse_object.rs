@@ -404,5 +404,6 @@ fn parse_elf64_object_inner(
         section_data,
         relocations,
         source_name: source_name.to_string(),
+        e_flags: read_u32(data, 48),
     })
 }

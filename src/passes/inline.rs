@@ -356,11 +356,43 @@ thread_local! {
     /// a process-global read would make the kill-switch test race its siblings
     /// on cargo's thread pool.
     static SELF_RECURSION_CLONE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Compilation-scoped trace switch for parameter-reference remapping.
+    static PARAMREF_DEBUG_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Functions `self_recursion::inline_self_recursion` already expanded in
+    /// the module being compiled. Each self-recursive function is expanded by
+    /// ONE mechanism: the clone skips these, so its level never compounds on
+    /// the multi-level expansion (whose bounds alone keep the growth sized).
+    static SELF_INLINED: std::cell::RefCell<FxHashSet<String>> =
+        std::cell::RefCell::new(FxHashSet::default());
 }
 
-/// Resolve the self-recursion clone kill switch for this thread.
+/// Resolve the self-recursion clone kill switch for this thread, and forget
+/// the previous module's `self_inline` expansions.
 pub(crate) fn set_self_recursion_clone_enabled(enabled: bool) {
     SELF_RECURSION_CLONE_ENABLED.with(|cell| cell.set(enabled));
+    SELF_INLINED.with(|set| set.borrow_mut().clear());
+}
+
+/// Set the parameter-reference trace switch once for this compilation.
+pub(crate) fn set_paramref_debug_enabled(enabled: bool) {
+    PARAMREF_DEBUG_ENABLED.with(|cell| cell.set(enabled));
+}
+
+/// Suspend or resume the clone within one module without forgetting its
+/// `self_inline` expansions (see the call sites in `passes::mod`).
+pub(crate) fn suspend_self_recursion_clone(suspended: bool, enabled: bool) {
+    SELF_RECURSION_CLONE_ENABLED.with(|cell| cell.set(enabled && !suspended));
+}
+
+/// Record a function `self_inline` expanded (see `SELF_INLINED`).
+pub(crate) fn note_self_inlined(name: &str) {
+    SELF_INLINED.with(|set| {
+        set.borrow_mut().insert(name.to_string());
+    });
+}
+
+fn was_self_inlined(name: &str) -> bool {
+    SELF_INLINED.with(|set| set.borrow().contains(name))
 }
 
 fn self_recursion_clone_enabled() -> bool {
@@ -2939,6 +2971,11 @@ struct CalleeData {
     ssp: crate::ir::module::SspInfo,
     /// For each param, Some(size) if it's a struct-by-value parameter, None otherwise.
     param_struct_sizes: Vec<Option<usize>>,
+    /// `IrFunction::param_alloca_values`: lowering's record of each
+    /// parameter's home alloca (see [`inlined_param_homes`]).
+    param_alloca_values: Vec<Value>,
+    /// Per parameter, the home lowering creates: `(ty, size, align)`.
+    param_home_shapes: Vec<(IrType, usize, usize)>,
     return_type: IrType,
     num_params: usize,
     next_value_id: u32,
@@ -3505,8 +3542,79 @@ fn const_branch_site_arg(
     })
 }
 
+/// The inlined callee's parameter homes, in parameter order, as
+/// `(home, ty, size)` in the caller's value space (`value_offset` applied).
+///
+/// Lowering records every parameter's home alloca in
+/// `IrFunction::param_alloca_values`, one per IR parameter (sret included),
+/// and the backend treats that record as authoritative; homes are resolved
+/// by value id against it. A home optimization deleted -- dead, because the
+/// parameter lives on as SSA `ParamRef` values -- is `None`. Identifying
+/// homes positionally as "the first N allocas of the entry block" is wrong
+/// once a home is gone: after nested inlining the next alloca is the inner
+/// callee's temporary, and the argument bridge then stores through that
+/// slot, with its type, ahead of the slot's own definition (invalid IR; the
+/// ParamRef-store filter would also treat the temporary as a home).
+///
+/// Without a record (IR not built by lowering, or a record a rewrite
+/// cleared) only the frontend's own guarantee is used: homes are the
+/// leading run of allocas, in order. `None` overall means a recorded home
+/// sits outside the entry block, where the entry-block bridge could not
+/// dominate it; the caller refuses to inline.
+fn inlined_param_homes(
+    callee: &CalleeData,
+    inlined_blocks: &[BasicBlock],
+    value_offset: u32,
+) -> Option<Vec<Option<(Value, IrType, usize)>>> {
+    let alloca_of = |inst: &Instruction| match inst {
+        Instruction::Alloca { dest, ty, size, .. } => Some((*dest, *ty, *size)),
+        _ => None,
+    };
+    let entry = inlined_blocks.first()?;
+    if callee.param_alloca_values.len() != callee.num_params {
+        // No provenance is not evidence that a leading local is a parameter.
+        // Live ParamRefs receive fresh homes below; dead parameters need none.
+        return Some(vec![None; callee.num_params]);
+    }
+    let mut homes = Vec::with_capacity(callee.num_params);
+    for recorded in &callee.param_alloca_values {
+        let want = recorded.0.checked_add(value_offset)?;
+        let find = |block: &BasicBlock| {
+            block
+                .instructions
+                .iter()
+                .filter_map(alloca_of)
+                .find(|(dest, _, _)| dest.0 == want)
+        };
+        match find(entry) {
+            Some(home) => homes.push(Some(home)),
+            None if inlined_blocks[1..].iter().any(|b| find(b).is_some()) => return None,
+            None => homes.push(None),
+        }
+    }
+    Some(homes)
+}
+
+/// The home alloca lowering creates for `param` (`func_lowering`'s parameter
+/// prologue): `(ty, size, align)`.
+fn param_home_shape(param: &crate::ir::module::IrParam) -> (IrType, usize, usize) {
+    let size = param
+        .ty
+        .size()
+        .max(param.struct_size.unwrap_or(param.ty.size()));
+    let align = param
+        .struct_align
+        .into_iter()
+        .chain(param.param_align)
+        .max()
+        .unwrap_or(0);
+    (param.ty, size, align)
+}
+
 mod devirt;
+mod self_recursion;
 use devirt::devirtualize_constant_indirect_calls;
+pub(crate) use self_recursion::inline_self_recursion;
 
 fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
     let mut counts = FxHashMap::default();
@@ -4153,6 +4261,8 @@ fn callee_data_for(
             builtin_policy: func.pass_policy.builtins,
             ssp: func.ssp,
             param_struct_sizes,
+            param_alloca_values: func.param_alloca_values.clone(),
+            param_home_shapes: func.params.iter().map(param_home_shape).collect(),
             return_type: func.return_type,
             num_params: func.params.len(),
             // Post-structural inlining can clone values into a function
@@ -5537,6 +5647,7 @@ fn clone_self_recursion_sites(
             || func.is_noinline
             || func.section.is_some()
             || skip_list.iter().any(|s| s == &func.name)
+            || was_self_inlined(&func.name)
         {
             continue;
         }
@@ -5778,7 +5889,7 @@ fn inline_call_site(
             let vp_name = "__lccc_va_arg_pack";
             for block in &mut inlined_blocks {
                 // Delete the sentinel call itself.
-                block.instructions.retain(|inst| {
+                block.retain_insts(|inst| {
                     !matches!(inst, Instruction::Call { func, info }
                             if func == vp_name && info.dest == Some(vrem))
                 });
@@ -5891,185 +6002,98 @@ fn inline_call_site(
         }
     }
 
-    // ── wire up the arguments ────────────────────────────────────────────
-    //
-    // A parameter's ABI home is the alloca its entry-block `ParamRef` is
-    // stored into (a `Store` for a scalar, a `Memcpy` of the bytes for a
-    // struct-by-value).  It is *not* "the first N allocas": that is only the
-    // front end's layout convention, and it stops holding as soon as an
-    // earlier pass removes a home.  `mem2reg` folds `store param -> home; load
-    // home` into a direct ParamRef use and leaves the home dead; the next pass
-    // drops a dead alloca, and from then on the first N allocas are the
-    // callee's LOCALS.  Bridging an argument into one of those stores a caller
-    // value into a slot whose type belongs to the local.  Measured (`load32`
-    // inlined into gzip's `longest_match` at `-O1`): the pointer parameter was
-    // stored into `unsigned int v` with `ty: U32`, reloaded as `U32`, cast
-    // back to a pointer and therefore zero-extended from 32 bits on every use.
-    // An ET_EXEC image lives below 4 GiB and never noticed; the same object
-    // linked ET_DYN read `0xaac8a202` and died.
-    //
-    // Resolution is therefore by data flow.  The positional guess survives
-    // only as a fallback, and only when it is type-consistent with the
-    // parameter; anything else declines the inline (the caller keeps its
-    // call), because a wrong home is a silent miscompile, not a missed
-    // optimization.
-    // ParamRef value -> (parameter index, declared type), remapped ids.
+    // Resolve homes by lowering's stable identity record, never alloca order
+    // or a store to an unrelated same-typed local. Missing live homes are
+    // synthesized with the ABI shape; dead parameters require no bridge.
+    let Some(mut param_alloca_info) = inlined_param_homes(callee, &inlined_blocks, value_offset)
+    else {
+        return false;
+    };
     let mut paramref_owner: FxHashMap<u32, (usize, IrType)> = FxHashMap::default();
-    for block in inlined_blocks.iter() {
+    let mut clone_max = 0u32;
+    for block in &inlined_blocks {
         for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                clone_max = clone_max.max(dest.0);
+            }
+            inst.for_each_used_value(|id| clone_max = clone_max.max(id));
             if let Instruction::ParamRef {
                 dest,
                 param_idx,
                 ty,
             } = inst
             {
-                paramref_owner.entry(dest.0).or_insert((*param_idx, *ty));
+                paramref_owner.insert(dest.0, (*param_idx, *ty));
             }
         }
+        block
+            .terminator
+            .for_each_used_value(|id| clone_max = clone_max.max(id));
     }
-    let clone_max = inlined_blocks
-        .iter()
-        .flat_map(|block| {
-            block
-                .instructions
-                .iter()
-                .filter_map(|inst| inst.dest().map(|dest| dest.0))
-                .chain(
-                    block
-                        .instructions
-                        .iter()
-                        .flat_map(|inst| inst.used_values().into_iter()),
-                )
-                .chain(block.terminator.used_values())
-        })
-        .max()
-        .unwrap_or(0);
-    let entry_block = &mut inlined_blocks[0];
-    // Allocas of the inlined entry block, already remapped onto caller ids.
-    let mut home_info: FxHashMap<u32, (IrType, usize)> = FxHashMap::default();
-    // The front end's layout, kept only as the type-checked fallback below.
-    let mut positional: Vec<(Value, IrType, usize)> = Vec::new();
-    for inst in &entry_block.instructions {
-        if let Instruction::Alloca { dest, ty, size, .. } = inst {
-            home_info.insert(dest.0, (*ty, *size));
-            if positional.len() < callee.num_params {
-                positional.push((*dest, *ty, *size));
-            }
-        }
-    }
-    // The home of parameter i is the alloca its ParamRef is stored into.  The
-    // LAST such store wins, mirroring the front end's single home per param.
-    let mut resolved: Vec<Option<(Value, IrType, usize)>> = vec![None; callee.num_params];
-    for inst in &entry_block.instructions {
-        let (source, home, copied) = match inst {
-            Instruction::Store {
-                val: Operand::Value(v),
-                ptr,
-                ..
-            } => (v, ptr, None),
-            Instruction::Memcpy { dest, src, size } => (src, dest, Some(*size)),
-            _ => continue,
-        };
-        let Some(&(idx, _)) = paramref_owner.get(&source.0) else {
-            continue;
-        };
-        if idx >= resolved.len() {
+    let Some(next_fresh) = clone_max
+        .checked_add(1)
+        .zip(value_offset.checked_add(callee.next_value_id))
+        .map(|(actual, cached)| actual.max(cached))
+    else {
+        return false;
+    };
+    let mut next_fresh = next_fresh;
+    let mut synthesized = Vec::new();
+    for (idx, home) in param_alloca_info.iter_mut().enumerate() {
+        if home.is_some() {
             continue;
         }
-        if let Some(size) = copied {
-            // A scalar local is filled the same way `memcpy(&v, p, 4)` fills
-            // `v`, so a small `Memcpy` from the ParamRef only identifies a
-            // home when it copies the WHOLE struct-by-value object (gzip's
-            // `load32` is the counter-example: the copy is from the parameter,
-            // but into a local of another type).
-            if callee.param_struct_sizes.get(idx).copied().flatten() != Some(size) {
-                continue;
-            }
-        }
-        if let Some(&(ty, size)) = home_info.get(&home.0)
-            && size
-                >= paramref_owner
-                    .get(&source.0)
-                    .map_or(0, |&(_, ty)| ir_type_slot_size(ty))
-        {
-            resolved[idx] = Some((*home, ty, size));
-        }
-    }
-    // A parameter with no resolvable home gets a home of its OWN, typed by its
-    // `ParamRef`: the slot must be at least as wide as the argument, and every
-    // later load from it reads the declared type.  Its id comes from above the
-    // clone's real maximum (`clone_max`): the cached `CalleeData::next_value_id`
-    // can lag a body that structural transforms extended, and a collision here
-    // is silent (the value that survives is whichever definition a later pass
-    // sees last).
-    let mut next_fresh = std::cmp::max(value_offset + callee.next_value_id, clone_max + 1);
-    let mut synthesized: Vec<(usize, Value, IrType, usize)> = Vec::new(); // (param, dest, ty, size)
-    let mut param_alloca_info: Vec<(Value, IrType, usize)> = Vec::with_capacity(callee.num_params);
-    for (idx, home) in resolved.into_iter().enumerate() {
-        if let Some(info) = home {
-            param_alloca_info.push(info);
-            continue;
-        }
-        let paramref_ty = paramref_owner
+        let Some(param_ty) = paramref_owner
             .values()
             .find(|&&(owner, _)| owner == idx)
-            .map(|&(_, ty)| ty);
-        // Front end layout, accepted only when it cannot mistype the argument.
-        if let Some(&(value, ty, size)) = positional.get(idx)
-            && paramref_ty.is_none_or(|param_ty| param_ty == ty)
-        {
-            param_alloca_info.push((value, ty, size));
+            .map(|&(_, ty)| ty)
+        else {
             continue;
-        }
-        // Otherwise host the argument in a fresh slot of its own type. A
-        // struct-by-value argument addresses `size` bytes, which a scalar slot
-        // cannot stand in for, so that shape declines the inline instead.
-        let Some(param_ty) = paramref_ty else {
-            return false;
         };
+        if idx >= site.args.len() {
+            return false;
+        }
+        let (ty, size, align) = callee.param_home_shapes.get(idx).copied().unwrap_or((
+            param_ty,
+            ir_type_slot_size(param_ty),
+            0,
+        ));
         if callee
             .param_struct_sizes
             .get(idx)
             .copied()
             .flatten()
-            .is_some()
-            || idx >= site.args.len()
+            .is_some_and(|n| n > size)
         {
             return false;
         }
         let dest = Value(next_fresh);
-        next_fresh += 1;
-        let size = ir_type_slot_size(param_ty);
-        synthesized.push((idx, dest, param_ty, size));
-        param_alloca_info.push((dest, param_ty, size));
+        let Some(next) = next_fresh.checked_add(1) else {
+            return false;
+        };
+        next_fresh = next;
+        synthesized.push((dest, ty, size, align));
+        *home = Some((dest, ty, size));
     }
-    if !synthesized.is_empty() {
-        // After the LAST alloca: a store may not precede the definition of the
-        // alloca it writes.
-        let prologue_end = entry_block
-            .instructions
-            .iter()
-            .rposition(|inst| matches!(inst, Instruction::Alloca { .. }))
-            .map_or(0, |i| i + 1);
-        let parallel_spans = entry_block.source_spans.len() == entry_block.instructions.len();
-        for (offset, &(_, dest, ty, size)) in synthesized.iter().enumerate() {
-            entry_block.instructions.insert(
-                prologue_end + offset,
-                Instruction::Alloca {
-                    dest,
-                    ty,
-                    size,
-                    align: 0,
-                    volatile: false,
-                    semantic_volatile: false,
-                },
-            );
-            if parallel_spans {
-                entry_block
-                    .source_spans
-                    .insert(prologue_end + offset, crate::common::source::Span::dummy());
-            }
-        }
+    let entry_block = &mut inlined_blocks[0];
+    let prologue_end = entry_block
+        .instructions
+        .iter()
+        .rposition(|inst| matches!(inst, Instruction::Alloca { .. }))
+        .map_or(0, |i| i + 1);
+    for (offset, (dest, ty, size, align)) in synthesized.into_iter().enumerate() {
+        entry_block.insert_inst(
+            prologue_end + offset,
+            Instruction::Alloca {
+                dest,
+                ty,
+                size,
+                align,
+                volatile: false,
+                semantic_volatile: false,
+            },
+            crate::common::source::Span::dummy(),
+        );
     }
 
     // ms178: SSA parameter substitution. For pure scalar params (home never
@@ -6080,18 +6104,10 @@ fn inline_call_site(
     // such a value in an undefined callee-saved register on some paths
     // (zlib-ng deflateSetParamPre *out=param wrote a stale %rbx). Constants
     // are materialized at the use site, so they have no register interaction.
-    let orig_homes: Vec<Value> = {
-        let mut v = Vec::with_capacity(16);
-        for inst in &callee.blocks[0].instructions {
-            if let Instruction::Alloca { dest, .. } = inst {
-                v.push(*dest);
-                if v.len() >= callee.num_params {
-                    break;
-                }
-            }
-        }
-        v
-    };
+    let orig_homes: Vec<Option<Value>> = param_alloca_info
+        .iter()
+        .map(|home| home.map(|(v, _, _)| Value(v.0 - value_offset)))
+        .collect();
     // Record remapped ParamRef values before removing them.  Unlike ordinary
     // home loads, ParamRef is an SSA incoming parameter value; it can survive
     // prior structural transforms and be consumed directly by intrinsics.
@@ -6133,7 +6149,11 @@ fn inline_call_site(
                 // store. Do not remove their home alloca through the older
                 // load-only optimization.
                 && !paramref_params.contains(&i)
-                && orig_homes.get(i).is_some_and(|h| param_substitutable(callee, i, *h));
+                && orig_homes
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|h| param_substitutable(callee, i, h));
             if ok && ssa_log {
                 eprintln!("[SSA_PARAM] {} arg{} substituted", site.callee_name, i);
             }
@@ -6151,9 +6171,9 @@ fn inline_call_site(
     let mut home_subst: FxInlineMap<u32, (Operand, IrType)> = FxInlineMap::default();
     for i in 0..param_alloca_info.len() {
         if substitutable[i] {
-            if let Operand::Const(c) = &site.args[i] {
+            if let (Operand::Const(c), Some((home, _, _))) = (&site.args[i], param_alloca_info[i]) {
                 if let Some(at) = const_ir_type(c) {
-                    home_subst.insert(param_alloca_info[i].0.0, (site.args[i], at));
+                    home_subst.insert(home.0, (site.args[i], at));
                 }
             }
         }
@@ -6164,7 +6184,7 @@ fn inline_call_site(
     // inlined path before any cloned block can consume them.
     let mut paramref_next_value = next_fresh;
     let mut paramref_subst: FxInlineMap<u32, Operand> = FxInlineMap::default();
-    let paramref_debug = std::env::var("CCC_INLINE_PARAMREF_DEBUG").is_ok();
+    let paramref_debug = PARAMREF_DEBUG_ENABLED.with(std::cell::Cell::get);
     {
         use crate::common::fx_hash::FxHashMap as ParamMap;
         let entry_block = &mut inlined_blocks[0];
@@ -6196,7 +6216,9 @@ fn inline_call_site(
         let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
         let mut bridge: Vec<(usize, Instruction)> = Vec::new();
         for i in 0..num_args_to_store {
-            let home = param_alloca_info[i].0;
+            let Some((home, home_ty, _)) = param_alloca_info[i] else {
+                continue;
+            };
             if home_subst.contains_key(&home.0) {
                 continue; // value flows via the older pure-home substitution
             }
@@ -6220,7 +6242,7 @@ fn inline_call_site(
                     },
                 ));
             } else {
-                let store_ty = param_alloca_info[i].1;
+                let store_ty = home_ty;
                 bridge.push((
                     pos,
                     Instruction::Store {
@@ -6302,7 +6324,9 @@ fn inline_call_site(
                 return false;
             }
 
-            let (home, home_ty, _) = param_alloca_info[*param_idx];
+            let Some((home, home_ty, _)) = param_alloca_info[*param_idx] else {
+                return false;
+            };
 
             // Reuse existing load for this param_idx if present
             let loaded = if let Some(&v) = loaded_per_param.get(param_idx) {
@@ -6375,8 +6399,11 @@ fn inline_call_site(
     // instructions (and their associated stores to param allocas) are redundant.
     // We also remove the Store that immediately follows each ParamRef since it
     // stores the (now-removed) ParamRef dest into a param alloca.
-    let param_alloca_set: crate::common::fx_hash::FxHashSet<u32> =
-        param_alloca_info.iter().map(|(v, _, _)| v.0).collect();
+    let param_alloca_set: crate::common::fx_hash::FxHashSet<u32> = param_alloca_info
+        .iter()
+        .flatten()
+        .map(|(v, _, _)| v.0)
+        .collect();
     for block in &mut inlined_blocks {
         let has_spans =
             block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty();
@@ -7576,6 +7603,8 @@ mod inline_limit_tests {
                 })
                 .collect(),
             param_struct_sizes: Vec::new(),
+            param_alloca_values: Vec::new(),
+            param_home_shapes: Vec::new(),
             return_type: IrType::Void,
             num_params: 0,
             next_value_id: 0,
@@ -10677,6 +10706,8 @@ mod sroa_unlock_tests {
                 source_spans: Vec::new(),
             }],
             param_struct_sizes: Vec::new(),
+            param_alloca_values: Vec::new(),
+            param_home_shapes: Vec::new(),
             return_type: IrType::Void,
             num_params: 1,
             next_value_id: instructions as u32,
@@ -10927,5 +10958,264 @@ mod sroa_unlock_tests {
             &p_sizes,
             &[Operand::Value(Value(9))]
         ));
+    }
+}
+
+#[cfg(test)]
+mod param_home_tests {
+    //! Parameter homes are resolved through `param_alloca_values`, never by
+    //! position (`inlined_param_homes`). Each case is a shape the positional
+    //! "first N allocas" rule bridged through the wrong slot or ahead of the
+    //! slot's definition; the IR verifier is the oracle.
+    use super::*;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, CallInfo, Instruction, IrConst, IrFunction, IrModule, IrParam,
+        Operand, Terminator, Value,
+    };
+
+    fn callee(name: &str, blocks: Vec<BasicBlock>, homes: Vec<Value>, next: u32) -> IrFunction {
+        let mut f = IrFunction::new(
+            name.to_string(),
+            IrType::I32,
+            vec![IrParam {
+                ty: IrType::I32,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                is_f128_sse: false,
+                riscv_float_class: None,
+            }],
+            false,
+        );
+        f.is_static = true;
+        f.is_always_inline = true;
+        f.blocks = blocks;
+        f.param_alloca_values = homes;
+        f.next_value_id = next;
+        f
+    }
+
+    fn caller_of(name: &str) -> IrFunction {
+        let mut f = IrFunction::new("caller".to_string(), IrType::I32, vec![], false);
+        f.next_value_id = 2;
+        f.next_label = 101;
+        f.blocks.push(BasicBlock {
+            label: BlockId(100),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+                Instruction::Call {
+                    func: name.to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(1)),
+                        args: vec![Operand::Value(Value(0))],
+                        arg_types: vec![IrType::I32],
+                        return_type: IrType::I32,
+                        num_fixed_args: 1,
+                        ..CallInfo::default()
+                    },
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+        f
+    }
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn alloca(dest: u32, ty: IrType, size: usize) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty,
+            size,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn inline_into_caller(callee: IrFunction) -> IrModule {
+        let name = callee.name.clone();
+        let mut module = IrModule::new();
+        module.functions = vec![caller_of(&name), callee];
+        super::inline_run(&mut module, false);
+        module
+    }
+
+    fn calls(f: &IrFunction, name: &str) -> bool {
+        f.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Call { func, .. } if func == name))
+        })
+    }
+
+    fn violations(f: &IrFunction) -> Vec<String> {
+        let mut out = Vec::new();
+        crate::passes::verify::verify_function(f, "test", &mut out);
+        out.into_iter().map(|v| v.detail).collect()
+    }
+
+    /// The `_mm_set1_pi32` shape after nested inlining: the parameter's dead
+    /// home `v0` was deleted, and the first remaining alloca is an inner
+    /// temporary defined after the `ParamRef`. Checked with lowering's record
+    /// and without one (where only the leading alloca run may be homes).
+    #[test]
+    fn a_deleted_home_is_synthesized_not_taken_from_a_later_temporary() {
+        for record in [vec![Value(0)], Vec::new()] {
+            deleted_home_case(record);
+        }
+    }
+
+    fn deleted_home_case(record: Vec<Value>) {
+        let body = vec![
+            Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 0,
+                ty: IrType::I32,
+            },
+            alloca(2, IrType::Ptr, 8),
+            Instruction::Store {
+                val: Operand::Value(Value(1)),
+                ptr: Value(2),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Load {
+                dest: Value(3),
+                ptr: Value(2),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        ];
+        let f = callee(
+            "set1",
+            vec![block(
+                0,
+                body,
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            )],
+            record,
+            4,
+        );
+        let module = inline_into_caller(f);
+        let caller = &module.functions[0];
+        assert!(!calls(caller, "set1"), "the call must still inline");
+        assert_eq!(violations(caller), Vec::<String>::new());
+        // The temporary (the only Ptr alloca) never receives the argument.
+        let ptr_allocas: Vec<_> = caller
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|i| match i {
+                Instruction::Alloca {
+                    dest,
+                    ty: IrType::Ptr,
+                    ..
+                } => Some(*dest),
+                _ => None,
+            })
+            .collect();
+        assert!(!ptr_allocas.is_empty(), "temporary survives");
+        let stores_arg_into_temp = caller.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+            matches!(i, Instruction::Store { val: Operand::Value(Value(0)), ptr, .. } if ptr_allocas.contains(ptr))
+        });
+        assert!(!stores_arg_into_temp);
+    }
+
+    /// A recorded home behind a non-alloca is hoisted ahead of the bridge.
+    #[test]
+    fn a_home_after_the_leading_alloca_run_is_hoisted() {
+        let body = vec![
+            Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 0,
+                ty: IrType::I32,
+            },
+            alloca(0, IrType::I32, 4),
+            Instruction::Store {
+                val: Operand::Value(Value(1)),
+                ptr: Value(0),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Load {
+                dest: Value(2),
+                ptr: Value(0),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        ];
+        let f = callee(
+            "late_home",
+            vec![block(
+                0,
+                body,
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            )],
+            vec![Value(0)],
+            3,
+        );
+        let module = inline_into_caller(f);
+        let caller = &module.functions[0];
+        assert!(!calls(caller, "late_home"));
+        assert_eq!(violations(caller), Vec::<String>::new());
+    }
+
+    /// A recorded home outside the entry block cannot be dominated by the
+    /// entry-block bridge: the site is refused, never miscompiled.
+    #[test]
+    fn a_home_outside_the_entry_block_refuses_the_site() {
+        let entry = vec![Instruction::ParamRef {
+            dest: Value(1),
+            param_idx: 0,
+            ty: IrType::I32,
+        }];
+        let next = vec![
+            alloca(0, IrType::I32, 4),
+            Instruction::Store {
+                val: Operand::Value(Value(1)),
+                ptr: Value(0),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Load {
+                dest: Value(2),
+                ptr: Value(0),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        ];
+        let f = callee(
+            "far_home",
+            vec![
+                block(0, entry, Terminator::Branch(BlockId(1))),
+                block(1, next, Terminator::Return(Some(Operand::Value(Value(2))))),
+            ],
+            vec![Value(0)],
+            3,
+        );
+        let module = inline_into_caller(f);
+        let caller = &module.functions[0];
+        assert!(calls(caller, "far_home"), "the site must be refused");
+        assert_eq!(violations(caller), Vec::<String>::new());
     }
 }

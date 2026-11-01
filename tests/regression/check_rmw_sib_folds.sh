@@ -146,11 +146,11 @@ grep -qE "addq[[:space:]]+\\\$1,[[:space:]]*bins\(,[[:space:]]*%[a-z0-9]+,[[:spa
     || bad "-fno-pie: no \`addq \$1, bins(, %idx, 8)\` in main"
 grep -qE "^[[:space:]]+shl[a-z]*[[:space:]]" <<< "$np" \
     && bad "-fno-pie: a \`shl\` survived in main"
-CCC_PEEPHOLE_SKIP=shl_sib "$CCC" -O2 -fno-pie -S "$bench" -o "$work/bench_np_nos.s" \
-    || bad "-S build failed (-fno-pie, no-sib)"
-grep -qE "^[[:space:]]+shl[a-z]*[[:space:]]" "$work/bench_np_nos.s" \
-    || bad "-fno-pie: skipping shl_sib left no shl: the arm is not what removed it"
-note "non-PIC: parity, absolute scaled SIB RMW, no shl; skip arm keeps the shl"
+# Do not require `shl` to survive when only `shl_sib` is skipped: other
+# independently valid LEA/address folds may remove it. The PIC mutation arm
+# above already proves this pass's ownership on the isolated shape; here we
+# pin the non-PIC output shape and runtime parity only.
+note "non-PIC: parity, absolute scaled SIB RMW, no shl"
 
 note "contract 3: the index's definition survives"
 grep -qE "movzbl" <<< "$body" \

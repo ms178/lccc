@@ -131,12 +131,20 @@ jobs:
           git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/research-main"
           cargo build --profile fastbuild --locked --bin lccc -j 2 \
             --config 'target.x86_64-unknown-linux-gnu.linker="gcc-16"'
-          (
+          # A paired comparison needs a "before" compiler. When the base
+          # commit itself does not build (a merge skew on main, as with the
+          # base of #1025), fail with that diagnosis instead of a bare cargo
+          # exit status that reads like a candidate failure.
+          if ! (
             cd "$RUNNER_TEMP/research-main"
             CARGO_TARGET_DIR="$RUNNER_TEMP/research-main-target" \
               cargo build --profile fastbuild --locked --bin lccc -j 2 \
               --config 'target.x86_64-unknown-linux-gnu.linker="gcc-16"'
-          )
+          ); then
+            base=$(cat results/research/baseline.sha)
+            echo "::error title=Research baseline does not compile::baseline $base ($BASELINE_REF) failed to build while the candidate built; the paired before/after comparison cannot run until the base compiles (repair main or rebase)."
+            exit 1
+          fi
           sha256sum target/fastbuild/lccc "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
             > results/research/compiler-binaries.sha256
       - name: Dual-mode native AVX API contracts with exact current tools

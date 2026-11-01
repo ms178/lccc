@@ -374,6 +374,24 @@ impl SymbolTable {
             .is_some_and(|scope| scope.automatic.contains(name))
     }
 
+    /// The scope index (0 = file scope) of the innermost visible declaration
+    /// of `name` when that declaration is an automatic object or parameter.
+    pub fn automatic_object_scope(&self, name: &str) -> Option<usize> {
+        let (index, scope) = self
+            .scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, scope)| scope.symbols.contains_key(name))?;
+        scope.automatic.contains(name).then_some(index)
+    }
+
+    /// The index the next pushed scope will have; the innermost scope's
+    /// index is `depth() - 1`.
+    pub fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+
     /// Record that the innermost scope's object `name` has a `const` base
     /// specifier (see `common::qualifiers`).
     pub fn mark_const_base(&mut self, name: &str) {

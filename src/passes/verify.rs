@@ -188,6 +188,28 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
         }
     }
 
+    // 1a. source spans: either absent or exactly parallel to the
+    // instructions. `.loc` emission reads `source_spans[i]` for instruction
+    // `i`, so a block whose lists drifted attributes every later instruction
+    // to a neighbour's line, and passes that splice spans at an instruction
+    // index (copy placement) step outside a shorter list. Naming the pass that
+    // first breaks the pairing is the point: every consumer downstream is
+    // forgiving (clamped indices), so nothing else reports it.
+    for (i, block) in func.blocks.iter().enumerate() {
+        if !block.source_spans.is_empty() && block.source_spans.len() != block.instructions.len() {
+            push(
+                out,
+                format!(
+                    "block #{} ({:?}) has {} source spans for {} instructions",
+                    i,
+                    block.label,
+                    block.source_spans.len(),
+                    block.instructions.len()
+                ),
+            );
+        }
+    }
+
     // 1b. label-counter health: the documented `IrFunction::next_label`
     // invariant is that every live label is < next_label. A pass that mints
     // blocks without writing the counter back (loop_unroll pre-fix) leaves a

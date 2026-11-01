@@ -227,14 +227,39 @@ pub(crate) fn apply(module: &mut IrModule, cli: &BuiltinFlags) {
     }
 }
 
-/// Largest constant `memcpy` length [`canonicalize_library_memcpy`] turns
-/// into the native `Memcpy` instruction.  64 bytes is the x86-64 emitter's
+/// The x86-64 and AArch64 [`library_memcpy_inline_max`].  64 bytes is the x86-64 emitter's
 /// straight-line window (`emit_memcpy_impl_impl`: one `movdqu`/`movq` pair
 /// per chunk; above it the emitter switches to a copy loop, which a tuned
 /// libc `memcpy` beats) and lies inside AArch64's 256-byte `ldp`/`stp`
 /// window.  Everything the copy-aware passes model (aggregate SROA, the
 /// store/load and memcpy-chain forwards, DSE) is far below it.
 const LIBRARY_MEMCPY_INLINE_MAX: i64 = 64;
+
+/// Largest constant `memcpy` length [`canonicalize_library_memcpy`] turns
+/// into IR `Memcpy` for `target`: the lengths its emitter expands faster than
+/// the library call (or, under `-Os`, smaller). x86-64 and AArch64 use
+/// [`LIBRARY_MEMCPY_INLINE_MAX`]. i686 uses its emitter's own straight-line
+/// window (`straight_memcpy_max`: 256 bytes with SSE, 64 without), so a
+/// rewritten call is always expanded straight-line; under `-Os` it uses the
+/// shared 64, because even the `rep movsb` fallback (15-19 bytes) is smaller
+/// than the argument set-up and call it replaces. Zero (no rewrite) for
+/// targets whose expansion is slower than the call: RISC-V's byte loop.
+pub(crate) fn library_memcpy_inline_max(
+    target: crate::backend::Target,
+    i686_sse: bool,
+    optimize_for_size: bool,
+) -> i64 {
+    use crate::backend::Target;
+    match target {
+        Target::X86_64 | Target::Aarch64 => LIBRARY_MEMCPY_INLINE_MAX,
+        // `rep movsb` (15-19 bytes) is smaller than the call sequence, so
+        // every length in the shared window is rewritten; the emitter then
+        // keeps the smaller of `rep movsb` and the straight-line copy.
+        Target::I686 if optimize_for_size => LIBRARY_MEMCPY_INLINE_MAX,
+        Target::I686 => crate::backend::i686::codegen::emit::straight_memcpy_max(i686_sse) as i64,
+        _ => 0,
+    }
+}
 
 /// Give a plain `memcpy(d, s, n)` with a small constant `n` the same IR as
 /// `__builtin_memcpy(d, s, n)`: the native `Memcpy` instruction.
@@ -256,26 +281,21 @@ const LIBRARY_MEMCPY_INLINE_MAX: i64 = 64;
 /// The result, when the call has one, becomes a `Copy` of the destination
 /// operand; copy propagation removes it.  `n` is accepted as a literal or as
 /// a `Copy`/`Cast` of one (the size_t promotion of an `int` literal), and
-/// only when it is in `1..=LIBRARY_MEMCPY_INLINE_MAX` -- a positive value
-/// that small is unchanged by any integer cast of at least 32 bits, so the
-/// cast's direction never matters.  Targets whose `Memcpy` expansion is
-/// slower than the library call are left alone: RISC-V expands it as a
-/// byte loop and i686 as `rep movsb`.
-pub(crate) fn canonicalize_library_memcpy(module: &mut IrModule, target: crate::backend::Target) {
-    use crate::backend::Target;
+/// only when it is in `1..=max_len` ([`library_memcpy_inline_max`], at most
+/// 256) -- a positive value that small is unchanged by any integer cast of at
+/// least 32 bits, so the cast's direction never matters.
+pub(crate) fn canonicalize_library_memcpy(module: &mut IrModule, max_len: i64) {
     use crate::ir::reexports::{IrConst, Operand, Value};
-    if !matches!(target, Target::X86_64 | Target::Aarch64) {
+    if max_len <= 0 {
         return;
     }
-    fn small_len(c: &IrConst) -> Option<usize> {
+    let small_len = |c: &IrConst| -> Option<usize> {
         let v = match *c {
             IrConst::I128(v) => i64::try_from(v).ok()?,
             other => other.to_i64()?,
         };
-        (1..=LIBRARY_MEMCPY_INLINE_MAX)
-            .contains(&v)
-            .then_some(v as usize)
-    }
+        (1..=max_len).contains(&v).then_some(v as usize)
+    };
     fn is_candidate(func: &str, info: &crate::ir::instruction::CallInfo) -> bool {
         func == "memcpy"
             && info.assume_library
@@ -810,10 +830,16 @@ mod library_memcpy_tests {
     #[test]
     fn literal_length_becomes_native_memcpy_and_result_copy() {
         let mut m = copy_fn(None, Operand::Const(IrConst::I64(16)), true);
-        canonicalize_library_memcpy(&mut m, Target::X86_64);
+        canonicalize_library_memcpy(
+            &mut m,
+            library_memcpy_inline_max(Target::X86_64, false, false),
+        );
         assert!(rewritten(&m, 16));
         let mut m = copy_fn(None, Operand::Const(IrConst::I64(64)), true);
-        canonicalize_library_memcpy(&mut m, Target::Aarch64);
+        canonicalize_library_memcpy(
+            &mut m,
+            library_memcpy_inline_max(Target::Aarch64, false, false),
+        );
         assert!(rewritten(&m, 64));
     }
 
@@ -827,7 +853,10 @@ mod library_memcpy_tests {
             to_ty: IrType::U64,
         };
         let mut m = copy_fn(Some(cast), Operand::Value(Value(5)), true);
-        canonicalize_library_memcpy(&mut m, Target::X86_64);
+        canonicalize_library_memcpy(
+            &mut m,
+            library_memcpy_inline_max(Target::X86_64, false, false),
+        );
         assert!(rewritten(&m, 24));
         assert_eq!(body(&m).instructions.len(), 3);
     }
@@ -837,7 +866,10 @@ mod library_memcpy_tests {
     #[test]
     fn a_call_not_known_to_reach_the_library_stays_a_call() {
         let mut m = copy_fn(None, Operand::Const(IrConst::I64(16)), false);
-        canonicalize_library_memcpy(&mut m, Target::X86_64);
+        canonicalize_library_memcpy(
+            &mut m,
+            library_memcpy_inline_max(Target::X86_64, false, false),
+        );
         assert!(untouched(&m));
     }
 
@@ -853,7 +885,10 @@ mod library_memcpy_tests {
         });
         m.functions.push(def);
         apply(&mut m, &BuiltinFlags::default());
-        canonicalize_library_memcpy(&mut m, Target::X86_64);
+        canonicalize_library_memcpy(
+            &mut m,
+            library_memcpy_inline_max(Target::X86_64, false, false),
+        );
         assert!(untouched(&m));
     }
 
@@ -867,19 +902,74 @@ mod library_memcpy_tests {
             Operand::Value(Value(7)),
         ] {
             let mut m = copy_fn(None, len, true);
-            canonicalize_library_memcpy(&mut m, Target::X86_64);
+            canonicalize_library_memcpy(
+                &mut m,
+                library_memcpy_inline_max(Target::X86_64, false, false),
+            );
             assert!(untouched(&m));
         }
     }
 
-    /// RISC-V expands `Memcpy` as a byte loop and i686 as `rep movsb`; both
-    /// lose to the library call, so neither target is rewritten.
+    /// RISC-V expands `Memcpy` as a byte loop, which loses to the library
+    /// call, so it is not rewritten.
     #[test]
     fn targets_with_a_slow_memcpy_expansion_keep_the_call() {
-        for t in [Target::Riscv64, Target::I686] {
-            let mut m = copy_fn(None, Operand::Const(IrConst::I64(16)), true);
-            canonicalize_library_memcpy(&mut m, t);
-            assert!(untouched(&m));
+        let mut m = copy_fn(None, Operand::Const(IrConst::I64(16)), true);
+        canonicalize_library_memcpy(
+            &mut m,
+            library_memcpy_inline_max(Target::Riscv64, false, false),
+        );
+        assert!(untouched(&m));
+    }
+
+    /// i686 rewrites exactly its emitter's straight-line window: with SSE
+    /// 256 bytes, without 64, both edges included and nothing past them.
+    /// Under `-Os` the shared 64 (the `rep movsb` fallback is smaller than
+    /// the call), whatever the SSE setting.
+    #[test]
+    fn i686_rewrites_exactly_the_emitter_window() {
+        use crate::backend::i686::codegen::emit::straight_memcpy_max;
+        for (sse, size_opt, max) in [
+            (true, false, 256i64),
+            (false, false, 64),
+            (true, true, LIBRARY_MEMCPY_INLINE_MAX),
+            (false, true, LIBRARY_MEMCPY_INLINE_MAX),
+        ] {
+            let window = library_memcpy_inline_max(Target::I686, sse, size_opt);
+            assert_eq!(window, max, "sse={sse} -Os={size_opt}");
+            if !size_opt {
+                assert_eq!(window, straight_memcpy_max(sse) as i64);
+            }
+            for len in [1, 8, 16, 65, 128, max] {
+                if len > max {
+                    continue;
+                }
+                let mut m = copy_fn(None, Operand::Const(IrConst::I64(len)), true);
+                canonicalize_library_memcpy(&mut m, window);
+                assert!(
+                    rewritten(&m, len as usize),
+                    "sse={sse} -Os={size_opt} len {len}"
+                );
+            }
+            let mut m = copy_fn(None, Operand::Const(IrConst::I64(max + 1)), true);
+            canonicalize_library_memcpy(&mut m, window);
+            assert!(untouched(&m), "sse={sse} -Os={size_opt} past {max}");
+        }
+    }
+
+    /// The other targets' windows ignore the i686-only inputs.
+    #[test]
+    fn other_targets_windows_ignore_the_i686_inputs() {
+        for sse in [false, true] {
+            for size_opt in [false, true] {
+                for t in [Target::X86_64, Target::Aarch64] {
+                    assert_eq!(
+                        library_memcpy_inline_max(t, sse, size_opt),
+                        LIBRARY_MEMCPY_INLINE_MAX
+                    );
+                }
+                assert_eq!(library_memcpy_inline_max(Target::Riscv64, sse, size_opt), 0);
+            }
         }
     }
 }
