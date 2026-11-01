@@ -32,7 +32,19 @@ set -euo pipefail
 # abort on the first intended rejection) and the EXIT trap reports it when the
 # script ends badly.
 last_command=
+tmp=
 trap 'last_command=$BASH_COMMAND' DEBUG
+report_on_exit() {
+    local rc=$?
+    trap - DEBUG
+    if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+    if ((rc)); then
+        echo "::error::severity gate exited $rc; last command: $last_command"
+    fi
+    return 0
+}
+# Install before compiler discovery and mktemp, not after those can fail.
+trap report_on_exit EXIT
 redteam_runner=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/check_diagnostic_redteam.py
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -44,7 +56,6 @@ CCC=$(cd "$(dirname -- "$CCC")" && pwd)/$(basename -- "$CCC")
 GCC=${GCC:-gcc-16}
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-gcc162-severity.XXXXXX")
-trap 'rc=$?; trap - DEBUG; rm -rf "$tmp"; if ((rc)); then echo "::error::severity gate exited $rc; last command: $last_command"; fi' EXIT
 cd "$tmp"
 
 # The message also becomes a GitHub annotation, so a red step names its own

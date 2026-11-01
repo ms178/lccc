@@ -52,6 +52,20 @@ def _escape_github_annotation_data(value: str) -> str:
     return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+def fixture_library_env(directory):
+    """Prefer the fixture DSO without hiding a non-system compiler runtime.
+
+    Cache-selected multilib GCC installs libstdc++ outside the system loader
+    directories. Replacing LD_LIBRARY_PATH with the fixture directory made
+    the C++ exception test fail before it could exercise either linker.
+    An unset/empty inherited path must not introduce an implicit cwd entry.
+    """
+    env = dict(os.environ)
+    inherited = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = directory + (os.pathsep + inherited if inherited else "")
+    return env
+
+
 def compiler_for(fname):
     """Pick the driver for a fixture source; C++ needs g++, not gcc."""
     return CXX if os.path.splitext(fname)[1] in (".cpp", ".cc", ".cxx") else CC
@@ -4408,7 +4422,7 @@ def _dso_emit_semantics_test(args, oracles):
                 f.write(body)
         lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
         shim = _shim_for(td, lccc_ld)
-        env = dict(os.environ, LD_LIBRARY_PATH=td)
+        env = fixture_library_env(td)
         r = sh([CC, "-shared", "-fPIC", "-O1", "tlsdef.c", "-o", "libtv.so"], cwd=td)
         if r.returncode != 0:
             return Result(name, "FAIL", f"fixture libtv: {r.stderr.decode()[:200]}")
@@ -4540,7 +4554,7 @@ def _dso_emit_semantics_i386_test(args, oracles):
             return Result(name, status, f"no -m32 toolchain: {r.stderr.decode()[:150]}")
         lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
         shim = _shim_for(td, lccc_ld)
-        env = dict(os.environ, LD_LIBRARY_PATH=td)
+        env = fixture_library_env(td)
         for dialect in ("gnu", "gnu2"):
             for opt in ("-O0", "-O2"):
                 r = sh([CC, "-m32", "-B" + shim, "-shared", "-fPIC", opt,

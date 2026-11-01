@@ -339,3 +339,50 @@ claimed as meaningful wins. No ICX or patched-LLVM timing is claimed locally.
 
 Full frozen modern fast-suite rerun and current-head hosted acceptance remain
 required; earlier hosted results do not certify these additional changes.
+
+## Frozen-run result, hosted green milestone and final harness follow-up
+
+At source milestone `9327e12a1`, all five hosted workflows completed successfully:
+CI `41304114851`, research `41304114858`, Debian `41304114833`, relocation
+`41304114816`, IPA/LRS `41304114904`. Main CI includes authenticated ICX 2026.2
+integration, all frontend/ABI/codegen/runtime shards and assembler/linker tests.
+The expensive opt-in patched-LLVM job was skipped, NOT passed. The research
+artifact is ID `13083673184` (`compiler-research`, 8,087,395 bytes); local download
+failed at the external artifact-storage host, so no unseen numeric ICX timing
+is asserted here.
+
+The frozen modern-selected local fast run completed **542 PASS / 1 FAIL /
+9 SKIP** (`/home/user/unified-ci-frozen-pr1062.log`). The only failing test was
+`i386_dso_emit_semantics`: its fixture replaced `LD_LIBRARY_PATH`, hiding the
+cache-selected GCC 16 lib32 C++ runtime before the exception test executed.
+The two DSO semantic batteries now prepend their own directory while preserving
+explicit inherited compiler-runtime paths. Two additional unit contracts pin
+fixture-first order, environment isolation and no implicit cwd for unset/empty
+paths. Actual strict full linker suite after correction: **341 PASS / 0 FAIL /
+0 WARN / 0 SKIP** (`/home/user/unified-linker-final.log`), with BFD and mold
+oracles. No leg was disabled and no exception assertion was relaxed.
+
+The latest #1060 startup-annotation concern is also addressed: one EXIT reporter
+is installed before compiler discovery and temp setup. Missing-compiler and
+failed-mktemp negative controls preserve exit 1 and 7 and emit annotations.
+All six annotation contracts pass; 1,617 real GCC 16.2 diagnostic red-team
+contracts still pass. Full corpus after these harness changes: **1,099 tests
+PASS / six skips** (`/home/user/unified-corpus-final-1099.log`). The earlier
+frozen whole-tree run is not relabeled as a clean run of these changes.
+
+Paired-round bootstrap of the committed pixel timings (10,000 resamples,
+seed 63122730) gives a by-value elapsed-time change interval of -24.04% to
+-21.89% versus GCC and -21.16% to -18.30% versus Clang. The separate-buffer
+loss versus Clang persists at +5.08% to +9.91%. These intervals describe only
+the 12 measured rounds, not systematic cloud-host effects.
+
+PR #1063 opened during the frozen run, at head `1a78be8ae`. Its new producer
+accepts I8/U8/I16/U16, but the AArch64 and RV64 bit-modify emitters reduce indices
+only modulo 32/64. Independently assembling the exact isolated emitter sequence
+and executing under QEMU confirms `BitSet(U8(0),8)` yields 0 rather than the
+stated IR result 1, on BOTH targets. This is an emitter/model counterexample,
+not a claim that the entire PR was built. Review posted at
+https://github.com/ms178/lccc/pull/1063#issuecomment-6557857349 . Do not import
+that uncorrected feature or discard its valuable tests to manufacture acceptance.
+Its corrected integration and the remaining Chromium/LLVM work are outstanding;
+there is no universal-superiority or exhaustive-production-certification claim.
