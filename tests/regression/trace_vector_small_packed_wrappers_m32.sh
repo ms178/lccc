@@ -32,11 +32,15 @@ if [[ -n $eip ]]; then
     addr=$((eip))
     lo=$((addr > 24 ? addr - 24 : 0))
     hi=$((addr + 24))
+    if objdump -d -M intel --disassemble=ret "$work/probe" \
+        >"$work/disassembly" 2>/dev/null; then
+        symbol_disassembly=$(tr '\n' ';' < "$work/disassembly")
+        printf '::notice title=i686 ret function disassembly::%s\n' "$symbol_disassembly"
+    fi
     if objdump -d -M intel --start-address="$lo" --stop-address="$hi" \
         "$work/probe" >"$work/disassembly" 2>/dev/null; then
-        while IFS= read -r line; do
-            printf '::notice title=i686 vector disassembly::%s\n' "$line"
-        done < "$work/disassembly"
+        context_disassembly=$(tr '\n' ';' < "$work/disassembly")
+        printf '::notice title=i686 fault-window disassembly::%s\n' "$context_disassembly"
     fi
 else
     echo "::notice title=i686 vector trace probe failed::rc=$rc; no EIP marker (signal handler or executable environment unavailable)"
