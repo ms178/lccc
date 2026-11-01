@@ -362,7 +362,7 @@ echo "PASS: gcc-16.2 diagnostic severity, message and column parity"
 if ! redteam=$(CCC="$CCC" GCC="$GCC" python3 "$redteam_runner" 2>&1); then
     printf '%s\n' "$redteam" >&2
     printf '::error::%s\n' "$(printf '%s\n' "$redteam" \
-        | grep -m1 -E 'FAIL|Traceback|error:' || printf 'redteam matrix failed')"
+        | grep -E 'FAIL|Traceback|error:' | sed -n '1p' || printf 'redteam matrix failed')"
     exit 1
 fi
 printf '%s\n' "$redteam"

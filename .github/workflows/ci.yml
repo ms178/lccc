@@ -3285,7 +3285,7 @@ jobs:
       with:
         path: ~/.cache/lccc-toolchain
         key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
-    - name: Provision multilib prerequisites for exact modern oracles
+    - name: Provision oracle toolchain (cached bundle, else apt)
       run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Cache the GCC 16.2 oracle
       uses: actions/cache@v6

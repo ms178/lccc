@@ -1764,6 +1764,7 @@ gate "integer-order-networks" fast python3 tests/regression/check_integer_order_
 # switch, host fallback and pair liveness. Mirrors the hosted step.
 gate "peephole-pair-parallel" fast python3 tests/regression/check_peephole_pair_parallel.py
 gate "oracle-diagnostics" fast python3 scripts/test_ci_oracle_diagnostics.py
+gate "llvm-slp-oracle-builder" fast python3 scripts/test_llvm_slp_oracle_builder.py
 gate "cross-linker-discovery" fast python3 tests/regression/test_check_switch_cross_execute.py
 
 gate "tls-model-option" fast \
