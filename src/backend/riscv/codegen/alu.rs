@@ -114,6 +114,33 @@ impl RiscvCodegen {
             return;
         }
 
+        if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear) {
+            // Portable bit modify: `1 << (index mod W)` then OR it in, or
+            // complement the mask and AND it out.  RISC-V has no `bts`/`btr`
+            // (those are Zbs), and `sll`/`sllw` reduce the count modulo XLEN
+            // rather than modulo the operation width, so the index is reduced
+            // explicitly -- that reduction IS `IrBinOp::BitSet`'s contract, and
+            // it keeps an index of W or more (an undefined C shift in dead
+            // code) defined and equal to what the constant folder computes.
+            // The mask is built in t0 from the immediate 1, so the 32-bit form
+            // needs no sign-extension normalization: bit 31 is the highest bit
+            // a 32-bit mask can carry, and `or`/`and` preserve the operand's
+            // own normalization.
+            let mask_bits = if use_32bit { 31 } else { 63 };
+            self.state
+                .emit_fmt(format_args!("    andi t2, t2, {mask_bits}"));
+            self.state.emit("    li t0, 1");
+            self.state.emit("    sll t0, t0, t2");
+            if op == IrBinOp::BitSet {
+                self.state.emit("    or t0, t1, t0");
+            } else {
+                self.state.emit("    xori t0, t0, -1");
+                self.state.emit("    and t0, t1, t0");
+            }
+            self.store_t0_to(dest);
+            return;
+        }
+
         if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
             // RV64I has no rotate: `rol`/`ror` are Zbb, and this backend does
             // not yet model Z-extension availability, so emit the portable
@@ -170,6 +197,9 @@ impl RiscvCodegen {
             (IrBinOp::LShr, false) => "srl",
             (IrBinOp::LShr, true) => "srlw",
             (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
+            (IrBinOp::BitSet | IrBinOp::BitClear, _) => {
+                unreachable!("BitSet/BitClear handled above")
+            }
             (IrBinOp::Bzhi, _) => crate::ir::ops::bzhi_outside_x86_64(),
             (IrBinOp::UMulHigh, false) => "mulhu",
             (IrBinOp::SMulHigh, false) => "mulh",

@@ -485,6 +485,13 @@ impl ArmCodegen {
             let dest_name = callee_saved_name(dest_phys);
             let dest_name_32 = callee_saved_name_32(dest_phys);
 
+            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear) {
+                if self.emit_bit_modify_into(op, dest_phys, lhs, rhs, use_32bit) {
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+
             let is_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
             let is_simple_alu = matches!(
                 op,
@@ -825,6 +832,7 @@ impl ArmCodegen {
                     crate::ir::ops::mul_high_unsupported_here()
                 }
                 IrBinOp::BitTest => self.emit_bit_test(rhs, false),
+                IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify(op, rhs, true),
             }
         } else {
             match op {
@@ -876,10 +884,114 @@ impl ArmCodegen {
                 IrBinOp::UMulHigh => self.state.emit("    umulh x0, x1, x2"),
                 IrBinOp::SMulHigh => self.state.emit("    smulh x0, x1, x2"),
                 IrBinOp::BitTest => self.emit_bit_test(rhs, true),
+                IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify(op, rhs, false),
             }
         }
 
         self.store_x0_to(dest);
+    }
+
+    /// `BitSet`/`BitClear` into a destination that already has a register
+    /// home: stage the base there, build the one-hot mask in x3 and `orr`
+    /// (set) or `bic` (clear) it in place.  Three instructions, the same
+    /// count the shift/OR spelling it replaces needs, without the accumulator
+    /// path's two staging moves.
+    ///
+    /// Refused -- letting the caller fall through to the accumulator path --
+    /// when the index lives in the destination register (the base staging
+    /// would destroy it) or in x3 itself (the mask build writes x3).
+    fn emit_bit_modify_into(
+        &mut self,
+        op: IrBinOp,
+        dest_phys: crate::backend::regalloc::PhysReg,
+        base: &Operand,
+        index: &Operand,
+        use_32bit: bool,
+    ) -> bool {
+        let own_idx = self.operand_reg(index).filter(|r| !is_arm_fp_phys(*r));
+        if own_idx == Some(dest_phys) || own_idx.map(|r| r.0) == Some(3) {
+            return false;
+        }
+        let (r, width) = if use_32bit { ('w', 32) } else { ('x', 64) };
+        let dest = if use_32bit {
+            callee_saved_name_32(dest_phys)
+        } else {
+            callee_saved_name(dest_phys)
+        };
+        // The base is read in place when it already has a home: the
+        // three-operand form above does the same, and staging a copy into the
+        // destination would be a dead `mov` for every value with a register
+        // home (`x | 1 << n` with x in a callee-saved register).
+        let base_reg = self.operand_reg(base).filter(|r| !is_arm_fp_phys(*r));
+        let read = match base_reg {
+            Some(reg) => {
+                if use_32bit {
+                    callee_saved_name_32(reg).to_string()
+                } else {
+                    callee_saved_name(reg).to_string()
+                }
+            }
+            None => {
+                self.operand_to_callee_reg(base, dest_phys);
+                dest.to_string()
+            }
+        };
+        self.state.emit("    mov w3, #1");
+        match Self::const_as_imm12(index) {
+            Some(imm) => {
+                let amount = (imm as i64).rem_euclid(width);
+                self.state
+                    .emit_fmt(format_args!("    lsl {r}3, {r}3, #{amount}"));
+            }
+            None => match own_idx {
+                Some(reg) => {
+                    let src = if use_32bit {
+                        callee_saved_name_32(reg)
+                    } else {
+                        callee_saved_name(reg)
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    lsl {r}3, {r}3, {src}"));
+                }
+                None => {
+                    self.operand_to_x0(index);
+                    self.state
+                        .emit_fmt(format_args!("    lsl {r}3, {r}3, {r}0"));
+                }
+            },
+        }
+        let mnemonic = if op == IrBinOp::BitSet { "orr" } else { "bic" };
+        self.state
+            .emit_fmt(format_args!("    {mnemonic} {dest}, {read}, {r}3"));
+        true
+    }
+
+    /// `BitSet`/`BitClear(x1, x2)` into x0/w0: one `mov` of the immediate 1,
+    /// one `lsl` by the index and one `orr` (set) or `bic` (clear, AArch64's
+    /// bit-clear).  There is no variable-immediate BFI, and `lsl`/`lslv` reduce
+    /// the count modulo the register size, which is exactly the operation's
+    /// `index mod W` contract.  x3 is this path's scratch (the rotate arm above
+    /// uses it the same way); t1 holds the base and t2 the index throughout.
+    fn emit_bit_modify(&mut self, op: IrBinOp, rhs: &Operand, is_32: bool) {
+        let (r, width) = if is_32 { ('w', 32) } else { ('x', 64) };
+        self.state.emit("    mov w3, #1");
+        match Self::const_as_imm12(rhs) {
+            Some(imm) => {
+                let amount = (imm as i64).rem_euclid(width);
+                self.state
+                    .emit_fmt(format_args!("    lsl {r}3, {r}3, #{amount}"));
+            }
+            None => self
+                .state
+                .emit_fmt(format_args!("    lsl {r}3, {r}3, {r}2")),
+        }
+        if op == IrBinOp::BitSet {
+            self.state
+                .emit_fmt(format_args!("    orr {r}0, {r}1, {r}3"));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    bic {r}0, {r}1, {r}3"));
+        }
     }
 
     /// `BitTest(x1, rhs)` into x0/w0: bit `rhs mod W` of the base (the IR

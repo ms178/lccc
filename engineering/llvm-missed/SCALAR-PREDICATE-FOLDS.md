@@ -38,6 +38,7 @@ in the tree is called a batch:
 | matcher (`bit_idioms.rs`) | `fold_shift_pair_into_mask` | `(x << k) >>u k` → `x & (2^(W-k)-1)` |
 | matcher (`bit_idioms.rs`) | `fold_unit_interval_test` | `(x == 0) \| (x == 1)` → `x <=u 1` |
 | matcher (`bit_idioms_compare_dominance.rs`) | `fold_compare_dominance` | `(x != 0) & (x > 4)` → `x > 4`; a join of two comparisons of one value is its stronger (or weaker) operand |
+| matcher (`bit_idioms_bit_select.rs`) | `fold_bit_select` | `x \| 1 << n` → `BitSet`, `x & ~(1 << n)` → `BitClear`, `(x & 1 << n) != 0` → `BitTest` |
 | matcher (`bit_idioms.rs`) | `fold_lowest_set_bit` | `1 << Ctz(~x)` → `(x + 1) & ~x`, plus the exact `~x == 0` arm |
 | rule (`simplify.rs`) | `zeroneg` | `0 - x` → `Neg x` (the modular negate, canonically spelled) |
 | rule (`simplify.rs`) | `negcast` | `(i32)(-(i64)(i32)v)` → `-(i32)v` (a truncation distributes over a negate) |
@@ -48,8 +49,10 @@ in the tree is called a batch:
 | gate (`check_lowest_set_bit_fold.sh`) | `lowest-set-bit-fold` | the lowest-set-bit matcher and `zeroneg` |
 | gate (`check_narrow_negate_fold.sh`) | `narrow-negate-fold` | `zeroneg`, `negcast` and `notcast`, with the untouched widths pinned as controls |
 | gate (`check_compare_dominance_fold.sh`) | `compare-dominance-fold` | `fold_compare_dominance`, both directions, with the two non-dominant shapes pinned as controls |
+| gate (`check_bit_select_fold.sh`) | `bit-select-fold` | `fold_bit_select` on x86-64/i686/AArch64/RISC-V, with the non-single-bit shapes pinned as controls |
 | tests (`bit_idioms_lowest_bit_tests.rs`) | — | executes the rewritten block against the reference semantics |
 | tests (`bit_idioms_compare_dominance_tests.rs`) | — | evaluates the join and the returned `Copy` over the whole 8-/16-bit ring |
+| tests (`bit_idioms_bit_select_tests.rs`) | — | evaluates the original shift shape and the returned bit operation over every ring |
 
 ## The five rewrites
 
@@ -363,9 +366,46 @@ widening step cannot be dropped, and the two controls in
 `check_narrow_negate_fold.sh` (`~(unsigned long)x`, and the unsigned spelling
 that never widened) pin that.
 
-The remaining gap on that shape is instruction selection, not folding: GCC and
-Clang reach three instructions with `btr`, which LCCC's IR has no operation for
-(see "What is not done").
+### 12. Single-bit selection — `bit_select`
+
+```c
+unsigned set(unsigned x, unsigned n)   { return x | (1u << n); }        /* 6 -> 3 */
+unsigned clr(unsigned x, unsigned n)   { return x & ~(1u << n); }       /* 8 -> 3 */
+int      test(unsigned x, unsigned n)  { return (x & (1u << n)) != 0; } /* 7 -> 4 */
+```
+
+§11's shape ends in a truncation, and its last paragraph named the remaining gap
+as instruction selection. It was: `x | 1u << n` reaches the backend as a
+materialized constant, a variable shift pinned to `%cl`, and the logic op, and
+no IR operation said "set bit n". `IrBinOp` now has `BitSet` and `BitClear`
+next to the existing `BitTest`, all three with the same contract — the index is
+taken **modulo the operand width**, so an index of W or more (an undefined C
+shift that may sit in dead code) still compiles and still agrees with the
+constant folder, and they are typed I32/U32/I64/U64 with the wide-int pair path
+refusing 64-bit operations on a 32-bit target.
+
+`fold_bit_select` creates them, and it only ever replaces the instruction it
+matched: the shift (and the complement above it) must be single-use, so DCE
+deletes them and nothing needs the pass's producer-repurposing bookkeeping. All
+three shapes are accepted in both operand orders, the complement may be spelled
+`Not` or `Xor -1`, and the index is read *through* integer casts — `index mod W`
+survives any of them (a narrowing cast drops bits that are multiples of 2^8, a
+sign-extending one adds 2^(8k-1), and every W here divides those), which is what
+removes the count's widened copy (`movslq %esi, %rdx`) from the 64-bit forms.
+
+The equality direction, `(x & 1 << n) == 0`, is deliberately *not* folded:
+`BitTest` is a 0/1 value, so the negated form needs a second instruction on top
+of it and the compare would survive anyway; the inequality direction folds
+because `BitTest`'s 0/1 result *is* the answer. That is the one row of this
+section's probe corpus that stays at its old count, and the gate pins it.
+
+Backend lowerings, all of them measured in this section's probe corpus:
+
+| Target | `BitSet` | `BitClear` | Note |
+| --- | --- | --- | --- |
+| x86-64, i686 | `bts` | `btr` | one instruction in place of the base; the register-direct form refuses the shapes where staging the base would destroy the index, and the accumulator form covers the rest (8-bit has no `btsb`, so it reduces the index and uses the 64-bit form) |
+| AArch64 | `mov w3, #1` + `lsl` + `orr` | … + `bic` | three instructions, the same count the shift/OR spelling costs, and the base is read in place from its home |
+| RISC-V | `andi` (index mod W) + `li` + `sll` + `or` | … + `xori` + `and` | no `bts`/`btr` (Zbs), so the portable sequence with the index reduced explicitly |
 
 ## Measurements
 
@@ -508,17 +548,24 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
 
 ## What is not done
 
-* **`bt`/`bts`/`btr` instruction selection** — `x & ~(1 << n)`, `x | (1 << n)` and
-  `(x & (1 << n)) != 0` are the bit-clear/bit-set/bit-test idioms, and both
-  oracles select the one-instruction `btr`/`bts`/`bt` for them (3 instructions
-  against LCCC's 8, 6 and 8). The IR has `BitTest` but no bit-set or bit-clear
-  operation, so this needs a new IR operation plus an x86 lowering and a generic
-  fallback for the other backends — the largest remaining item in this file's
-  probe corpus, and the reason §11's shape still costs 8.
-* **`__builtin_popcount` / parity** — the SWAR expansion is 17 instructions
-  where GCC calls `__popcountdi2` (5) and Clang inlines 16; `popcount(x) & 1`
-  adds the `andl $1` on top (18 against 7). Selecting `popcnt` (or the library
-  call) is a target-support question, not a fold.
+* **`btc` (bit toggle)** — `x ^ (1 << n)` is the fourth single-bit idiom, and
+  both oracles select the one-instruction `btc` for it (3 instructions against
+  LCCC's 6). It needs a fourth IR operation with a fourth lowering in every
+  backend; §12's recognition is one arm away from it, but nothing in the probe
+  corpus or the 3,016-file sweep carries the shape, so it is not added
+  speculatively.
+* **`__builtin_popcount` / parity below `-mpopcnt`** — the remaining gap is a
+  linking decision, not a fold, and the numbers say so. With `-mpopcnt` LCCC
+  already selects the instruction: `pop32` is `popcntl; mov; ret` (3, equal to
+  GCC's 3 and one behind Clang's 2), `parity32` is `popcntl; andl $1; mov; ret`
+  (4, equal to GCC) and `pop_and1` the same (4). Without `-mpopcnt` LCCC inlines
+  the 17-instruction SWAR where GCC emits a call to libgcc's `__popcountdi2`
+  (5) and Clang inlines 16; taking GCC's route would make every LCCC object
+  depend on `libgcc` for one builtin, which the kernel and freestanding targets
+  cannot assume, so the baseline stays inline. Parity is the same story from the
+  other side: without `popcnt` GCC's `shr/xor/xorb/setnp` chain is 7 and LCCC's
+  SWAR plus `andl $1` is 18 — worth revisiting only together with the popcount
+  decision.
 * **`1u << __builtin_ctz(y)` (no complement)** — refused on purpose: with the
   exact `Ctz(0) == width` arm it is no shorter than the count path (5/6 vs 8/8
   with the arm), and Clang's four-instruction form depends on `ctz(0)` being
