@@ -165,7 +165,7 @@ class FailureAnnotationContracts(unittest.TestCase):
         self.assertEqual(sorted(lanes), sorted([
             "build", "debug", "corpus",
             "frontend-a", "frontend-b", "frontend-c", "codegen-a", "codegen-b",
-            "backend", "backend-contracts-a", "backend-contracts-b", "unit"]))
+            "backend", "backend-contracts-a", "backend-contracts-b", "icx-oracle", "unit"]))
 
 
 if __name__ == "__main__":

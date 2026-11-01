@@ -88,7 +88,6 @@ jobs:
           path: ${{ runner.temp }}/toolchain-cache/toolchain-cache.json
           if-no-files-found: error
   evidence:
-    if: ${{ !inputs.patched_llvm_slp }}
     # Opt-in research: manual, or a PR touching watched compiler/research inputs.
     name: Same-host portable/native runtime and Callgrind
     runs-on: ubuntu-24.04

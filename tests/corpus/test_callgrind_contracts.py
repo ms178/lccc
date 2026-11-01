@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -558,7 +559,14 @@ class InterspersedCliRatchetTests(unittest.TestCase):
         """
         import ast
         found=set()
-        for path in sorted(REPO.rglob('*.py')):
+        # Scan owned sources, not ignored build trees or archived baselines.
+        sources = subprocess.check_output(
+            ['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard',
+             '--', '*.py'], cwd=REPO).decode().split('\0')
+        for relpath in sorted(set(sources) - {''}):
+            path = REPO / relpath
+            if not path.is_file():
+                continue
             rel=path.relative_to(REPO).as_posix()
             if rel.startswith('tests/corpus/clang-c/') or '/clang-c/' in rel:continue
             try:tree=ast.parse(path.read_text(),rel)

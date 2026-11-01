@@ -44,6 +44,17 @@ if [ -z "$march" ]; then
     exit 0
 fi
 
+# Independently validate the fixture's C semantics. In particular, testing
+# wraparound through signed arithmetic can make both the oracle and the
+# compiler under test appear to pass a program whose behavior is undefined.
+"${GCC:-gcc}" -O2 -Werror -fsanitize=undefined,float-cast-overflow \
+    -fsanitize-undefined-trap-on-error "$src" -o "$td/oracle"
+"$td/oracle" > "$td/oracle.out"
+[ "$(cat "$td/oracle.out")" = "$out" ] || {
+    echo "FAIL: bb_slp_v6 sanitized oracle disagrees"
+    exit 1
+}
+
 # ── 2–6. codegen contracts ─────────────────────────────────────────────
 "$ccc" -O2 $march -S "$src" -o "$td/v6.s"
 
@@ -60,10 +71,19 @@ scoped() {  # scoped <func> — the function's asm slice (label to next fn)
 # matches only LOAD-form movdqu/vmovdqu (memory source: the operand after
 # the mnemonic is not a %register) — the trailing result STORE
 # (`movdqu %xmmN, (%rsi)`) is not a load.
-n_mf=$(scoped v6_mf_add | grep -cE "vpaddd|vmovdqu|movdqu" || true)
-n_mf_load=$(scoped v6_mf_add | grep -cE "[vm]*movdqu [^%]" || true)
-if [ "$n_mf" -lt 1 ] || [ "$n_mf_load" -ne 0 ]; then
-    echo "FAIL: v6_mf_add not folded ($n_mf ops, $n_mf_load loads)"
+n_mf=$(scoped v6_mf_add_dynamic | grep -cE "vpaddd|vmovdqu|movdqu" || true)
+n_mf_load=$(scoped v6_mf_add_dynamic | grep -cE "[vm]*movdqu [^%]" || true)
+if [ "$n_mf" -lt 1 ] || [ "$n_mf_load" -ne 0 ] || ! scoped v6_mf_add_dynamic | grep -E 'vpaddd .*\(' >/dev/null; then
+    echo "FAIL: v6_mf_add_dynamic not folded ($n_mf ops, $n_mf_load loads)"
+    exit 1
+fi
+# Literal pooling may fold the constant instead of the stream, an equal-cost
+# choice also available to GCC. Keep that original fixture, require a packed
+# memory arithmetic op and at most load+add+store+ret, and retain the stricter
+# no-stream-load mechanism assertion on the dynamic broadcast above.
+n_literal=$(scoped v6_mf_add | grep -cE '^[[:space:]]+[a-z][a-z0-9]*([[:space:]]|$)' || true)
+if ! scoped v6_mf_add | grep -E 'vpaddd .*\(' >/dev/null || [ "$n_literal" -gt 4 ]; then
+    echo "FAIL: v6_mf_add literal pool cost/packed-memory contract ($n_literal instructions)"
     exit 1
 fi
 n_mf2=$(scoped v6_mf_xor | grep -cE "vpxor" || true)

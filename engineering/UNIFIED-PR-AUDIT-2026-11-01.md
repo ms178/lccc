@@ -239,3 +239,51 @@ rerun, fresh unified timing, current-head hosted CI, and the remaining browser
 and follow-up work are **not yet certified** by the receipts above. Focused
 validated `ms178-1.patch` snapshots 04 through 08 record their exact commits
 and these limitations rather than manufacturing a canonical local pass stamp.
+
+## Harness and v6 fixture repair receipts (2026-11-01)
+
+- Complete corpus rerun: 1,097 tests, six skips, 107.423 seconds, PASS;
+  external log `/home/user/unified-corpus-contracts-v6.log`. The subsequent
+  strengthened v6 assembly assertion and negative control also pass.
+- Callgrind object IDs share the `ob`/`cob` namespace, but only `ob` changes
+  current object context. The streaming parser now handles either definition
+  order, exact integer counts and malformed/missing-count errors. Five
+  synthetic tests pass. The real layout gate counts 96,397,664 selected-layout
+  versus 96,973,245 historical-layout transfers, with matching output and
+  13 static jumps each (the previous zero count was a parser defect).
+- Source ratchets enumerate Git's source set rather than recursively scanning
+  ignored source archives. CI expectation tests include the actual ICX and
+  optional LLVM-builder contracts. Hosted/local parity passes: 493 commands,
+  27 invocation contracts. Ordinary compiler-research evidence is unconditional;
+  the expensive patched-LLVM comparison remains opt-in.
+- The v6 C fixture had actual signed overflow in add, subtract, add8 and the
+  equality-select false arm, despite claiming defined wraparound. Those kernels
+  now use unsigned arithmetic. The XOR expected-value expression also lacked
+  parentheses and could accept incorrect results; a deliberately zeroed XOR
+  lane now fails the repaired check. GCC 16.2 compiles with `-Werror`, and the
+  complete fixture passes undefined-behavior/float-cast-overflow trap sanitizers.
+  This sanitizer oracle is now part of the regression gate.
+- The apparent constant-add stream-fold regression was an over-specific shape
+  expectation: literal pooling permits folding either memory input. Retain the
+  original literal fixture and require packed memory arithmetic in at most four
+  instructions (including return). Add a noinline runtime-broadcast fixture
+  that must fold the input stream, with no separate vector load; it passes
+  1,000 constants across four edge-value lanes. Both strict assembly contracts
+  pass. GCC 16.2's corresponding literal function uses five instructions at
+  `-O2 -march=x86-64-v3`; this is an instruction-count observation, not a runtime
+  speedup claim. No compiler optimizer change was necessary for this gate.
+- Offline environment provisioning: the Arm September-2026 archive was verified
+  and installed through its official installer; kernel relocs v7.3 was rebuilt
+  through its official source-pin verification. Modern GCC's local m32 wrapper
+  now adds the shared Debian UAPI include only without explicit sysroot or
+  nostdinc policies, honoring the last ABI switch. Its genuine GCC 16 lib32
+  runtime is selected, and the throw/catch C++ probe runs successfully.
+
+Outstanding: the full modern fast run remains 517 pass / 18 fail / 16 skip
+before these repairs; no frozen clean rerun or green hosted acceptance yet.
+GNU tool provisioning is still in progress (Texinfo documentation generation is
+unavailable locally; `MAKEINFO=true` suppresses manuals, not tool validation).
+The open-PR refresh additionally found #1061 and #1062; their unique changes
+still require audit/integration without deleting retained improvements. Latest
+main remains `013983d6a0c94d9cabb700aa8fdde5c3cfa16e88`. Actual patched-LLVM
+comparison and fresh whole-computation runtime measurements remain unrun.

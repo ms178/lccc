@@ -251,6 +251,8 @@ class ParallelLayout(unittest.TestCase):
             'branches': ['main'],
             'paths': [
                 '.github/workflows/compiler-research.yml',
+                'scripts/ci_build_llvm_slp_oracles.sh',
+                'scripts/test_llvm_slp_oracle_builder.py',
                 'src/passes/vec_ssa.rs',
                 'src/passes/slp_vectorizer.rs',
                 'src/passes/vectorize.rs',

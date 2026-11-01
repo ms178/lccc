@@ -131,20 +131,12 @@ fi
 # Executed taken transfers inside one binary's own object: Callgrind's
 # per-instruction jump records, `jcnd=<taken>/<executed>` and `jump=<count>`,
 # summed while the current `ob=` is the binary itself. Callgrind compresses
-# names: the first `ob=(N) path` binds N, later lines repeat only `ob=(N)`.
+# names: BOTH `ob=(N) path` and `cob=(N) path` bind N; only `ob=` changes
+# the current cost object. Ignoring cob's bindings loses whole owned profiles.
 taken_transfers() { # taken_transfers <binary> <callgrind-out>
     valgrind --tool=callgrind --collect-jumps=yes --dump-instr=yes \
         --callgrind-out-file="$2" "$1" >/dev/null 2>&1
-    awk -v own="$1" '
-        /^ob=/ {
-            id = $0; sub(/^ob=\(/, "", id); sub(/\).*/, "", id)
-            rest = $0; sub(/^ob=\([0-9]+\) ?/, "", rest)
-            if (rest != "") name[id] = rest
-            cur = name[id]
-            next
-        }
-        cur == own && /^(jcnd|jump)=/ { split($0, f, /[=\/ ]/); n += f[2] }
-        END { print n + 0 }' "$2"
+    python3 "$root/scripts/callgrind_transfers.py" "$1" "$2"
 }
 
 # Build and run both arms: clause 3 measures them, clause 4 checks their output.
