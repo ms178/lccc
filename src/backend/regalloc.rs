@@ -14114,6 +14114,17 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                 (site.0, site.1, site.1)
             };
 
+            // Alloca is an address rematerialized at its uses, not a register
+            // definition emitted here. Giving it the phi's register would let
+            // an earlier call argument read that register before the latch copy
+            // ever initializes it (i686 vector sret pointer corruption).
+            if matches!(
+                func.blocks[source_block].instructions[source_def_idx],
+                Instruction::Alloca { .. }
+            ) {
+                continue;
+            }
+
             let same_block = source_block == block_idx;
             // Split-latch shape (any type): the loop body ends in a
             // conditional branch whose loop edge is critical, so phi
@@ -14728,6 +14739,60 @@ mod ra_config_tests {
 mod phi_coalesce_tests {
     use super::*;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, Value};
+
+    #[test]
+    fn frame_alloca_cannot_inherit_a_phi_register() {
+        let mut func = IrFunction::new("alloca_phi".into(), IrType::I32, vec![], false);
+        func.next_value_id = 11;
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(10),
+                    src: Operand::Const(IrConst::Zero),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::Alloca {
+                        dest: Value(1),
+                        ty: IrType::Ptr,
+                        size: 8,
+                        align: 8,
+                        volatile: false,
+                        semantic_volatile: false,
+                    },
+                    Instruction::Load {
+                        dest: Value(3),
+                        ptr: Value(1),
+                        ty: IrType::I32,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                        volatile: false,
+                    },
+                    Instruction::Copy {
+                        dest: Value(10),
+                        src: Operand::Value(Value(1)),
+                    },
+                    Instruction::Load {
+                        dest: Value(4),
+                        ptr: Value(10),
+                        ty: IrType::I32,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                        volatile: false,
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+        ];
+        let live = compute_live_intervals(&func);
+        assert!(
+            detect_phi_coalesce_groups(&func, &live)
+                .iter()
+                .all(|c| c.backedge_src != 1)
+        );
+    }
 
     #[test]
     fn segment_interference_preserves_holes_and_half_open_handoffs() {
