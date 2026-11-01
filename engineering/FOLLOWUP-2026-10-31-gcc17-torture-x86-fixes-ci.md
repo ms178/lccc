@@ -249,3 +249,127 @@ reach the one narrow input that traps.
    diagnostic suites are not covered.
 5. No physical-PMU performance claim is possible on shared virtualized hardware;
    the fastbuild / two-job policy is unchanged.
+
+## 2026-11-01 — the lane's first red run: three defects, one of them silent since birth
+
+The lane went red on `main` at `bcacb9e78` and stayed red on the merge of #1049
+(`445a0ffe7`) with an identical signature. It was **not** a compiler failure, a
+corpus failure, or a flake, and none of the three defects below could have been
+observed from the pull-request path, because the lane is off it by design.
+
+### Defect 1 — the artifact loses its executable bit (this is why it died in 0 s)
+
+Step 10 (`Run full GCC 17 compile + execute corpus`) started at
+`20:51:29Z` and failed at `20:51:29Z` — zero seconds. The follow-up upload step
+then reported "No files were found with the provided path:
+`/home/runner/work/_temp/gcc17-torture/x86_64`", which reads like a harness
+failure but is only the consequence: no report was ever written because the
+driver never reached the corpus.
+
+`actions/upload-artifact` stores file CONTENT, not permissions. Every other lane
+in this repository is immune by accident of design — `ci.yml` and `bench.yml`
+upload one `lccc-fast.tar.gz` and `tar -xzf` restores the member modes. This lane
+shipped the six binaries as *bare* artifact paths, so `target/fastbuild/lccc`
+arrived at mode 0644 and `scripts/ci_gcc17_torture.sh` stopped at its first
+guard, `[[ -x $compiler ]]`, before printing anything. The identity check had
+already passed (`sha256sum -c` proves content, not mode), which is exactly what
+made the failure look like something else.
+
+Fix: an explicit `chmod +x` step after the download, plus the guard rewritten to
+say WHICH failure it is — a missing file is a broken artifact, a non-executable
+one is a missing `chmod` — instead of letting both produce a silent exit 2.
+
+### Defect 2 — two payload shapes behind one artifact name (found by the new gate)
+
+`ci.yml` publishes `lccc-fast-${{ github.sha }}` as a single `lccc-fast.tar.gz`;
+this lane published the *same name* as six bare binaries. Artifacts are scoped
+per run, so nothing failed at runtime, but any consumer that downloads
+`lccc-fast-<sha>` gets a shape determined by which workflow produced it. The lane's
+artifact is now `lccc-fast-binaries-${{ github.sha }}`, and the new gate compares
+artifact names by exact equality after collapsing `${{ … }}` to one placeholder
+(a glob would fold `lccc-fast-binaries-*` straight back into `lccc-fast-*`,
+which is how the ambiguity survived review).
+
+### Defect 3 — the "GCC 16.2" oracle was the distribution's 16.0.1
+
+The lane's annotation recorded `gcc-16=16.0.1 (/usr/bin/gcc-16)`, while every
+per-test identity in this document was measured against GCC 16.2 and known gap 3
+says those identities should be re-derived against GCC 16 in CI. A rolling
+oracle makes the reports compare against a version no document claims. The pin is
+now DELIVERED rather than assumed: `scripts/ci_install_gcc_oracle.sh --version
+16.2` unpacks the tag cache's relocatable 16.2 prefix (`harness-cache-1`,
+sha256 `4fa6af4f…`, which ships its own 32-bit libgcc), only shadowing
+`gcc-16`/`g++-16`; `ci_verify_oracles.sh --gcc-version 16.2` then proves it, and
+the driver asserts `GCC_TORTURE_GCC_VERSION` at the point of use, so a
+provisioning step that silently fails to shadow the rolling compiler is a loud
+failure rather than a subtly re-based report.
+
+### The corpus revision is pinned, so a weekly run means the same thing
+
+The corpus now defaults to `c94b688a83fc84015c6fab8ab0ff142051598fc8` — the
+revision this document's tables were measured against — instead of resolving
+`refs/heads/master` on every main push. Following trunk turned the lane red
+whenever upstream added a torture case LCCC does not handle yet: a real campaign
+signal, but not a regression in the tree that pushed, and it made the lane's
+verdict depend on the calendar. `GCC17_TORTURE_REF` (or the dispatch `ref` input)
+overrides, including `refs/heads/master` to track trunk deliberately.
+
+Measured before choosing to keep the git provisioner rather than downgrade the
+lane to the released 16.2 corpus: the sparse `--depth=1 --filter=blob:none` fetch
+of that exact commit from `github.com/gcc-mirror/gcc.git` completes in **16 s**
+and yields a 269 MB tree with 1,700 `gcc.c-torture/execute` cases and
+`gcc/BASE-VER` = `17.0.0`; the same fetch of today's master (`cf6e2057…`)
+behaves identically. The provisioning path was never the problem, so the lane
+keeps GCC 17-git tests and takes its *compiler* pin from the tag cache.
+
+### The gate that catches this class
+
+`tests/regression/check_ci_artifact_modes.py` (fast contract shard b of 2, 0.30 s):
+
+1. every job that downloads an artifact whose manifest lists BARE compiler
+   binaries must restore each binary's executable bit (a tarball shipment is
+   exempt only because extraction restores modes), and
+2. `gcc17-torture-leg.yml` must provision → install the exact 16.2 oracle →
+   verify that exact version → download → `chmod` → run the corpus, must pass
+   `GCC_TORTURE_GCC_VERSION`, and `ci_gcc17_torture.sh` must default
+   `GCC17_TORTURE_REF` to a 40-hex commit and pass `--ref`.
+
+Run against the pre-fix tree it reports 13 errors, 12 of them the artifact-name
+collision and one the real missing `chmod`; against this tree it reports one
+live pair and passes. `--self-test` drives 11 fixtures (download without chmod,
+download with chmod, tarball shipment, a download of an artifact nothing
+publishes, a caller-supplied artifact name in the reusable bench workflow, a
+conforming lane, four mutated lanes, and an unpinned corpus) so a checker that
+cannot fail is itself caught.
+
+### What was NOT verified here
+
+No Rust toolchain and no compiler run of this tree was performed locally; the
+lane's own execution is verified by hosted CI on the next run of
+`GCC 17 C torture (x86)`. The static checks that were run: `bash -n` on both
+shell scripts, the driver's five guard paths against synthetic binaries (exit 2
+in each case, with the intended message), the new gate and its self-test,
+`check_ci_lane_plan.py` (PASS, 102 steps in backend-contracts-b, 429.08 s) and
+`check_ci_gate_parity.py` (PASS, the new gate mirrored in `scripts/ci_local.sh`).
+
+### The verdict policy, made explicit
+
+Fixing the three defects above does not by itself produce a green lane: a full
+corpus has candidate failures today, and known gap 1 says the per-test inventory
+— not a collapsed bucket — is the deliverable. `x86_gcc_torture.py` exits 0
+clean, 1 on candidate failures, and 2 when the run is not evidence at all
+(all-skipped, reference preflight, mid-flight input drift). The driver now uses
+that distinction:
+
+* exit 2 is fatal, always;
+* exit 1 is *published* — both files under `GCC_TORTURE_RESULTS_DIR` are the
+  lane's uploaded artifact — and, only when `GCC_TORTURE_ADVISORY_FAILURES=1`
+  (what the hosted lane sets), it does not red the run. Local runs are strict by
+  default, so a developer invoking the script directly still gets exit 1.
+
+The follow-up that flips the lane to strict is a checked-in baseline inventory of
+the currently-failing cases, regenerated from a report's failure log: then a *new*
+failure is a regression, a fixed case is a stale entry, and both can fail the
+lane. That baseline cannot be authored from this tree — the per-test lists are
+CI artifacts, not checked-in evidence — so it is seeded from the first full run's
+artifact rather than invented here.

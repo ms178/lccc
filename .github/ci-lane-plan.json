@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 437.59,
+      "predicted_gate_seconds": 437.94,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -78,6 +78,10 @@
         {
           "measured_s": 1.08,
           "name": "bash tests/regression/check_ensure_gcc_torture.sh"
+        },
+        {
+          "measured_s": 0.35,
+          "name": "python3 tests/regression/check_ci_artifact_modes.py"
         },
         {
           "measured_s": 1.18,
