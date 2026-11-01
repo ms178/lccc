@@ -1240,6 +1240,7 @@ impl Parser {
                 pointer_const: false,
                 pointer_quals: Vec::new(),
                 base_restrict: false,
+                parsing_record_attributes: false,
                 paren_star_quals: Vec::new(),
                 adjusted_cvr: 0,
             });

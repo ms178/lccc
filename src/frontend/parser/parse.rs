@@ -1984,6 +1984,24 @@ impl Parser {
         self.parse_gcc_attributes_inner()
     }
 
+    /// `__attribute__((...))` on a `struct`/`union` tag.
+    ///
+    /// Identical to [`Self::parse_gcc_attributes`] except that the
+    /// record-placement flag is raised for the duration, which is what lets
+    /// `attribute_registry::abi_effect` tell `struct __attribute__((ms_struct))
+    /// S {...}` (gcc honours it, so lccc must refuse rather than ignore) from
+    /// `__attribute__((ms_struct)) void f(void)` (gcc ignores it with a
+    /// warning, so lccc must do the same). The flag is restored, not cleared,
+    /// so nested parses cannot observe a stale placement.
+    pub(super) fn parse_record_attributes(
+        &mut self,
+    ) -> (bool, Option<usize>, Option<ModeKind>, bool, Option<bool>) {
+        let saved = std::mem::replace(&mut self.attrs.parsing_record_attributes, true);
+        let parsed = self.parse_gcc_attributes();
+        self.attrs.parsing_record_attributes = saved;
+        parsed
+    }
+
     pub(super) fn parse_gcc_attributes(
         &mut self,
     ) -> (bool, Option<usize>, Option<ModeKind>, bool, Option<bool>) {
@@ -2133,6 +2151,19 @@ impl Parser {
         scalar_storage_order: &mut Option<bool>,
     ) {
         use super::attribute_registry::{AttributeClass, AttributeTarget};
+        // ABI-selecting attributes are decided BEFORE the generic funnel,
+        // because their three answers are not the funnel's two. See
+        // `attribute_registry::abi_effect`: a convention this target already
+        // uses is supported (silence), one GCC ignores is warned about in GCC's
+        // words, and one this compiler cannot honour is refused rather than
+        // emitted as the wrong ABI.
+        if self.attribute_abi_effect(name, name_span) {
+            self.advance();
+            if matches!(self.peek(), TokenKind::LParen) {
+                self.skip_balanced_parens();
+            }
+            return;
+        }
         match attribute_registry::classify(name) {
             AttributeClass::Unknown => {
                 // GCC 16.2 verbatim (measured): the unknown-name wording.
@@ -2186,6 +2217,112 @@ impl Parser {
                 );
             }
         }
+    }
+
+    /// Decide an ABI-selecting attribute, returning whether this names one.
+    ///
+    /// Three verdicts, from `attribute_registry::abi_effect`:
+    ///
+    /// * the convention this target already uses — supported, silent. Applying
+    ///   `sysv_abi` on x86-64 or `cdecl` on i686 *is* the codegen lccc emits, so
+    ///   there is nothing to record and nothing to warn about.
+    /// * a convention GCC ignores on this target — GCC's own sentence, emitted
+    ///   by default (GCC's `-Wattributes` is on by default) and suppressible
+    ///   with `-Wno-attributes`, which is exactly how GCC behaves.
+    /// * a different convention — an error naming the attribute and the
+    ///   convention. This is the R1 guard: a translation unit that declares a
+    ///   Microsoft-ABI function must not be compiled into System-V code that
+    ///   links happily and returns garbage.
+    ///
+    /// `CCC_ALLOW_UNSUPPORTED_ABI=1` downgrades the error to GCC's warning for
+    /// the narrow case where every object in the program is built by lccc and
+    /// the convention therefore never crosses a compiler boundary. It is a
+    /// kill switch, not a default: the correct fix is to drop the attribute.
+    /// Decide the fate of a convention attribute and consume it.
+    ///
+    /// Returns `false` for every name that is not a calling-convention
+    /// attribute, so the ordinary classification funnel and dispatcher keep
+    /// their behaviour; `true` means the attribute is fully handled here.
+    ///
+    /// This runs *before* the classification funnel on purpose. The funnel has
+    /// two answers (`unknown`, `known-but-not-applied`), and a convention needs
+    /// four (see [`super::attribute_registry::AbiEffect`]); routing a
+    /// convention through the funnel is what produced the silent miscompile
+    /// GP-02 describes — `__attribute__((ms_abi))` was classified as known and
+    /// parsed without applying, so a caller and a callee could disagree about
+    /// where every argument lives and still link.
+    fn attribute_abi_effect(&mut self, name: &str, span: crate::common::source::Span) -> bool {
+        use super::attribute_registry::{abi_effect, abi_target, AbiEffect, AbiPlacement};
+        // Cheap rejection first: an attribute that is not a convention must
+        // not pay for a target lookup.
+        if !super::attribute_registry::is_abi_attribute(name) {
+            return false;
+        }
+        let placement = if self.attrs.parsing_record_attributes {
+            AbiPlacement::Record
+        } else {
+            AbiPlacement::Other
+        };
+        let target = abi_target();
+        let Some(effect) = abi_effect(name, target, placement) else {
+            return false;
+        };
+        let is_32bit = target == super::attribute_registry::AbiTarget::I686;
+        let spelling = super::attribute_registry::canonical(name).to_string();
+        match effect {
+            // The attribute names the convention this target already emits.
+            // Applying nothing is the whole implementation, and gcc is silent
+            // here too, so silence is parity as well as correctness.
+            AbiEffect::Default => {}
+            // Unreachable: `abi_effect` hands implemented conventions back to
+            // the dispatcher instead of returning a verdict for them. Kept
+            // explicit so a future table edit cannot silently swallow one.
+            AbiEffect::Implemented => return false,
+            AbiEffect::GccIgnored => {
+                let message = if super::attribute_registry::abi_gcc_directive_ignored(name) {
+                    format!("'{spelling}' attribute directive ignored")
+                } else {
+                    format!("'{spelling}' attribute ignored")
+                };
+                // `explicit_only = false`: gcc emits this without being asked,
+                // and it is the only signal that the declaration is not what it
+                // looks like.
+                self.attribute_warning(message, span, false);
+            }
+            AbiEffect::OnlyAvailable32Bit => {
+                self.attribute_warning(
+                    format!("'{spelling}' attribute only available for 32-bit"),
+                    span,
+                    false,
+                );
+            }
+            AbiEffect::Unsupported => {
+                let target = if is_32bit { "i686" } else { "x86-64" };
+                let convention = super::attribute_registry::abi_convention(name);
+                if std::env::var_os("CCC_ALLOW_UNSUPPORTED_ABI").is_some() {
+                    self.attribute_warning(
+                        format!(
+                            "'{spelling}' attribute ignored (unimplemented ABI, allowed by \
+                             CCC_ALLOW_UNSUPPORTED_ABI)"
+                        ),
+                        span,
+                        false,
+                    );
+                } else {
+                    self.emit_error(
+                        format!(
+                            "'{spelling}' attribute selects {convention}, which this compiler \
+                             does not implement for {target}; refusing rather than emitting \
+                             {target}'s default convention under a foreign-ABI declaration \
+                             (define CCC_ALLOW_UNSUPPORTED_ABI only if every object in the \
+                             program is built by this compiler)"
+                        ),
+                        span,
+                    );
+                }
+            }
+        }
+        true
     }
 
     /// Emit a `-Wattributes` diagnostic at the attribute's name token (the
@@ -2431,6 +2568,20 @@ impl Parser {
         is_common: &mut bool,
         scalar_storage_order: &mut Option<bool>,
     ) {
+        // Shared by both spellings: `[[gnu::ms_abi]]` reaches this dispatcher
+        // directly instead of the `__attribute__` funnel, so the ABI decision
+        // has to be here as well — a convention must not be refusable in one
+        // syntax and silently ignored in the other. Hoisted above the `match`
+        // rather than written as a guard arm: the decision mutably borrows the
+        // parser, which a pattern guard may not do.
+        let abi_span = self.peek_span();
+        if self.attribute_abi_effect(name, abi_span) {
+            self.advance();
+            if matches!(self.peek(), TokenKind::LParen) {
+                self.skip_balanced_parens();
+            }
+            return;
+        }
         match name {
             "constructor" | "__constructor__" => {
                 self.attrs.set_constructor(true);

@@ -856,7 +856,7 @@ impl Parser {
         if !self.enter_record_frame(self.peek_span()) {
             return TypeSpecifier::Int;
         }
-        let (mut is_packed, mut struct_aligned, _, _, mut sso) = self.parse_gcc_attributes();
+        let (mut is_packed, mut struct_aligned, _, _, mut sso) = self.parse_record_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
@@ -864,7 +864,7 @@ impl Parser {
         } else {
             None
         };
-        let (packed2, aligned2, _, _, sso2) = self.parse_gcc_attributes();
+        let (packed2, aligned2, _, _, sso2) = self.parse_record_attributes();
         is_packed = is_packed || packed2;
         if aligned2.is_some() {
             struct_aligned = aligned2;
@@ -902,7 +902,7 @@ impl Parser {
         // GCC's `struct T { ... } __attribute__((aligned(N)));` semantics).
         self.attrs.parsed_alignas = saved_pending_alignas;
         self.attrs.parsed_alignas_type = saved_pending_alignas_type;
-        let (packed3, aligned3, _, _, sso3) = self.parse_gcc_attributes();
+        let (packed3, aligned3, _, _, sso3) = self.parse_record_attributes();
         is_packed = is_packed || packed3;
         if aligned3.is_some() {
             struct_aligned = aligned3;
@@ -1270,6 +1270,7 @@ impl Parser {
                         is_packed: pre_spec_packed,
                         base_volatile: false,
                         base_restrict: false,
+                        parsing_record_attributes: false,
                         base_const: self.attrs.parsing_const(),
                         object_volatile: false,
                         object_const: self.attrs.parsing_const(),
@@ -1414,6 +1415,7 @@ impl Parser {
                     is_packed: packed_from_type || extra_packed,
                     base_volatile: false,
                     base_restrict: false,
+                    parsing_record_attributes: false,
                     base_const: false,
                     object_volatile: false,
                     object_const: false,
