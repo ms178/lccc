@@ -2524,6 +2524,14 @@ jobs:
         # controls, and bit-exact -O0..-O3 agreement over every 8/16-bit input.
         # Mirrored in scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_narrow_negate_fold.sh
+        # Comparison dominance: a `&`/`|` of two comparisons of ONE value is
+        # its stronger (conjunction) or weaker (disjunction) operand, so
+        # `(x != 0) & (x > 4)` is `x > 4` (9 -> 4 instructions).  Pins the
+        # emitted shapes at every width, the CCC_NO_COMPARE_DOMINANCE
+        # ownership, the two non-dominant controls, and bit-exact -O0..-O3
+        # agreement against GCC.  Mirrored in scripts/ci_local.sh
+        # (parity-checked).
+        bash tests/regression/check_compare_dominance_fold.sh
         # Predicate differences and ranges: difference compares, interval and
         # membership tests, sign-magnitude selects, five near-miss controls.
         python3 tests/regression/check_predicate_differences_and_ranges.py

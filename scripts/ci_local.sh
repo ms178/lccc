@@ -1835,6 +1835,14 @@ gate "lowest-set-bit-fold" fast \
 gate "narrow-negate-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_narrow_negate_fold.sh
 
+# Comparison dominance: two comparisons of the same value joined by `&` or `|`
+# collapse to the operand that implies the other, so `(x != 0) & (x > 4)` is
+# `x > 4` and `(x != 0) | (x > 4)` is `x != 0` (9 -> 4 instructions at every
+# width).  Pins the shapes, both join directions, the CCC_NO_COMPARE_DOMINANCE
+# ownership, the two non-dominant controls and -O0..-O3 agreement against GCC.
+gate "compare-dominance-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_compare_dominance_fold.sh
+
 # Observable-access gates.  Three instruments, because each catches a
 # different way the `volatile` contract gets broken and each was proved to do
 # so by mutation (reintroducing the guard deletion in licm.rs):

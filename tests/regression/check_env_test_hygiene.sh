@@ -101,7 +101,12 @@ MARKER='FIX''ME'
 #        algebra's, so the matcher pays one read per process, not per site).
 #        Raised to the measurement, exactly -- a fold that needs no switch gets
 #        no budget.
-ENV_READ_BUDGET=144
+#   145  2026-11-01: the comparison-dominance kill switch
+#        (CCC_NO_COMPARE_DOMINANCE), resolved once next to the two above in
+#        src/passes/bit_idioms_facts.rs.  The truncated-complement rule reuses
+#        the existing CCC_SIMPLIFY_SKIP parse and adds no read.  Raised to the
+#        measurement, exactly.
+ENV_READ_BUDGET=145
 
 fail=0
 report() { # report <label> <offending lines>

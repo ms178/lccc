@@ -2929,6 +2929,8 @@ pub(crate) fn recognize_function(
     let bool_algebra_disabled = facts::bool_algebra_disabled();
     // Lowest-set-bit kill switch (`1 << Ctz(y)` -> `y & -y` plus the zero arm).
     let lowest_set_bit_disabled = facts::lowest_set_bit_disabled();
+    // Comparison-dominance kill switch (`(x != 0) & (x > 4)` -> `x > 4`).
+    let compare_dominance_disabled = facts::compare_dominance_disabled();
     // Deferred cross-block rewrites (mask distribution): the producer and
     // consumer may live in different blocks; both mutations are applied
     // after the scan ends so no &mut borrow of `func.blocks` overlaps the
@@ -3263,6 +3265,16 @@ pub(crate) fn recognize_function(
             if let Some(new) = fold_same_condition_select(&block.instructions[index], &defs)
                 .or_else(|| fold_sign_choice_zero(&block.instructions[index], &defs))
                 .or_else(|| fold_shift_pair_into_mask(&block.instructions[index], &defs))
+                .or_else(|| {
+                    (!compare_dominance_disabled)
+                        .then(|| {
+                            compare_dominance::fold_compare_dominance(
+                                &block.instructions[index],
+                                &defs,
+                            )
+                        })
+                        .flatten()
+                })
                 .or_else(|| fold_unit_interval_test(&block.instructions[index], &defs))
             {
                 // New direct arm uses must be counted BEFORE a later boolean
@@ -6457,8 +6469,15 @@ mod zero_choice_tests;
 mod mask_interval_tests;
 
 #[cfg(test)]
+#[path = "bit_idioms_compare_dominance_tests.rs"]
+mod compare_dominance_tests;
+
+#[cfg(test)]
 #[path = "bit_idioms_lowest_bit_tests.rs"]
 mod lowest_bit_tests;
+
+#[path = "bit_idioms_compare_dominance.rs"]
+mod compare_dominance;
 
 #[path = "bit_idioms_observe.rs"]
 mod observe;
