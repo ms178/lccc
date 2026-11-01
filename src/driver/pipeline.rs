@@ -1220,10 +1220,9 @@ impl Driver {
     /// so `printf '#include <stdio.h>\n' | lccc -x c - -fsyntax-only`
     /// compiled AND LINKED the stdin TU and failed on the missing `main`.
     /// Emit collected preprocessor diagnostics (`#warning` and friends)
-    /// through `diagnostics` with the [`crate::common::error::WarningKind::Cpp`]
-    /// kind, so `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control them exactly as
-    /// GCC does. Shared by every path that preprocesses without going
-    /// through `parse_and_analyze_c_tu`, which has the same drain inline.
+    /// through `diagnostics` with their own warning categories, so leaf
+    /// suppression, promotion and blanket -Werror apply in every mode.
+    /// Shared by preprocessing, syntax-only and full compilation.
     fn emit_preprocessor_warnings(
         &self,
         preprocessor: &Preprocessor,
@@ -1232,7 +1231,7 @@ impl Driver {
         for warn in preprocessor.warnings() {
             let diag = crate::common::error::Diagnostic::warning_with_kind(
                 warn.message.clone(),
-                crate::common::error::WarningKind::Cpp,
+                warn.kind,
             )
             .with_location(&warn.file, warn.line, warn.col);
             diagnostics.emit(&diag);
@@ -1300,7 +1299,7 @@ impl Driver {
             diagnostics.set_warning_config(self.effective_warning_config());
             diagnostics.set_color_mode(self.color_mode);
             diagnostics.set_source_manager(source_manager);
-            // Drain preprocessor warnings through the engine with the Cpp
+            // Drain preprocessor warnings through the engine with their own
             // kind — the full compile path does this, and without it
             // `-fsyntax-only` dropped `#warning` entirely (measured against
             // gcc-16.2, which reports it in every mode, `-fsyntax-only`
@@ -2270,17 +2269,9 @@ impl Driver {
         diagnostics.set_warning_config(self.effective_warning_config());
         diagnostics.set_color_mode(self.color_mode);
 
-        // Emit preprocessor warnings through diagnostic engine with Cpp kind
-        // so they can be controlled via -Wcpp / -Wno-cpp / -Werror=cpp.
-        // Preprocessor diagnostics carry file:line:col location info for GCC-compatible output.
-        for warn in preprocessor.warnings() {
-            let diag = crate::common::error::Diagnostic::warning_with_kind(
-                warn.message.clone(),
-                crate::common::error::WarningKind::Cpp,
-            )
-            .with_location(&warn.file, warn.line, warn.col);
-            diagnostics.emit(&diag);
-        }
+        // Preserve the warning's category on every driver path, not just
+        // -E and syntax-only. A -Wundef must never become a -Wcpp here.
+        self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
 
         // Check for #error directives and missing #include errors
         let pp_errors = preprocessor.errors();

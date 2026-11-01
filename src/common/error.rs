@@ -98,6 +98,8 @@ pub enum WarningKind {
     /// A `#warning` preprocessor directive was encountered.
     /// GCC flag: -Wcpp
     Cpp,
+    /// An evaluated #if/#elif operand names an undefined identifier.
+    Undef,
     /// Control reaches end of non-void function, or non-void function does
     /// not return a value in all control paths.
     /// GCC flag: -Wreturn-type
@@ -266,6 +268,14 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         "undeclared function call"
     ),
     warning!(Cpp, "cpp", true, [], false, "preprocessor #warning"),
+    warning!(
+        Undef,
+        "undef",
+        false,
+        [],
+        false,
+        "undefined preprocessor conditional identifier"
+    ),
     warning!(
         ReturnType,
         "return-type",

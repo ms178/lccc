@@ -124,6 +124,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), false, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -137,6 +138,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), true, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -147,6 +149,7 @@ impl Preprocessor {
             }
         } else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -156,6 +159,7 @@ impl Preprocessor {
         };
         let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -184,6 +188,7 @@ impl Preprocessor {
                 )
             };
             self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,

@@ -11,6 +11,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = {
+    'undef': '#if MISSING\nint x;\n#endif\nint y;\n',
+    'undef_macro': '#define ALIAS MISSING\n#if ALIAS\n#endif\nint y;\n',
+    'undef_short': '#if 0 && QUIET_A\n#endif\n#if 1 || QUIET_B\n#endif\nint y;\n',
+    'undef_ternary': '#if 1 ? 7 : QUIET\n#endif\nint y;\n',
+    'undef_taken': '#if 0 ? QUIET : MISSING\n#endif\nint y;\n',
+    'undef_restore': '#if (1 || QUIET) && MISSING\n#endif\nint y;\n',
+    'undef_inactive': '#if 0\n#if QUIET_A\n#endif\n#elif 1\n#elif QUIET_B\n#endif\nint y;\n',
+    'undef_true': '#if true\n#endif\nint y;\n',
+    'undef_defined': '#if defined(MISSING)\n#endif\nint y;\n',
+    'undef_wide_char': "#if L'a' != 97 || U'\\x1234' != 0x1234\n#error incorrect wide character value\n#endif\nint y;\n",
     'unused': 'int f(void) { int unused_local; return 0; }\n',
     'sign': 'int f(int s, unsigned u) { return s < u; }\n',
     'cpp': '#warning sentinel\nint x;\n',
@@ -22,6 +32,24 @@ FIXTURES = {
 }
 # name, source, dialect, options, leaf label, expected classification
 CASES = (
+    ('undef-default-off', 'undef', 'gnu23', (), 'undef', '-'),
+    ('undef-wall-does-not-enable', 'undef', 'gnu23', ('-Wall', '-Wextra'), 'undef', '-'),
+    ('undef-enabled', 'undef', 'gnu23', ('-Wundef',), 'undef', 'W'),
+    ('undef-error', 'undef', 'gnu23', ('-Werror=undef',), 'undef', 'E'),
+    ('undef-disabled', 'undef', 'gnu23', ('-Wundef', '-Wno-undef'), 'undef', '-'),
+    ('undef-global-error', 'undef', 'gnu23', ('-Wundef', '-Werror'), 'undef', 'E'),
+    ('undef-demotion', 'undef', 'gnu23', ('-Werror=undef', '-Wno-error=undef'), 'undef', 'W'),
+    ('undef-inhibit-all', 'undef', 'gnu23', ('-Werror=undef', '-w'), 'undef', '-'),
+    ('undef-macro-expansion', 'undef_macro', 'gnu23', ('-Wundef',), 'undef', 'W'),
+    ('undef-short-circuit', 'undef_short', 'gnu23', ('-Werror=undef',), 'undef', '-'),
+    ('undef-ternary-inactive', 'undef_ternary', 'gnu23', ('-Werror=undef',), 'undef', '-'),
+    ('undef-ternary-active', 'undef_taken', 'gnu23', ('-Wundef',), 'undef', 'W'),
+    ('undef-quiet-restored', 'undef_restore', 'gnu23', ('-Wundef',), 'undef', 'W'),
+    ('undef-inactive-directives', 'undef_inactive', 'gnu23', ('-Werror=undef',), 'undef', '-'),
+    ('undef-c23-true', 'undef_true', 'gnu23', ('-Werror=undef',), 'undef', '-'),
+    ('undef-pre-c23-true', 'undef_true', 'gnu11', ('-Wundef',), 'undef', 'W'),
+    ('undef-defined-operand', 'undef_defined', 'gnu23', ('-Werror=undef',), 'undef', '-'),
+    ('undef-wide-character-token', 'undef_wide_char', 'gnu23', ('-Werror=undef',), 'undef', '-'),
     ('default-unused', 'unused', 'gnu23', (), 'unused-variable', '-'),
     ('wall-unused', 'unused', 'gnu23', ('-Wall',), 'unused-variable', 'W'),
     ('leaf-negative-before-wall', 'unused', 'gnu23', ('-Wno-unused-variable', '-Wall'), 'unused-variable', '-'),
@@ -106,22 +134,24 @@ def main() -> int:
         src=Path(tmp)/'probe.c'
         obj=Path(tmp)/'probe.o'
         for label, fixture, dialect, flags, leaf, expected in CASES:
-            src.write_text(FIXTURES[fixture], encoding='utf-8')
-            results={}
-            for name, compiler in [('gcc',gcc),('lccc',lccc)]:
-                proc=subprocess.run(compiler + [f'-std={dialect}', '-c', '-o', str(obj), *flags, str(src)],
-                                    cwd=ROOT, text=True, capture_output=True, timeout=30)
-                value=classification(proc.stderr,leaf)
-                # A diagnostic label must agree with success/failure. Missing
-                # expected errors or unrelated compile errors are not a pass.
-                valid=(proc.returncode != 0) == (value == 'E')
-                results[name]=(value,proc.returncode,proc.stderr,valid)
-            if results['gcc'][0] != expected or not results['gcc'][3]:
-                failures.append(f'{label}: GCC expected {expected}, got {results["gcc"]}')
-            elif results['lccc'][0] != expected or not results['lccc'][3]:
-                failures.append(f'{label}: LCCC expected {expected}, got {results["lccc"]}')
-            else:
-                print(f'PASS {label}: {expected}')
+            modes = ('-c', '-E', '-fsyntax-only') if leaf == 'undef' else ('-c',)
+            for mode in modes:
+                src.write_text(FIXTURES[fixture], encoding='utf-8')
+                results={}
+                for name, compiler in [('gcc',gcc),('lccc',lccc)]:
+                    proc=subprocess.run(compiler + [f'-std={dialect}', mode, '-o', str(obj), *flags, str(src)],
+                                        cwd=ROOT, text=True, capture_output=True, timeout=30)
+                    value=classification(proc.stderr,leaf)
+                    # A diagnostic label must agree with success/failure. Missing
+                    # expected errors or unrelated compile errors are not a pass.
+                    valid=(proc.returncode != 0) == (value == 'E')
+                    results[name]=(value,proc.returncode,proc.stderr,valid)
+                if results['gcc'][0] != expected or not results['gcc'][3]:
+                    failures.append(f'{label}: GCC expected {expected}, got {results["gcc"]}')
+                elif results['lccc'][0] != expected or not results['lccc'][3]:
+                    failures.append(f'{label}: LCCC expected {expected}, got {results["lccc"]}')
+                else:
+                    print(f'PASS {label}: {expected}')
     if failures:
         raise RuntimeError(f'{len(failures)}/{len(CASES)} cases failed:\n' + '\n'.join(failures))
     print(f'warning precedence: PASS ({len(CASES)} cases against GCC {version})')

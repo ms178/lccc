@@ -54,6 +54,14 @@ impl ConditionalStack {
         });
     }
 
+    /// An elif expression is evaluated only in an active parent with no
+    /// previously selected branch. Skipped expressions must not diagnose.
+    pub fn needs_elif_evaluation(&self) -> bool {
+        self.stack
+            .last()
+            .is_some_and(|s| s.parent_active && !s.any_branch_taken)
+    }
+
     /// Handle #elif.
     pub fn handle_elif(&mut self, condition: bool) {
         if let Some(state) = self.stack.last_mut() {
@@ -95,11 +103,14 @@ impl Default for ConditionalStack {
 
 /// Evaluate a preprocessor #if expression.
 /// This handles basic constant expressions, defined() operator, and macro expansion.
-pub fn evaluate_condition(expr: &str, macros: &MacroTable) -> bool {
+pub fn evaluate_condition(expr: &str, macros: &MacroTable) -> (bool, Vec<String>) {
     // First expand macros in the expression (except inside defined())
     let expanded = expand_condition_macros(expr, macros);
     // Then evaluate the constant expression
-    eval_const_expr(&expanded)
+    let tokens = tokenize_expr(&expanded);
+    let mut parser = ExprParser::new(&tokens);
+    let result = parser.parse_ternary().0 != 0;
+    (result, parser.undefined)
 }
 
 /// Expand macros in a condition expression, handling `defined(X)` and `defined X` specially.
@@ -247,22 +258,6 @@ fn expand_condition_macros(expr: &str, macros: &MacroTable) -> String {
     result
 }
 
-/// Evaluate a constant expression for #if directives.
-/// Supports: integer literals, defined(X), !, &&, ||, ==, !=, <, >, <=, >=, +, -, *, /, %, (), unary -, ~
-/// Per C99 6.10.1, preprocessor integer expressions use intmax_t (signed) or uintmax_t (unsigned)
-/// depending on whether any operand has a 'u'/'U' suffix.
-pub fn eval_const_expr(expr: &str) -> bool {
-    let expr = expr.trim();
-    if expr.is_empty() {
-        return false;
-    }
-
-    let tokens = tokenize_expr(expr);
-    let mut parser = ExprParser::new(&tokens);
-    let (result, _is_unsigned) = parser.parse_ternary();
-    result != 0
-}
-
 /// Simple token for expression evaluation.
 /// Num holds (value_as_i64, is_unsigned). The i64 stores the bit pattern;
 /// for unsigned values, interpret as u64 via `as u64`.
@@ -320,7 +315,7 @@ fn scan_pp_number_token(bytes: &[u8], start: usize) -> (ExprToken, usize) {
 }
 
 /// Scan a character constant in `#if` / `#elif` and return `(token, next_index)`.
-fn scan_pp_char_token(bytes: &[u8], start: usize) -> (ExprToken, usize) {
+fn scan_pp_char_token(bytes: &[u8], start: usize, wide: bool) -> (ExprToken, usize) {
     let len = bytes.len();
     let mut i = start + 1;
     let val = if i < len && bytes[i] == b'\\' {
@@ -352,7 +347,7 @@ fn scan_pp_char_token(bytes: &[u8], start: usize) -> (ExprToken, usize) {
                     if i < len && bytes[i] == b'}' {
                         i += 1;
                     }
-                    v & 0xFF
+                    if wide { v } else { v & 0xFF }
                 }
                 b'x' => {
                     let mut v = 0i64;
@@ -375,7 +370,7 @@ fn scan_pp_char_token(bytes: &[u8], start: usize) -> (ExprToken, usize) {
                             i += 1;
                         }
                     }
-                    v & 0xFF
+                    if wide { v } else { v & 0xFF }
                 }
                 b'u' | b'U' => {
                     let mut v = 0i64;
@@ -415,7 +410,7 @@ fn scan_pp_char_token(bytes: &[u8], start: usize) -> (ExprToken, usize) {
                             break;
                         }
                     }
-                    v & 0xFF
+                    if wide { v } else { v & 0xFF }
                 }
                 other => other as i64,
             }
@@ -460,9 +455,17 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
             continue;
         }
 
-        // Character literal
-        if b == b'\'' && !is_digit_separator(bytes, i) {
-            let (tok, next) = scan_pp_char_token(bytes, i);
+        // An encoding prefix is part of a character token, not an undefined
+        // identifier. Keep its full escaped value for wide character literals.
+        let prefix = if matches!(b, b'L' | b'u' | b'U') && bytes.get(i + 1) == Some(&b'\'') {
+            1
+        } else if bytes[i..].starts_with(b"u8'") {
+            2
+        } else {
+            0
+        };
+        if (b == b'\'' && !is_digit_separator(bytes, i)) || prefix != 0 {
+            let (tok, next) = scan_pp_char_token(bytes, i + prefix, prefix == 1);
             i = next;
             tokens.push(tok);
             continue;
@@ -587,6 +590,9 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
 struct ExprParser<'a> {
     tokens: &'a [ExprToken],
     pos: usize,
+    /// Parse inactive operands for grammar, but suppress their diagnostics.
+    quiet: bool,
+    undefined: Vec<String>,
 }
 
 /// Result of a preprocessor expression: (bit_pattern_as_i64, is_unsigned)
@@ -594,7 +600,12 @@ type PpVal = (i64, bool);
 
 impl<'a> ExprParser<'a> {
     fn new(tokens: &'a [ExprToken]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            quiet: false,
+            undefined: Vec::new(),
+        }
     }
 
     fn peek(&self) -> Option<&ExprToken> {
@@ -618,11 +629,15 @@ impl<'a> ExprParser<'a> {
         let cond = self.parse_or();
         if self.peek_op("?") {
             self.advance(); // ?
+            let quiet = self.quiet;
+            self.quiet = quiet || cond.0 == 0;
             let then_val = self.parse_ternary();
             if self.peek_op(":") {
                 self.advance(); // :
             }
+            self.quiet = quiet || cond.0 != 0;
             let else_val = self.parse_ternary();
+            self.quiet = quiet;
             if cond.0 != 0 { then_val } else { else_val }
         } else {
             cond
@@ -633,7 +648,10 @@ impl<'a> ExprParser<'a> {
         let mut left = self.parse_and();
         while self.peek_op("||") {
             self.advance();
+            let quiet = self.quiet;
+            self.quiet = quiet || left.0 != 0;
             let right = self.parse_and();
+            self.quiet = quiet;
             // Logical operators always produce signed int result
             left = (if left.0 != 0 || right.0 != 0 { 1 } else { 0 }, false);
         }
@@ -644,7 +662,10 @@ impl<'a> ExprParser<'a> {
         let mut left = self.parse_bitor();
         while self.peek_op("&&") {
             self.advance();
+            let quiet = self.quiet;
+            self.quiet = quiet || left.0 == 0;
             let right = self.parse_bitor();
+            self.quiet = quiet;
             left = (if left.0 != 0 && right.0 != 0 { 1 } else { 0 }, false);
         }
         left
@@ -934,9 +955,14 @@ impl<'a> ExprParser<'a> {
                 // Undefined identifiers in #if evaluate to 0
                 // Special case: "true" and "false"
                 match name.as_str() {
-                    "true" => (1, false),
-                    "false" => (0, false),
-                    _ => (0, false),
+                    "true" if super::utils::c23_dialect() => (1, false),
+                    "false" if super::utils::c23_dialect() => (0, false),
+                    _ => {
+                        if !self.quiet {
+                            self.undefined.push(name);
+                        }
+                        (0, false)
+                    }
                 }
             }
             _ => {

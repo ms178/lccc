@@ -93,6 +93,11 @@ review obligations, and measured non-kernel variadic-home-save improvements.
   tested and does not remove that guard.
 - Parser attribute placement and inherited conventions need further adversarial
   coverage, including post-asm attributes and typedef-derived declarations.
+- `-Wundef` now has evaluated-operand diagnostics, not option silencing.
+  The warning-precedence gate passes 75 GCC 16.2 differential cases, with
+  its 18 undef cases checked in compilation, preprocessing and syntax-only
+  modes. The frozen kernel6 compiler predates this warning implementation;
+  its warning stream is not claimed clean.
 - Further kernel compiler/linker defects and unsupported-option warnings must
   be resolved. The previous full build failed at i915; a clean, content-identified
   rebuild with the validated fix is required, not a successful kernel yet.

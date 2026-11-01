@@ -48,6 +48,8 @@ const MAX_PENDING_NEWLINES: usize = 100_000;
 /// output for `#error`, `#warning`, and missing `#include` errors.
 #[derive(Debug, Clone)]
 pub struct PreprocessorDiagnostic {
+    /// Diagnostic category; warnings retain independent -W controls.
+    pub kind: crate::common::error::WarningKind,
     /// The source file where the diagnostic originated.
     pub file: String,
     /// The 1-based line number in the source file.
@@ -1361,6 +1363,7 @@ impl Preprocessor {
                 // C11 6.10.5p1 / C23 6.10.6p1: preprocessing tokens in #error
                 // are not subject to macro expansion.
                 self.errors.push(PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1370,6 +1373,7 @@ impl Preprocessor {
             "warning" => {
                 // GCC extension, collect warning for structured diagnostic output
                 self.warnings.push(PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1394,6 +1398,7 @@ impl Preprocessor {
                     // are visible while preserving compatibility with projects
                     // that intentionally use vendor-specific directives.
                     self.warnings.push(PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -1579,6 +1584,7 @@ impl Preprocessor {
                     || (def.is_variadic && operand == "__VA_ARGS__"));
             if !valid {
                 self.errors.push(PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1604,6 +1610,20 @@ impl Preprocessor {
         self.conditionals.push_if(condition);
     }
 
+    fn evaluate_pp_condition(&mut self, expr: &str, line: usize) -> bool {
+        let (value, undefined) = evaluate_condition(expr, &self.macros);
+        for name in undefined {
+            self.warnings.push(PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Undef,
+                file: self.current_file(),
+                line,
+                col: 1,
+                message: format!("\"{name}\" is not defined, evaluates to 0"),
+            });
+        }
+        value
+    }
+
     fn handle_if(&mut self, expr: &str, diag_line: usize) {
         // First resolve `defined(X)` and `__has_*()` before macro expansion
         let resolved = self.resolve_defined_in_expr(expr, diag_line);
@@ -1615,8 +1635,7 @@ impl Preprocessor {
         // __has_attribute(), __has_builtin(), __has_include(), etc.
         let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
         // Replace any remaining identifiers with 0 (standard C behavior for #if)
-        let final_expr = self.replace_remaining_idents_with_zero(&expanded);
-        let condition = evaluate_condition(&final_expr, &self.macros);
+        let condition = self.evaluate_pp_condition(&expanded, diag_line);
         self.conditionals.push_if(condition);
     }
 
@@ -1630,14 +1649,17 @@ impl Preprocessor {
     }
 
     fn handle_elif(&mut self, expr: &str, diag_line: usize) {
+        if !self.conditionals.needs_elif_evaluation() {
+            self.conditionals.handle_elif(false);
+            return;
+        }
         let resolved = self.resolve_defined_in_expr(expr, diag_line);
         let expanded = self
             .macros
             .expand_line_reuse(&resolved, &mut self.directive_expanding);
         // Resolve again after macro expansion (same reason as handle_if)
         let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
-        let final_expr = self.replace_remaining_idents_with_zero(&expanded);
-        let condition = evaluate_condition(&final_expr, &self.macros);
+        let condition = self.evaluate_pp_condition(&expanded, diag_line);
         self.conditionals.handle_elif(condition);
     }
 

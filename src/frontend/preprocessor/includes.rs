@@ -778,6 +778,7 @@ impl Preprocessor {
             // The include path token is at col (of '#') + len("include") + whitespace.
             let include_path_col = col + "include ".len();
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col: include_path_col,
@@ -902,6 +903,7 @@ impl Preprocessor {
             // Restarting can alternate between two GCC wrapper headers until
             // the recursion cap and silently omit the real libc header.
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col: col + "include_next ".len(),
@@ -1123,6 +1125,7 @@ impl Preprocessor {
             }
         };
         self.errors.push(super::pipeline::PreprocessorDiagnostic {
+            kind: crate::common::error::WarningKind::Cpp,
             file: self.current_file(),
             line: line_num,
             col,
@@ -1199,6 +1202,7 @@ impl Preprocessor {
     ) -> Option<Vec<u8>> {
         if filename.is_empty() {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -1208,6 +1212,7 @@ impl Preprocessor {
         }
         let Some(resolved) = self.resolve_and_record_include_path(filename, is_system) else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -1219,6 +1224,7 @@ impl Preprocessor {
             Ok(b) => Some(b),
             Err(_) => {
                 self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                    kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
                     col,
@@ -1291,6 +1297,7 @@ impl Preprocessor {
         }
         if filename.is_empty() {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: diag_line,
                 col: 0,
