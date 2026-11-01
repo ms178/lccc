@@ -11,7 +11,8 @@ benchmark report. The Debian exact-version oracle (`41315532322`), relocation
 contracts (`41315532407`), IPA/LRS (`41315532403`) and targeted research
 (`41315532335`) also completed successfully. Targeted research's explicitly
 optional patched-LLVM comparison was skipped, not passed. These runs are for
-`7fe29e478`, before the latest-main rebase; the rebased result must be retested.
+`7fe29e478`, before the latest-main rebase; they are historical receipts only.
+The latest-main tree was separately retested as recorded below.
 
 The hosted CI lane reports warning-denied builds, formatting, Clippy, MSRV,
 GCC 16.2 / Clang 23.1.4 contracts and authenticated ICX 2026.2 integration.
@@ -31,7 +32,11 @@ build, format, Clippy, MSRV, assertion-enabled suite, ABI/frontend shards,
 codegen/runtime shards, assembler/linker contracts, benchmark shards, and
 aggregate benchmark report; authenticated ICX 2026.2 integration also passed.
 No current-head hosted job failed. The optional patched-LLVM comparison is not
-part of these runs and is not claimed as passed.
+part of these runs and is not claimed as passed. A later report-only commit
+`f2753f443` updates this audit after those workflows finished; GitHub did not
+create another workflow run for that documentation-only push. The code and test
+tree is unchanged from checked head `9cc96bf2`, so do not interpret the green
+run IDs as checks attached to `f2753f443` itself.
 
 Latest main already contains the compiler implementation from the merged
 #1056/#1063 work; after the rebase, this PR's incremental diff is the ABI
