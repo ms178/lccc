@@ -62,6 +62,9 @@ the translation unit previously stopped by fourteen `ms_abi` diagnostics.
   coverage, including post-asm attributes and typedef-derived declarations.
 - Further kernel compiler/linker defects and unsupported-option warnings must
   be resolved. The full build is still in progress, not a successful kernel.
-- A complete kernel link, QEMU boot, latest-main integration and green hosted
-  CI remain required before production readiness. No full-kernel success or
-  performance improvement is asserted by the scalar tests.
+- Latest main (`4494df45b`) has been merged into the draft branch. The running
+  full build still uses the identified pre-merge executable; merged-source
+  compiler rebuilding and kernel validation remain necessary.
+- A complete kernel link, QEMU boot and green hosted CI remain required before
+  production readiness. No full-kernel success or performance improvement is
+  asserted by the scalar tests.

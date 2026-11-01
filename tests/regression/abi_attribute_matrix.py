@@ -29,8 +29,8 @@ Two independent directions are asserted, because either one alone can lie:
 2. **The table versus lccc.** For every cell, lccc must be silent on `Default`,
    reproduce gcc's sentence on `GccIgnored`/`OnlyAvailable32Bit`, and *refuse*
    `Unsupported` — with `CCC_ALLOW_UNSUPPORTED_ABI` as the documented escape
-   hatch, which must downgrade the refusal to a warning. The two conventions
-   lccc genuinely implements (`regparm`, `fastcall` on i686) are proved by a
+   hatch, which must downgrade the refusal to a warning. Implemented conventions
+   (`regparm`, `fastcall` on i686; scalar `ms_abi` on x86-64) are proved by a
    cross-compiler runtime sentinel: gcc builds one side and lccc the other, in
    both directions, and the program must exit with the value only an agreeing
    ABI can produce.
@@ -318,9 +318,9 @@ EXPECTED_VERDICT = {
 }
 
 # Measured exceptions, each justified in the registry's ABI section:
-#  * lccc *implements* these two conventions on i686, so gcc observing
+#  * lccc implements two i686 conventions and scalar Microsoft x64, so gcc observing
 #    `honours` is the reason to keep them, not to refuse them.
-LCCC_IMPLEMENTS = {('regparm', 'i686'), ('fastcall', 'i686')}
+LCCC_IMPLEMENTS = {('regparm', 'i686'), ('fastcall', 'i686'), ('ms_abi', 'x86-64')}
 
 
 def registry_verdicts() -> dict[tuple[str, str], str]:
@@ -385,10 +385,10 @@ def check_table_against_gcc(gcc: str, verdicts: dict[tuple[str, str], str],
                 failures.append((f'abi:{name}/{target}',
                                  'lccc implements it but gcc no longer honours it',
                                  'honours', (observation, evidence)))
-            elif verdict == 'Unsupported':
+            elif verdict != 'Implemented':
                 failures.append((f'abi:{name}/{target}',
-                                 'table refuses a convention lccc implements',
-                                 'not Unsupported', verdict))
+                                 'table does not mark the implemented convention',
+                                 'Implemented', verdict))
             continue
         if expected != verdict:
             if strict:
@@ -449,8 +449,19 @@ def check_lccc(verdicts: dict[tuple[str, str], str],
     for (name, target), verdict in sorted(verdicts.items()):
         if not built:
             break
-        if (name, target) in LCCC_IMPLEMENTS:
-            continue  # proved end-to-end by the sentinel below
+        if (name, target) in LCCC_IMPLEMENTS and verdict == 'Implemented':
+            if (name, target) == ('ms_abi', 'x86-64'):
+                proc = run_bounded(
+                    ['bash', str(ROOT / 'tests/regression/check_ms_abi.sh')],
+                    timeout=COMPILE_TIMEOUT,
+                    env={**ENV, 'CCC': str(driver.resolve())})
+                if proc.returncode:
+                    failures.append(('abi:ms_abi/x86-64',
+                                     'scalar interoperability/unwind sentinel failed',
+                                     0, (proc.returncode, proc.stdout, proc.stderr)))
+                else:
+                    notes.append('Microsoft x64 scalar interoperability/unwind sentinel passed')
+            continue  # i686 conventions use the sentinel below
         source = BODIES['rec' if name in RECORD_ONLY else 'int'].format(
             attr=attribute_spelling(name))
         flags = ['-O2', *_arch_flags(target)]
