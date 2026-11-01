@@ -26,11 +26,13 @@
 //! distinct strong private globals that do not name a linker alias. Extern,
 //! common, weak and arbitrary-asm names cannot prove global disjointness.
 //! A disjoint copy with a nullable pointer parameter guards `memcpy` on
-//! `n > 0` so a zero-trip source loop never calls libc with null pointers.
+//! `n > 0` so a zero-trip source loop never calls libc with null pointers;
+//! the guard's false edge is the zero-trip exit itself, so that loop is
+//! deleted rather than kept as a never-iterating fallback.
 //!
-//! Guarded rewriting versions the preheader, extends existing exit phis,
-//! creates SSA merge phis for live-out IV/bump pointers and retains the
-//! original scalar loop. A per-pass header set prevents repeatedly versioning
+//! Guarded rewriting versions the preheader, extends existing exit phis and
+//! creates SSA merge phis for live-out IV/bump pointers; the non-smear
+//! (overlap) guard retains the original scalar loop. A per-pass header set prevents repeatedly versioning
 //! the same fallback. Bound loads that can alias either copy operand cannot
 //! be hoisted. Unsupported CFG/phi/bound forms are rejected before mutation.
 //!
@@ -55,6 +57,11 @@ use crate::passes::loop_analysis::{DominanceChecker, find_natural_loops, merge_l
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Capabilities {
     pub native_popcount: bool,
+    /// i686 code generation may use SSE moves (the backend's `sse_enabled`,
+    /// resolved from the same driver state). It sizes the i686 window of the
+    /// `memcpy` call rewrite, which must match the emitter's straight-line
+    /// window; the default (false) is the smaller, never-wrong window.
+    pub i686_sse: bool,
 }
 
 /// Per-function entry point for the dirty-tracking pipeline. Two globals
@@ -346,6 +353,10 @@ struct CopyLoop {
     /// may be null on a zero trip. Calling even memcpy(_, null, 0) is not
     /// universally valid, while the source loop never dereferences it.
     needs_zero_guard: bool,
+    /// The copy sits in the header (a single-block loop), so it also runs on
+    /// the header visit whose `iv < bound` test exits: `bound + 1` elements
+    /// are copied, and both pointers are dereferenced before the first test.
+    copy_in_header: bool,
 }
 
 impl CopyLoop {
@@ -550,7 +561,10 @@ fn try_match_copy_loop(
     let label_to_idx = analysis::build_label_map(func);
 
     // Header must end in a conditional branch with one successor in the
-    // loop (body entry) and one outside (the single exit).
+    // loop (body entry) and one outside (the single exit). Polarity matters:
+    // the trip count below reads `Ult(iv, bound)` as "iterate while true".
+    // `if (i < n) break;` loops while the test is FALSE (zero iterations for
+    // any nonzero n from 0) and must not become a copy of `n` bytes.
     let (cond_val, _in_succ, exit_idx) = match &func.blocks[header].terminator {
         Terminator::CondBranch {
             cond,
@@ -572,11 +586,11 @@ fn try_match_copy_loop(
                     return None;
                 }
             };
-            if t_in {
-                (cond_val, ti, fi)
-            } else {
-                (cond_val, fi, ti)
+            if !t_in {
+                dlog!("{name} loop@{header}: bail (header test exits on true)");
+                return None;
             }
+            (cond_val, ti, fi)
         }
         _ => {
             dlog!("{name} loop@{header}: bail (header not CondBranch)");
@@ -876,7 +890,7 @@ fn try_match_copy_loop(
         dlog!("{name} loop@{header}: bail (missing load)");
         return None;
     };
-    let Some((_, store_val, store_ptr)) = store_inst else {
+    let Some((store_block, store_val, store_ptr)) = store_inst else {
         dlog!("{name} loop@{header}: bail (missing store)");
         return None;
     };
@@ -1243,7 +1257,11 @@ fn try_match_copy_loop(
         return None;
     }
     let needs_overlap_guard = !roots_proven_disjoint(func, &store_root, &load_root, symbol_facts);
+    // A header copy runs before the first exit test, so even a zero bound
+    // dereferences both pointers: no zero-trip guard is needed.
+    let copy_in_header = store_block == header;
     let needs_zero_guard = !needs_overlap_guard
+        && !copy_in_header
         && (matches!(store_root, ObjectRoot::Param(_))
             || matches!(load_root, ObjectRoot::Param(_)));
 
@@ -1416,6 +1434,7 @@ fn try_match_copy_loop(
         load_init,
         needs_overlap_guard,
         needs_zero_guard,
+        copy_in_header,
     })
 }
 
@@ -1433,6 +1452,34 @@ fn alloc_value(func: &mut IrFunction) -> Value {
     let v = Value(func.next_value_id);
     func.next_value_id += 1;
     v
+}
+
+/// Element count of a copy loop with a constant `bound`: `bound` masked to
+/// the `Ult` width (unsigned compare), plus one for a header copy (which also
+/// runs on the exiting header visit). `None` if it does not fit `size_t`;
+/// a header copy of `UINT32_MAX + 1` bytes is real on a 64-bit target.
+fn const_copy_len(raw: i64, ult_ty: IrType, copy_in_header: bool, size_ty: IrType) -> Option<u64> {
+    let width_bytes = ult_ty.size();
+    let mask: u64 = if width_bytes >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width_bytes * 8)) - 1
+    };
+    let n = (raw as u64 & mask).checked_add(u64::from(copy_in_header))?;
+    let size_max = match size_ty {
+        IrType::I32 => u64::from(u32::MAX),
+        IrType::I64 => u64::MAX,
+        _ => return None,
+    };
+    (n <= size_max).then_some(n)
+}
+
+/// `n` as a `size_t` constant (`size_ty` is `I32` or `I64`, validated).
+fn size_const(n: u64, size_ty: IrType) -> Operand {
+    Operand::Const(match size_ty {
+        IrType::I32 => IrConst::I32(n as u32 as i32),
+        _ => IrConst::I64(n as i64),
+    })
 }
 
 /// Both the statically-disjoint rewrite and the guarded fast edge use the
@@ -1502,15 +1549,27 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
     }
     // A const bound must be an in-range integer const (float consts can
     // appear as `Ult` operands after bit-twiddling folds).
-    if let Operand::Const(c) = &m.bound {
-        if c.to_i64().is_none() {
-            dlog!(
-                "{fname} loop@{}: rewrite abort (non-int const bound)",
-                m.header
-            );
-            return false;
+    // The element count of a const bound, fixed before any mutation.
+    let const_len = match &m.bound {
+        Operand::Const(c) => {
+            let Some(raw) = c.to_i64() else {
+                dlog!(
+                    "{fname} loop@{}: rewrite abort (non-int const bound)",
+                    m.header
+                );
+                return false;
+            };
+            let Some(n) = const_copy_len(raw, m.ult_ty, m.copy_in_header, size_ty) else {
+                dlog!(
+                    "{fname} loop@{}: rewrite abort (copy length exceeds size_t)",
+                    m.header
+                );
+                return false;
+            };
+            Some(n)
         }
-    }
+        Operand::Value(_) => None,
+    };
     let header_label = func.blocks[m.header].label;
     let preheader_label = func.blocks[m.preheader].label;
     let exit_label = func.blocks[m.exit].label;
@@ -1708,7 +1767,7 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
             | Instruction::LabelAddr { dest, .. } => *dest = fresh,
             _ => unreachable!("loop-idiom: clone template is always a leaf"),
         }
-        func.blocks[m.preheader].instructions.push(inst);
+        func.blocks[m.preheader].push_inst(inst, crate::common::source::Span::dummy());
         fresh
     };
     let use_val = |orig: Value,
@@ -1735,65 +1794,60 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
             Some((p, ty, pmat)) => {
                 let ptr = use_val(p, pmat, &mut *func, &mut clone_of);
                 let d = alloc_value(&mut *func);
-                func.blocks[m.preheader]
-                    .instructions
-                    .push(Instruction::Load {
+                func.blocks[m.preheader].push_inst(
+                    Instruction::Load {
                         dest: d,
                         ptr,
                         ty,
                         seg_override: crate::common::types::AddressSpace::Default,
                         volatile: false,
-                    });
+                    },
+                    crate::common::source::Span::dummy(),
+                );
                 Operand::Value(d)
             }
             None => Operand::Value(*v),
         },
     };
 
-    // Length argument, sized to `size_t`. Const bounds are masked to the
-    // `Ult` width (unsigned compare semantics) and zero-extended; value
-    // bounds widen with a value-preserving `Cast` (unsigned from-types
-    // zero-extend; the `Ult` width was proven to fit `size_t` above).
-    let len: Operand = match &bound_ult {
-        Operand::Const(c) => {
-            // Validated in the pre-scan (in-range int, I32/I64 size_t).
-            // Fail-closed: if the const is not an int (e.g. float that
-            // slipped through), abort this idiom rewrite rather than panic.
-            let Some(raw_i) = c.to_i64() else {
-                dlog!(
-                    "{fname} loop@{}: rewrite abort (const bound not int)",
-                    m.header
-                );
-                return false;
-            };
-            let raw = raw_i as u64;
-            let width_bytes = m.ult_ty.size();
-            let mask: u64 = if width_bytes >= 8 {
-                u64::MAX
-            } else {
-                (1u64 << (width_bytes * 8)) - 1
-            };
-            let v = raw & mask;
-            match size_ty {
-                IrType::I64 => Operand::Const(IrConst::I64(v as i64)),
-                IrType::I32 => Operand::Const(IrConst::I32(v as i32)),
-                _ => unreachable!("loop-idiom: size_t form validated"),
-            }
-        }
-        Operand::Value(v) => {
-            if m.ult_ty == size_ty {
-                Operand::Value(*v)
+    // Length argument, sized to `size_t`: the element count, `bound` (or
+    // `bound + 1` for a header copy). Const bounds are masked to the `Ult`
+    // width (unsigned compare semantics) and zero-extended; value bounds
+    // widen with a value-preserving `Cast` (unsigned from-types zero-extend;
+    // the `Ult` width was proven to fit `size_t` above).
+    let len: Operand = match const_len {
+        Some(n) => size_const(n, size_ty),
+        None => {
+            let widened = if m.ult_ty == size_ty {
+                bound_ult.clone()
             } else {
                 let d = alloc_value(&mut *func);
-                func.blocks[m.preheader]
-                    .instructions
-                    .push(Instruction::Cast {
+                func.blocks[m.preheader].push_inst(
+                    Instruction::Cast {
                         dest: d,
-                        src: Operand::Value(*v),
+                        src: bound_ult.clone(),
                         from_ty: m.ult_ty,
                         to_ty: size_ty,
-                    });
+                    },
+                    crate::common::source::Span::dummy(),
+                );
                 Operand::Value(d)
+            };
+            if m.copy_in_header {
+                let d = alloc_value(&mut *func);
+                func.blocks[m.preheader].push_inst(
+                    Instruction::BinOp {
+                        dest: d,
+                        op: IrBinOp::Add,
+                        lhs: widened,
+                        rhs: size_const(1, size_ty),
+                        ty: size_ty,
+                    },
+                    crate::common::source::Span::dummy(),
+                );
+                Operand::Value(d)
+            } else {
+                widened
             }
         }
     };
@@ -1803,7 +1857,7 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
     // memcpy or memmove.
     let call_name = m.callee().name();
     let call = make_copy_call(func, call_name, dst, src, len, size_ty);
-    func.blocks[m.preheader].instructions.push(call);
+    func.blocks[m.preheader].push_inst(call, crate::common::source::Span::dummy());
 
     // Bump-pointer exit values: `GEP(init, bound)` (byte scale, matching
     // the per-iteration `+1`). Always emitted (dead ones fold away);
@@ -1815,14 +1869,15 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
             .copied()
             .unwrap_or(store_ptr_src);
         let d = alloc_value(&mut *func);
-        func.blocks[m.preheader]
-            .instructions
-            .push(Instruction::GetElementPtr {
+        func.blocks[m.preheader].push_inst(
+            Instruction::GetElementPtr {
                 dest: d,
                 base: init,
                 offset: bound_ult.clone(),
                 ty: IrType::Ptr,
-            });
+            },
+            crate::common::source::Span::dummy(),
+        );
         bump_final.insert(m.store_base.0, d);
     }
     if m.load_is_bump {
@@ -1831,14 +1886,15 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
             .copied()
             .unwrap_or(load_ptr_src);
         let d = alloc_value(&mut *func);
-        func.blocks[m.preheader]
-            .instructions
-            .push(Instruction::GetElementPtr {
+        func.blocks[m.preheader].push_inst(
+            Instruction::GetElementPtr {
                 dest: d,
                 base: init,
                 offset: bound_ult.clone(),
                 ty: IrType::Ptr,
-            });
+            },
+            crate::common::source::Span::dummy(),
+        );
         bump_final.insert(m.load_base.0, d);
     }
 
@@ -1933,10 +1989,13 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
     true
 }
 
-/// Version a byte-copy loop when the original loop must remain available:
-/// forward overlap (src < dst < src+n) needs the scalar smear semantics; a
-/// provably disjoint copy with a nullable parameter must skip the libc call
-/// on zero trips, where the source loop never dereferences that parameter.
+/// Version a byte-copy loop behind a runtime guard. Forward overlap
+/// (src < dst < src+n) needs the scalar smear semantics, so the non-smear
+/// guard keeps the original loop on its false edge. A provably disjoint copy
+/// with a nullable parameter must skip the libc call on zero trips, where the
+/// source loop never dereferences that parameter; that false edge carries
+/// the loop's zero-trip values (each header phi's preheader input) straight
+/// to the exit and the loop is deleted.
 ///
 /// In unsigned address arithmetic, `delta = dst - src`. If `dst > src`,
 /// `delta >= n` proves non-overlap. If `dst < src`, the wrapped delta may
@@ -2030,6 +2089,33 @@ fn rewrite_guarded_copy_loop(
         }
     }
 
+    // A zero guard is exactly "the loop runs zero iterations" (the IV starts
+    // at its preheader value and the fast path copies `bound` elements), so
+    // its false edge needs no loop: every header phi holds its
+    // preheader-edge value. That edge goes straight to the exit (whose only
+    // predecessor is the header), and the never-iterating loop is deleted.
+    // The overlap guard's false edge keeps the loop: forward overlap needs
+    // the scalar smear semantics.
+    let preheader_label = func.blocks[m.preheader].label;
+    let mut zero_trip: FxHashMap<u32, Operand> = FxHashMap::default();
+    if m.needs_zero_guard {
+        for inst in &func.blocks[m.header].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                let mut entry = incoming.iter().filter(|(_, b)| *b == preheader_label);
+                let (Some((op, _)), None) = (entry.next(), entry.next()) else {
+                    return false;
+                };
+                zero_trip.insert(dest.0, op.clone());
+            }
+        }
+        if !zero_trip.contains_key(&m.iv_phi.0)
+            || m.store_is_bump && !zero_trip.contains_key(&m.store_base.0)
+            || m.load_is_bump && !zero_trip.contains_key(&m.load_base.0)
+        {
+            return false;
+        }
+    }
+
     // Validate every old exit phi before ANY mutation. Its header-edge input
     // may be an IV, a bump pointer, a constant or a preheader-invariant.
     // Copy chains are resolved only on this incoming edge; they are not
@@ -2085,15 +2171,15 @@ fn rewrite_guarded_copy_loop(
     let Some(next_label) = fast_id.checked_add(1) else {
         return false;
     };
-    // Constants must be representable and carry only the Ult bit width.
-    let const_bound = match &m.bound {
+    // Constants must be representable and carry only the Ult bit width;
+    // the length is the element count (`bound + 1` for a header copy).
+    let const_len = match &m.bound {
         Operand::Const(c) => {
             let Some(raw) = c.to_i64() else { return false };
-            Some(if m.ult_ty == IrType::U32 {
-                raw as u32 as u64
-            } else {
-                raw as u64
-            })
+            let Some(n) = const_copy_len(raw, m.ult_ty, m.copy_in_header, size_ty) else {
+                return false;
+            };
+            Some(n)
         }
         Operand::Value(_) => None,
     };
@@ -2102,12 +2188,8 @@ fn rewrite_guarded_copy_loop(
     func.next_label = next_label;
     let fast_label = BlockId(fast_id);
     let mut pre_insts = Vec::new();
-    let len = if let Some(n) = const_bound {
-        match size_ty {
-            IrType::I32 => Operand::Const(IrConst::I32(n as i32)),
-            IrType::I64 => Operand::Const(IrConst::I64(n as i64)),
-            _ => unreachable!(),
-        }
+    let len = if let Some(n) = const_len {
+        size_const(n, size_ty)
     } else if let Operand::Value(v) = m.bound {
         let len_val = alloc_value(func);
         pre_insts.push(Instruction::Cast {
@@ -2116,7 +2198,19 @@ fn rewrite_guarded_copy_loop(
             from_ty: m.ult_ty,
             to_ty: size_ty,
         });
-        Operand::Value(len_val)
+        if m.copy_in_header {
+            let plus_one = alloc_value(func);
+            pre_insts.push(Instruction::BinOp {
+                dest: plus_one,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(len_val),
+                rhs: size_const(1, size_ty),
+                ty: size_ty,
+            });
+            Operand::Value(plus_one)
+        } else {
+            Operand::Value(len_val)
+        }
     } else {
         unreachable!("guarded copy bound was checked above")
     };
@@ -2204,7 +2298,11 @@ fn rewrite_guarded_copy_loop(
         pre.terminator = Terminator::CondBranch {
             cond: Operand::Value(use_fast),
             true_label: fast_label,
-            false_label: header_label,
+            false_label: if m.needs_zero_guard {
+                exit_label
+            } else {
+                header_label
+            },
         };
     }
 
@@ -2240,16 +2338,32 @@ fn rewrite_guarded_copy_loop(
 
     // Existing exit phis receive a fast-edge input; slow-edge inputs remain
     // unchanged. Then merge the loop-header values used directly after the
-    // exit. All resulting phis have exactly the two real predecessors.
+    // exit. All resulting phis name exactly the real predecessors: header and
+    // fast block, plus the preheader for the zero guard (whose header input
+    // disappears with the deleted loop).
     for (pos, value) in exit_incomings {
-        let fast_op = match value {
-            FastIncoming::Iv => m.bound.clone(),
-            FastIncoming::StoreBump => Operand::Value(bump_final[&m.store_base.0]),
-            FastIncoming::LoadBump => Operand::Value(bump_final[&m.load_base.0]),
-            FastIncoming::Invariant(op) => op,
+        // `zero_trip` is empty unless this is the zero guard.
+        let zero = |v: Value| zero_trip.get(&v.0).cloned();
+        let (fast_op, zero_op) = match value {
+            FastIncoming::Iv => (m.bound.clone(), zero(m.iv_phi)),
+            FastIncoming::StoreBump => (
+                Operand::Value(bump_final[&m.store_base.0]),
+                zero(m.store_base),
+            ),
+            FastIncoming::LoadBump => (
+                Operand::Value(bump_final[&m.load_base.0]),
+                zero(m.load_base),
+            ),
+            FastIncoming::Invariant(op) => {
+                let zero_op = m.needs_zero_guard.then(|| op.clone());
+                (op, zero_op)
+            }
         };
         if let Instruction::Phi { incoming, .. } = &mut func.blocks[m.exit].instructions[pos] {
             incoming.push((fast_op, fast_label));
+            if let Some(op) = zero_op {
+                incoming.push((op, preheader_label));
+            }
         }
     }
     let mut replacements: FxHashMap<u32, Value> = FxHashMap::default();
@@ -2257,11 +2371,11 @@ fn rewrite_guarded_copy_loop(
     let mut add_merge = |old: Value, ty: IrType, fast_op: Operand, func: &mut IrFunction| {
         let dest = alloc_value(func);
         replacements.insert(old.0, dest);
-        merge_phis.push(Instruction::Phi {
-            dest,
-            ty,
-            incoming: vec![(Operand::Value(old), header_label), (fast_op, fast_label)],
-        });
+        let mut incoming = vec![(Operand::Value(old), header_label), (fast_op, fast_label)];
+        if let Some(op) = zero_trip.get(&old.0) {
+            incoming.push((op.clone(), preheader_label));
+        }
+        merge_phis.push(Instruction::Phi { dest, ty, incoming });
     };
     add_merge(m.iv_phi, m.ult_ty, m.bound.clone(), func);
     if m.store_is_bump {
@@ -2326,6 +2440,16 @@ fn rewrite_guarded_copy_loop(
         });
     }
     func.blocks.push(fast);
+    if m.needs_zero_guard {
+        // The header lost its only entry; the dead loop and its phi inputs go.
+        let _ = crate::passes::cfg_simplify::eliminate_unreachable_blocks(func);
+        dlog!(
+            "{} loop@{}: REWROTE with nonzero guard (zero trips skip the loop)",
+            func.name,
+            m.header
+        );
+        return true;
+    }
     dlog!(
         "{} loop@{}: REWROTE with {} guard and scalar fallback",
         func.name,
@@ -4244,6 +4368,7 @@ mod tests {
             &symbol_facts,
             Capabilities {
                 native_popcount: true,
+                i686_sse: false,
             },
         )
     }
@@ -4655,35 +4780,301 @@ mod tests {
 
     #[test]
     fn distinct_restrict_params_are_disjoint() {
-        let mut f = self_loop_copy_with_bases(param_def(1, 0), param_def(2, 1), 2);
+        let mut f = two_block_copy_with_bases(param_def(1, 0), param_def(2, 1), 2);
         f.params[0].noalias = true;
         assert_eq!(run_function(&mut f), 1);
         assert!(has_call(&f, "memcpy"));
         assert!(!has_call(&f, "memmove"));
-        assert_guarded_scalar_fallback(&f); // n == 0 may have null params
+        assert_zero_trips_skip_the_loop(&f); // n == 0 may have null params
+    }
+
+    /// Two-block counted copy, the frontend's `for` shape:
+    ///   P -> H (test) -> B (copy, latch) -> H, H -> E
+    /// `for (i = 0; i < n; i++) d[i] = s[i]; return i;`
+    /// Values: 1 = d, 2 = s, 3 = n (U64 param after the pointers), 10 = iv,
+    /// 11 = Ult, 12/14 = GEPs, 13 = iv + 1, 15 = byte, 20 = exit phi of iv.
+    fn two_block_copy_with_bases(
+        d_def: Instruction,
+        s_def: Instruction,
+        n_params: usize,
+    ) -> IrFunction {
+        let mut params = vec![ptr_param(); n_params];
+        params.push(IrParam {
+            ty: IrType::U64,
+            ..ptr_param()
+        });
+        let mut f = IrFunction::new("two_block_bases".into(), IrType::I64, params, false);
+        f.next_value_id = 30;
+        f.next_label = 4;
+        f.blocks.push(block(
+            0,
+            vec![d_def, s_def, param_ty_def(3, n_params, IrType::U64)],
+            Terminator::Branch(BlockId(1)),
+        ));
+        f.blocks.push(block(
+            1,
+            vec![
+                Instruction::Phi {
+                    dest: Value(10),
+                    ty: IrType::U64,
+                    incoming: vec![(i64c(0), BlockId(0)), (val(13), BlockId(2))],
+                },
+                Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Ult,
+                    lhs: val(10),
+                    rhs: val(3),
+                    ty: IrType::U64,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: val(11),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        f.blocks.push(block(
+            2,
+            vec![
+                Instruction::GetElementPtr {
+                    dest: Value(12),
+                    base: Value(1),
+                    offset: val(10),
+                    ty: IrType::Ptr,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(14),
+                    base: Value(2),
+                    offset: val(10),
+                    ty: IrType::Ptr,
+                },
+                load(15, 14, IrType::U8),
+                store(val(15), 12, IrType::U8),
+                Instruction::BinOp {
+                    dest: Value(13),
+                    op: IrBinOp::Add,
+                    lhs: val(10),
+                    rhs: i64c(1),
+                    ty: IrType::U64,
+                },
+            ],
+            Terminator::Branch(BlockId(1)),
+        ));
+        f.blocks.push(block(
+            3,
+            vec![Instruction::Phi {
+                dest: Value(20),
+                ty: IrType::U64,
+                incoming: vec![(val(10), BlockId(1))],
+            }],
+            Terminator::Return(Some(val(20))),
+        ));
+        f
+    }
+    fn i64c(v: i64) -> Operand {
+        Operand::Const(IrConst::I64(v))
+    }
+    fn verify_ir(f: &IrFunction) {
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(f, "loop-idiom-test", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+    /// The `len` argument of the single synthesized copy call.
+    fn copy_len(f: &IrFunction) -> Operand {
+        let lens: Vec<Operand> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|i| match i {
+                Instruction::Call { func, info } if func == "memcpy" || func == "memmove" => {
+                    Some(info.args[2].clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lens.len(), 1, "exactly one copy call");
+        lens[0].clone()
+    }
+    fn def_of(f: &IrFunction, v: Value) -> Instruction {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find(|i| i.dest() == Some(v))
+            .cloned()
+            .expect("value has a definition")
+    }
+
+    /// Zero-guard shape: the guard's false edge is the zero-trip exit, the
+    /// never-iterating loop is gone, and the exit phi holds `n` from the
+    /// call block and the IV's preheader value 0 from the guard.
+    fn assert_zero_trips_skip_the_loop(f: &IrFunction) {
+        verify_ir(f);
+        assert!(
+            !f.blocks.iter().any(|b| matches!(b.label.0, 1 | 2)),
+            "the zero-trip loop must be deleted"
+        );
+        let Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } = f.blocks[0].terminator
+        else {
+            panic!("the nonzero guard must remain")
+        };
+        assert_eq!(
+            false_label,
+            BlockId(3),
+            "zero trips go straight to the exit"
+        );
+        let exit = f.blocks.iter().find(|b| b.label == BlockId(3)).unwrap();
+        let Instruction::Phi { incoming, .. } = &exit.instructions[0] else {
+            panic!("exit phi kept")
+        };
+        let mut incoming = incoming.clone();
+        incoming.sort_by_key(|(_, b)| b.0);
+        assert_eq!(incoming, vec![(i64c(0), BlockId(0)), (val(3), true_label)]);
+    }
+
+    #[test]
+    fn zero_guard_skips_the_never_iterating_loop_for_direct_uses() {
+        // A direct use of the IV after the exit (no exit phi) becomes a merge
+        // phi whose zero-trip input is the IV's preheader value.
+        let mut f = two_block_copy_with_bases(alloca_def(1), param_def(2, 0), 1);
+        f.blocks[3].instructions.clear();
+        f.blocks[3].terminator = Terminator::Return(Some(val(10)));
+        assert_eq!(run_function(&mut f), 1);
+        verify_ir(&f);
+        assert!(!f.blocks.iter().any(|b| matches!(b.label.0, 1 | 2)));
+        let exit = f.blocks.iter().find(|b| b.label == BlockId(3)).unwrap();
+        let Terminator::Return(Some(Operand::Value(ret))) = exit.terminator else {
+            panic!("return kept")
+        };
+        let Instruction::Phi { incoming, .. } = def_of(&f, ret) else {
+            panic!("the live-out IV is merged")
+        };
+        assert!(incoming.contains(&(i64c(0), BlockId(0))), "{incoming:?}");
+        assert!(incoming.iter().any(|(op, _)| *op == val(3)), "{incoming:?}");
+        assert_eq!(incoming.len(), 2, "{incoming:?}");
+    }
+
+    #[test]
+    fn inverted_header_test_is_not_a_copy_loop() {
+        // `while (1) { if (i < n) break; d[i] = s[i]; i++; }` iterates while
+        // the test is false: zero iterations for every n != 0, so it must
+        // not become a copy of n bytes (it did, at -O2).
+        let mut f = two_block_copy_with_bases(alloca_def(1), param_def(2, 0), 1);
+        f.blocks[1].terminator = Terminator::CondBranch {
+            cond: val(11),
+            true_label: BlockId(3),
+            false_label: BlockId(2),
+        };
+        let before = format!("{:?}", f.blocks);
+        assert_eq!(run_function(&mut f), 0);
+        assert_eq!(format!("{:?}", f.blocks), before, "refused before mutation");
+    }
+
+    #[test]
+    fn header_copy_length_is_bound_plus_one() {
+        // A single-block loop copies on the exiting header visit too:
+        // `do d[i] = s[i]; while (i++ < 16);` copies 17 bytes (it was 16).
+        let mut f = self_loop_copy_func(IrType::U8);
+        assert_eq!(run_function(&mut f), 1);
+        verify_ir(&f);
+        assert_eq!(copy_len(&f), i64c(17));
+
+        // UINT32_MAX + 1 bytes is a real length on a 64-bit target.
+        let mut f = self_loop_copy_func(IrType::U8);
+        let Instruction::Cmp { rhs, .. } = &mut f.blocks[1].instructions[1] else {
+            panic!("fixture Ult")
+        };
+        *rhs = i32c(-1);
+        assert_eq!(run_function(&mut f), 1);
+        assert_eq!(copy_len(&f), i64c(1 << 32));
+
+        // Dynamic bound: zext(n) + 1 in size_t.
+        let mut f = self_loop_copy_func(IrType::U8);
+        f.params = vec![IrParam {
+            ty: IrType::U32,
+            ..ptr_param()
+        }];
+        f.blocks[0]
+            .instructions
+            .push(param_ty_def(5, 0, IrType::U32));
+        let Instruction::Cmp { rhs, .. } = &mut f.blocks[1].instructions[1] else {
+            panic!("fixture Ult")
+        };
+        *rhs = val(5);
+        assert_eq!(run_function(&mut f), 1);
+        verify_ir(&f);
+        let Operand::Value(len) = copy_len(&f) else {
+            panic!("dynamic length")
+        };
+        let Instruction::BinOp {
+            op: IrBinOp::Add,
+            lhs: Operand::Value(widened),
+            rhs,
+            ty: IrType::I64,
+            ..
+        } = def_of(&f, len)
+        else {
+            panic!("len = widened bound + 1")
+        };
+        assert_eq!(rhs, i64c(1));
+        assert!(matches!(
+            def_of(&f, widened),
+            Instruction::Cast {
+                src: Operand::Value(Value(5)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn header_copy_needs_no_zero_guard() {
+        // The header copy dereferences both pointers before the first test,
+        // so a nullable parameter cannot reach memcpy with zero length.
+        let mut f = self_loop_copy_with_bases(alloca_def(1), param_def(2, 0), 1);
+        assert_eq!(run_function(&mut f), 1);
+        verify_ir(&f);
+        assert!(has_call(&f, "memcpy"));
+        assert!(matches!(f.blocks[0].terminator, Terminator::Branch(_)));
+        assert!(!f.blocks.iter().any(|b| b.label == BlockId(1)));
+        assert_eq!(copy_len(&f), i64c(17));
+    }
+
+    #[test]
+    fn header_copy_overlap_guard_copies_bound_plus_one() {
+        let mut f = self_loop_copy_with_bases(global_def(1, "G"), param_def(2, 0), 1);
+        assert_eq!(run_function(&mut f), 1);
+        verify_ir(&f);
+        assert!(has_call(&f, "memmove"));
+        assert_guarded_scalar_fallback(&f);
+        assert_eq!(copy_len(&f), i64c(17));
     }
 
     #[test]
     fn param_to_alloca_copy_uses_memcpy() {
         // Fresh-object disjointness: the alloca postdates the param value,
         // so no `restrict` is needed for memcpy's no-overlap contract.
-        let mut f = self_loop_copy_with_bases(alloca_def(1), param_def(2, 0), 1);
+        let mut f = two_block_copy_with_bases(alloca_def(1), param_def(2, 0), 1);
         let n = run_function(&mut f);
         assert_eq!(n, 1, "param->alloca copy must rewrite");
         assert!(has_call(&f, "memcpy"), "disjoint pair lowers to memcpy");
         assert!(!has_call(&f, "memmove"), "no memmove for disjoint pair");
-        assert_guarded_scalar_fallback(&f); // nullable source, zero trip
+        assert_zero_trips_skip_the_loop(&f); // nullable source, zero trip
     }
 
     #[test]
     fn alloca_to_param_copy_uses_memcpy() {
         // Same rule, store side: alloca destination, param source.
-        let mut f = self_loop_copy_with_bases(param_def(1, 0), alloca_def(2), 1);
+        let mut f = two_block_copy_with_bases(param_def(1, 0), alloca_def(2), 1);
         let n = run_function(&mut f);
         assert_eq!(n, 1, "alloca->param copy must rewrite");
         assert!(has_call(&f, "memcpy"), "disjoint pair lowers to memcpy");
         assert!(!has_call(&f, "memmove"), "no memmove for disjoint pair");
-        assert_guarded_scalar_fallback(&f); // nullable destination, zero trip
+        assert_zero_trips_skip_the_loop(&f); // nullable destination, zero trip
     }
 
     #[test]

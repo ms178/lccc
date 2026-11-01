@@ -487,6 +487,15 @@ fn fp_data_op(base: &str) -> bool {
 /// `blsi`, ...) hide a later `jcc`/`setcc`/`adc` that still reads the value
 /// (the `addq $imm` → `leaq` rewrite in local_patterns miscompiled exactly
 /// this shape).
+/// A whole-line comment (`#` first, GAS x86 syntax): it emits no bytes, so it
+/// can neither read nor write EFLAGS.  `classify_line` keeps such lines whole
+/// (the `# LCCC_*` markers are read from their text), so they reach the
+/// mnemonic classifier, which would charge them as unknown flag readers.  The
+/// inline-asm quarantine markers stay opaque.
+pub(super) fn is_byteless_comment(t: &str) -> bool {
+    t.starts_with('#') && t != "#APP" && t != "#NO_APP"
+}
+
 pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
     let mut n = from;
     let mut live = F_ALL;
@@ -500,7 +509,9 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
         // directive is not: `.byte 0xf5` is `cmc`.  It is deliberately left to
         // the classifier below, which answers `Reads` for text it cannot
         // identify and therefore reports the flags live (see `steps_over_line`).
-        if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
+        if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n)))
+            || is_byteless_comment(infos[n].trimmed(store.get(n)))
+        {
             n += 1;
             continue;
         }
@@ -2535,7 +2546,7 @@ fn reader_also_writes_flags(t: &str) -> bool {
 }
 
 /// What a flag-consumer walk established about the flags live at its start.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct ConsumerFacts {
     /// At least one consumer was reached.
     pub(super) saw_consumer: bool,
@@ -2666,6 +2677,19 @@ pub(super) fn walk_flag_consumers_seeded(
         }
     };
 
+    // A codegen-marked sibling call (`# LCCC_TAIL_CALL`, conditional or not)
+    // to a symbol outside this function is a CALL: EFLAGS are no argument
+    // (SysV leaves them undefined at entry), so that edge ends the path like
+    // `call` does instead of making the walk unprovable.  A label of this
+    // function stays an ordinary edge, marker or not.
+    let sibling_or_resolve = |n: usize, t: &str, facts: &mut ConsumerFacts| -> Option<usize> {
+        let local = super::helpers::extract_jump_target(t)
+            .and_then(|target| labels.iter().find(|(name, _)| *name == target));
+        if local.is_none() && super::liveness::tail_call_marked(store, infos, n) {
+            return None;
+        }
+        resolve(t, facts)
+    };
     let mut seen = vec![false; fe - fs];
     let mut work: Vec<usize> = seeds.to_vec();
     while let Some(head) = work.pop() {
@@ -2709,8 +2733,12 @@ pub(super) fn walk_flag_consumers_seeded(
             // every flag-divergent rewrite.  Emitting nothing, a blank line
             // cannot observe EFLAGS, so skipping it is strictly more precise
             // and cannot license anything the writer before it did not already
-            // license.
-            if t.is_empty() {
+            // license.  The same holds for a whole-line comment
+            // ([`is_byteless_comment`]): the codegen's call and tail-call
+            // markers sit between a branch and a sibling `jmp`, and charging
+            // them as unknown readers vetoed every flag fold before a tail
+            // call.  `#APP`/`#NO_APP` stay opaque.
+            if t.is_empty() || is_byteless_comment(t) {
                 n += 1;
                 continue;
             }
@@ -2747,7 +2775,7 @@ pub(super) fn walk_flag_consumers_seeded(
                 // An unconditional jump has no fall-through; the flags go to
                 // the target only.
                 LineKind::Jmp => {
-                    if let Some(idx) = resolve(t, &mut facts) {
+                    if let Some(idx) = sibling_or_resolve(n, t, &mut facts) {
                         work.push(idx);
                     }
                     break;
@@ -2824,7 +2852,7 @@ pub(super) fn walk_flag_consumers_seeded(
                     if infos[n].kind == LineKind::CondJmp
                         || (t.starts_with('j') && !t.starts_with("jmp"))
                     {
-                        if let Some(idx) = resolve(t, &mut facts) {
+                        if let Some(idx) = sibling_or_resolve(n, t, &mut facts) {
                             work.push(idx);
                         }
                     }
@@ -3337,7 +3365,7 @@ pub(super) fn fold_redundant_flags_compare(store: &LineStore, infos: &mut [LineI
 /// is the safe one: a missed fold costs one instruction, a wrong one is a
 /// miscompile.
 #[inline]
-fn preserves_eflags(t: &str) -> bool {
+pub(super) fn preserves_eflags(t: &str) -> bool {
     // Documented pure readers of the condition codes.
     if t.starts_with("cmov")
         || t.starts_with("set")
@@ -5350,9 +5378,27 @@ pub(super) fn fold_setcc_increment(store: &mut LineStore, infos: &mut [LineInfo]
         }
         let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
         let owned = [i, j, k, l];
-        if !super::relay_and_lea::provably_dead_lv(lv, store, infos, l, r_fam, &owned)
-            || (b_fam != r_fam
-                && !super::relay_and_lea::provably_dead_lv(lv, store, infos, l, b_fam, &owned))
+        let cheap_dead = super::relay_and_lea::provably_dead_lv(lv, store, infos, l, r_fam, &owned)
+            && (b_fam == r_fam
+                || super::relay_and_lea::provably_dead_lv(lv, store, infos, l, b_fam, &owned));
+        // In a loop the dataflow models `setcc b` as also reading b's family
+        // (bits 8..63 survive a byte write), so the sequence's OWN deleted
+        // reads keep the boolean live around the back edge whenever the
+        // family is used elsewhere in the function and the uniqueness proof
+        // cannot apply. Ask about the rewritten program instead, as
+        // `fold_conditional_increment` does: neutralise the carrier families
+        // on `j..=l`, every line of which loses its mention of them
+        // (`setcc` and the extension disappear, the add becomes an
+        // immediate `sbb`/`adc`; `acc` is neither family). The compare at
+        // `i` survives with its operand -- which may BE the boolean family
+        // (`testb %r10b, %r10b`) -- so it stays outside the region and a
+        // loop-carried read through it still vetoes.
+        let carriers = (1u16 << r_fam) | (1u16 << b_fam);
+        if !cheap_dead
+            && !matches!(
+                lv.live_after_dropping_region(store, infos, l, j, l, carriers),
+                Some(live) if live & carriers == 0
+            )
         {
             continue;
         }
@@ -5433,6 +5479,51 @@ mod setcc_increment_tests {
         assert!(!fold(&live_b).0, "{live_b}");
         let live_r = valid.replace("    ret", "    movq %r10, %rdx\n    ret");
         assert!(!fold(&live_r).0, "{live_r}");
+    }
+
+    /// The `sieve` counting loop: `%rsi` is used before the loop, so the
+    /// whole-function uniqueness proof cannot apply, and the dataflow sees the
+    /// boolean live around the back edge only through `setne %sil`'s own
+    /// partial-write read. The rewritten program reads `%rsi` nowhere after
+    /// the add, so the fold must fire.
+    const LOOP: &str = "    movl $1, %esi\n    movq %rsi, (%rdi)\n    xorl %eax, %eax\n    movl $0, %r10d\n.L1:\n    cmpb $0, (%r8,%r10)\n    setne %sil\n    movzbl %sil, %esi\n    addq %rsi, %rax\n    addq $1, %r10\n    cmpq $100, %r10\n    jl .L1\n    ret";
+
+    #[test]
+    fn folds_in_a_loop_whose_boolean_family_is_used_elsewhere() {
+        let (changed, out) = fold(LOOP);
+        assert!(changed, "{out}");
+        assert!(
+            out.contains("    cmpb $1, (%r8,%r10)\n    sbbq $-1, %rax\n"),
+            "{out}"
+        );
+        assert!(!out.contains("setne") && !out.contains("movzbl"), "{out}");
+    }
+
+    #[test]
+    fn refuses_when_the_boolean_is_observed_after_the_rewritten_sequence() {
+        // Each variant adds one genuine reader of the pre-fold boolean value
+        // that the rewrite would leave reading a stale register.
+        let compare_reads_it = LOOP.replace("    cmpb $0, (%r8,%r10)\n", "    testb %sil, %sil\n");
+        let header_reads_it = LOOP.replace(".L1:\n", ".L1:\n    movq %rsi, 16(%rdi)\n");
+        let exit_reads_it = LOOP.replace("    jl .L1\n", "    jl .L1\n    movq %rsi, 8(%rdi)\n");
+        let copy_read_after = LOOP
+            .replace(
+                "    movzbl %sil, %esi\n    addq %rsi, %rax\n",
+                "    movzbl %sil, %r11d\n    addq %r11, %rax\n",
+            )
+            .replace("    jl .L1\n", "    jl .L1\n    movq %r11, 8(%rdi)\n");
+        for body in [
+            compare_reads_it,
+            header_reads_it,
+            exit_reads_it,
+            copy_read_after,
+        ] {
+            let (changed, out) = fold(&body);
+            assert!(
+                !changed,
+                "folded although the boolean is still read:\n{body}\n=> {out}"
+            );
+        }
     }
 
     #[test]
@@ -6094,5 +6185,72 @@ mod copy_mask_lazy_liveness_tests {
         let output = store.build_result(|i| infos[i].is_nop());
         assert!(output.contains("testb $1, %dil"), "{output}");
         assert!(output.contains("testq %rcx, %rsi"), "{output}");
+    }
+}
+
+#[cfg(test)]
+mod walker_comment_and_sibling_tests {
+    use super::*;
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    fn line(store: &LineStore, text: &str) -> usize {
+        (0..store.len())
+            .find(|&i| store.get(i).trim() == text)
+            .unwrap()
+    }
+
+    #[test]
+    fn comments_are_transparent_but_app_markers_are_not() {
+        let (store, infos) = build(concat!(
+            "f:\n.cfi_startproc\n    testl %edi, %edi\n    # a human note\n",
+            "    # LCCC_CALL_ARGS 0\n    je .LBB2\n    ret\n.LBB2:\n    ret\n.cfi_endproc\n"
+        ));
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(f.proved && f.saw_consumer && !f.saw_non_zf && !f.saw_whole_reader);
+        let (store, infos) = build(concat!(
+            "f:\n.cfi_startproc\n    testl %edi, %edi\n#APP\n#NO_APP\n",
+            "    je .LBB2\n    ret\n.LBB2:\n    ret\n.cfi_endproc\n"
+        ));
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(f.saw_whole_reader, "#APP must stay opaque");
+        // flags_dead_after: a comment before the overwriting compare.
+        let (store, infos) = build(concat!(
+            "f:\n.cfi_startproc\n    addl $1, %eax\n    # note\n    cmpl $3, %eax\n",
+            "    je .LBB2\n    ret\n.LBB2:\n    ret\n.cfi_endproc\n"
+        ));
+        assert!(flags_dead_after(
+            &store,
+            &infos,
+            line(&store, "addl $1, %eax") + 1
+        ));
+    }
+
+    #[test]
+    fn marked_sibling_calls_end_the_path_unmarked_ones_are_unknown() {
+        let marked = concat!(
+            "f:\n.cfi_startproc\n    testl %edi, %edi\n    je .LBB2\n    jmp fast@PLT\n",
+            "    # LCCC_TAIL_CALL\n    # LCCC_CALL_ARGS 0\n.LBB2:\n    jmp slow@PLT\n",
+            "    # LCCC_TAIL_CALL\n    # LCCC_CALL_ARGS 0\n.cfi_endproc\n"
+        );
+        let (store, infos) = build(marked);
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(f.proved && f.saw_consumer && !f.saw_non_zf, "{f:?}");
+        // A conditional sibling call: consumer, and its taken edge ends.
+        let (store, infos) = build(concat!(
+            "f:\n.cfi_startproc\n    testl %edi, %edi\n    jne slow@PLT\n",
+            "    # LCCC_TAIL_CALL\n    # LCCC_CALL_ARGS 0\n    ret\n.cfi_endproc\n"
+        ));
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(f.proved && f.saw_consumer, "{f:?}");
+        let (store, infos) = build(&marked.replace("    # LCCC_TAIL_CALL\n", ""));
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(!f.proved, "an unmarked foreign jmp may be anything");
     }
 }

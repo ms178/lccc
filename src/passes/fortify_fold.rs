@@ -737,10 +737,11 @@ pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
         decisions.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         for (bi, ii, decision) in decisions.into_iter().rev() {
             let block = &mut func.blocks[bi];
+            // The folded call's replacements implement it: they take its span.
             if decision.insts.is_empty() {
-                block.instructions.remove(ii);
+                block.remove_inst(ii);
             } else {
-                block.instructions.splice(ii..ii + 1, decision.insts);
+                block.splice_inst(ii, decision.insts);
             }
             if let Some(lit) = decision.new_literal {
                 pending_literals.push(lit);

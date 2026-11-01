@@ -55,6 +55,7 @@
 
 mod archive;
 mod args;
+pub mod binary_input;
 pub mod build_id;
 pub mod cet;
 mod check;
@@ -63,6 +64,7 @@ pub mod defsym;
 mod dynamic;
 mod dynstr;
 mod eh_frame;
+pub mod eh_frame_gnu;
 pub mod filemap;
 mod gc_sections;
 mod hash;
@@ -81,6 +83,7 @@ mod section_map;
 pub mod shdr;
 pub mod stack_note;
 pub mod strmerge;
+pub mod strmerge_gnu;
 mod symbols;
 mod symstr;
 pub mod symtab;
@@ -137,8 +140,8 @@ pub use symbols::{
 // merge.rs
 pub use merge::{
     allocate_common_symbols_elf64, is_debug_section_name, merge_comment_sections,
-    merge_debug_sections_elf64, merge_sections_elf64, merge_sections_elf64_gc,
-    place_debug_sections,
+    merge_debug_sections_elf64, merge_nonalloc_sections_elf64, merge_sections_elf64,
+    merge_sections_elf64_gc, place_debug_sections,
 };
 
 // dynamic.rs
@@ -170,6 +173,7 @@ pub use args::{
     HashStyle, InputItem, LinkerArgs, Symbolic, TextrelPolicy, as_needed_states, dyn_flags,
     exclude_libs_matches, input_as_needed, object_as_needed, parse_linker_args, rpath_dyn_entry,
 };
+pub(crate) use args::{SearchOption, VALUE_TAKING, join_split_wl_values, search_option};
 pub use build_id::BuildIdStyle;
 
 // check.rs

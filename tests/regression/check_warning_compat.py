@@ -180,6 +180,10 @@ KIND_FIXTURES = {
         "const int probe_daq_src[2][2];\nint (*probe_daq(void))[2] { return probe_daq_src; }",
         "return discards 'const' qualifier from pointer target type",
     ),
+    "return-local-addr": (
+        "int *probe_rla(void) { int probe_local = 0; return &probe_local; }",
+        "function returns address of local variable",
+    ),
 }
 
 # Measured membership/severity cells, stated INDEPENDENTLY of the LCCC
@@ -204,6 +208,7 @@ DEFAULT_ON = {
     "compare-distinct-pointer-types",
     "discarded-qualifiers",
     "discarded-array-qualifiers",
+    "return-local-addr",
 }
 IN_WALL = {"return-type", "unused-variable", "format"}
 IN_WEXTRA = {"sign-compare"}
@@ -615,12 +620,14 @@ def main() -> int:
         assert FORMAT_SECURITY_ERROR_FLAGS == ("-Wformat", "-Werror=format-security")
         # Registry manifest: one fixture per kind, the measured cells stay
         # self-consistent, and no fixture is missing a pin.
-        assert len(KIND_FIXTURES) == 15
+        assert len(KIND_FIXTURES) == 20
         assert C99_DEFAULT_ERROR <= DEFAULT_ON
         assert DEFAULT_ON == set(KIND_FIXTURES) - {
             "return-type",
             "unused-variable",
             "sign-compare",
+            "pedantic",
+            "vla",
             "format",
             "format-security",
         }

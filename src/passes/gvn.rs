@@ -1898,65 +1898,28 @@ fn gvn_dfs(
     state.restore_scope(&checkpoint);
 }
 
-/// Check if an instruction may modify memory, invalidating cached load values.
-/// This is conservative: any instruction that could write to memory or call
-/// external code (which could write to memory) returns true.
+/// Whether `inst` invalidates cached load values: the exhaustive byte-write
+/// model ([`Instruction::may_write_memory`], no catch-all arm, so a new
+/// instruction kind cannot silently fail open here) plus GVN's own layer:
+///
+/// * a pure/const call writes nothing the caller can load, EXCEPT through a
+///   hidden sret pointer (i686: every struct/_Complex return; 20070614-1);
+/// * an atomic load stronger than relaxed synchronises with another thread's
+///   release, after which that thread's writes must be visible
+///   (`while (!load_acquire(&ready)); use(data);`), and a fence orders the
+///   same way although neither writes a byte;
+/// * `StackRestore` releases dynamic-alloca memory, so a load cached from it
+///   must not survive into a reuse of the same stack bytes.
 fn clobbers_memory(inst: &Instruction) -> bool {
     match inst {
-        // A pure/const call cannot modify user-visible memory — EXCEPT that
-        // an sret return writes the result through the hidden sret pointer
-        // (i686: every struct/_Complex return). Cached loads across such a
-        // call must be invalidated (20070614-1 family).
-        Instruction::Call {
-            info:
-                CallInfo {
-                    is_sret,
-                    is_pure: true,
-                    ..
-                }
-                | CallInfo {
-                    is_sret,
-                    is_const: true,
-                    ..
-                },
-            ..
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+            !(info.is_pure || info.is_const) || info.is_sret
         }
-        | Instruction::CallIndirect {
-            info:
-                CallInfo {
-                    is_sret,
-                    is_pure: true,
-                    ..
-                }
-                | CallInfo {
-                    is_sret,
-                    is_const: true,
-                    ..
-                },
-            ..
-        } => *is_sret,
-        Instruction::Store { .. }
-        | Instruction::Call { .. }
-        | Instruction::CallIndirect { .. }
-        | Instruction::Memcpy { .. }
-        | Instruction::AtomicRmw { .. }
-        | Instruction::AtomicInc { .. }
-        | Instruction::AtomicCmpxchg { .. }
-        | Instruction::AtomicStore { .. }
-        | Instruction::Fence { .. }
-        | Instruction::InlineAsm { .. }
-        | Instruction::VaStart { .. }
-        | Instruction::VaEnd { .. }
-        | Instruction::VaCopy { .. }
-        | Instruction::VaArg { .. }
-        | Instruction::VaArgStruct { .. }
-        | Instruction::VaArgVector { .. } => true,
-        Instruction::Intrinsic { dest_ptr, op, .. }
-            if dest_ptr.is_some() || op.writes_memory_via_args() =>
-        {
-            true
+        Instruction::AtomicLoad { ordering, .. } => {
+            !matches!(ordering, crate::ir::reexports::AtomicOrdering::Relaxed)
         }
-        _ => false,
+        Instruction::Fence { .. } | Instruction::StackRestore { .. } => true,
+        _ => inst.may_write_memory(),
     }
 }
 

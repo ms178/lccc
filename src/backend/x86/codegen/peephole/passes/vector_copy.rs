@@ -601,6 +601,7 @@ fn is_barrier(info: &LineInfo, t: &str) -> bool {
 pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut fp: Option<FpLiveness> = None;
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -672,6 +673,18 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
+        // Rule 4, implicit readers: a mention scan cannot see the readers
+        // that never spell the register -- a `call`/tail `jmp` whose
+        // `LCCC_CALL_FP` count covers it, a `ret` of `%xmm0`/`%xmm1`. Deleting
+        // the copy-in leaves the temporary holding its OLD value, so it must
+        // be dead after the copy-out. Observed: `c4(p0, 99.5f, p0, 80.5f)`
+        // stages `movapd %xmm0, %xmm2; movapd %xmm2, %xmm0`, the bracket is
+        // empty, and coalescing it sent `c4` a stale third argument.
+        let oracle = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if oracle.xmm_live_after(kout, u32::from(copy_in.dst)) != Some(false) {
+            i += 1;
+            continue;
+        }
         // Rule 5: no read of the source after the bracket wider than the
         // copy-out, whose upper-bit behaviour the rewrite changes -- `ret`
         // included (a `__m128d` return reads all of `%xmm0`); any `ret` of
@@ -706,6 +719,7 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
         mark_nop(&mut infos[i]);
         mark_nop(&mut infos[kout]);
         changed = true;
+        fp = None;
         i = kout + 1;
     }
     changed
@@ -3058,6 +3072,38 @@ mod tests {
                 tail == "ret",
                 "{tail}"
             );
+        }
+    }
+
+    #[test]
+    fn bracket_temporary_read_by_a_call_argument_survives() {
+        // `c4(p0, 99.5f, p0, 80.5f)` stages p0 into %xmm0 AND %xmm2 through
+        // an empty bracket; the call reads %xmm2 without spelling it.
+        let staging = "    movapd %xmm0, %xmm2\n    movapd %xmm2, %xmm0\n    movss .LC0(%rip), %xmm1\n    movss .LC1(%rip), %xmm3\n";
+        let run = |fp: u32, tail: bool| {
+            let call = if tail {
+                format!(
+                    "    # LCCC_CALL_ARGS 0\n    # LCCC_CALL_FP {fp}\n    jmp c4@PLT\n    # LCCC_TAIL_CALL\n    # LCCC_CALL_ARGS 0\n    # LCCC_CALL_FP {fp}\n"
+                )
+            } else {
+                format!(
+                    "    call c4@PLT\n    # LCCC_CALL_ARGS 0\n    # LCCC_CALL_FP {fp}\n    ret\n"
+                )
+            };
+            // A void caller, as `prologue.rs` publishes it: its `ret` reads
+            // no vector register, so rule 5 (upper bits read by a `ret`)
+            // stays out of the way and rule 4 alone decides.
+            let mut store = LineStore::new(body(&format!("    # LCCC_RET_XMM 0\n{staging}{call}")));
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            coalesce_vector_brackets(&mut store, &mut infos)
+        };
+        for tail in [false, true] {
+            assert!(!run(4, tail), "%xmm2 is the third argument (tail={tail})");
+            // Control: with two FP arguments %xmm2 is dead and the empty
+            // bracket still cancels.
+            assert!(run(2, tail), "%xmm2 is dead (tail={tail})");
         }
     }
 

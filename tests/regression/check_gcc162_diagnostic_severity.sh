@@ -26,6 +26,25 @@
 #   * a valid translation unit still compiles (a gate that only asserted
 #     rejections would pass with every construct deleted).
 set -euo pipefail
+# A bare `set -e` abort names nothing in the CI check UI. A DEBUG trap records
+# the last command executed (it never changes control flow, which matters here:
+# the gate deliberately runs compilers that must fail, so an ERR trap would
+# abort on the first intended rejection) and the EXIT trap reports it when the
+# script ends badly.
+last_command=
+tmp=
+trap 'last_command=$BASH_COMMAND' DEBUG
+report_on_exit() {
+    local rc=$?
+    trap - DEBUG
+    if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+    if ((rc)); then
+        echo "::error::severity gate exited $rc; last command: $last_command"
+    fi
+    return 0
+}
+# Install before compiler discovery and mktemp, not after those can fail.
+trap report_on_exit EXIT
 redteam_runner=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/check_diagnostic_redteam.py
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -37,10 +56,11 @@ CCC=$(cd "$(dirname -- "$CCC")" && pwd)/$(basename -- "$CCC")
 GCC=${GCC:-gcc-16}
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-gcc162-severity.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
 cd "$tmp"
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# The message also becomes a GitHub annotation, so a red step names its own
+# failure in the check UI instead of only in a log the branch cannot read.
+fail() { echo "FAIL: $*" >&2; echo "::error::$*"; exit 1; }
 
 # run_exit <compiler> <file> <std> -> prints the exit code, stderr in <file>.err
 run_exit() {
@@ -349,7 +369,13 @@ fi
 
 echo "PASS: gcc-16.2 diagnostic severity, message and column parity"
 
-CCC="$CCC" GCC="$GCC" python3 "$redteam_runner"
+if ! redteam=$(CCC="$CCC" GCC="$GCC" python3 "$redteam_runner" 2>&1); then
+    printf '%s\n' "$redteam" >&2
+    printf '::error::%s\n' "$(printf '%s\n' "$redteam" \
+        | grep -E 'FAIL|Traceback|error:' | sed -n '1p' || printf 'redteam matrix failed')"
+    exit 1
+fi
+printf '%s\n' "$redteam"
 
 "$CCC" -O2 "${redteam_runner%/*}/diagnostic_const_legal_execute.c" -o "$tmp/const-legal"
 "$tmp/const-legal"

@@ -986,6 +986,7 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
             outputs,
             inputs,
             clobbers,
+            goto_labels,
             ..
         } => {
             // `asm volatile("" ::: "memory")` is a compiler barrier, not a
@@ -1005,7 +1006,20 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
             // is unchanged: a `"memory"` clobber still orders the accesses at
             // the IR level (`may_write_memory`, LICM's barrier model); only
             // the register accounting is corrected.
-            !crate::backend::inline_asm::inline_asm_template_has_no_instructions(template)
+            //
+            // An empty template still stages REGISTER operands (`"+d"(y)`
+            // loads %rdx, a tie delivers its value), so only the operand
+            // classes the emitter provably skips qualify: the shared
+            // `inline_asm_is_register_inert` contract.
+            let inert = crate::backend::inline_asm::inline_asm_is_register_inert(
+                template,
+                outputs
+                    .iter()
+                    .map(|(c, ..)| c.as_str())
+                    .chain(inputs.iter().map(|(c, ..)| c.as_str())),
+                !goto_labels.is_empty(),
+            );
+            !inert
                 && (!outputs.is_empty()
                     || !inputs.is_empty()
                     || clobbers.iter().any(|c| clobber_is_allocatable_reg(c)))
@@ -3514,6 +3528,87 @@ mod tests {
             !result.call_points.is_empty(),
             "a non-empty template with operands stays a call point"
         );
+    }
+
+    /// The register-effect contract shared with the emitter: an empty
+    /// template is register-inert only when every operand is memory-only or
+    /// immediate-only. A register operand is staged even when nothing is
+    /// assembled (`"+d"(y)` loads %rdx), so it keeps the statement a call
+    /// point; before this contract a value homed in %rdx across
+    /// `asm("" : "+d"(y))` was overwritten by the staging move.
+    #[test]
+    fn test_empty_template_asm_register_operands_stay_call_points() {
+        fn asm(template: &str, outs: &[&str], ins: &[&str], goto: bool) -> Instruction {
+            Instruction::InlineAsm {
+                template: template.to_string(),
+                outputs: outs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.to_string(), Value(i as u32), None))
+                    .collect(),
+                inputs: ins
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (c.to_string(), Operand::Value(Value(10 + i as u32)), None))
+                    .collect(),
+                clobbers: vec!["memory".to_string()],
+                operand_types: vec![IrType::I32; outs.len() + ins.len()],
+                goto_labels: if goto {
+                    vec![("l".to_string(), BlockId(1))]
+                } else {
+                    vec![]
+                },
+                input_symbols: vec![None; ins.len()],
+                seg_overrides: vec![],
+            }
+        }
+        let register_staged: &[(&[&str], &[&str])] = &[
+            (&["+r"], &[]),
+            (&["+d"], &[]),
+            (&["+c"], &[]),
+            (&["=a"], &[]),
+            (&[], &["S"]),
+            (&[], &["D"]),
+            (&["={rdx}"], &[]),
+            (&["=r"], &["0"]),
+            (&["+m"], &["0"]),
+            (&["+rm"], &[]),
+            (&["=g"], &[]),
+            (&["+m"], &["r"]),
+            (&["=x"], &[]),
+            (&["+{mm0}"], &[]),
+        ];
+        for (outs, ins) in register_staged {
+            assert!(
+                instruction_is_call_point(&asm("", outs, ins, false)),
+                "an empty template still stages {outs:?} {ins:?}"
+            );
+        }
+        let inert: &[(&[&str], &[&str])] = &[
+            (&["+m"], &[]),
+            (&["=m"], &["m"]),
+            (&["+o"], &["V"]),
+            (&["=&m"], &["i"]),
+            (&[], &["n"]),
+        ];
+        for (outs, ins) in inert {
+            assert!(
+                !instruction_is_call_point(&asm(" ;\n\t", outs, ins, false)),
+                "memory/immediate operands under an empty template: {outs:?} {ins:?}"
+            );
+            // Controls: a real instruction, or goto labels, keep the call point.
+            assert!(instruction_is_call_point(&asm("nop", outs, ins, false)));
+            assert!(instruction_is_call_point(&asm("", outs, ins, true)));
+        }
+        // Dialect alternatives that are empty in both dialects assemble to
+        // nothing; a non-empty alternative does not.
+        assert!(!instruction_is_call_point(&asm("{|}", &["+m"], &[], false)));
+        assert!(instruction_is_call_point(&asm(
+            "{nop|nop}",
+            &["+m"],
+            &[],
+            false
+        )));
     }
 
     #[test]

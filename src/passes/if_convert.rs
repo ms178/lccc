@@ -1220,7 +1220,7 @@ fn apply_if_combine(func: &mut IrFunction, c: &IfCombine, next_val: &mut u32) ->
         rhs: c.inner_cond.clone(),
         ty,
     });
-    func.blocks[c.pred_idx].instructions.extend(hoisted);
+    func.blocks[c.pred_idx].extend_insts(hoisted, crate::common::source::Span::dummy());
     func.blocks[c.pred_idx].terminator = Terminator::CondBranch {
         cond: Operand::Value(combined),
         true_label: c.new_true,
@@ -1252,7 +1252,7 @@ fn apply_if_combine(func: &mut IrFunction, c: &IfCombine, next_val: &mut u32) ->
     }
     // `inner` is now unreachable; leave the empty shell for cfg_simplify
     // rather than renumbering blocks mid-pass.
-    func.blocks[c.inner_idx].instructions.clear();
+    func.blocks[c.inner_idx].clear_insts();
     func.blocks[c.inner_idx].terminator = Terminator::Branch(c.shared);
     true
 }

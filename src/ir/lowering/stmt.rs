@@ -1631,6 +1631,16 @@ impl Lowerer {
                         self.lower_expr_discard(e);
                     }
                     None
+                } else if let Some(e) = expr
+                    .as_ref()
+                    .filter(|e| self.sema_local_address_returns.contains(&e.id()))
+                {
+                    // `return &local;`: the address dies with the frame. Like
+                    // GCC 16.2 (at every level), evaluate the operand for its
+                    // side effects and return a null pointer, so a caller's
+                    // dereference faults instead of reading a dead frame.
+                    self.lower_expr_discard(e);
+                    Some(Operand::Const(IrConst::ptr_int(0)))
                 } else {
                     expr.as_ref().map(|e| self.lower_return_expr(e))
                 };

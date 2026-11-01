@@ -401,6 +401,13 @@ impl Driver {
         if self.nodefaultlibs {
             args.push("-nodefaultlibs".to_string());
         }
+        // GCC's RISC-V link spec turns `-mno-relax` into `--no-relax`
+        // (`%{mno-relax:--no-relax}`): the objects were assembled without
+        // relaxation pairs, and the link must not relax the others either.
+        // It goes first so a later `-Wl,--relax` still wins, as with gcc.
+        if self.target == Target::Riscv64 && self.riscv_no_relax && !self.relocatable {
+            args.push("-Wl,--no-relax".to_string());
+        }
         for path in &self.linker_paths {
             args.push(format!("-L{}", path));
         }

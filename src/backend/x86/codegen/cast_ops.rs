@@ -19,6 +19,9 @@ pub(super) struct PendingWiden {
     pub from_ty: IrType,
     /// Destination register home the widening move would have written.
     pub dest_phys: PhysReg,
+    /// The move writes the 32-bit form (`X86Codegen::sext_widen_writes_32`),
+    /// decided at record time so the flush equals the immediate emission.
+    pub to_32: bool,
 }
 
 /// Policy: does a value's home already hold its own zero-extended 64-bit
@@ -639,7 +642,11 @@ impl X86Codegen {
     /// definition of the widening sequences: the register-direct cast path
     /// and the PF-15 deferred-widen flush both route through it, so the
     /// deferred form is bit-identical to the immediate form.
-    fn emit_int_widen_move(&mut self, src: &Operand, ft: IrType, dest_phys: PhysReg) {
+    ///
+    /// `to_32`: a signed byte/half source is extended into the 32-bit
+    /// register (`movsbl`/`movswl`) instead of the full 64-bit one; see
+    /// `sext_widen_writes_32`, the only place that decides it.
+    fn emit_int_widen_move(&mut self, src: &Operand, ft: IrType, dest_phys: PhysReg, to_32: bool) {
         use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
         let dest_64 = phys_reg_name(dest_phys);
         let dest_32 = phys_reg_name_32(dest_phys);
@@ -665,6 +672,12 @@ impl X86Codegen {
             let src_typed = typed_phys_reg_name(src_reg, ft);
             if ft.is_signed() {
                 match ft.size() {
+                    1 if to_32 => self
+                        .state
+                        .emit_fmt(format_args!("    movsbl %{}, %{}", src_typed, dest_32)),
+                    2 if to_32 => self
+                        .state
+                        .emit_fmt(format_args!("    movswl %{}, %{}", src_typed, dest_32)),
                     1 => self
                         .state
                         .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
@@ -715,6 +728,16 @@ impl X86Codegen {
             // addressing automatically.
             if ft.is_signed() {
                 match ft.size() {
+                    1 if to_32 => {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movsbl", slot_off, dest_32)
+                    }
+                    2 if to_32 => {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movswl", slot_off, dest_32)
+                    }
                     1 => self
                         .state
                         .out
@@ -842,11 +865,13 @@ impl X86Codegen {
         } else {
             1
         };
+        let to_32 = self.sext_widen_writes_32(from_ty, to_ty, dest.0);
         self.pending_widen[free] = Some(PendingWiden {
             dest: dest.0,
             src: src.clone(),
             from_ty,
             dest_phys,
+            to_32,
         });
         self.pf15_trace("record");
         true
@@ -859,7 +884,7 @@ impl X86Codegen {
     pub(super) fn flush_pending_widen_impl(&mut self) {
         for slot in 0..2 {
             if let Some(p) = self.pending_widen[slot].take() {
-                self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys);
+                self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys, p.to_32);
                 if !p.from_ty.is_signed()
                     && p.from_ty.size() <= 4
                     && matches!(p.src, Operand::Value(v) if self.zext_loaded_values.contains(&v.0))
@@ -885,8 +910,8 @@ impl X86Codegen {
         lhs: &Operand,
         rhs: &Operand,
     ) -> Option<(
-        (Operand, IrType, bool, PhysReg),
-        (Operand, IrType, bool, PhysReg),
+        (Operand, IrType, bool, PhysReg, bool),
+        (Operand, IrType, bool, PhysReg, bool),
     )> {
         let (lv, rv) = match (lhs, rhs) {
             (Operand::Value(l), Operand::Value(r)) => (l.0, r.0),
@@ -915,16 +940,16 @@ impl X86Codegen {
             let sa = a.from_ty.is_signed();
             let sb = b.from_ty.is_signed();
             return Some((
-                (a.src, a.from_ty, sa, a.dest_phys),
-                (b.src, b.from_ty, sb, b.dest_phys),
+                (a.src, a.from_ty, sa, a.dest_phys, a.to_32),
+                (b.src, b.from_ty, sb, b.dest_phys, b.to_32),
             ));
         }
         if a.dest == rv && b.dest == lv {
             let sa = b.from_ty.is_signed();
             let sb = a.from_ty.is_signed();
             return Some((
-                (b.src, b.from_ty, sa, b.dest_phys),
-                (a.src, a.from_ty, sb, a.dest_phys),
+                (b.src, b.from_ty, sa, b.dest_phys, b.to_32),
+                (a.src, a.from_ty, sb, a.dest_phys, a.to_32),
             ));
         }
         // Mismatch: restore and report.
@@ -1000,7 +1025,7 @@ impl X86Codegen {
             }
         };
         // Full-pair shape.
-        if let Some(((lsrc, lty, lsign, ldest), (rsrc, rty, rsign, rdest))) =
+        if let Some(((lsrc, lty, lsign, ldest, l32), (rsrc, rty, rsign, rdest, r32))) =
             self.take_pending_widen_pair(lhs, rhs)
         {
             let folded = if lty != rty {
@@ -1022,8 +1047,8 @@ impl X86Codegen {
             }
             // Refused: the records are already taken OUT of the slots, so
             // re-emit both widening moves explicitly, in program order.
-            self.emit_int_widen_move(&lsrc, lty, ldest);
-            self.emit_int_widen_move(&rsrc, rty, rdest);
+            self.emit_int_widen_move(&lsrc, lty, ldest, l32);
+            self.emit_int_widen_move(&rsrc, rty, rdest, r32);
             return None;
         }
         // Single-side const shape: cmp(cast(x), C) with C in the narrow
@@ -1033,8 +1058,10 @@ impl X86Codegen {
             self.flush_pending_widen_impl();
             return None;
         }
-        let (src, from_ty, dest_phys) = match (lhs, self.pending_widen[0].take()) {
-            (Operand::Value(v), Some(p)) if p.dest == v.0 => (p.src, p.from_ty, p.dest_phys),
+        let (src, from_ty, dest_phys, to_32) = match (lhs, self.pending_widen[0].take()) {
+            (Operand::Value(v), Some(p)) if p.dest == v.0 => {
+                (p.src, p.from_ty, p.dest_phys, p.to_32)
+            }
             (_, other) => {
                 self.pending_widen[0] = other;
                 self.flush_pending_widen_impl();
@@ -1066,7 +1093,7 @@ impl X86Codegen {
             return Some(f);
         }
         // Refused after take: re-emit the taken widening move explicitly.
-        self.emit_int_widen_move(&src, from_ty, dest_phys);
+        self.emit_int_widen_move(&src, from_ty, dest_phys, to_32);
         None
     }
 
@@ -1083,6 +1110,13 @@ impl X86Codegen {
     ) -> bool {
         use crate::backend::cast::CastKind;
         match kind {
+            // Signed sources keep the 64-bit form even for a 32-bit result
+            // (unlike `emit_int_widen_move`, see `sext_widen_writes_32`): the
+            // accumulator typically holds a just-loaded `movsbq`/`movswq`
+            // value, the repeated extension becomes a 64-bit copy, and the
+            // copy-propagation peepholes collapse 64-bit chains but not the
+            // 32-bit `movl` pair (popcount_loop_density's argv parse: +2
+            // instructions with movsbl).
             CastKind::IntWiden { from_ty: ft, .. } => {
                 let (insn, src, dst) = match (ft.is_signed(), ft.size()) {
                     (true, 1) => ("movsbq", "al", dest_64),
@@ -1206,6 +1240,28 @@ impl X86Codegen {
         true
     }
 
+    /// Does a sign-extending widen of a byte/half into a 32-bit result write
+    /// the 32-bit form (`movsbl`/`movswl`, bits 32..63 cleared) rather than
+    /// `movsbq`/`movswq`? The 64-bit form is needed only for a raw 64-bit
+    /// reader of the home, and that is the contract every 32-bit ALU result
+    /// already follows (`emit_sext32_for_value` over `needs_sext_values`,
+    /// computed by `signed_i32_home_requirements`; explicit widening casts
+    /// extend their own input). A U32 result always takes the 32-bit form:
+    /// its canonical home is zero-extended. The accumulator emits the same
+    /// cast as `movsbl %al,%eax`; without this, a register home turned it
+    /// into `movsbq`, which no 32-bit fold (`fold_copy_logical_shift_signext`)
+    /// recognizes.
+    pub(super) fn sext_widen_writes_32(&self, from_ty: IrType, to_ty: IrType, dest: u32) -> bool {
+        if !from_ty.is_signed() || from_ty.size() >= 4 || to_ty.is_float() || to_ty.size() != 4 {
+            return false;
+        }
+        if !to_ty.is_signed() {
+            return true;
+        }
+        self.skip_i32_sext
+            || (!self.needs_sext_values.is_empty() && !self.needs_sext_values.contains(&dest))
+    }
+
     /// Register-direct cast emission, wrapped so the
     /// definition-writes-home invariant is enforced at ONE boundary: every
     /// arm of the inner emitter writes `dest_phys` with the cast's result
@@ -1221,7 +1277,8 @@ impl X86Codegen {
         to_ty: IrType,
         dest_phys: crate::backend::regalloc::PhysReg,
     ) -> bool {
-        if !self.try_emit_cast_reg_direct_inner(src, from_ty, to_ty, dest_phys) {
+        let widen_to_32 = self.sext_widen_writes_32(from_ty, to_ty, dest.0);
+        if !self.try_emit_cast_reg_direct_inner(src, from_ty, to_ty, dest_phys, widen_to_32) {
             return false;
         }
         // A same-width unsigned-to-signed cast may be a low-bit identity,
@@ -1245,6 +1302,7 @@ impl X86Codegen {
         from_ty: IrType,
         to_ty: IrType,
         dest_phys: crate::backend::regalloc::PhysReg,
+        widen_to_32: bool,
     ) -> bool {
         use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
         use crate::backend::cast::{CastKind, classify_cast};
@@ -1326,7 +1384,7 @@ impl X86Codegen {
                 // Widen: sign or zero extend from smaller to larger type.
                 // (Single definition shared with the PF-15 deferred-widen
                 // flush — emit_int_widen_move above.)
-                self.emit_int_widen_move(src, ft, dest_phys);
+                self.emit_int_widen_move(src, ft, dest_phys, widen_to_32);
                 true
             }
             CastKind::IntNarrow { to_ty: t } => {
@@ -1508,6 +1566,50 @@ mod widening_home_tests {
         }
     }
 
+    /// A signed byte/half widened to a 32-bit result takes the 64-bit form
+    /// exactly when a raw 64-bit reader needs the canonical home (I32 in
+    /// `needs_sext_values`) or the result is 64-bit; U32 results are
+    /// always zero-extended. Register and slot homes, immediate and
+    /// deferred; an accumulator-staged source keeps the 64-bit form
+    /// (`emit_cast_from_accumulator`).
+    #[test]
+    fn signed_sub_word_widen_writes_64_bits_only_for_wide_readers() {
+        for home in 0..4 {
+            for (from, narrow, full) in [
+                (IrType::I8, "movsbl", "movsbq"),
+                (IrType::I16, "movswl", "movswq"),
+            ] {
+                for to in [IrType::I32, IrType::U32, IrType::I64] {
+                    for wide in [false, true] {
+                        let expect_full =
+                            home == 3 || to == IrType::I64 || (to == IrType::I32 && wide);
+                        let mut cg = emitter(home, from);
+                        cg.value_types.insert(9, to);
+                        cg.skip_i32_sext = !wide;
+                        if wide {
+                            cg.needs_sext_values.insert(9);
+                        }
+                        assert_eq!(
+                            cg.sext_widen_writes_32(from, to, 9),
+                            !(to == IrType::I64 || (to == IrType::I32 && wide)),
+                            "policy: from={from:?}, to={to:?}, wide={wide}"
+                        );
+                        cg.emit_cast_impl(&Value(9), &Operand::Value(Value(1)), from, to);
+                        // A deferred (PF-15) record emits at its flush.
+                        cg.flush_pending_widen_impl();
+                        let out = &cg.state.out.buf;
+                        let want = if expect_full { full } else { narrow };
+                        let other = if expect_full { narrow } else { full };
+                        assert!(
+                            out.contains(want) && !out.contains(other),
+                            "home={home}, from={from:?}, to={to:?}, wide={wide}: {out}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn deferred_fallback_moves_are_typed_extensions_not_bit_copies() {
         for home in 0..4 {
@@ -1520,7 +1622,7 @@ mod widening_home_tests {
                 (IrType::U32, "movl"),
             ] {
                 let mut cg = emitter(home, ty);
-                cg.emit_int_widen_move(&Operand::Value(Value(1)), ty, PhysReg(2));
+                cg.emit_int_widen_move(&Operand::Value(Value(1)), ty, PhysReg(2), false);
                 let out = &cg.state.out.buf;
                 assert!(out.contains(mnemonic), "home={home}, ty={ty:?}: {out}");
             }

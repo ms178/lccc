@@ -137,6 +137,12 @@ struct LineInfo {
     /// at classification so the barrier test in the hot loop stays
     /// integer-only and no pass re-derives -- or mis-derives -- the law.
     inert_dir: bool,
+    /// The line belongs to a function with no frame proof (no
+    /// `movl %esp, %ebp`), so `%ebp` is an ordinary data register there and
+    /// a `(%ebp)` operand is an indirect access, not a frame slot. Set by
+    /// [`classify_all`] and carried through every re-classification by
+    /// [`classify_line_ctx`]; see there.
+    ebp_gpr: bool,
 }
 
 impl LineInfo {
@@ -191,6 +197,7 @@ fn line_info(kind: LineKind, ts: u16) -> LineInfo {
         has_indirect_mem: false,
         ebp_offset: EBP_OFFSET_NONE,
         inert_dir: false,
+        ebp_gpr: false,
     }
 }
 
@@ -241,6 +248,7 @@ fn cmp_line_info(ts: u16, s: &str) -> LineInfo {
         has_indirect_mem: has_indirect,
         ebp_offset,
         inert_dir: false,
+        ebp_gpr: false,
     }
 }
 
@@ -831,6 +839,71 @@ fn is_known_string_mnemonic(m: &str) -> bool {
 
 // ── Line classifier ──────────────────────────────────────────────────────────
 
+/// [`classify_line`] for a line whose function's `%ebp` is (`ebp_gpr`) or
+/// is not an ordinary data register.
+///
+/// The context-free classifier reads every `N(%ebp)` as a frame slot, which
+/// is right only where `%ebp` is the frame pointer. Under
+/// `-fomit-frame-pointer` the allocator hands `%ebp` out like any other
+/// callee-saved register, and the slot reading made the windowed dead-store
+/// pass delete `movl %edi, (%ebp)` because a later `movl %edi, (%ebp)` --
+/// through a *different* pointer, `%ebp` having been reloaded in between --
+/// "overwrote the same slot" (i32_product_map at -m32 -O1 stored half its
+/// input array).
+///
+/// No `LineKind` records a memory operand's base register: every register
+/// field names a data register. So a `(%ebp)` operand on a data `%ebp` is by
+/// definition classified exactly like the same operand on any other base
+/// register, which is how it is computed here: an indirect access, no slot
+/// kind, no frame offset. Base+index forms (`(%ebp,%eax,4)`) are indirect in
+/// either context already.
+fn classify_line_ctx(raw: &str, ebp_gpr: bool) -> LineInfo {
+    LineInfo {
+        ebp_gpr,
+        ..classify_line(&data_ebp_view(raw, ebp_gpr))
+    }
+}
+
+/// The text a frame-operand parser must see for a line of a function whose
+/// `%ebp` is (`ebp_gpr`) or is not a data register: unchanged, or with every
+/// base-only `(%ebp)` operand re-based onto another register (`%ecx`; which
+/// one is immaterial, since no analysis that consumes this view records a
+/// memory base register). The one definition behind [`classify_line_ctx`]
+/// and every pass that parses frame operands from text.
+fn data_ebp_view(raw: &str, ebp_gpr: bool) -> std::borrow::Cow<'_, str> {
+    if ebp_gpr && raw.contains("(%ebp)") {
+        std::borrow::Cow::Owned(raw.replace("(%ebp)", "(%ecx)"))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    }
+}
+
+/// Classify a whole text: [`classify_line`] per line, then
+/// [`classify_line_ctx`] for every line of a function without a frame proof.
+///
+/// The proof is positive -- the function's own `movl %esp, %ebp` -- and the
+/// default is the data-register reading: a line outside every function
+/// extent, or in a function that never establishes a frame pointer, never
+/// gets frame-slot semantics for `(%ebp)`. Mentioning `(%ebp)` is not a
+/// proof: that is exactly what a data `%ebp` does.
+fn classify_all(store: &LineStore) -> Vec<LineInfo> {
+    let mut infos: Vec<LineInfo> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    let mut framed = vec![false; infos.len()];
+    for (start, end) in function_extents(store, &infos) {
+        if (start..end).any(|i| trimmed(store, &infos[i], i) == "movl %esp, %ebp") {
+            framed[start..end].fill(true);
+        }
+    }
+    for (i, info) in infos.iter_mut().enumerate() {
+        if !framed[i] {
+            *info = classify_line_ctx(store.get(i), true);
+        }
+    }
+    infos
+}
+
 fn classify_line(raw: &str) -> LineInfo {
     let trim_start = raw.len() - raw.trim_start().len();
     let lead = &raw[trim_start..];
@@ -886,6 +959,7 @@ fn classify_line(raw: &str) -> LineInfo {
             has_indirect_mem: true,
             ebp_offset: EBP_OFFSET_NONE,
             inert_dir: false,
+            ebp_gpr: false,
         };
     }
 
@@ -1031,6 +1105,7 @@ fn classify_line(raw: &str) -> LineInfo {
         has_indirect_mem: has_indirect,
         ebp_offset: ebp_off,
         inert_dir: false,
+        ebp_gpr: false,
     }
 }
 
@@ -1110,7 +1185,9 @@ fn parse_jmp_target(s: &str) -> Option<&str> {
 /// Replaced lines are stored in a side buffer.
 // Re-export the shared LineStore from peephole_common.
 // See backend/peephole_common.rs for the implementation.
-use crate::backend::peephole_common::LineStore;
+use crate::backend::peephole_common::{
+    LineStore, SectionKind, SectionSwitch, SectionTracker, section_switch,
+};
 
 // ── Trimmed line helper ──────────────────────────────────────────────────────
 
@@ -1445,6 +1522,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
                         inert_dir: false,
+                        ebp_gpr: false,
                     };
                     changed = true;
                     i += 1;
@@ -1463,6 +1541,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
                         inert_dir: false,
+                        ebp_gpr: false,
                     };
                     changed = true;
                     i += 1;
@@ -1481,6 +1560,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
                         inert_dir: false,
+                        ebp_gpr: false,
                     };
                     changed = true;
                     i += 1;
@@ -1499,6 +1579,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
                         inert_dir: false,
+                        ebp_gpr: false,
                     };
                     changed = true;
                     i += 1;
@@ -1527,6 +1608,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
                         inert_dir: false,
+                        ebp_gpr: false,
                     };
                     changed = true;
                     i += 1;
@@ -1605,7 +1687,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                 }
                                 if dead {
                                     store.replace(j, format!("    cmpl {}, {}", imm, rhs));
-                                    infos[j] = classify_line(store.get(j));
+                                    infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                                     infos[i].kind = LineKind::Nop;
                                     changed = true;
                                     i += 1;
@@ -1711,7 +1793,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             let rewritten = consumer.replacen(old_reg, new_reg, 1);
                             if rewritten != consumer {
                                 store.replace(j, format!("    {}", rewritten));
-                                infos[j] = classify_line(store.get(j));
+                                infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                                 infos[i].kind = LineKind::Nop;
                                 changed = true;
                                 i += 1;
@@ -1722,7 +1804,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             let rewritten = consumer.replace(old_reg, new_reg);
                             if rewritten != consumer {
                                 store.replace(j, format!("    {}", rewritten));
-                                infos[j] = classify_line(store.get(j));
+                                infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                                 infos[i].kind = LineKind::Nop;
                                 changed = true;
                                 i += 1;
@@ -1790,7 +1872,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             let memop = &orig[..comma]; // e.g. "movl 84(%esp)"
                             let fused = format!("    {}, {}", memop, reg32_name(mdst));
                             store.replace(i, fused);
-                            infos[i] = classify_line(store.get(i));
+                            infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
                             infos[j].kind = LineKind::Nop;
                             changed = true;
                             i += 1;
@@ -1921,7 +2003,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                         base
                                     );
                                     store.replace(j, fused);
-                                    infos[j] = classify_line(store.get(j));
+                                    infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                                     infos[i].kind = LineKind::Nop;
                                     changed = true;
                                     i += 1;
@@ -1983,7 +2065,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                 let head = &src_line[..comma]; // "movl $X" or "leal M(%r)"
                                 let fused = format!("    {}, {}", head, reg32_name(mdst));
                                 store.replace(i, fused);
-                                infos[i] = classify_line(store.get(i));
+                                infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
                                 infos[j].kind = LineKind::Nop;
                                 changed = true;
                                 i += 1;
@@ -2046,7 +2128,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             if dead {
                                 let rn = reg32_name(mdst);
                                 store.replace(i, format!("    xorl {}, {}", rn, rn));
-                                infos[i] = classify_line(store.get(i));
+                                infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
                                 infos[j].kind = LineKind::Nop;
                                 changed = true;
                                 i += 1;
@@ -2077,7 +2159,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     let f2 = format!("testl %eax, {}", rn);
                     if t == f1 || t == f2 {
                         store.replace(j, format!("    testl {}, {}", rn, rn));
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         // Deadness scan for the mov: skip the (rewritten) test.
                         let mut k = j + 1;
                         let mut cnt = 0;
@@ -2216,7 +2298,10 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                                     format!("    {}, {}", head, mem)
                                                 };
                                                 store.replace(j, new_line);
-                                                infos[j] = classify_line(store.get(j));
+                                                infos[j] = classify_line_ctx(
+                                                    store.get(j),
+                                                    infos[j].ebp_gpr,
+                                                );
                                                 infos[i].kind = LineKind::Nop;
                                                 infos[k].kind = LineKind::Nop;
                                                 changed = true;
@@ -2271,6 +2356,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             has_indirect_mem: false,
                             ebp_offset: EBP_OFFSET_NONE,
                             inert_dir: false,
+                            ebp_gpr: false,
                         };
                         changed = true;
                         i += 1;
@@ -2506,7 +2592,9 @@ fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -
             continue;
         }
         let line = trimmed(store, &infos[i], i);
-        let Some((val, slot, store_size)) = parse_immediate_store(line) else {
+        let Some((val, slot, store_size)) =
+            parse_immediate_store(&data_ebp_view(line, infos[i].ebp_gpr))
+        else {
             continue;
         };
 
@@ -2532,7 +2620,9 @@ fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -
                 }
                 LineKind::Other { .. } => {
                     let t = trimmed(store, &infos[j], j);
-                    if let Some((_, s2, sz2)) = parse_immediate_store(t) {
+                    if let Some((_, s2, sz2)) =
+                        parse_immediate_store(&data_ebp_view(t, infos[j].ebp_gpr))
+                    {
                         if ranges_overlap(slot, store_size.byte_size(), s2, sz2.byte_size()) {
                             killed = true;
                         }
@@ -2589,7 +2679,7 @@ fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -
                                     };
                                     let v = val & mask;
                                     store.replace(j, format!("    {mn} ${v}, {dstname}"));
-                                    infos[j] = classify_line(store.get(j));
+                                    infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                                     changed = true;
                                     j += 1;
                                     count += 1;
@@ -2637,7 +2727,8 @@ fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -
                                             j,
                                             format!("    movl ${v}, {}", reg32_name(dst)),
                                         );
-                                        infos[j] = classify_line(store.get(j));
+                                        infos[j] =
+                                            classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                                         infos[k].kind = LineKind::Nop;
                                         changed = true;
                                         j = k + 1;
@@ -2815,7 +2906,7 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                         j,
                                         format!("    {mn} {srcname}, {}", reg32_name(dst_reg)),
                                     );
-                                    infos[j] = classify_line(store.get(j));
+                                    infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                                     infos[k].kind = LineKind::Nop;
                                     changed = true;
                                     j = k + 1;
@@ -2861,7 +2952,7 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         rewrite_alu_slot_source(trimmed(store, &infos[j], j), slot, src_reg, size)
                     {
                         store.replace(j, new_line);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         changed = true;
                         j += 1;
                         count += 1;
@@ -3135,7 +3226,7 @@ fn frame_kill_extents(s: &str, info: &LineInfo, precise: bool, out: &mut [(i32, 
         out[0] = (info.ebp_offset, 16);
         return 1;
     }
-    frame_write_extents(s, out)
+    frame_write_extents(&data_ebp_view(s, info.ebp_gpr), out)
 }
 
 /// Directives that describe code rather than emit it: unwind/CFI records, debug
@@ -3260,7 +3351,7 @@ fn rewrite_slot_reload(
         return false;
     };
     store.replace(j, text);
-    infos[j] = classify_line(store.get(j));
+    infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
     true
 }
 
@@ -4573,7 +4664,7 @@ fn fold_x87_gp_pair_staging(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
         // ---- apply: rewrite the fldl in place, nop the four staging lines ----
         let folded = format!("    fldl {}", mlo);
         store.replace(k, folded);
-        infos[k] = classify_line(store.get(k));
+        infos[k] = classify_line_ctx(store.get(k), infos[k].ebp_gpr);
         for &d in &[l0, l1, l2, l3] {
             infos[d].kind = LineKind::Nop;
         }
@@ -4849,7 +4940,7 @@ fn fold_x87_gp_pair_unstaging(store: &mut LineStore, infos: &mut [LineInfo]) -> 
         // ---- apply: retarget the x87 store, nop the four GP lines ----
         let folded = format!("    {} {}", mn0, mlo);
         store.replace(a0, folded);
-        infos[a0] = classify_line(store.get(a0));
+        infos[a0] = classify_line_ctx(store.get(a0), infos[a0].ebp_gpr);
         for &d in &[a1, a2, a3, a4] {
             infos[d].kind = LineKind::Nop;
         }
@@ -5984,7 +6075,7 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     if let Some(new_line) = replace_att_source_reg(store.get(j), dst_name, src_name)
                     {
                         store.replace(j, new_line);
-                        let re = classify_line(store.get(j));
+                        let re = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         infos[j] = LineInfo {
                             trim_start: infos[j].trim_start,
                             ..re
@@ -6030,7 +6121,7 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 };
                 if let Some(new_line) = new_line {
                     store.replace(j, new_line);
-                    let re = classify_line(store.get(j));
+                    let re = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                     infos[j] = LineInfo {
                         trim_start: infos[j].trim_start,
                         ..re
@@ -6297,16 +6388,47 @@ impl GprLiveness {
     }
 }
 
-/// `[start, end)` line ranges of every function body: from the global label
-/// (`name:` not starting with `.`) up to its `.cfi_endproc`/`.size`.
-/// Identical to the per-function walk in `optimize_cfg_register_liveness`.
+/// Section kind in effect for each line, after any section switch on that
+/// line itself. Dead (nop) lines are skipped; no pass deletes a section
+/// directive, and a deleted one emits nothing.
+fn line_section_kinds(store: &LineStore, infos: &[LineInfo]) -> Vec<SectionKind> {
+    let mut tracker = SectionTracker::default();
+    (0..infos.len())
+        .map(|n| {
+            if !infos[n].is_nop() {
+                if let Some(switch) = section_switch(trimmed(store, &infos[n], n)) {
+                    tracker.apply(switch);
+                }
+            }
+            tracker.current()
+        })
+        .collect()
+}
+
+/// `[start, end)` line ranges of every function body: from a global label
+/// (`name:` not starting with `.`) assembled into a code section, up to its
+/// `.cfi_endproc`/`.size`. The single definition of a function boundary for
+/// every whole-function pass in this file. `.size f, .-f` is the closer that
+/// is always emitted: `-fno-asynchronous-unwind-tables` (the realmode rule)
+/// suppresses the CFI pair the x86-64 passes key on.
+///
+/// The section condition is what keeps data objects out. This backend emits
+/// `.size sym, N` *before* a data label, so a data label taken as a function
+/// start ran to the next `.size` -- for the last object before `.text`, that
+/// is the `.size` (or `.cfi_endproc`) of the first function after it, which
+/// therefore never got an extent of its own: its liveness was computed as part
+/// of a range opening with `.zero` lines, its prologue was not at the range
+/// start, and every pass keyed on either missed it. A label in a section of
+/// unknown kind starts no function -- that function loses coverage (all
+/// registers live, prologue passes skip it), never soundness.
 fn function_extents(store: &LineStore, infos: &[LineInfo]) -> Vec<(usize, usize)> {
     let len = infos.len();
+    let kinds = line_section_kinds(store, infos);
     let mut out = Vec::new();
     let mut start = 0usize;
     while start < len {
         while start < len {
-            if infos[start].kind == LineKind::Label {
+            if infos[start].kind == LineKind::Label && kinds[start] == SectionKind::Code {
                 let line = trimmed(store, &infos[start], start);
                 if line.ends_with(':') && !line.starts_with('.') {
                     break;
@@ -6329,6 +6451,32 @@ fn function_extents(store: &LineStore, infos: &[LineInfo]) -> Vec<(usize, usize)
         start = end;
     }
     out
+}
+
+/// Per line, whether it lies in a function that may execute bytes
+/// `line_reg_use_def` cannot see: a data directive (`.byte 0xb8 ...`) placed
+/// where code runs. Data in a section known not to hold code (a jump-table
+/// island in `.rodata`) is not executed, and a parsed section switch emits
+/// nothing, so neither taints its function; a data directive in a code or
+/// unknown section, or a compound statement that may switch sections, does.
+fn functions_with_hidden_code(store: &LineStore, infos: &[LineInfo]) -> Vec<bool> {
+    let kinds = line_section_kinds(store, infos);
+    let mut hidden = vec![false; infos.len()];
+    for (s, e) in function_extents(store, infos) {
+        let tainted = (s..e).any(|n| {
+            !infos[n].is_nop()
+                && opaque_data_directive(store, infos, n)
+                && match section_switch(trimmed(store, &infos[n], n)) {
+                    Some(SectionSwitch::Opaque) => true,
+                    Some(_) => false,
+                    None => kinds[n] != SectionKind::NonCode,
+                }
+        });
+        if tainted {
+            hidden[s..e].fill(true);
+        }
+    }
+    hidden
 }
 
 /// Backward GPR liveness over `[start, end)`; returns the live-out bitmask
@@ -6437,30 +6585,8 @@ fn optimize_cfg_register_liveness(
     infos: &mut [LineInfo],
     consume_return_marker: bool,
 ) -> bool {
-    let len = infos.len();
     let mut changed = false;
-    let mut start = 0usize;
-    while start < len {
-        while start < len {
-            if infos[start].kind == LineKind::Label {
-                let line = trimmed(store, &infos[start], start);
-                if line.ends_with(':') && !line.starts_with('.') {
-                    break;
-                }
-            }
-            start += 1;
-        }
-        if start >= len {
-            break;
-        }
-        let mut end = start + 1;
-        while end < len {
-            let line = trimmed(store, &infos[end], end);
-            if line == ".cfi_endproc" || line.starts_with(".size ") {
-                break;
-            }
-            end += 1;
-        }
+    for (start, end) in function_extents(store, infos) {
         let n = end - start;
         let return_uses_edx = (start..end).any(|i| {
             !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
@@ -6528,7 +6654,7 @@ fn optimize_cfg_register_liveness(
                 // the retargeted value after the setup copy is removed.
                 let replacement = store.get(mid).replace("%eax", reg32_name(reg));
                 store.replace(mid, replacement);
-                let re = classify_line(store.get(mid));
+                let re = classify_line_ctx(store.get(mid), infos[mid].ebp_gpr);
                 infos[mid] = LineInfo {
                     trim_start: infos[mid].trim_start,
                     ..re
@@ -6600,7 +6726,7 @@ fn optimize_cfg_register_liveness(
             }
             let new_line = format!("    {}, {}", src_part, reg32_name(dst));
             store.replace(i, new_line);
-            let re = classify_line(store.get(i));
+            let re = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
             infos[i] = LineInfo {
                 trim_start: infos[i].trim_start,
                 ..re
@@ -6651,7 +6777,7 @@ fn optimize_cfg_register_liveness(
                 j,
                 format!("    movl {}, {}({})", reg32_name(src), disp, base),
             );
-            let re = classify_line(store.get(j));
+            let re = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
             infos[j] = LineInfo {
                 trim_start: infos[j].trim_start,
                 ..re
@@ -6722,7 +6848,7 @@ fn optimize_cfg_register_liveness(
             };
             let fused = format!("    cmpl {}, {}({})", imm, disp, base);
             store.replace(j, fused);
-            let re = classify_line(store.get(j));
+            let re = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
             infos[j] = LineInfo {
                 trim_start: infos[j].trim_start,
                 ..re
@@ -6751,7 +6877,6 @@ fn optimize_cfg_register_liveness(
                 changed = true;
             }
         }
-        start = end.saturating_add(1);
     }
     changed
 }
@@ -7217,6 +7342,7 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             has_indirect_mem: false,
             ebp_offset: EBP_OFFSET_NONE,
             inert_dir: false,
+            ebp_gpr: false,
         };
 
         changed = true;
@@ -7602,6 +7728,7 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             has_indirect_mem: false,
             ebp_offset: EBP_OFFSET_NONE,
             inert_dir: false,
+            ebp_gpr: false,
         };
         changed = true;
         i = t + 1;
@@ -7832,7 +7959,7 @@ fn fold_arithmetic_test_sign_jcc_i686(store: &mut LineStore, infos: &mut [LineIn
     /// CMOV is a reader and vetoes; a partial writer (INC/DEC/NEG) does not end
     /// the walk because it leaves CF alive.
     fn no_later_flag_reader(store: &LineStore, infos: &[LineInfo], jcc: usize) -> bool {
-        let Some(&(fs, fe)) = function_ranges_i686(store, infos)
+        let Some(&(fs, fe)) = function_extents(store, infos)
             .iter()
             .find(|&&(s, e)| s <= jcc && jcc < e)
         else {
@@ -7999,6 +8126,7 @@ fn fold_arithmetic_test_sign_jcc_i686(store: &mut LineStore, infos: &mut [LineIn
             has_indirect_mem: false,
             ebp_offset: EBP_OFFSET_NONE,
             inert_dir: false,
+            ebp_gpr: false,
         };
         changed = true;
         i = j + 1;
@@ -8108,7 +8236,7 @@ fn fuse_sext_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             continue;
         }
         store.replace(i, format!("    {} {}, {}", narrow_mnem, narrow, narrow));
-        infos[i] = classify_line(store.get(i));
+        infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
         infos[j].kind = LineKind::Nop;
         changed = true;
         i = j + 1;
@@ -8595,6 +8723,9 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
 
     let mut changed = false;
     let len = infos.len();
+    // Whole-function liveness plus a per-line "function holds opaque data"
+    // mask, computed at the first scan that ends at a barrier (see below).
+    let mut oracle: Option<(GprLiveness, Vec<bool>)> = None;
     let mut i = 0;
     while i + 2 < len {
         if infos[i].is_nop() {
@@ -8665,12 +8796,16 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
         let reg_bit: u16 = 1 << reg;
         let mut k = st_idx + 1;
         let mut reg_dead = false;
+        // The scan ended at a label/jump/call/ret (or the end of the text)
+        // without a verdict: control flow, not a read, stopped it.
+        let mut undecided_at_barrier = true;
         while k < len {
             if steps_over_line(store, infos, k) {
                 k += 1;
                 continue;
             }
             if opaque_data_directive(store, infos, k) {
+                undecided_at_barrier = false;
                 break; // a hidden write/read: nothing is provable
             }
             // `popl %REG` in the epilogue is a pure restore (def) of the
@@ -8690,6 +8825,7 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
             }
             let (uses, defs) = line_reg_use_def(store, infos, k);
             if uses & reg_bit != 0 {
+                undecided_at_barrier = false;
                 break; // stale value would be read
             }
             if defs & reg_bit != 0 {
@@ -8698,17 +8834,47 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
             }
             k += 1;
         }
+        // Across control flow the whole-function oracle decides, as it does
+        // for `fold_memory_operands`: a counter bumped at the end of a block
+        // (`movl SLOT,%eax; incl %eax; movl %eax,SLOT` before a loop label)
+        // is the common shape, and the local scan alone kept it as three
+        // instructions whenever the block's next line was not an %eax write.
+        // The oracle stays valid across this sweep's collapses: each one
+        // deletes a definition of a register proven dead and two of its uses,
+        // and moves the op's source operand between adjacent code lines, so
+        // no register becomes live anywhere it was not. Functions that may
+        // execute data directives are excluded (`functions_with_hidden_code`):
+        // `line_reg_use_def` sees no register in a `.byte`-encoded
+        // instruction, and the local scan refuses those too.
+        if !reg_dead && undecided_at_barrier {
+            let (lv, opaque) = oracle.get_or_insert_with(|| {
+                (
+                    GprLiveness::compute(store, infos),
+                    functions_with_hidden_code(store, infos),
+                )
+            });
+            reg_dead = !opaque[st_idx] && lv.dead_after(st_idx, reg);
+        }
         if !reg_dead {
             i += 1;
             continue;
         }
-        // Collapse.
-        let mem_op = match src {
-            Some(src) => format!("    {} {}, {}", mnem, src, slot),
-            None => format!("    {} {}", mnem, slot),
+        // Collapse. A memory `inc`/`dec` decodes to one more fused-domain
+        // uop than `add`/`sub $1` on Intel P-cores (3 vs 2 retire slots on
+        // Skylake and Alder Lake-P, per uops.info; equal on Zen 4), which is
+        // why this backend emits memory increments as `addl $1` everywhere
+        // else. The two forms differ only in CF, which `inc` preserves, so
+        // the `add` form needs CF dead past the store.
+        let mem_op = match (src, mnem) {
+            (Some(src), _) => format!("    {} {}, {}", mnem, src, slot),
+            (None, "incl" | "decl") if !flags_live_after(store, infos, st_idx, true) => {
+                let op = if mnem == "incl" { "addl" } else { "subl" };
+                format!("    {} $1, {}", op, slot)
+            }
+            (None, _) => format!("    {} {}", mnem, slot),
         };
         store.replace(i, mem_op);
-        infos[i] = classify_line(store.get(i));
+        infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
         infos[op_idx].kind = LineKind::Nop;
         infos[st_idx].kind = LineKind::Nop;
         changed = true;
@@ -8824,6 +8990,7 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     has_indirect_mem: false,
                     ebp_offset: offset,
                     inert_dir: false,
+                    ebp_gpr: false,
                 };
                 infos[i].kind = LineKind::Nop; // Remove the load
                 changed = true;
@@ -9099,7 +9266,7 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
         // do, but the invariant is load-bearing for the ZF-only gate).
         let _ = test_shape;
         store.replace(i, new_text);
-        infos[i] = classify_line(store.get(i));
+        infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
         infos[j].kind = LineKind::Nop;
         changed = true;
         i += 1;
@@ -9692,7 +9859,7 @@ fn fold_copy_subreg_extend(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
         let mnem_end = tj.find(' ').unwrap_or(0);
         let mnem = &tj[..mnem_end];
         store.replace(j, format!("    {mnem} {new_src}, {ext_dst_text}"));
-        infos[j] = classify_line(store.get(j));
+        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
         // The copy's value is unobservable: delete it.
         infos[i].kind = LineKind::Nop;
         changed = true;
@@ -9870,7 +10037,7 @@ fn narrow_dead_and_to_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
         }
         if is_reader {
             store.replace(i, format!("    testb ${imm}, {low}"));
-            infos[i] = classify_line(store.get(i));
+            infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
         } else {
             infos[i].kind = LineKind::Nop;
         }
@@ -10282,7 +10449,7 @@ fn fold_zext_pair_reg_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             continue;
         }
         store.replace(k, format!("    {} {}, {}", mnem, op_s, op_d));
-        infos[k] = classify_line(store.get(k));
+        infos[k] = classify_line_ctx(store.get(k), infos[k].ebp_gpr);
         infos[i].kind = LineKind::Nop;
         infos[j].kind = LineKind::Nop;
         changed = true;
@@ -11035,7 +11202,7 @@ fn rewrite_label_token(
     new_raw.push_str(&raw[end..]);
     if new_raw != raw {
         store.replace(idx, new_raw);
-        infos[idx] = classify_line(store.get(idx));
+        infos[idx] = classify_line_ctx(store.get(idx), infos[idx].ebp_gpr);
     }
 }
 
@@ -11507,7 +11674,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     let t = trimmed(store, &infos[j], j);
                     if let Some(new_insn) = narrow_ext_from_slot(t, disp, r32) {
                         store.replace(j, new_insn);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         // Deletion convention: mark the staging load as a
                         // nop and leave the original text in place.
                         infos[i].kind = LineKind::Nop;
@@ -11550,7 +11717,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             };
                             let new_cmp = format!("    cmpw ${}, {}", imm_text, r16);
                             store.replace(i, new_cmp);
-                            infos[i] = classify_line(store.get(i));
+                            infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
                             changed = true;
                             i = i1;
                             continue;
@@ -11616,7 +11783,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     if y != x {
                         let new_xor = format!("    xorl {}, {}", y, y);
                         store.replace(j, new_xor);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         changed = true;
                     }
                     i = j + 1;
@@ -11632,7 +11799,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     if (src2 == (op_src, op_dst)) || (src2 == (op_dst, op_src)) {
                         let new_test = format!("    testl {}, {}", op_src, op_src);
                         store.replace(j, new_test);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         changed = true;
                         i = j + 1;
                         continue;
@@ -11645,7 +11812,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         // `movl $imm,%C; andl %C,%X` -> `andl $imm,%X`
                         let new_alu = format!("    {} ${}, {}", mnem, imm_text, other.1);
                         store.replace(j, new_alu);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         changed = true;
                         i = j + 1;
                         continue;
@@ -11677,7 +11844,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     {
                         let new_store = format!("    movl ${}, {}(%esp)", imm_text, disp);
                         store.replace(j, new_store);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         infos[i].kind = LineKind::Nop;
                         changed = true;
                         i = j + 1;
@@ -11709,7 +11876,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     {
                         let new_copy = format!("    movl ${}, {}", val_text, c);
                         store.replace(j, new_copy);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         infos[i].kind = LineKind::Nop;
                         changed = true;
                         i = j + 1;
@@ -11738,7 +11905,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     {
                         let new_cmp = format!("    {} ${}, {}", mnem, imm_of(&t), op_src);
                         store.replace(j, new_cmp);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         infos[i].kind = LineKind::Nop;
                         changed = true;
                         i = j + 1;
@@ -11777,7 +11944,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         let o1 = if other == op_dst { op_src } else { other };
                         let new_cmp = format!("    {} {}, {}", mnem, o1, op_src);
                         store.replace(j, new_cmp);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         infos[i].kind = LineKind::Nop;
                         changed = true;
                         i = j + 1;
@@ -11839,7 +12006,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             {
                                 let new_cmp = format!("    cmpl ${}, {}", fused, op_src);
                                 store.replace(i2, new_cmp);
-                                infos[i2] = classify_line(store.get(i2));
+                                infos[i2] = classify_line_ctx(store.get(i2), infos[i2].ebp_gpr);
                                 infos[i].kind = LineKind::Nop;
                                 infos[i1].kind = LineKind::Nop;
                                 changed = true;
@@ -11883,7 +12050,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     {
                         let new_test = format!("    testl ${}, {}", imm.unwrap(), op_src);
                         store.replace(j, new_test);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         infos[i].kind = LineKind::Nop;
                         changed = true;
                         i = i1;
@@ -11904,7 +12071,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     if let Some(sub) = low_subreg_name(src_reg, width) {
                         let new_load = format!("    {} {}, {}", mnem, sub, dst);
                         store.replace(j, new_load);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         changed = true;
                         i = j + 1;
                         continue;
@@ -11931,7 +12098,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     {
                         let new_add = format!("    addl {}, {}", x, x);
                         store.replace(j, new_add);
-                        infos[j] = classify_line(store.get(j));
+                        infos[j] = classify_line_ctx(store.get(j), infos[j].ebp_gpr);
                         infos[i].kind = LineKind::Nop;
                         changed = true;
                         i = j + 1;
@@ -12068,7 +12235,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     t[..t.len() - 1].to_string() // strip ':'
                 };
                 store.replace(xj, format!("    jmp {}", yname));
-                infos[xj] = classify_line(store.get(xj));
+                infos[xj] = classify_line_ctx(store.get(xj), infos[xj].ebp_gpr);
                 for &x in insns.iter().skip(1) {
                     infos[x].kind = LineKind::Nop;
                 }
@@ -12609,7 +12776,7 @@ fn fold_global_fnptr_calls(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
                 infos[m.li].kind = LineKind::Nop;
                 infos[m.sj].kind = LineKind::Nop;
                 store.replace(m.ck, format!("    call *{}", m.sym));
-                infos[m.ck] = classify_line(store.get(m.ck));
+                infos[m.ck] = classify_line_ctx(store.get(m.ck), infos[m.ck].ebp_gpr);
                 changed = true;
             }
         }
@@ -12862,7 +13029,10 @@ fn eliminate_never_read_stores_range(
                 continue;
             }
             if matches!(infos[i].kind, LineKind::Other { .. }) {
-                if let Some((_, slot, size)) = parse_immediate_store(trimmed(store, &infos[i], i)) {
+                if let Some((_, slot, size)) = parse_immediate_store(&data_ebp_view(
+                    trimmed(store, &infos[i], i),
+                    infos[i].ebp_gpr,
+                )) {
                     v.push((i, slot, size));
                 }
             }
@@ -12994,31 +13164,9 @@ fn parse_esp_adjust(line: &str, mnemonic: &str) -> Option<u32> {
 /// `sub $(F+4N)`/`add $(F+4N)`.  The body therefore sees the identical ESP,
 /// while the remaining saved registers become a compact push/pop sequence.
 fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) {
-    let len = infos.len();
-    let mut start = 0usize;
-    while start < len {
+    for (start, end) in function_extents(store, infos) {
         // A non-local label starts a generated function.  Local basic-block
         // labels begin with `.L` and remain inside the current range.
-        while start < len {
-            if infos[start].kind == LineKind::Label {
-                let line = trimmed(store, &infos[start], start);
-                if line.ends_with(':') && !line.starts_with('.') {
-                    break;
-                }
-            }
-            start += 1;
-        }
-        if start >= len {
-            break;
-        }
-        let mut end = start + 1;
-        while end < len {
-            let line = trimmed(store, &infos[end], end);
-            if line == ".cfi_endproc" || line.starts_with(".size ") {
-                break;
-            }
-            end += 1;
-        }
 
         // A real frame pointer needs different CFA/frame-layout accounting.
         // Omit-frame-pointer code may still use EBP as an ordinary register.
@@ -13030,7 +13178,6 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
             line.contains("(%ebp)") || line == "movl %esp, %ebp"
         });
         if has_frame_pointer {
-            start = end.saturating_add(1);
             continue;
         }
 
@@ -13056,7 +13203,6 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
             }
         }
         if prologue_pushes.is_empty() {
-            start = end.saturating_add(1);
             continue;
         }
 
@@ -13171,7 +13317,6 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                     && !is_tls_descriptor_call(trimmed(store, &infos[i], i))
             });
             if has_inline_asm {
-                start = end.saturating_add(1);
                 continue;
             }
             let mut envelope_ok = true;
@@ -13301,7 +13446,6 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                 envelope_ok = false;
             }
             if !envelope_ok {
-                start = end.saturating_add(1);
                 continue;
             }
             Shape::Framed
@@ -13311,12 +13455,10 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
             let any_esp_text = (start..end)
                 .any(|i| !infos[i].is_nop() && trimmed(store, &infos[i], i).contains("%esp"));
             if any_esp_text {
-                start = end.saturating_add(1);
                 continue;
             }
             Shape::Frameless
         } else {
-            start = end.saturating_add(1);
             continue;
         };
 
@@ -13456,17 +13598,17 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                 let growth = if crossing { 3 * (1 + addls.len()) } else { 0 };
                 let saving = 2 * removals.len();
                 if growth >= saving {
-                    start = end.saturating_add(1);
                     continue;
                 }
                 store.replace(
                     alloc_idx,
                     format!("    subl ${}, %esp", alloc_value + bytes),
                 );
-                infos[alloc_idx] = classify_line(store.get(alloc_idx));
+                infos[alloc_idx] =
+                    classify_line_ctx(store.get(alloc_idx), infos[alloc_idx].ebp_gpr);
                 for &(idx, v) in &addls {
                     store.replace(idx, format!("    addl ${}, %esp", v + bytes));
-                    infos[idx] = classify_line(store.get(idx));
+                    infos[idx] = classify_line_ctx(store.get(idx), infos[idx].ebp_gpr);
                 }
             }
             for (push, pops) in removals {
@@ -13480,12 +13622,10 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                     .trim()
                     .to_string();
                 store.replace(call, format!("    jmp {target}"));
-                infos[call] = classify_line(store.get(call));
+                infos[call] = classify_line_ctx(store.get(call), infos[call].ebp_gpr);
                 infos[ret].kind = LineKind::Nop;
             }
         }
-
-        start = end.saturating_add(1);
     }
 }
 /// Remove a function's stack-frame allocation/deallocation when the frame is
@@ -13523,31 +13663,9 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
     if std::env::var_os("CCC_NO_I686_DEAD_FRAME_ELISION").is_some() {
         return;
     }
-    let len = infos.len();
-    let mut start = 0usize;
-    while start < len {
+    for (start, end) in function_extents(store, infos) {
         // Find the next function: a non-local label (local basic blocks are
         // `.L*`).
-        while start < len {
-            if infos[start].kind == LineKind::Label {
-                let line = trimmed(store, &infos[start], start);
-                if line.ends_with(':') && !line.starts_with('.') {
-                    break;
-                }
-            }
-            start += 1;
-        }
-        if start >= len {
-            break;
-        }
-        let mut end = start + 1;
-        while end < len {
-            let line = trimmed(store, &infos[end], end);
-            if line == ".cfi_endproc" || line.starts_with(".size ") {
-                break;
-            }
-            end += 1;
-        }
 
         // Reject a frame-pointer function: esp-relative accounting differs.
         let has_frame_pointer = (start..end).any(|i| {
@@ -13558,7 +13676,6 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
             line.contains("(%ebp)") || line == "movl %esp, %ebp"
         });
         if has_frame_pointer {
-            start = end.saturating_add(1);
             continue;
         }
 
@@ -13612,7 +13729,6 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
             && !has_push_or_pop
             && !other_esp;
         if !shape_ok {
-            start = end.saturating_add(1);
             continue;
         }
         let alloc_idx = subls[0].0;
@@ -13654,7 +13770,6 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
             }
         }
         if !flow_ok {
-            start = end.saturating_add(1);
             continue;
         }
 
@@ -13663,8 +13778,6 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
         for &(ai, _) in &addls {
             infos[ai].kind = LineKind::Nop;
         }
-
-        start = end.saturating_add(1);
     }
 }
 
@@ -14104,6 +14217,7 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
                 has_indirect_mem: true,
                 ebp_offset: EBP_OFFSET_NONE,
                 inert_dir: false,
+                ebp_gpr: false,
             };
         }
     }
@@ -14135,10 +14249,7 @@ pub fn peephole_optimize(asm: String) -> String {
         return crate::backend::peephole_common::strip_volatile_markers(asm);
     }
     let mut store = LineStore::new(asm);
-    let line_count = store.len();
-    let mut infos: Vec<LineInfo> = (0..line_count)
-        .map(|i| classify_line(store.get(i)))
-        .collect();
+    let mut infos = classify_all(&store);
     let debug_rows = hide_debug_rows(&store, &mut infos);
     pin_inline_asm_regions(&store, &mut infos);
 
@@ -14531,7 +14642,7 @@ fn try_fold_sext_zext_at(
             zdst
         ),
     );
-    infos[sext_idx] = classify_line(store.get(sext_idx));
+    infos[sext_idx] = classify_line_ctx(store.get(sext_idx), infos[sext_idx].ebp_gpr);
     infos[zext_idx].kind = LineKind::Nop;
     true
 }
@@ -14616,7 +14727,7 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
                             i,
                             format!("    movl {}, {}", reg32_name(sf), reg32_name(df)),
                         );
-                        infos[i] = classify_line(store.get(i));
+                        infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
                         is_byte[df as usize] = true;
                         is_16[df as usize] = true;
                         changed = true;
@@ -14819,7 +14930,7 @@ fn fold_copy_narrow_ext_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> 
                     reg32_name(dst)
                 ),
             );
-            infos[i] = classify_line(store.get(i));
+            infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
             infos[j].kind = LineKind::Nop;
             changed = true;
             fused = true;
@@ -14887,7 +14998,7 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
                                 i,
                                 format!("    movl {}, {}", reg32_name(sf), reg32_name(df)),
                             );
-                            infos[i] = classify_line(store.get(i));
+                            infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
                             sign_ext[df as usize] = true;
                             is_bool[df as usize] = is_bool[sf as usize];
                             changed = true;
@@ -15210,7 +15321,7 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
             if let Some(jmp) = jmp_text {
                 infos[i].kind = LineKind::Nop;
                 store.replace(ridx, format!("    {}", jmp));
-                infos[ridx] = classify_line(store.get(ridx));
+                infos[ridx] = classify_line_ctx(store.get(ridx), infos[ridx].ebp_gpr);
                 changed = true;
             }
         }
@@ -15373,42 +15484,6 @@ fn fresh_epilogue_label(seq: &mut u64, occupied: &mut HashSet<String>) -> String
     }
 }
 
-/// Function ranges of a whole TU: `(first_line, one_past_last)`.  Same
-/// boundary idiom as `eliminate_unused_callee_saves` — a non-local label
-/// starts a generated function, `.cfi_endproc`/`.size` closes it — because
-/// `-fno-asynchronous-unwind-tables` (the realmode rule) suppresses the CFI
-/// pair the x86-64 pass keys on, while `.size f, .-f` is always emitted.
-fn function_ranges_i686(store: &LineStore, infos: &[LineInfo]) -> Vec<(usize, usize)> {
-    let len = store.len();
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    while start < len {
-        while start < len {
-            if infos[start].kind == LineKind::Label {
-                let line = trimmed(store, &infos[start], start);
-                if line.ends_with(':') && !line.starts_with('.') {
-                    break;
-                }
-            }
-            start += 1;
-        }
-        if start >= len {
-            break;
-        }
-        let mut end = start + 1;
-        while end < len {
-            let line = trimmed(store, &infos[end], end);
-            if line == ".cfi_endproc" || line.starts_with(".size ") {
-                break;
-            }
-            end += 1;
-        }
-        ranges.push((start, end.min(len)));
-        start = end.saturating_add(1);
-    }
-    ranges
-}
-
 fn merge_epilogue_tails_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     if std::env::var_os("CCC_NO_I686_EPILOGUE_MERGE").is_some() {
         return false;
@@ -15419,7 +15494,7 @@ fn merge_epilogue_tails_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> b
     let mut changed = false;
     let mut label_seq = 0u64;
     let mut occupied = occupied_label_names_i686(store);
-    for (start, end) in function_ranges_i686(store, infos) {
+    for (start, end) in function_extents(store, infos) {
         changed |= merge_one_function_i686(store, infos, start, end, &mut label_seq, &mut occupied);
     }
     changed
@@ -15528,14 +15603,14 @@ fn merge_one_function_i686(
                 let label = fresh_epilogue_label(label_seq, occupied);
                 let at = exits[host].line_of[host_parts.len() - guest_parts.len()];
                 store.replace(at, format!("{label}:\n{}", store.get(at).trim_end()));
-                infos[at] = classify_line(store.get(at));
+                infos[at] = classify_line_ctx(store.get(at), infos[at].ebp_gpr);
                 host_labels.insert(key, label.clone());
                 label
             };
 
             let (start, ret_idx) = (exits[guest].start, exits[guest].ret_idx);
             store.replace(start, format!("    jmp {label}"));
-            infos[start] = classify_line(store.get(start));
+            infos[start] = classify_line_ctx(store.get(start), infos[start].ebp_gpr);
             for k in (start + 1)..=ret_idx {
                 infos[k].kind = LineKind::Nop;
             }
@@ -15554,9 +15629,7 @@ fn merge_duplicate_epilogues_terminal(asm: String) -> String {
         return asm;
     }
     let mut store = LineStore::new(asm.clone());
-    let mut infos: Vec<LineInfo> = (0..store.len())
-        .map(|i| classify_line(store.get(i)))
-        .collect();
+    let mut infos = classify_all(&store);
     let debug_rows = hide_debug_rows(&store, &mut infos);
     pin_inline_asm_regions(&store, &mut infos);
     if !merge_epilogue_tails_i686(&mut store, &mut infos) {
@@ -17378,7 +17451,7 @@ mod tests {
     fn test_redundant_store_load() {
         // With a frame-pointer prologue, (%ebp) slots are genuine frame
         // slots: the load is forwarded and the never-read store deleted.
-        let asm = "    pushl %ebp\n    movl %esp, %ebp\n    movl %eax, -8(%ebp)\n    movl -8(%ebp), %eax\n    popl %ebp\n    ret\n".to_string();
+        let asm = "f:\n    pushl %ebp\n    movl %esp, %ebp\n    movl %eax, -8(%ebp)\n    movl -8(%ebp), %eax\n    popl %ebp\n    ret\n".to_string();
         let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("-8(%ebp)"),
@@ -18079,6 +18152,135 @@ mod tests {
         );
     }
 
+    /// A `(%ebp)` operand on a data `%ebp` classifies exactly like the same
+    /// operand on any other base register; with a frame pointer the
+    /// classification is the context-free one.
+    #[test]
+    fn data_ebp_operands_classify_like_any_other_base() {
+        for line in [
+            "    movl %edi, (%ebp)",
+            "    movl %eax, -8(%ebp)",
+            "    movb %al, 3(%ebp)",
+            "    movw %ax, 2(%ebp)",
+            "    movl 4(%ebp), %eax",
+            "    movzbl 1(%ebp), %ecx",
+            "    movl $7, 12(%ebp)",
+            "    addl $1, 8(%ebp)",
+            "    incl (%ebp)",
+            "    cmpl $0, 4(%ebp)",
+            "    leal 16(%ebp), %eax",
+            "    fldl 8(%ebp)",
+            "    pushl 4(%ebp)",
+            "    movl (%ebp,%eax,4), %edx",
+        ] {
+            let framed = classify_line_ctx(line, false);
+            let plain = classify_line(line);
+            assert_eq!(
+                (
+                    framed.kind,
+                    framed.has_indirect_mem,
+                    framed.ebp_offset,
+                    framed.ebp_gpr
+                ),
+                (plain.kind, plain.has_indirect_mem, plain.ebp_offset, false),
+                "{line}"
+            );
+            let data = classify_line_ctx(line, true);
+            let other = classify_line(&line.replace("(%ebp", "(%ecx"));
+            assert_eq!(
+                (
+                    data.kind,
+                    data.has_indirect_mem,
+                    data.ebp_offset,
+                    data.ebp_gpr
+                ),
+                (other.kind, other.has_indirect_mem, other.ebp_offset, true),
+                "{line}"
+            );
+            assert!(
+                !matches!(
+                    data.kind,
+                    LineKind::StoreEbp { .. } | LineKind::LoadEbp { .. }
+                ),
+                "{line}"
+            );
+            assert_eq!(data.ebp_offset, EBP_OFFSET_NONE, "{line}");
+        }
+        // `(%esp)` slots are frame slots in both contexts.
+        let esp = classify_line_ctx("    movl %eax, 8(%esp)", true);
+        assert!(matches!(esp.kind, LineKind::StoreEbp { .. }));
+    }
+
+    /// Frame semantics for `(%ebp)` need the function's own
+    /// `movl %esp, %ebp`; mentioning `(%ebp)` is not a proof, and a line
+    /// outside every function gets none.
+    #[test]
+    fn classify_all_grants_frame_slots_only_under_a_frame_proof() {
+        let asm = "    movl %eax, -4(%ebp)\n\
+                   framed:\n    pushl %ebp\n    movl %esp, %ebp\n    movl %eax, -8(%ebp)\n    popl %ebp\n    ret\n\
+                   .size framed, .-framed\n\
+                   data:\n    pushl %ebp\n    movl 8(%esp), %ebp\n    movl %eax, -8(%ebp)\n    popl %ebp\n    ret\n\
+                   .size data, .-data\n";
+        let store = LineStore::new(asm.to_string());
+        let infos = classify_all(&store);
+        let kind_of = |needle: &str, nth: usize| {
+            let i = (0..store.len())
+                .filter(|&i| store.get(i).contains(needle))
+                .nth(nth)
+                .unwrap();
+            infos[i]
+        };
+        assert!(kind_of("-4(%ebp)", 0).ebp_gpr, "outside every function");
+        let framed = kind_of("-8(%ebp)", 0);
+        assert!(!framed.ebp_gpr && matches!(framed.kind, LineKind::StoreEbp { offset: -8, .. }));
+        let data = kind_of("-8(%ebp)", 1);
+        assert!(data.ebp_gpr && data.has_indirect_mem);
+        assert!(!matches!(data.kind, LineKind::StoreEbp { .. }));
+    }
+
+    /// The miscompile: two stores through `%ebp`, reloaded in between, in a
+    /// function without a frame pointer. Both are writes through different
+    /// pointers and both survive, for register and immediate sources and
+    /// across every peephole round; the framed control proves the same
+    /// shape is still a dead store where `(%ebp)` IS one slot.
+    #[test]
+    fn stores_through_a_reloaded_data_ebp_are_not_dead() {
+        for (first, second) in [
+            ("movl %edi, (%ebp)", "movl %edi, (%ebp)"),
+            ("movl $1, 4(%ebp)", "movl $2, 4(%ebp)"),
+            ("movb %al, (%ebp)", "movb %al, (%ebp)"),
+        ] {
+            let asm = format!(
+                "f:\n    pushl %ebp\n    pushl %edi\n    movl 12(%esp), %ebp\n    movl 16(%esp), %edi\n    movl $5, %eax\n    {first}\n    movl 20(%esp), %ebp\n    {second}\n    popl %edi\n    popl %ebp\n    ret\n.size f, .-f\n"
+            );
+            let out = peephole_optimize(asm);
+            if first == second {
+                assert_eq!(out.matches(first).count(), 2, "{first}:\n{out}");
+            } else {
+                assert_eq!(out.matches(first).count(), 1, "{first}:\n{out}");
+                assert_eq!(out.matches(second).count(), 1, "{second}:\n{out}");
+            }
+        }
+        // One slot written twice and never read. With a frame proof it is
+        // this activation's slot and dies with the frame: both stores go.
+        // The same text with `%ebp` loaded from the stack writes memory the
+        // caller sees after `ret`: the last store must survive. (Deleting the
+        // first one is sound in both readings, so it is not asserted.)
+        let shape = |ebp_def: &str| {
+            format!(
+                "g:\n    pushl %ebp\n    {ebp_def}\n    subl $8, %esp\n    movl 20(%esp), %ecx\n    movl 24(%esp), %edx\n    movl %ecx, -8(%ebp)\n    movl %edx, -8(%ebp)\n    addl $8, %esp\n    popl %ebp\n    ret\n.size g, .-g\n"
+            )
+        };
+        let framed = peephole_optimize(shape("movl %esp, %ebp"));
+        assert!(!framed.contains(", -8(%ebp)"), "framed control:\n{framed}");
+        let data = peephole_optimize(shape("movl 8(%esp), %ebp"));
+        assert_eq!(
+            data.matches("movl %edx, -8(%ebp)").count(),
+            1,
+            "data mirror:\n{data}"
+        );
+    }
+
     #[test]
     fn test_store_load_different_reg() {
         // The trailing `pushl %ecx` observes the loaded value: without a
@@ -18086,7 +18288,7 @@ mod tests {
         // load before forwarding can see it (nothing in a ret-free
         // snippet observes %ecx).
         let asm = "    movl %eax, -8(%ebp)\n    movl -8(%ebp), %ecx\n    pushl %ecx\n".to_string();
-        let result = peephole_optimize(asm.to_string());
+        let result = peephole_optimize(in_framed_fn(&asm));
         assert!(
             result.contains("movl %eax, %ecx"),
             "should forward: {}",
@@ -18172,12 +18374,23 @@ mod tests {
         );
     }
 
-    /// Run the peephole over `f: <body>`; `.L2` redefines %eax before
-    /// `ret`, so %eax is dead at the branch target.  A body that wants
-    /// %eax dead on the fallthrough too must redefine it itself.
+    /// `body` as the start of a function with a frame-pointer prologue, so
+    /// its `(%ebp)` operands are frame slots. Without the prologue `%ebp` is
+    /// a data register (`classify_all`), and a slot test would pass or fail
+    /// without reaching the slot logic it is about.
+    fn in_framed_fn(body: &str) -> String {
+        format!("f:\n    pushl %ebp\n    movl %esp, %ebp\n{body}")
+    }
+
+    /// Run the peephole over `f: <prologue> <body>`; `.L2` redefines %eax
+    /// before `ret`, so %eax is dead at the branch target.  A body that
+    /// wants %eax dead on the fallthrough too must redefine it itself.  The
+    /// frame-pointer prologue (flag-neutral, before the body) makes the
+    /// bodies' `(%ebp)` spill slots frame slots.
     fn fuse_out(body: &str) -> String {
-        let asm =
-            format!("f:\n.cfi_startproc\n{body}.L2:\n    xorl %eax, %eax\n    ret\n.cfi_endproc\n");
+        let asm = format!(
+            "f:\n.cfi_startproc\n    pushl %ebp\n    movl %esp, %ebp\n{body}.L2:\n    xorl %eax, %eax\n    ret\n.cfi_endproc\n"
+        );
         peephole_optimize(asm)
     }
 
@@ -18205,11 +18418,11 @@ mod tests {
 
     #[test]
     fn test_compare_branch_fusion_with_store_load() {
-        // The stored boolean is PUBLISHED: -16(%ebp) may be read on either
-        // path later, so the store and the setCC feeding it stay.  The
+        // The stored boolean is PUBLISHED: the fallthrough passes the slot's
+        // address to `h`, so the store and the setCC feeding it stay.  The
         // re-test is still redundant (mov/movzbl preserve EFLAGS).
         let out = fuse_out(&format!(
-            "    cmpl %ecx, %eax\n    setge %al\n    movzbl %al, %eax\n    movl %eax, -16(%ebp)\n    movl -16(%ebp), %eax\n    testl %eax, %eax\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+            "    cmpl %ecx, %eax\n    setge %al\n    movzbl %al, %eax\n    movl %eax, -16(%ebp)\n    movl -16(%ebp), %eax\n    testl %eax, %eax\n    jne .L2\n    leal -16(%ebp), %ecx\n    pushl %ecx\n    call h\n{FUSE_DEAD_FALLTHROUGH}"
         ));
         assert!(out.contains("jge .L2"), "should fuse to jge:\n{out}");
         assert!(!out.contains("testl"), "testl survived:\n{out}");
@@ -18326,29 +18539,36 @@ mod tests {
 
     #[test]
     fn test_dead_store() {
-        // Two consecutive stores to the same slot: first is dead, second survives.
-        // But never-read store elimination also removes the second store if no
-        // loads exist. Use a load after the second store to keep it alive.
+        // Two consecutive stores to the same slot: the first is dead. The
+        // slot's address is passed to `h`, so the second store is observable
+        // and must survive (without a reader, the never-read-store pass
+        // rightly deletes it as well).
         let asm = [
             "    movl %eax, -8(%ebp)",
             "    movl %ecx, -8(%ebp)",
-            "    movl -8(%ebp), %edx",
+            "    leal -8(%ebp), %edx",
+            "    pushl %edx",
+            "    call h",
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm.to_string());
+        let result = peephole_optimize(in_framed_fn(&asm));
         assert!(
             !result.contains("%eax, -8(%ebp)"),
             "first store dead: {}",
             result
         );
-        assert!(result.contains("%ecx"), "second store alive: {}", result);
+        assert!(
+            result.contains("movl %ecx, -8(%ebp)"),
+            "second store alive: {}",
+            result
+        );
     }
 
     #[test]
     fn test_memory_fold() {
         let asm = ["    movl -48(%ebp), %ecx", "    addl %ecx, %eax"].join("\n") + "\n";
-        let result = peephole_optimize(asm.to_string());
+        let result = peephole_optimize(in_framed_fn(&asm));
         assert!(
             result.contains("addl -48(%ebp), %eax"),
             "should fold: {}",
@@ -18380,7 +18600,7 @@ mod tests {
     #[test]
     fn slot_forwarding_positive_control() {
         let asm = ["    movl %eax, -4(%ebp)", "    movl -4(%ebp), %ecx"].join("\n") + "\n";
-        let result = peephole_optimize(asm.to_string());
+        let result = peephole_optimize(in_framed_fn(&asm));
         assert!(
             !result.contains("movl -4(%ebp), %ecx"),
             "same-width slot round-trip should forward, leaving no memory \
@@ -18401,7 +18621,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm.to_string());
+        let result = peephole_optimize(in_framed_fn(&asm));
         assert!(
             result.contains("movl -4(%ebp), %ecx"),
             "the 8-byte x87 store overlaps the tracked 4-byte slot, so the \
@@ -18426,7 +18646,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm.to_string());
+        let result = peephole_optimize(in_framed_fn(&asm));
         assert!(
             result.contains("movl -4(%ebp), %ecx"),
             "a 16-byte SSE store overlaps the tracked slot: {result}"
@@ -18487,7 +18707,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let ebp_result = peephole_optimize(ebp_asm.to_string());
+        let ebp_result = peephole_optimize(in_framed_fn(&ebp_asm));
         assert!(
             ebp_result.contains("movl -4(%ebp), %ecx"),
             "push/pop are unconditional barriers (see the doc comment): the \
@@ -24642,5 +24862,168 @@ mod sign_test_jcc_tests {
         ));
         assert!(!changed, "{out}");
         assert!(out.contains("testl %edx, %edx"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod slot_rmw_cfg_tests {
+    use super::*;
+
+    fn collapse(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<LineInfo> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        collapse_slot_rmw_i686(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// A counter bumped at the end of a block, followed by a loop label: the
+    /// local scan stops at the label, every path past it overwrites %eax
+    /// before reading it, so the bump is one memory RMW. `l2_head` runs
+    /// before `.L2`'s `ret`; `extra` goes right before `.L1`.
+    fn counter_block(l2_head: &str, extra: &str) -> String {
+        format!(
+            "f:\n    movl 8(%esp), %eax\n    incl %eax\n    movl %eax, 8(%esp)\n    \
+             movl 12(%esp), %ebp\n{extra}.L1:\n    cmpl $11, %ebp\n    je .L2\n    \
+             movl 4(%esp), %eax\n    ret\n.L2:\n{l2_head}    ret\n.cfi_endproc\n"
+        )
+    }
+
+    #[test]
+    fn counter_bump_collapses_when_every_successor_overwrites_the_register() {
+        let out = collapse(&counter_block("    movl $0, %eax\n", ""));
+        assert!(out.iter().any(|l| l == "addl $1, 8(%esp)"), "{out:?}");
+        assert!(!out.iter().any(|l| l == "incl %eax"), "{out:?}");
+    }
+
+    #[test]
+    fn counter_bump_stays_when_a_successor_returns_the_register() {
+        // `.L2` returns the bumped value in %eax.
+        let out = collapse(&counter_block("", ""));
+        assert!(out.iter().any(|l| l == "incl %eax"), "{out:?}");
+        assert!(
+            !out.iter()
+                .any(|l| l.ends_with("8(%esp)") && !l.starts_with("movl")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn counter_bump_stays_when_data_sits_in_the_scan_window() {
+        // The local scan meets the `.byte` before any barrier and stops
+        // there with no verdict; the CFG fallback is not consulted.
+        let out = collapse(&counter_block("    movl $0, %eax\n", "    .byte 0x90\n"));
+        assert!(out.iter().any(|l| l == "incl %eax"), "{out:?}");
+    }
+
+    #[test]
+    fn counter_bump_stays_when_the_function_holds_opaque_data_elsewhere() {
+        // The scan reaches the `.L1` barrier cleanly, so the CFG fallback is
+        // asked, and the CFG proof alone would succeed. But a `.byte` in a
+        // code section anywhere in the function may encode an instruction
+        // reading %eax that `line_reg_use_def` cannot see: refuse.
+        let out = collapse(&counter_block("    movl $0, %eax\n    .byte 0x90\n", ""));
+        assert!(out.iter().any(|l| l == "incl %eax"), "{out:?}");
+        let out = collapse(&counter_block(
+            "    movl $0, %eax\n    .pushsection .text.cold,\"ax\"\n    .byte 0x90\n    .popsection\n",
+            "",
+        ));
+        assert!(
+            out.iter().any(|l| l == "incl %eax"),
+            "data in a pushed code section: {out:?}"
+        );
+        let out = collapse(&counter_block(
+            "    movl $0, %eax\n    .section .foo,#alloc,#execinstr\n    .byte 0x90\n    .text\n",
+            "",
+        ));
+        assert!(
+            out.iter().any(|l| l == "incl %eax"),
+            "data in a section of unknown kind: {out:?}"
+        );
+    }
+
+    /// The layout this backend emits for a TU with globals: data objects,
+    /// each with `.size` *before* its label, then `.text`.
+    const DATA_OBJECTS: &str = ".section .bss\n.align 4\n.type counter, @object\n\
+                                .size counter, 4\ncounter:\n    .zero 4\n.align 4\n\
+                                .type checksum, @object\n.size checksum, 4\nchecksum:\n    \
+                                .zero 4\n\n.text\n.globl f\n.type f, @function\n";
+
+    #[test]
+    fn counter_bump_collapses_in_the_first_function_after_data_objects() {
+        // Regression (fannkuch -m32 main): `checksum:` was taken as a function
+        // start and its extent swallowed `f`, so `f` looked like a function
+        // holding `.zero` data and the fallback refused.
+        let asm = format!("{DATA_OBJECTS}{}", counter_block("    movl $0, %eax\n", ""));
+        let out = collapse(&asm);
+        assert!(out.iter().any(|l| l == "addl $1, 8(%esp)"), "{out:?}");
+        assert!(!out.iter().any(|l| l == "incl %eax"), "{out:?}");
+    }
+
+    #[test]
+    fn counter_bump_collapses_past_non_code_islands() {
+        // A jump table in `.rodata` and an `__ex_table` entry are not executed
+        // and the section switches emit nothing: the function stays provable.
+        let island = "    movl $0, %eax\n.section .rodata\n.align 4\n.LJT0:\n    .long .L1\n    \
+                      .long .L2\n.text\n    .pushsection __ex_table,\"a\"\n    .long .L1, .L2\n    \
+                      .popsection\n";
+        let out = collapse(&counter_block(island, ""));
+        assert!(out.iter().any(|l| l == "addl $1, 8(%esp)"), "{out:?}");
+    }
+
+    #[test]
+    fn memory_increment_prefers_add_unless_carry_is_read() {
+        // CF dead (the `cmpl` rewrites it): the 2-uop `addl $1` form.
+        let out = collapse(&counter_block("    movl $0, %eax\n", ""));
+        assert!(out.iter().any(|l| l == "addl $1, 8(%esp)"), "{out:?}");
+        let dec = counter_block("    movl $0, %eax\n", "").replace("incl %eax", "decl %eax");
+        let out = collapse(&dec);
+        assert!(out.iter().any(|l| l == "subl $1, 8(%esp)"), "{out:?}");
+        // An `adcl` consumes the carry that `inc` passes through: keep `incl`.
+        let asm = "f:\n    movl 8(%esp), %eax\n    incl %eax\n    movl %eax, 8(%esp)\n    \
+                   adcl $0, %edx\n    movl $0, %eax\n    ret\n.cfi_endproc\n";
+        let out = collapse(asm);
+        assert!(out.iter().any(|l| l == "incl 8(%esp)"), "{out:?}");
+        assert!(out.iter().any(|l| l == "adcl $0, %edx"), "{out:?}");
+        // `neg`/`not` have no `add`-family twin and keep their mnemonic.
+        let neg = counter_block("    movl $0, %eax\n", "").replace("incl %eax", "negl %eax");
+        let out = collapse(&neg);
+        assert!(out.iter().any(|l| l == "negl 8(%esp)"), "{out:?}");
+    }
+
+    #[test]
+    fn function_extents_open_at_code_labels_only() {
+        let asm = format!(
+            "{DATA_OBJECTS}f:\n    ret\n.size f, .-f\n.data\nd:\n    .long 1\n\
+                           .text\ng:\n    ret\n.size g, .-g\n"
+        );
+        let store = LineStore::new(asm);
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let starts: Vec<String> = function_extents(&store, &infos)
+            .iter()
+            .map(|&(s, e)| format!("{}..{}", store.get(s).trim(), store.get(e).trim()))
+            .collect();
+        assert_eq!(starts, ["f:...size f, .-f", "g:...size g, .-g"]);
+        // A label in a section of unknown kind opens nothing (no coverage,
+        // never a wrong range).
+        let store = LineStore::new(".section .foo,@progbits\nh:\n    ret\n.size h, .-h\n".into());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(function_extents(&store, &infos).is_empty());
+    }
+
+    #[test]
+    fn counter_bump_stays_when_a_path_leaves_the_function() {
+        // An external tail jump may pass %eax to its target.
+        let asm = "f:\n    movl 8(%esp), %eax\n    incl %eax\n    movl %eax, 8(%esp)\n.L1:\n    \
+                   jmp g\n.cfi_endproc\n";
+        let out = collapse(asm);
+        assert!(out.iter().any(|l| l == "incl %eax"), "{out:?}");
     }
 }

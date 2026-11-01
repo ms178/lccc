@@ -1622,6 +1622,111 @@ pub(super) fn upper_vector_access_line(t: &str) -> (u32, u32) {
 }
 
 /// Analyse one function.
+/// The effect and successors of a control transfer (`ret`, `call`, `jmp`,
+/// `jcc`) for [`analyse`]; `None` when the target is unknowable (an indirect
+/// or unmarked foreign jump), which makes the whole function unanalysable.
+fn transfer_effect(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    n: usize,
+    ret_reads: u128,
+    fall: Vec<usize>,
+    resolve: &dyn Fn(&str) -> Option<usize>,
+) -> Option<(Effect, Vec<usize>)> {
+    let t = infos[n].trimmed(store.get(n));
+    Some(match infos[n].kind {
+        LineKind::Ret => (
+            Effect {
+                reads: ret_reads | upper_regions(ret_reads),
+                writes: 0,
+            },
+            Vec::new(),
+        ),
+        LineKind::Call => (
+            Effect {
+                reads: call_xmm_reads(store, infos, start, n)
+                    | xmm_mentions(t)
+                    | upper_regions(CALL_READS)
+                    | upper_mentions(t),
+                writes: VECTOR_ALL,
+            },
+            fall,
+        ),
+        // A codegen-marked sibling call (`# LCCC_TAIL_CALL`, see
+        // `liveness::tail_call_marked`): the suppressed call's reads --
+        // the same `# LCCC_CALL_FP` authority, now after the `jmp` --
+        // and no successor. SysV has no callee-saved vector register,
+        // and the return registers are the tail callee's to produce.
+        // A jump to a label of this function stays an ordinary edge.
+        LineKind::Jmp | LineKind::JmpIndirect
+            if super::liveness::tail_call_marked(store, infos, n)
+                && !(infos[n].kind == LineKind::Jmp
+                    && resolve(t.split_whitespace().nth(1).unwrap_or("")).is_some()) =>
+        {
+            (
+                Effect {
+                    reads: call_xmm_reads(store, infos, start, n)
+                        | xmm_mentions(t)
+                        | upper_regions(CALL_READS)
+                        | upper_mentions(t),
+                    writes: 0,
+                },
+                Vec::new(),
+            )
+        }
+        LineKind::JmpIndirect => {
+            return None; // unknown target: unanalysable
+        }
+        LineKind::Jmp => {
+            let target = t.split_whitespace().nth(1).unwrap_or("");
+            if target.starts_with('*') {
+                return None;
+            }
+            let Some(idx) = resolve(target) else {
+                return None; // unmarked tail call / foreign label
+            };
+            (
+                Effect {
+                    reads: 0,
+                    writes: 0,
+                },
+                vec![idx],
+            )
+        }
+        LineKind::CondJmp => {
+            let target = t.split_whitespace().nth(1).unwrap_or("");
+            match resolve(target) {
+                Some(idx) => {
+                    let mut edges = fall;
+                    edges.push(idx);
+                    (
+                        Effect {
+                            reads: 0,
+                            writes: 0,
+                        },
+                        edges,
+                    )
+                }
+                // A conditional sibling call (see the `Jmp` arm above):
+                // the taken edge reads the suppressed call's vector
+                // arguments, the fall-through continues.
+                None if super::liveness::tail_call_marked(store, infos, n) => (
+                    Effect {
+                        reads: call_xmm_reads(store, infos, start, n) | upper_regions(CALL_READS),
+                        writes: 0,
+                    },
+                    fall,
+                ),
+                None => return None,
+            }
+        }
+        // Not a transfer: no caller asks, and "unanalysable" is the
+        // answer that can never license a rewrite.
+        _ => return None,
+    })
+}
+
 fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> FnFacts {
     let n_lines = end - start;
     let mut facts = FnFacts {
@@ -1809,56 +1914,15 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                 },
                 fall,
             ),
-            LineKind::Ret => (
-                Effect {
-                    reads: ret_reads | upper_regions(ret_reads),
-                    writes: 0,
-                },
-                Vec::new(),
-            ),
-            LineKind::Call => (
-                Effect {
-                    reads: call_xmm_reads(store, infos, start, n)
-                        | xmm_mentions(t)
-                        | upper_regions(CALL_READS)
-                        | upper_mentions(t),
-                    writes: VECTOR_ALL,
-                },
-                fall,
-            ),
-            LineKind::JmpIndirect => {
-                return facts; // unknown target: unanalysable
-            }
-            LineKind::Jmp => {
-                let target = t.split_whitespace().nth(1).unwrap_or("");
-                if target.starts_with('*') {
-                    return facts;
+            LineKind::Ret
+            | LineKind::Call
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp => {
+                match transfer_effect(store, infos, start, n, ret_reads, fall, &resolve) {
+                    Some(effect) => effect,
+                    None => return facts, // unknown target: unanalysable
                 }
-                let Some(idx) = resolve(target) else {
-                    return facts; // tail call / foreign label
-                };
-                (
-                    Effect {
-                        reads: 0,
-                        writes: 0,
-                    },
-                    vec![idx],
-                )
-            }
-            LineKind::CondJmp => {
-                let target = t.split_whitespace().nth(1).unwrap_or("");
-                let Some(idx) = resolve(target) else {
-                    return facts;
-                };
-                let mut edges = fall;
-                edges.push(idx);
-                (
-                    Effect {
-                        reads: 0,
-                        writes: 0,
-                    },
-                    edges,
-                )
             }
             _ => {
                 let (mn, operands) = split_mnemonic(t);
@@ -2062,7 +2126,8 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                 // never executes past its last line: a function ends in
                 // `ret`, a tail `jmp`, or a noreturn `call`/`ud2`/`hlt`,
                 // all of which are modelled explicitly (a `ret` reads the
-                // return registers; an unresolvable `jmp` makes the
+                // return registers; a marked sibling-call `jmp` reads its
+                // call's arguments; any other unresolvable `jmp` makes the
                 // function unknown; a noreturn call has no live-out).  The
                 // only texts that reach here are fragments (unit tests,
                 // hand-written stubs) whose end is the end of observation:

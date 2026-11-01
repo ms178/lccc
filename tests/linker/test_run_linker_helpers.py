@@ -3,6 +3,7 @@
 
 import importlib.util
 import pathlib
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -30,6 +31,21 @@ class ShellWrapperTests(unittest.TestCase):
             missing = str(pathlib.Path(parent) / "gone")
             with self.assertRaisesRegex(RuntimeError, r"working directory not found: .*gone"):
                 HARNESS.sh(["true"], cwd=missing)
+
+
+class FixtureLibraryEnvironmentTests(unittest.TestCase):
+    def test_fixture_precedes_inherited_modern_runtime_paths(self):
+        with patch.dict(os.environ, {"LD_LIBRARY_PATH": "/gcc/lib32:/gcc/lib64", "KEEP": "yes"}, clear=True):
+            before = dict(os.environ)
+            env = HARNESS.fixture_library_env("/fixture")
+            self.assertEqual(env["LD_LIBRARY_PATH"], "/fixture:/gcc/lib32:/gcc/lib64")
+            self.assertEqual(env["KEEP"], "yes")
+            self.assertEqual(dict(os.environ), before)
+
+    def test_absent_or_empty_path_does_not_add_current_directory(self):
+        for inherited in ({}, {"LD_LIBRARY_PATH": ""}):
+            with self.subTest(inherited=inherited), patch.dict(os.environ, inherited, clear=True):
+                self.assertEqual(HARNESS.fixture_library_env("/fixture")["LD_LIBRARY_PATH"], "/fixture")
 
 
 class CustomFixtureCodeModelTests(unittest.TestCase):

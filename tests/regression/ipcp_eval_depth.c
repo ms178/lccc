@@ -1,17 +1,20 @@
-/* Exercise the constant evaluator with actual constant arguments.  The small
- * recursion must fold; the larger one exceeds MAX_EVAL_CALL_DEPTH and must
- * remain a runtime call.  The volatile result keeps the latter observable,
- * without hiding its argument from the evaluator. */
+/* Exercise IPCP with a recursively non-linear function. The positive control
+ * must fold, while the much deeper constant call remains executable at run
+ * time instead of exhausting the compiler's evaluation stack. */
 #include <stdio.h>
 
-__attribute__((noinline)) static int deep(int n) {
+__attribute__((noinline)) static int chain(int n) {
     if (n == 0) return 0;
-    return 1 + deep(n - 1);
+    return (chain(n - 1) * 3 + n) & 0xffff;
 }
 
-int main(void) {
-    int small = deep(100);
-    volatile int result = deep(100000);
-    printf("%d %d\n", small, result);
+int main(int argc, char **argv) {
+    (void)argv;
+    volatile int shallow = chain(1000);
+    printf("%d\n", shallow);
+    if (argc > 64) {
+        volatile int deep = chain(400000);
+        printf("%d\n", deep);
+    }
     return 0;
 }

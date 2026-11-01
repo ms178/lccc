@@ -371,6 +371,7 @@ mod tests {
                     fold_base_regs: Vec::new(),
                     fold_readmit: FxHashSet::default(),
                     reg_hints: FxHashMap::default(),
+                    reg_prefs: FxHashMap::default(),
                     ra_config: Arc::new(RaConfig::default()),
                     leaf_caller_saved_homes: false,
                 },

@@ -4,14 +4,22 @@
 #
 # The differential tests (loop_memset_fill_basic/norewrite) pin SEMANTICS.
 # This script pins the DECISIONS, which are compile-time properties:
-#   1. recognised fill shapes lower to `call memset` (byte, wide-uniform
+#   1. recognised fill shapes lower to a memset call (byte, wide-uniform
 #      zero, wide-uniform nonzero, advancing pointer, exit-value, nested),
 #   2. near misses keep their loops (computed store value, stored load =
 #      copy loop, strided store, volatile store),
 #   3. the pass is inert under CCC_NO_MEMSET_LOOP=1 (default pipeline
 #      bit-identical to pre-pass codegen),
 #   4. copy loops never get a memset from THIS pass (disjoint from the
-#      loop_idiom memcpy pass).
+#      loop_idiom memcpy pass),
+#   5. the affine model is exact: narrowing index casts, mismatched
+#      extensions, narrow unsigned (or -fwrapv signed) index arithmetic and
+#      counters that can wrap in their own type keep their loops; scaled,
+#      offset, runtime-start, short and second-counter fills rewrite, and
+#      i686 accepts what wraps exactly as its 32-bit addresses do. Every
+#      decision here equals GCC 16.2's; the wrapping shapes need objects
+#      over 4 GiB or -fwrapv overflow to show at run time, so only the
+#      decision can be tested.
 # ============================================================================
 set -euo pipefail
 
@@ -26,11 +34,13 @@ fail=0
 check() { # name, want_memset(1/0), c-file, extra-env...
     local name=$1 want=$2 src=$3; shift 3
     local asm="$work/$name.s"
-    if ! env "$@" "$CCC" -O2 -S "$src" -o "$asm" 2>"$work/$name.err"; then
+    # shellcheck disable=SC2086 # EXTRA is a flag list
+    if ! env "$@" "$CCC" -O2 ${EXTRA:-} -S "$src" -o "$asm" 2>"$work/$name.err"; then
         echo "FAIL($name): compile error"; head -5 "$work/$name.err"; fail=1; return
     fi
     local got=0
-    grep -q "call memset" "$asm" && got=1
+    # A memset in tail position is a sibling call: `jmp memset@PLT`.
+    grep -Eq "(call|jmp)[[:space:]]+memset" "$asm" && got=1
     if [[ $got != "$want" ]]; then
         echo "FAIL($name): want_memset=$want got=$got"
         fail=1
@@ -96,6 +106,52 @@ unsigned char G[4096]; unsigned N;
 void f(void) { for (unsigned i = 0; i < N; i++) *(volatile unsigned char *)(G + i) = 0; }
 EOF
 
+# --- affine exactness (5) ---
+cat > "$work/m_runtime_scaled.c" <<'EOF'
+void f(int *p, int a, int n) { for (int i = a; i < n; i++) p[i] = 0; }
+EOF
+cat > "$work/m_offset_signed.c" <<'EOF'
+void f(unsigned char *d, int a, int n) { for (int i = a; i < n; i++) d[i + 2] = 0; }
+EOF
+cat > "$work/m_sub_offset.c" <<'EOF'
+void f(unsigned char *d, int a, int n) { for (int i = a; i < n; i++) d[i - 1] = 0; }
+EOF
+cat > "$work/m_scaled_offset.c" <<'EOF'
+void f(int *p, int a, int n) { for (int i = a; i < n; i++) p[i + 3] = 0; }
+EOF
+cat > "$work/m_short.c" <<'EOF'
+void f(unsigned char *d, short a, short n) { for (short i = a; i < n; i++) d[i] = 0; }
+EOF
+cat > "$work/m_two_signed.c" <<'EOF'
+void f(unsigned char *d, int a, int n) { int j = a; for (int i = 0; i < n; i++, j++) d[j] = 0; }
+EOF
+cat > "$work/m_ne_signed.c" <<'EOF'
+void f(unsigned char *d, int a, int n) { for (int i = a; i != n; i++) d[i] = 0; }
+EOF
+cat > "$work/m_ne_u32_zero.c" <<'EOF'
+void f(unsigned char *d, unsigned n) { for (unsigned i = 0; i != n; i++) d[i] = 0; }
+EOF
+cat > "$work/n_narrow_u8.c" <<'EOF'
+void f(unsigned char *d, int n) { for (int i = 0; i < n; i++) d[(unsigned char)i] = 0; }
+EOF
+cat > "$work/n_narrow_u16.c" <<'EOF'
+void f(unsigned char *d, unsigned long n) { for (unsigned long i = 0; i < n; i++) d[(unsigned short)i] = 0; }
+EOF
+cat > "$work/n_zext_signed.c" <<'EOF'
+void f(unsigned char *d, int a, int n) { for (int i = a; i < n; i++) d[(unsigned)i] = 0; }
+EOF
+cat > "$work/n_u32_offset.c" <<'EOF'
+void f(unsigned char *d, unsigned n) { for (unsigned i = 0; i < n; i++) d[i + 2] = 0; }
+EOF
+cat > "$work/n_ne_u32_wrap.c" <<'EOF'
+void f(unsigned char *d, unsigned a, unsigned n) { for (unsigned i = a; i != n; i++) d[i] = 0; }
+EOF
+cat > "$work/n_ne_short_wrap.c" <<'EOF'
+void f(unsigned char *d, short a, short n) { for (short i = a; i != n; i++) d[i] = 0; }
+EOF
+cat > "$work/n_two_u32.c" <<'EOF'
+void f(unsigned char *d, unsigned a, unsigned n) { unsigned j = a; for (unsigned i = 0; i < n; i++, j++) d[j] = 0; }
+EOF
 # --- decisions ---
 check byte_fill        1 "$work/m_byte.c"
 check byte_fill_nz     1 "$work/m_byte_nz.c"
@@ -111,6 +167,30 @@ check keep_computed    0 "$work/n_computed.c"
 check keep_copy        0 "$work/n_copy.c"
 check keep_strided     0 "$work/n_strided.c"
 check keep_volatile    0 "$work/n_volatile.c"
+check runtime_scaled   1 "$work/m_runtime_scaled.c"
+check offset_signed    1 "$work/m_offset_signed.c"
+check sub_offset       1 "$work/m_sub_offset.c"
+check scaled_offset    1 "$work/m_scaled_offset.c"
+check short_counter    1 "$work/m_short.c"
+check two_signed       1 "$work/m_two_signed.c"
+check ne_signed        1 "$work/m_ne_signed.c"
+check ne_u32_zero      1 "$work/m_ne_u32_zero.c"
+check keep_narrow_u8   0 "$work/n_narrow_u8.c"
+check keep_narrow_u16  0 "$work/n_narrow_u16.c"
+check keep_zext_signed 0 "$work/n_zext_signed.c"
+check keep_u32_offset  0 "$work/n_u32_offset.c"
+check keep_ne_u32_wrap 0 "$work/n_ne_u32_wrap.c"
+check keep_ne_short    0 "$work/n_ne_short_wrap.c"
+check keep_two_u32     0 "$work/n_two_u32.c"
+EXTRA=-fwrapv check keep_wrapv_offset 0 "$work/m_offset_signed.c"
+EXTRA=-fwrapv check keep_wrapv_two    0 "$work/m_two_signed.c"
+# i686: 32-bit counters wrap exactly as the 32-bit address arithmetic does.
+if "$CCC" -m32 -O2 -S -o /dev/null "$work/m_byte.c" 2>/dev/null; then
+    EXTRA=-m32 check i686_u32_offset  1 "$work/n_u32_offset.c"
+    EXTRA=-m32 check i686_zext_signed 1 "$work/n_zext_signed.c"
+    EXTRA=-m32 check i686_ne_u32      1 "$work/n_ne_u32_wrap.c"
+    EXTRA=-m32 check i686_keep_u8     0 "$work/n_narrow_u8.c"
+fi
 
 # --- inert under the kill switch: no memset anywhere in a TU that would
 # --- otherwise rewrite ---

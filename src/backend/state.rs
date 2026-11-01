@@ -439,6 +439,13 @@ pub struct CodegenState {
     /// block by the generation driver; consulted by the Call arms to arm
     /// the backend. `None` in every other block.
     pub sibcall_hint: Option<SibcallHint>,
+    /// The call-site marker lines (`# LCCC_CALL_ARGS`, `# LCCC_CHAIN_CALL`,
+    /// `# LCCC_CALL_FP`, ...) of the sibling call in flight, captured as
+    /// they are published at the suppressed call text. `emit_return_impl`
+    /// re-publishes them after the tail `jmp` behind `# LCCC_TAIL_CALL`,
+    /// which is what lets the peephole liveness oracle model that `jmp`
+    /// as a call-plus-return instead of an unknown transfer.
+    pub sibcall_marker_lines: Vec<String>,
     /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
     /// provably holds the vector data (128-bit vector register allocation).
     pub vec_live_regs: FxHashMap<u32, &'static str>,
@@ -943,6 +950,7 @@ impl CodegenState {
             direct_fp_result: None,
             pending_sibcall: None,
             sibcall_hint: None,
+            sibcall_marker_lines: Vec::new(),
             vec_live_regs: FxHashMap::default(),
             dirty_upper_ymm: false,
             requires_executable_stack: false,
@@ -1343,6 +1351,7 @@ impl CodegenState {
         self.direct_fp_result = None;
         self.pending_sibcall = None;
         self.sibcall_hint = None;
+        self.sibcall_marker_lines.clear();
         self.vec_live_regs.clear();
         self.dirty_upper_ymm = false;
         self.uses_sret = false;

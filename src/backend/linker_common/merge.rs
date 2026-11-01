@@ -10,8 +10,8 @@ use super::section_map::map_section_name;
 use super::symbols::{GlobalSymbolOps, InputSection, OutputSection};
 use super::types::Elf64Object;
 use crate::backend::elf::{
-    SHF_ALLOC, SHF_EXCLUDE, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHN_COMMON, SHT_GROUP, SHT_NOBITS,
-    SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+    SHF_ALLOC, SHF_EXCLUDE, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_COMMON,
+    SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
 };
 
 /// Merge input sections from all objects into output sections.
@@ -210,13 +210,32 @@ pub fn merge_debug_sections_elf64<'a>(
     section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
     dead_sections: &FxHashSet<(usize, usize)>,
 ) -> Result<(), String> {
+    merge_nonalloc_sections_elf64(
+        objects,
+        output_sections,
+        section_map,
+        dead_sections,
+        is_debug_section_name,
+    )
+}
+
+/// `merge_debug_sections_elf64` for the non-allocated `SHT_PROGBITS`
+/// sections whose names `keep` accepts (e.g. the debug sections plus
+/// `.comment`), merged by exact name in input order.
+pub fn merge_nonalloc_sections_elf64<'a>(
+    objects: impl IntoIterator<Item = &'a Elf64Object>,
+    output_sections: &mut Vec<OutputSection>,
+    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
+    dead_sections: &FxHashSet<(usize, usize)>,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(), String> {
     let mut output_map: FxHashMap<String, usize> = FxHashMap::default();
     for (obj_idx, object) in objects.into_iter().enumerate() {
         for (section_idx, section) in object.sections.iter().enumerate() {
             if section.flags & SHF_ALLOC != 0
                 || section.flags & SHF_EXCLUDE != 0
                 || section.sh_type != SHT_PROGBITS
-                || !is_debug_section_name(&section.name)
+                || !keep(&section.name)
                 || dead_sections.contains(&(obj_idx, section_idx))
             {
                 continue;
@@ -344,35 +363,60 @@ pub fn allocate_common_symbols_elf64<G: GlobalSymbolOps>(
     output_sections[bss_idx].mem_size = bss_off;
 }
 
-/// Merge `.comment` input sections (compiler version strings) into one blob.
+/// Merge `.comment` input sections (compiler version strings) into one blob,
+/// exactly as GNU ld does.
 ///
-/// Every toolchain object carries a `.comment` section (e.g. `GCC: (Debian
-/// 14.2.0-19) 14.2.0\0`).  The output keeps each distinct NUL-terminated
-/// string once, in first-seen input order: bfd, lld and mold all
-/// deduplicate (the section carries SHF_MERGE|SHF_STRINGS).  lld and mold
-/// additionally append their own identity string, bfd does not — lccc
-/// follows bfd (merge only, no identity string), so the output is a pure
-/// function of the inputs.  Empty fragments contribute nothing; a missing
-/// trailing NUL is repaired rather than dropped.
+/// Every toolchain object carries a `.comment` section (e.g. `\0GCC: (Debian
+/// 14.2.0-19) 14.2.0\0`) flagged `SHF_MERGE|SHF_STRINGS`, so bfd runs it
+/// through `merge.c` like any other string section: each distinct string
+/// once, in first-seen order, with suffixes tail-merged into longer strings
+/// (`strmerge_gnu`). lld and mold additionally append their own identity
+/// string; bfd does not, and lccc follows bfd, so the output is a pure
+/// function of the inputs. Inputs that are not mergeable (no `SHF_MERGE`,
+/// relocations, ...) are copied as they are, aligned, in input order.
 pub fn merge_comment_sections(objects: &[Elf64Object]) -> Vec<u8> {
-    let mut seen: FxHashSet<&[u8]> = FxHashSet::default();
+    use super::strmerge_gnu::{MergeInput, Placement, merge};
+    let sections: Vec<(&Elf64Object, usize)> = objects
+        .iter()
+        .flat_map(|obj| {
+            obj.sections
+                .iter()
+                .enumerate()
+                .filter(|(si, sec)| {
+                    sec.name == ".comment"
+                        && sec.sh_type == SHT_PROGBITS
+                        && sec.flags & SHF_ALLOC == 0
+                        && obj.section_data.get(*si).is_some()
+                })
+                .map(move |(si, _)| (obj, si))
+        })
+        .collect();
+    let inputs: Vec<MergeInput> = sections
+        .iter()
+        .map(|&(obj, si)| {
+            let sec = &obj.sections[si];
+            MergeInput {
+                data: obj.section_data[si].as_slice(),
+                merge: sec.flags & SHF_MERGE != 0,
+                strings: sec.flags & SHF_STRINGS != 0,
+                entsize: sec.entsize,
+                addralign: sec.addralign.max(1),
+                has_relocs: obj.relocations.get(si).is_some_and(|r| !r.is_empty()),
+            }
+        })
+        .collect();
     let mut out = Vec::new();
-    for obj in objects {
-        for (si, sec) in obj.sections.iter().enumerate() {
-            if sec.name != ".comment" {
-                continue;
-            }
-            let Some(data) = obj.section_data.get(si) else {
-                continue;
-            };
-            for frag in data.as_slice().split(|&b| b == 0) {
-                if frag.is_empty() || !seen.insert(frag) {
-                    continue;
-                }
-                out.extend_from_slice(frag);
-                out.push(0);
-            }
-        }
+    for (input, placement) in inputs.iter().zip(merge(&inputs)) {
+        let bytes = match &placement {
+            Placement::Raw => input.data,
+            Placement::Merged {
+                pool: Some(pool), ..
+            } => pool.as_slice(),
+            Placement::Merged { pool: None, .. } => continue,
+        };
+        let align = usize::try_from(input.addralign).unwrap_or(1).max(1);
+        out.resize(out.len().next_multiple_of(align), 0);
+        out.extend_from_slice(bytes);
     }
     out
 }
@@ -402,6 +446,7 @@ mod tests {
             section_data: vec![SectionData::owned(data.to_vec())],
             relocations: vec![Vec::new()],
             source_name: "<test>".to_string(),
+            e_flags: 0,
         }
     }
 
@@ -422,6 +467,17 @@ mod tests {
         assert_eq!(
             merge_comment_sections(&[a, b]),
             b"toolchain-A\0toolchain-B\0"
+        );
+    }
+
+    #[test]
+    fn tail_merges_suffixes_like_gnu_ld() {
+        // `merge.c` shares a string that is a suffix of another one.
+        let a = obj_with_comment(b"\0GCC: (GNU) 16.2.0\0");
+        let b = obj_with_comment(b"16.2.0\0clang 23\0");
+        assert_eq!(
+            merge_comment_sections(&[a, b]),
+            b"GCC: (GNU) 16.2.0\0clang 23\0"
         );
     }
 

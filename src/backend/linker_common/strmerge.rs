@@ -435,6 +435,7 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
         section_data,
         relocations: vec![Vec::new(); n_secs],
         source_name: "<string-merge>".into(),
+        e_flags: 0,
     });
 
     // Rewrite relocations: point at a per-object GLOBAL undefined symbol
@@ -505,6 +506,7 @@ mod tests {
             section_data,
             relocations: vec![Vec::<Elf64Rela>::new(); n],
             source_name: "test.o".into(),
+            e_flags: 0,
         }
     }
 

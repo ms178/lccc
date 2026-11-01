@@ -486,7 +486,7 @@ impl ArmCodegen {
             let dest_name_32 = callee_saved_name_32(dest_phys);
 
             if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear) {
-                if self.emit_bit_modify_into(op, dest_phys, lhs, rhs, use_32bit) {
+                if self.emit_bit_modify_into(op, dest_phys, lhs, rhs, ty) {
                     self.state.reg_cache.invalidate_acc();
                     return;
                 }
@@ -832,7 +832,7 @@ impl ArmCodegen {
                     crate::ir::ops::mul_high_unsupported_here()
                 }
                 IrBinOp::BitTest => self.emit_bit_test(rhs, false),
-                IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify(op, rhs, true),
+                IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify(op, rhs, ty),
             }
         } else {
             match op {
@@ -884,7 +884,7 @@ impl ArmCodegen {
                 IrBinOp::UMulHigh => self.state.emit("    umulh x0, x1, x2"),
                 IrBinOp::SMulHigh => self.state.emit("    smulh x0, x1, x2"),
                 IrBinOp::BitTest => self.emit_bit_test(rhs, true),
-                IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify(op, rhs, false),
+                IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify(op, rhs, ty),
             }
         }
 
@@ -906,8 +906,15 @@ impl ArmCodegen {
         dest_phys: crate::backend::regalloc::PhysReg,
         base: &Operand,
         index: &Operand,
-        use_32bit: bool,
+        ty: IrType,
     ) -> bool {
+        // Narrow operations need an explicit modulo-8/16 index, supplied by
+        // the accumulator path. Do not silently use the register's modulo-64.
+        let use_32bit = match ty {
+            IrType::I32 | IrType::U32 => true,
+            IrType::I64 | IrType::U64 => false,
+            _ => return false,
+        };
         let own_idx = self.operand_reg(index).filter(|r| !is_arm_fp_phys(*r));
         if own_idx == Some(dest_phys) || own_idx.map(|r| r.0) == Some(3) {
             return false;
@@ -969,11 +976,12 @@ impl ArmCodegen {
     /// `BitSet`/`BitClear(x1, x2)` into x0/w0: one `mov` of the immediate 1,
     /// one `lsl` by the index and one `orr` (set) or `bic` (clear, AArch64's
     /// bit-clear).  There is no variable-immediate BFI, and `lsl`/`lslv` reduce
-    /// the count modulo the register size, which is exactly the operation's
-    /// `index mod W` contract.  x3 is this path's scratch (the rotate arm above
-    /// uses it the same way); t1 holds the base and t2 the index throughout.
-    fn emit_bit_modify(&mut self, op: IrBinOp, rhs: &Operand, is_32: bool) {
-        let (r, width) = if is_32 { ('w', 32) } else { ('x', 64) };
+    /// the count modulo the register size; narrow operations explicitly reduce
+    /// it modulo their IR width first. x3 is this path's scratch (the rotate
+    /// arm above uses it the same way); x1 holds the base and x2 the index.
+    fn emit_bit_modify(&mut self, op: IrBinOp, rhs: &Operand, ty: IrType) {
+        let width = (ty.size() * 8) as i64;
+        let r = if width == 32 { 'w' } else { 'x' };
         self.state.emit("    mov w3, #1");
         match Self::const_as_imm12(rhs) {
             Some(imm) => {
@@ -981,9 +989,14 @@ impl ArmCodegen {
                 self.state
                     .emit_fmt(format_args!("    lsl {r}3, {r}3, #{amount}"));
             }
-            None => self
-                .state
-                .emit_fmt(format_args!("    lsl {r}3, {r}3, {r}2")),
+            None => {
+                if width < 32 {
+                    self.state
+                        .emit_fmt(format_args!("    and w2, w2, #{}", width - 1));
+                }
+                self.state
+                    .emit_fmt(format_args!("    lsl {r}3, {r}3, {r}2"));
+            }
         }
         if op == IrBinOp::BitSet {
             self.state
@@ -1103,5 +1116,83 @@ impl ArmCodegen {
     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
         self.operand_to_x0_x1(src);
         self.store_x0_x1_to(dest);
+    }
+}
+
+#[cfg(test)]
+mod narrow_bit_modify_backend_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+    use crate::ir::reexports::IrConst;
+
+    #[test]
+    fn narrow_bit_modify_backend_emission() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ] {
+            let bits = ty.size() * 8;
+            for op in [IrBinOp::BitSet, IrBinOp::BitClear] {
+                for immediate in [
+                    None,
+                    Some(0),
+                    Some(bits - 1),
+                    Some(bits),
+                    Some(bits + 1),
+                    Some(4095),
+                ] {
+                    let mut cg = ArmCodegen::new();
+                    let index = immediate.map_or(Operand::Value(Value(99)), |n| {
+                        Operand::Const(IrConst::I64(n as i64))
+                    });
+                    cg.emit_bit_modify(op, &index, ty);
+                    let body = &cg.state.out.buf;
+                    if let Some(n) = immediate {
+                        let r = if bits == 32 { 'w' } else { 'x' };
+                        assert!(
+                            body.contains(&format!("lsl {r}3, {r}3, #{}", n % bits)),
+                            "{ty:?}: {body}"
+                        );
+                    } else if bits < 32 {
+                        assert!(
+                            body.contains(&format!("and w2, w2, #{}", bits - 1)),
+                            "{ty:?}: {body}"
+                        );
+                    } else {
+                        assert!(!body.contains("and w2"));
+                    }
+                    // Captured normally; --nocapture supplies the ACTUAL backend
+                    // stream to the external GNU-as/QEMU execution audit.
+                    println!(
+                        "BIT_MODIFY_ARM|{bits}|{}|{}\n{body}END_BIT_MODIFY",
+                        op == IrBinOp::BitSet,
+                        immediate.map_or("dynamic".to_owned(), |n| n.to_string())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_register_direct_declines_without_clobbering_any_home() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            let mut cg = ArmCodegen::new();
+            cg.reg_assignments.insert(0, PhysReg(0));
+            cg.reg_assignments.insert(1, PhysReg(1));
+            assert!(!cg.emit_bit_modify_into(
+                IrBinOp::BitSet,
+                PhysReg(2),
+                &Operand::Value(Value(0)),
+                &Operand::Value(Value(1)),
+                ty
+            ));
+            assert!(cg.state.out.buf.is_empty());
+        }
     }
 }

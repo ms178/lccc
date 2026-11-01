@@ -1335,9 +1335,7 @@ fn transform_arx_loop(
             rot_masks.insert(n, m);
         }
     }
-    func.blocks[arx.preheader_idx]
-        .instructions
-        .extend(pre_insts);
+    func.blocks[arx.preheader_idx].extend_insts(pre_insts, crate::common::source::Span::dummy());
 
     // ---- Header: four vector phis (backedge values named upfront; the
     //      kernel renames its final role values onto them). ----
@@ -1363,7 +1361,7 @@ fn transform_arx_loop(
             (phi_c, pack_c, next_c),
             (phi_d, pack_d, next_d),
         ] {
-            header.instructions.insert(
+            header.insert_inst(
                 phi_pos,
                 Instruction::Phi {
                     dest,
@@ -1373,6 +1371,7 @@ fn transform_arx_loop(
                         (Operand::Value(nxt), latch_label),
                     ],
                 },
+                crate::common::source::Span::dummy(),
             );
         }
     }
@@ -1620,10 +1619,10 @@ fn transform_arx_loop(
         }
         let mut body_insts = k;
         body_insts.extend(retained);
-        func.blocks[main_block].instructions = body_insts;
+        func.blocks[main_block].replace_insts_synthesized(body_insts);
         for &bi in arx.order.iter() {
             if bi != main_block {
-                func.blocks[bi].instructions.clear();
+                func.blocks[bi].clear_insts();
             }
         }
     }
@@ -1659,7 +1658,7 @@ fn transform_arx_loop(
             .unwrap_or(exit.instructions.len());
         let mut at = phi_end;
         for inst in ext_insts {
-            exit.instructions.insert(at, inst);
+            exit.insert_inst(at, inst, crate::common::source::Span::dummy());
             at += 1;
         }
     }
@@ -1684,8 +1683,7 @@ fn transform_arx_loop(
     // ---- Delete the dead word phis from the header. ----
     let word_phis = arx.word_phis;
     func.blocks[arx.header_idx]
-        .instructions
-        .retain(|i| !matches!(i, Instruction::Phi { dest, .. } if word_phis.contains(dest)));
+        .retain_insts(|i| !matches!(i, Instruction::Phi { dest, .. } if word_phis.contains(dest)));
 
     func.next_value_id = next_val_id;
     if debug {

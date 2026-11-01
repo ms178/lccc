@@ -401,11 +401,206 @@ off=$("$tmp/instrumented_off")
 }
 echo "PASS: per-instruction void-call identity and runtime hook order"
 
+# --- Branch-arm sibling calls, frame-less tails, tail-call liveness ---------
+# backend::x86::ret_dup hands each call arm the shared return block's
+# `Return`, so `if (c) f(); else g();` / `return c ? f(x) : g(x);` end in two
+# `jmp`s (GCC 16.2, Clang 23.1.4 and ICX 2026.2 all emit that).  A function
+# whose every call converts owes no call-alignment pad (no `subq $8`), and
+# the `# LCCC_TAIL_CALL` marker lets the liveness oracle delete argument-
+# staging copies the tail callee never reads (`movq %rdi, %rax`).
+cat > "$tmp/arms.c" <<'C'
+extern void fast(void), slow(void);
+extern int G;
+void dispatch(void) { if (G & 32) fast(); else slow(); }
+extern int g1(int), g2(int);
+int sel(int c, int x) { return c ? g1(x) : g2(x); }
+extern int h3(int, int, int);
+int sel3(int c, int x, int y) { if (c > 0) return h3(x, y, c); if (c < 0) return g1(y); return g2(x); }
+int one(int x) { return g1(x); }
+int swap2(int x, int y) { return h3(y, x, 0); }
+void vf(void) { fast(); }
+int const_arm(int c, int x) { return c ? g1(x) : 0; }
+/* Refusals and mixed shapes: a stack-argument arm keeps its call (and the
+ * function its pad); a non-tail call keeps the pad for the tail arm too. */
+extern long sink7(long, long, long, long, long, long, long), gl(long);
+long arm7(int c, long v) { if (c) return sink7(v, v, v, v, v, v, 7); return gl(v); }
+/* The callee's int result must be sign-extended after it returns: never a
+ * tail call (gcc-16.2 / clang-23.1.4: call g1; cltq). */
+long widen(int x) { return g1(x); }
+int mixed(int c, int x) { int r = g1(x); if (c) return g2(r); return r + 1; }
+C
+"$CCC" -O2 -S "$tmp/arms.c" -o "$tmp/arms.s"
+CCC_NO_SIBCALL=1 "$CCC" -O2 -S "$tmp/arms.c" -o "$tmp/arms_ctl.s"
+# call_aligned BODY: forward dataflow over the function's frame adjustments
+# (entry %rsp is 8 mod 16 after the caller's call); require 0 mod 16 at every
+# `call`.  A conditional jump records its offset for the target label; a label
+# reached only by a jump (previous instruction ret/jmp) takes that offset, so
+# per-arm epilogues laid out before another arm's call do not skew the walk.
+# Fails if a label is reached with conflicting offsets or a target is unknown.
+call_aligned() {
+    awk 'function adj(v) { gsub(/[$,]/, "", v); return v + 0 }
+         BEGIN { off = 8; bad = 0; calls = 0; dead = 0 }
+         /^[[:space:]]*#/ || /^[[:space:]]*\./ && !/^\.[A-Za-z0-9_]+:/ { next }
+         /^\.?[A-Za-z0-9_.]+:/ {
+             l = $1; sub(/:$/, "", l)
+             if (dead) { if (!(l in at)) { bad++; next } off = at[l]; dead = 0 }
+             else if ((l in at) && at[l] != off) bad++
+             next }
+         dead { next }
+         /^[[:space:]]*push[ql]?[[:space:]]/ { off += 8 }
+         /^[[:space:]]*pop[ql]?[[:space:]]/  { off -= 8 }
+         /^[[:space:]]*subq[[:space:]]+\$[0-9]+, %rsp/ { off += adj($2) }
+         /^[[:space:]]*addq[[:space:]]+\$[0-9]+, %rsp/ { off -= adj($2) }
+         /^[[:space:]]*call[[:space:]]/ { calls++; if (off % 16 != 0) bad++ }
+         /^[[:space:]]*j[a-z]+[[:space:]]+\.L/ {
+             t = $2
+             if ((t in at) && at[t] != off) bad++
+             at[t] = off
+             if ($1 == "jmp") dead = 1
+             next }
+         /^[[:space:]]*(ret|jmp)/ { dead = 1 }
+         END { exit (calls > 0 && bad == 0) ? 0 : 1 }' <<<"$1"
+}
+insns() { grep -Ev '^[[:space:]]*($|#|\.)|^[A-Za-z_.][A-Za-z0-9_.]*:' <<<"$1"; }
+for spec in 'dispatch fast slow' 'sel g1 g2' 'sel3 h3 g1 g2' 'one g1' 'swap2 h3' 'vf fast' \
+            'const_arm g1'; do
+    set -- $spec
+    fn=$1; shift
+    b=$(body "$tmp/arms.s" "$fn")
+    for t in "$@"; do
+        # `jmp sym` or the conditional sibling call `jcc sym` (Clang's form).
+        has "$b" "^[[:space:]]*j[a-z]* $t@PLT" || { echo "$fn: arm to $t is not a sibling call:" >&2; echo "$b" >&2; exit 1; }
+    done
+    lacks "$b" '^[[:space:]]*call ' || { echo "$fn: a call survived" >&2; exit 1; }
+    lacks "$b" '%rsp' || { echo "$fn: frame (call pad) without any call:" >&2; echo "$b" >&2; exit 1; }
+done
+# The tail callee reads only its arguments: no staging copy into %rax.
+for fn in one swap2 sel; do
+    b=$(body "$tmp/arms.s" "$fn")
+    lacks "$b" '%rax\|%eax' || { echo "$fn: dead accumulator staging survived:" >&2; echo "$b" >&2; exit 1; }
+done
+[ "$(insns "$(body "$tmp/arms.s" one)")" = "    jmp g1@PLT" ] || {
+    echo "one: expected exactly 'jmp g1@PLT' (gcc-16.2: jmp g1):" >&2; body "$tmp/arms.s" one >&2; exit 1; }
+# `if (G & 32) fast(); else slow();`: the load+mask folds into a memory
+# test (GCC 16.2: `testb $32, G(%rip)`) and the slow arm becomes a
+# conditional sibling call (Clang 23.1.4: `je slow@PLT`) -- three
+# instructions, one fewer than GCC.
+b=$(insns "$(body "$tmp/arms.s" dispatch)")
+[ "$(wc -l <<<"$b")" -eq 3 ] && has "$b" '^    testb \$32, G(%rip)$' && has "$b" '^    je slow@PLT$' \
+    && has "$b" '^    jmp fast@PLT$' || {
+    echo "dispatch: expected testb \$32, G(%rip); je slow@PLT; jmp fast@PLT:" >&2; echo "$b" >&2; exit 1; }
+# Bisection switches restore the longer forms: no conditional tail call
+# without cond_tail_call, no memory test without load_mask_test.
+CCC_PEEPHOLE_SKIP=cond_tail_call "$CCC" -O2 -S "$tmp/arms.c" -o "$tmp/arms_nct.s"
+b=$(body "$tmp/arms_nct.s" dispatch)
+has "$b" 'jmp slow@PLT' && lacks "$b" 'je slow@PLT' || {
+    echo "dispatch: CCC_PEEPHOLE_SKIP=cond_tail_call did not keep the relay" >&2; echo "$b" >&2; exit 1; }
+CCC_PEEPHOLE_SKIP=load_mask_test "$CCC" -O2 -S "$tmp/arms.c" -o "$tmp/arms_nlm.s"
+b=$(body "$tmp/arms_nlm.s" dispatch)
+lacks "$b" 'testb \$32, G' || {
+    echo "dispatch: CCC_PEEPHOLE_SKIP=load_mask_test still folded the load" >&2; echo "$b" >&2; exit 1; }
+[ "$(insns "$(body "$tmp/arms.s" vf)")" = "    jmp fast@PLT" ] || {
+    echo "vf: expected exactly 'jmp fast@PLT':" >&2; body "$tmp/arms.s" vf >&2; exit 1; }
+b=$(body "$tmp/arms.s" const_arm)
+has "$b" '^[[:space:]]*ret$' || { echo "const_arm: the constant arm lost its return" >&2; exit 1; }
+b=$(body "$tmp/arms.s" arm7)
+has "$b" 'call sink7@PLT' || { echo "arm7: stack-argument arm converted" >&2; echo "$b" >&2; exit 1; }
+has "$b" 'jmp gl@PLT' || { echo "arm7: register arm not converted" >&2; echo "$b" >&2; exit 1; }
+call_aligned "$b" || { echo "arm7: call reached with a misaligned stack (pad dropped next to a real call)" >&2; echo "$b" >&2; exit 1; }
+b=$(body "$tmp/arms.s" widen)
+has "$b" 'call g1@PLT' && lacks "$b" 'jmp g1@PLT' && has "$b" 'movslq %eax, %rax\|cltq' && call_aligned "$b" || {
+    echo "widen: an int result widened to long was tail-called or not sign-extended:" >&2; echo "$b" >&2; exit 1; }
+b=$(body "$tmp/arms.s" mixed)
+has "$b" 'call g1@PLT' && has "$b" 'jmp g2@PLT' && call_aligned "$b" || {
+    echo "mixed: expected call g1 + jmp g2 with the call aligned:" >&2; echo "$b" >&2; exit 1; }
+# Kill switch: every arm back to call + ret.
+for fn in dispatch sel sel3 one vf; do
+    b=$(body "$tmp/arms_ctl.s" "$fn")
+    has "$b" '^[[:space:]]*call ' && has "$b" '^[[:space:]]*ret$' || {
+        echo "$fn (control): CCC_NO_SIBCALL did not restore call + ret" >&2; exit 1; }
+done
+# Oracle: no more instructions than gcc-16.2 in the converted functions.
+if "$gcc" --version 2>/dev/null | grep -c "16\.2" >/dev/null; then
+    "$gcc" -O2 -S "$tmp/arms.c" -o "$tmp/arms_gcc.s"
+    for fn in dispatch sel sel3 one swap2 vf const_arm; do
+        g=$(sed -n "/^$fn:/,/\.size[[:space:]]*$fn,/p" "$tmp/arms_gcc.s" | grep -Ev '^[[:space:]]*($|#|\.)|^[A-Za-z_.][A-Za-z0-9_.]*:' | wc -l)
+        l=$(insns "$(body "$tmp/arms.s" "$fn")" | wc -l)
+        [ "$l" -le "$g" ] || { echo "$fn: lccc $l instructions > gcc-16.2 $g" >&2; body "$tmp/arms.s" "$fn" >&2; exit 1; }
+    done
+    echo "PASS: branch-arm sibling calls within gcc-16.2's instruction count"
+fi
+# Runtime: values, and 16-byte stack alignment at every callee entry
+# (a frame without the pad must never reach a real `call`), at -O1 and -O2,
+# conversion on and off.
+cat > "$tmp/arms_rt.c" <<'C'
+#include <stdio.h>
+#include <stdint.h>
+static int misaligned, trace;
+#define CHECK() do { if (((uintptr_t)__builtin_frame_address(0) & 15) != 0) misaligned++; } while (0)
+__attribute__((noinline)) void fast(void) { CHECK(); trace = trace * 3 + 1; }
+__attribute__((noinline)) void slow(void) { CHECK(); trace = trace * 3 + 2; }
+int G;
+__attribute__((noinline)) int g1(int x) { CHECK(); return x * 7; }
+__attribute__((noinline)) int g2(int x) { CHECK(); return x * 11; }
+__attribute__((noinline)) int h3(int a, int b, int c) { CHECK(); return a * 100 + b * 10 + c; }
+__attribute__((noinline)) long sink7(long a, long b, long c, long d, long e, long f, long g)
+{ CHECK(); return a + b + c + d + e + f + g; }
+__attribute__((noinline)) void dispatch(void) { if (G & 32) fast(); else slow(); }
+__attribute__((noinline)) int sel(int c, int x) { return c ? g1(x) : g2(x); }
+__attribute__((noinline)) int sel3(int c, int x, int y) { if (c > 0) return h3(x, y, c); if (c < 0) return g1(y); return g2(x); }
+__attribute__((noinline)) int one(int x) { return g1(x); }
+__attribute__((noinline)) int swap2(int x, int y) { return h3(y, x, 0); }
+__attribute__((noinline)) void vf(void) { fast(); }
+__attribute__((noinline)) int const_arm(int c, int x) { return c ? g1(x) : 0; }
+__attribute__((noinline)) long gl(long x) { CHECK(); return x * 13 - 5; }
+__attribute__((noinline)) long arm7(int c, long v) { if (c) return sink7(v, v, v, v, v, v, 7); return gl(v); }
+__attribute__((noinline)) long widen(int x) { return g1(x); }
+__attribute__((noinline)) int mixed(int c, int x) { int r = g1(x); if (c) return g2(r); return r + 1; }
+int main(void) {
+    long acc = 0;
+    for (int i = -2; i <= 2; i++) {
+        G = i & 1 ? 32 : 0;
+        dispatch(); vf();
+        acc = acc * 31 + sel(i, i + 3) + sel3(i, i + 1, i + 2) + one(i) + swap2(i, i + 5)
+            + const_arm(i & 1, i) + arm7(i & 1, i) + mixed(i & 1, i)
+            + widen(i - 1) + widen(-100000 * (i + 3));
+    }
+    printf("%ld %d %d\n", acc, trace, misaligned);
+    return misaligned != 0;
+}
+C
+ref=""
+for opt in -O1 -O2; do
+    for sib in on off nct nlm; do
+        case $sib in
+            off) CCC_NO_SIBCALL=1 "$CCC" "$opt" "$tmp/arms_rt.c" -o "$tmp/arms_rt" ;;
+            nct) CCC_PEEPHOLE_SKIP=cond_tail_call "$CCC" "$opt" "$tmp/arms_rt.c" -o "$tmp/arms_rt" ;;
+            nlm) CCC_PEEPHOLE_SKIP=load_mask_test "$CCC" "$opt" "$tmp/arms_rt.c" -o "$tmp/arms_rt" ;;
+            *) "$CCC" "$opt" "$tmp/arms_rt.c" -o "$tmp/arms_rt" ;;
+        esac
+        out=$("$tmp/arms_rt") || { echo "arms runtime $opt sibcalls=$sib failed: $out" >&2; exit 1; }
+        [ -z "$ref" ] && ref=$out
+        [ "$out" = "$ref" ] || { echo "arms runtime $opt sibcalls=$sib: '$out' != '$ref'" >&2; exit 1; }
+    done
+done
+if "$gcc" --version 2>/dev/null | grep -c "16\.2" >/dev/null; then
+    # The reference keeps every call 16-byte aligned, as lccc does. GCC's
+    # -fipa-stack-alignment (on at -O2) may call a local callee it proved
+    # alignment-free with %rsp = 8 mod 16, which `misaligned` counts (15 with
+    # gcc 16.2.0 here: `widen`/`mixed` call `g1` without realigning). That is
+    # legal IPA, not a parity property, and it varies between GCC builds.
+    "$gcc" -O2 -fno-ipa-stack-alignment "$tmp/arms_rt.c" -o "$tmp/arms_rt_gcc"
+    g=$("$tmp/arms_rt_gcc")
+    [ "$g" = "$ref" ] || { echo "arms runtime differs from gcc-16.2: lccc '$ref' gcc '$g'" >&2; exit 1; }
+fi
+echo "PASS: branch-arm sibling calls (shapes, refusals, alignment, runtime parity: $ref)"
+
 # The shared driver computes hints on every target, but only x86-64 implements
 # conversion. Other backends must not grow a silent partial tail-call path.
 cat > "$tmp/cross.c" <<'C'
-extern int target(int);
+extern int target(int), other(int);
 int forward(int x) { return target(x); }
+int arms(int c, int x) { return c ? target(x) : other(x); }
 C
 bindir=$(dirname "$CCC")
 for target_cc in lccc-i686 lccc-arm lccc-riscv; do

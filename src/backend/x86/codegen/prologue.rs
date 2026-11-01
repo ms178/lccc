@@ -938,6 +938,7 @@ impl X86Codegen {
             }
         }
         self.func_has_calls = has_calls;
+        self.func_has_non_tail_calls = has_calls && !self.every_call_is_sibling(func, has_i128_ops);
         // r10: use call *%rax instead of call *%r10 (frees r10 for non-call-spanning).
         // Exception: indirect branch thunks still use r10 (rare).
         if has_i128_ops {
@@ -3101,7 +3102,7 @@ impl X86Codegen {
         // reserve: the frame-size rounding then adds exactly the bytes the
         // call-site 16-byte alignment needs (0 or 8), nothing more.
         if !func.is_variadic
-            && !self.func_has_calls
+            && !self.func_has_non_tail_calls
             && space == callee_save_reserve
             && !self.state.ra_config.no_empty_local_frame_elision
         {
@@ -3111,6 +3112,68 @@ impl X86Codegen {
         }
     }
 
+    /// Whether every reason `calculate_stack_space_impl` found for
+    /// `func_has_calls` is a call site the emitter turns into a sibling call
+    /// (`<epilogue>; jmp target`). The prediction is the emitter's own
+    /// decision, from the same two predicates: the driver's per-block shape
+    /// (`generation::sibcall_function_use_counts` + `sibcall_block_hint`;
+    /// such sites always take the mature call path, never `CallTyped`) and
+    /// the per-site ABI refusals (`sibcall_abi_admits`). Anything else that
+    /// emits a `call` -- a non-tail site, a dynamic-TLS descriptor call, a
+    /// 16-byte atomic's libatomic call, an `i128` helper (`__divti3`, ...)
+    /// the body's integer operations may emit -- answers `false`.
+    /// `emit_call_instruction_impl` asserts the prediction at every real
+    /// call.
+    fn every_call_is_sibling(&self, func: &IrFunction, has_i128_ops: bool) -> bool {
+        if has_i128_ops {
+            return false;
+        }
+        let Some(use_counts) = crate::backend::generation::sibcall_function_use_counts(
+            func,
+            &self.state.incoming_byval_slots,
+        ) else {
+            return false;
+        };
+        for block in &func.blocks {
+            let hint = crate::backend::generation::sibcall_block_hint(block, &use_counts);
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                let tail = hint.as_ref().is_some_and(|h| h.instruction_index == idx);
+                match inst {
+                    Instruction::Call { func: name, info } => {
+                        let inline_expanded =
+                            crate::backend::generation::inline_memcpy_len(name, info).is_some()
+                                || crate::backend::generation::x86_inline_memset_len(name, info)
+                                    .is_some();
+                        if !inline_expanded && !(tail && self.sibcall_abi_admits(info).is_some()) {
+                            return false;
+                        }
+                    }
+                    Instruction::CallIndirect { info, .. } => {
+                        if !(tail && self.sibcall_abi_admits(info).is_some()) {
+                            return false;
+                        }
+                    }
+                    Instruction::GlobalAddr { name, .. }
+                        if self.state.tls_symbols.contains(name)
+                            && self.state.tls_model(name).is_dynamic() =>
+                    {
+                        return false;
+                    }
+                    Instruction::AtomicLoad { ty, .. }
+                    | Instruction::AtomicStore { ty, .. }
+                    | Instruction::AtomicRmw { ty, .. }
+                    | Instruction::AtomicCmpxchg { ty, .. }
+                        if matches!(ty, IrType::I128 | IrType::U128) =>
+                    {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        true
+    }
+
     pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
         if self.state.omit_frame_pointer {
             // With frame pointer omission, there's no `push %rbp` to absorb the
@@ -3118,7 +3181,7 @@ impl X86Codegen {
             // so that RSP is 16-byte aligned at subsequent CALL instructions.
             // At function entry: RSP ≡ 8 (mod 16) due to the caller's CALL.
             // subq $(8 mod 16), %rsp → RSP ≡ 8 - 8 = 0 (mod 16) ✓
-            fpo_frame_size(raw_space, self.func_has_calls)
+            fpo_frame_size(raw_space, self.func_has_non_tail_calls)
         } else {
             if raw_space <= 0 {
                 // Frame-pointer path: `push %rbp` already realigns entry

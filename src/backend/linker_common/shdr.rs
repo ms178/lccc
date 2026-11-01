@@ -17,8 +17,9 @@
 
 use crate::backend::elf::{
     SHF_ALLOC, SHF_EXECINSTR, SHF_INFO_LINK, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_LORESERVE,
-    SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_HASH, SHT_GNU_VERNEED, SHT_GNU_VERSYM, SHT_NOBITS,
-    SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_LOCAL,
+    SHT_DYNAMIC, SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_GNU_VERNEED, SHT_GNU_VERSYM,
+    SHT_INIT_ARRAY, SHT_NOBITS, SHT_PREINIT_ARRAY, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+    STB_LOCAL,
 };
 use crate::common::fx_hash::FxHashMap;
 
@@ -42,7 +43,15 @@ pub struct ShdrSpec {
 }
 
 impl ShdrSpec {
+    /// A header with `sh_entsize` defaulted the way bfd's `elf_fake_sections`
+    /// does for an ELF64 output: the pointer arrays (`.init_array`,
+    /// `.fini_array`, `.preinit_array`) have 8-byte entries, everything else
+    /// states its own.
     pub fn new(name: &str, sh_type: u32, flags: u64, addr: u64, offset: u64, size: u64) -> Self {
+        let entsize = match sh_type {
+            SHT_INIT_ARRAY | SHT_FINI_ARRAY | SHT_PREINIT_ARRAY => 8,
+            _ => 0,
+        };
         ShdrSpec {
             name: name.to_string(),
             sh_type,
@@ -54,7 +63,7 @@ impl ShdrSpec {
             info_link: None,
             info: 0,
             align: 1,
-            entsize: 0,
+            entsize,
         }
     }
 }

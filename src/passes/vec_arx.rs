@@ -107,6 +107,7 @@
 //! knob).
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::source::Span;
 use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::instruction::{Instruction, Terminator};
@@ -1256,24 +1257,39 @@ fn try_transform_loop(
     next_val = emitter.next_val;
 
     // ── 4b. Commit the entry loads (all decline points are past). ─────
-    func.blocks[preheader].instructions.extend(entry_insts);
+    func.blocks[preheader].extend_insts(entry_insts, Span::dummy());
 
     // ── 5. Rewrite the work (latch) block. ─────────────────────────────
     {
         let block = &mut func.blocks[work];
+        // Surviving scalar instructions keep their spans; the vector body and
+        // the phis are synthesized (dummy spans, no `.loc`).
+        let spans = block.take_parallel_spans();
+        let tracked = !spans.is_empty();
         let mut kept: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
+        let mut kept_spans: Vec<Span> = Vec::with_capacity(spans.len());
         for (i, inst) in block.instructions.iter().enumerate() {
             if body.consumed.contains(&i) {
                 continue;
             }
             kept.push(inst.clone());
+            if tracked {
+                kept_spans.push(spans[i]);
+            }
         }
         let mut new_insts: Vec<Instruction> =
             Vec::with_capacity(kept.len() + body_insts.len() + phi_insts.len());
+        let mut new_spans: Vec<Span> = Vec::new();
+        let body_len = body_insts.len();
+        let dummies = |n: usize| std::iter::repeat_n(Span::dummy(), n);
         if !self_loop {
             // 2-block shape: phis live in the header, not here.
             new_insts.extend(kept.iter().cloned());
             new_insts.extend(body_insts);
+            if tracked {
+                new_spans.extend(kept_spans.iter().copied());
+                new_spans.extend(dummies(body_len));
+            }
         } else {
             new_insts.append(&mut phi_insts.clone());
             let iv_start = kept.iter().position(|inst| {
@@ -1291,17 +1307,19 @@ fn try_transform_loop(
             new_insts.extend(kept.iter().take(iv_start).cloned());
             new_insts.extend(body_insts);
             new_insts.extend(kept.iter().skip(iv_start).cloned());
+            if tracked {
+                new_spans.extend(dummies(phi_insts.len()));
+                new_spans.extend(kept_spans[..iv_start].iter().copied());
+                new_spans.extend(dummies(body_len));
+                new_spans.extend(kept_spans[iv_start..].iter().copied());
+            }
         }
-        block.instructions = new_insts;
+        block.replace_insts(new_insts, new_spans);
     }
     // Insert the header phis (2-block shape).
     if !self_loop {
         let hdr = &mut func.blocks[header];
-        let mut new_insts: Vec<Instruction> =
-            Vec::with_capacity(hdr.instructions.len() + phi_insts.len());
-        new_insts.extend(phi_insts);
-        new_insts.extend(hdr.instructions.iter().cloned());
-        hdr.instructions = new_insts;
+        hdr.insert_insts(0, phi_insts, Span::dummy());
     }
 
     // ── 6. Exit materialization. ───────────────────────────────────────
@@ -1428,12 +1446,7 @@ fn install_exit_materialization(
         }
         *next_val = nv;
         let block = &mut func.blocks[exit_idx];
-        let mut new_insts: Vec<Instruction> =
-            Vec::with_capacity(block.instructions.len() + head.len() + stores.len());
-        new_insts.extend(head);
-        new_insts.extend(stores);
-        new_insts.extend(block.instructions.iter().cloned());
-        block.instructions = new_insts;
+        block.insert_insts(0, head.into_iter().chain(stores), Span::dummy());
         let _ = dom;
         let _ = preheader;
         let _ = srcs;

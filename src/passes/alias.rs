@@ -141,12 +141,24 @@ pub(crate) fn vec_intrinsic_access<'a>(
         | IntrinsicOp::VecStoreI64x4
         | IntrinsicOp::VecStoreI8x32
         | IntrinsicOp::VecStoreI16x16 => (true, 32),
+        IntrinsicOp::VecStoreNarrowMaxU8x4 => (true, 4),
+        IntrinsicOp::VecLoadWidenU8ToI32x4 => {
+            let count = match args.get(4)? {
+                Operand::Const(c) => c.to_i64()?,
+                _ => return None,
+            };
+            if !(3..=4).contains(&count) {
+                return None;
+            }
+            (false, count)
+        }
         IntrinsicOp::VecStoreI32x4Pair => (true, 8),
         // The actual accesses are four dwords at 0, 8, 16 and 24; the
         // enclosing 28-byte interval is a conservative alias footprint.
         IntrinsicOp::VecLoadStrided2I32x8 => (false, 28),
-        // Two exact dwords at 0 and 8; the enclosing interval is conservative.
-        IntrinsicOp::VecLoadStrided2I32x4 => (false, 12),
+        // Four exact dwords at 0, 8, 16 and 24; the enclosing interval is
+        // conservative.
+        IntrinsicOp::VecLoadStrided2I32x4 => (false, 28),
         // The compact form reads both full 16-byte halves of its proven window.
         IntrinsicOp::VecLoadStrided2CompactI32x4 => (false, 32),
         IntrinsicOp::VecLoadF64x4
@@ -363,6 +375,41 @@ mod tests {
         }
     }
     #[test]
+    fn narrow_pixel_memory_footprints_are_not_vector_home_widths() {
+        use crate::ir::reexports::IrConst;
+        for count in 0..=5 {
+            let args = [
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+                Operand::Const(IrConst::I64(32)),
+                Operand::Const(IrConst::I32(36)),
+                Operand::Const(IrConst::I32(count)),
+            ];
+            let access = vec_intrinsic_access(&IntrinsicOp::VecLoadWidenU8ToI32x4, &args);
+            if (3..=4).contains(&count) {
+                assert_eq!(access, Some((false, count as i64, &args[0], &args[1], 32)));
+            } else {
+                assert_eq!(access, None);
+            }
+        }
+        let args = [
+            Operand::Value(Value(0)),
+            Operand::Value(Value(1)),
+            Operand::Value(Value(2)),
+            Operand::Const(IrConst::I64(32)),
+            Operand::Const(IrConst::I32(7)),
+        ];
+        assert_eq!(
+            vec_intrinsic_access(&IntrinsicOp::VecStoreNarrowMaxU8x4, &args),
+            Some((true, 4, &args[1], &args[2], 32))
+        );
+        assert_eq!(
+            vec_intrinsic_access(&IntrinsicOp::VecNarrowMaxU8x4, &args),
+            None
+        );
+    }
+
+    #[test]
     fn strided_load_aliases_the_enclosing_interval() {
         use crate::ir::reexports::IrConst;
         let args = [
@@ -373,7 +420,7 @@ mod tests {
         let access = vec_intrinsic_access(&IntrinsicOp::VecLoadStrided2I32x8, &args);
         assert_eq!(access, Some((false, 28, &args[0], &args[1], 32)));
         let access = vec_intrinsic_access(&IntrinsicOp::VecLoadStrided2I32x4, &args);
-        assert_eq!(access, Some((false, 12, &args[0], &args[1], 32)));
+        assert_eq!(access, Some((false, 28, &args[0], &args[1], 32)));
         let access = vec_intrinsic_access(&IntrinsicOp::VecLoadStrided2CompactI32x4, &args);
         assert_eq!(access, Some((false, 32, &args[0], &args[1], 32)));
     }

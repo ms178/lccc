@@ -155,10 +155,13 @@ fn hoist_in_loop(
     for c in consts {
         let new_val = func.next_value_id;
         func.next_value_id += 1;
-        func.blocks[preheader].instructions.push(Instruction::Copy {
-            dest: Value(new_val),
-            src: Operand::Const(c.to_ir_const()),
-        });
+        func.blocks[preheader].push_inst(
+            Instruction::Copy {
+                dest: Value(new_val),
+                src: Operand::Const(c.to_ir_const()),
+            },
+            crate::common::source::Span::dummy(),
+        );
         count += 1;
 
         // Rewrite uses within the loop body.

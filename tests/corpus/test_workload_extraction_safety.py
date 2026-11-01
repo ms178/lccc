@@ -20,6 +20,7 @@ import importlib.util
 import inspect
 import io
 import os
+import subprocess
 import pathlib
 import stat
 import tarfile
@@ -605,7 +606,14 @@ class CallSiteWiringTests(unittest.TestCase):
         import ast
         guarded = {'extract_untrusted', 'extract'}
         offenders = []
-        for path in sorted(REPO.rglob('*.py')):
+        # Scan owned sources, not ignored build trees or archived baselines.
+        sources = subprocess.check_output(
+            ['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard',
+             '--', '*.py'], cwd=REPO).decode().split('\0')
+        for relpath in sorted(set(sources) - {''}):
+            path = REPO / relpath
+            if not path.is_file():
+                continue
             rel = path.relative_to(REPO).as_posix()
             if rel.startswith('tests/corpus/clang-c/') or '/clang-c/' in rel:
                 continue

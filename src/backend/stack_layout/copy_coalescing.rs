@@ -1672,6 +1672,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadI64x4
             | O::VecLoadI16x8
             | O::VecLoadI8x16
+            | O::VecLoadWidenU8ToI32x4
             | O::VecLoadI32x4Pair
             | O::VecLoadWidenI32ToI64x2
             | O::VecHorizontalAddF64x2
@@ -1737,6 +1738,8 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // folds into the VEX.128 destination exactly like the
             // unsigned byte twins above.
             | O::VecSminI32x4
+            | O::VecMinU32x4
+            | O::VecMaxU32x4
             | O::VecSmaxI32x4
             | O::VecSubI64x4
             | O::VecAndI64x4
@@ -1906,6 +1909,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // stored to a slot every iteration (a dead 256-bit store that
             // made the vectorized find_max SLOWER than scalar).
             | O::VecMaxI32x8
+            | O::VecMinU32x8 | O::VecMaxU32x8
             | O::VecMinI32x8
             // Byte-lane arithmetic mirrors the dword policy above: the
             // AVX2 forms fold a deferred load into the three-operand VEX
@@ -2108,6 +2112,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // Integer min/max map results: with the exact ternary fold
             // these now feed VecStore like the lane ops above (previously
             // only the reduction path consumed VecMaxI32x8).
+            | O::VecMinU32x8 | O::VecMaxU32x8
             | O::VecMinI32x8
             | O::VecMaxI32x8
             // Byte-lane map ops (AVX2 32xI8): same SSA-scratch-pair
@@ -2149,6 +2154,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecXorI8x16
             | O::VecPackI64x2
             | O::VecPackF64x2
+            | O::VecLoadWidenU8ToI32x4
             | O::VecLoadI32x4Pair
             | O::VecPackI32x4Pair
             | O::VecZeroI64x2
@@ -2189,6 +2195,8 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecXorF32x4
             | O::VecXorF64x2
             | O::VecSminI32x4
+            | O::VecMinU32x4
+            | O::VecMaxU32x4
             | O::VecSmaxI32x4
             | O::VecShlI16x16
             | O::VecShlI16x8
@@ -2325,6 +2333,7 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
             | O::VecLoadF32x4
             | O::VecLoadI32x4
             | O::VecLoadI64x2
+            | O::VecLoadWidenU8ToI32x4
             | O::VecLoadI32x4Pair
             | O::VecLoadI64x4
             | O::VecLoadI16x8
@@ -2490,6 +2499,8 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecMinI16x8
         | O::VecMaxI16x8
         | O::VecSminI32x4
+        | O::VecMinU32x4
+        | O::VecMaxU32x4
         | O::VecSmaxI32x4 => Some(true),
         // Non-commutative: FP sub/div return different results under
         // operand exchange; packed FP min/max return SRC2 on unordered and
@@ -2527,6 +2538,8 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecAddI32x8
         | O::VecMulI32x8
         | O::VecMaxI32x8
+        | O::VecMinU32x8
+        | O::VecMaxU32x8
         | O::VecMinI32x8 => Some(true),
         O::VecSubF64x4 | O::VecSubF32x8 | O::VecDivF64x4 | O::VecDivF32x8 => Some(false),
         // Packed min/max are NON-commutative (MINPS/MAXPS return the second

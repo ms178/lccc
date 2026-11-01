@@ -43,6 +43,7 @@ KINDS: list[tuple[str, str]] = [
     ("BAD_TARGET", "targets unknown block"),
     ("PHI_ORDER", "after a non-phi instruction"),
     ("DUP_LABEL", "duplicate block label"),
+    ("SPAN_DRIFT", "source spans for"),
 ]
 
 STAGE_RE = re.compile(r"after `([^`]*)`")

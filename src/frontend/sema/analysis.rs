@@ -16,6 +16,7 @@
 //! information for the lowerer. Full type checking is TODO.
 
 mod constexpr;
+mod return_local_addr;
 
 use super::const_eval::{ConstMap, SemaConstEval};
 use super::type_context::{EnumConstant, FunctionTypedefInfo, TypeContext};
@@ -77,21 +78,10 @@ enum FormatExpectation {
     PointerTo(CType),
 }
 
+/// A `-Wformat` type as GCC 16.2 quotes it: `Display` spells it, except that
+/// a pointer drops its pointee qualifiers and address space.
 fn gcc_format_type_name(ty: &CType) -> String {
     match ty {
-        CType::Bool => "_Bool".to_string(),
-        CType::SChar => "signed char".to_string(),
-        CType::UChar => "unsigned char".to_string(),
-        CType::Short => "short int".to_string(),
-        CType::UShort => "short unsigned int".to_string(),
-        CType::Int => "int".to_string(),
-        CType::UInt => "unsigned int".to_string(),
-        CType::Long => "long int".to_string(),
-        CType::ULong => "long unsigned int".to_string(),
-        CType::LongLong => "long long int".to_string(),
-        CType::ULongLong => "long long unsigned int".to_string(),
-        CType::Int128 => "__int128".to_string(),
-        CType::UInt128 => "unsigned __int128".to_string(),
         CType::Pointer(pointee, _) => format!("{} *", gcc_format_type_name(pointee)),
         _ => ty.to_string(),
     }
@@ -213,6 +203,11 @@ pub struct SemaResult {
     /// type-name (`sizeof(enum { E = 30 }) + E`) or in an inner block that
     /// shadows an outer object of the same name.
     pub enumerator_refs: FxHashMap<ExprId, i64>,
+    /// `return` expressions diagnosed by `-Wreturn-local-addr` as the address
+    /// of a local variable: the lowerer evaluates them for their side effects
+    /// and returns a null pointer instead (GCC 16.2's code generation at
+    /// every level; see `analysis::return_local_addr`).
+    pub local_address_returns: FxHashSet<ExprId>,
 }
 
 impl Default for SemaResult {
@@ -224,6 +219,7 @@ impl Default for SemaResult {
             call_entities: FxHashMap::default(),
             const_values: ConstMap::default(),
             enumerator_refs: FxHashMap::default(),
+            local_address_returns: FxHashSet::default(),
         }
     }
 }
@@ -293,6 +289,13 @@ pub struct SemanticAnalyzer {
     /// dereference consumes this before analyzing its own operand: the
     /// exemption must not leak into nested expressions (measured).
     address_of_operand: Cell<bool>,
+    /// Symbol-table scope index of the innermost function definition's
+    /// parameter scope: automatic objects at or above it belong to that
+    /// function, those below to an enclosing one (`-Wreturn-local-addr`).
+    function_scope_floor: usize,
+    /// Names declared `weak` (attribute or `#pragma weak`): their address may
+    /// be null, so the front end cannot fold it to true.
+    weak_symbols: FxHashSet<String>,
 }
 
 /// Where an implicit conversion occurs, for GCC 16.2's verbatim
@@ -325,6 +328,8 @@ impl SemanticAnalyzer {
             unevaluated_depth: Cell::new(0),
             div_zero_quiet: Cell::new(0),
             address_of_operand: Cell::new(false),
+            function_scope_floor: usize::MAX,
+            weak_symbols: FxHashSet::default(),
         };
         // Pre-populate with common implicit declarations
         analyzer.declare_implicit_functions();
@@ -453,6 +458,12 @@ impl SemanticAnalyzer {
     }
 
     /// Select a pre-C99 dialect (see [`Self::pre_c99`]).
+    /// Names `#pragma weak` declared weak in this translation unit.
+    pub fn set_weak_pragma_names<'n>(&mut self, names: impl IntoIterator<Item = &'n str>) {
+        self.weak_symbols
+            .extend(names.into_iter().map(str::to_string));
+    }
+
     pub fn set_pre_c99_dialect(&mut self, pre_c99: bool) {
         self.pre_c99 = pre_c99;
     }
@@ -614,9 +625,16 @@ impl SemanticAnalyzer {
             }
         }
         let previous_return_type = self.current_return_type.replace(return_type.clone());
+        // The nested body's own objects start at its parameter scope; the
+        // parent's locals below it outlive the nested call.
+        let previous_scope_floor = std::mem::replace(
+            &mut self.function_scope_floor,
+            self.symbol_table.depth() - 1,
+        );
         self.function_nesting_stack.push(func.name.clone());
         self.analyze_compound_stmt(&func.body);
         self.function_nesting_stack.pop();
+        self.function_scope_floor = previous_scope_floor;
         self.current_return_type = previous_return_type;
         self.result.type_context.pop_scope();
         self.symbol_table.pop_scope();
@@ -703,6 +721,13 @@ impl SemanticAnalyzer {
         // so local struct/union definitions don't overwrite global layouts)
         self.symbol_table.push_scope();
         self.result.type_context.push_scope();
+        let previous_scope_floor = std::mem::replace(
+            &mut self.function_scope_floor,
+            self.symbol_table.depth() - 1,
+        );
+        if func.attrs.is_weak() {
+            self.weak_symbols.insert(func.name.clone());
+        }
 
         // Declare parameters in function scope. Function-pointer parameters
         // (`int (*cb)(void*)`) store the function type in `fptr_params`, not
@@ -782,6 +807,7 @@ impl SemanticAnalyzer {
         let previous_return_type = self.current_return_type.replace(return_type.clone());
         self.analyze_compound_stmt(&func.body);
         self.current_return_type = previous_return_type;
+        self.function_scope_floor = previous_scope_floor;
 
         // -Wreturn-type: warn if a non-void function can fall through without returning.
         // Skip the check for:
@@ -1386,6 +1412,9 @@ impl SemanticAnalyzer {
                 }
             }
 
+            if init_decl.attrs.is_weak() {
+                self.weak_symbols.insert(init_decl.name.clone());
+            }
             if init_decl.attrs.ifunc_target.is_some() {
                 if !matches!(full_type, CType::Function(_)) {
                     self.diagnostics
@@ -2731,6 +2760,14 @@ impl SemanticAnalyzer {
                                 null_constant,
                             );
                         }
+                    }
+                    // GCC 16.2's `c_finish_return` order (measured): the
+                    // conversion's own diagnostic first, then the
+                    // local-address walk -- which a rejected conversion
+                    // (`error_mark_node`) never reaches. A permerror such as
+                    // `-Wincompatible-pointer-types` still converts.
+                    if !self.return_conversion_rejected(expr, &expected) {
+                        self.check_return_local_addr(expr, &expected);
                     }
                 }
             }
@@ -4843,19 +4880,11 @@ impl SemanticAnalyzer {
         }
     }
 
-    /// Simple assignment and the conversions "as if by assignment"
-    /// (initialization, argument passing, `return`; C23 6.5.16.1p1) for a
-    /// record, `void` or `nullptr_t` operand. Whether it reported an error.
-    fn check_assignment_operand(
-        &self,
-        from: &Expr,
-        to: &CType,
-        span: Span,
-        ctx: IConvContext<'_>,
-    ) -> bool {
-        let Some(constraint_from_ty) = self.constraint_operand(from) else {
-            return false;
-        };
+    /// The source type an implicit conversion (initialization, assignment,
+    /// argument, `return`) judges: the value-decayed constraint operand, with
+    /// a decayed array's named address space kept.
+    fn assignment_source_ctype(&self, from: &Expr) -> Option<CType> {
+        let constraint_from_ty = self.constraint_operand(from)?;
         // The constraint operand is value-decayed, but ordinary array decay
         // uses the default address space. If the expression's object type
         // identifies a different named space, update only that pointer-space
@@ -4883,6 +4912,43 @@ impl SemanticAnalyzer {
                 .unwrap_or(constraint_from_ty)
         } else {
             constraint_from_ty
+        };
+        Some(from_ty)
+    }
+
+    /// GCC 16.2's hard address-space constraint error: a pointer whose
+    /// outermost pointee space differs from the target's (a null-pointer
+    /// constant spelled through `void` excepted). GCC turns the operand into
+    /// `error_mark_node` here, so nothing downstream inspects it.
+    fn rejects_address_space(&self, from_ty: &CType, to: &CType, from: &Expr) -> bool {
+        matches!(
+            (from_ty, to),
+            (
+                CType::Pointer(_, from_space),
+                CType::Pointer(_, to_space)
+            ) if from_space != to_space
+        ) && !self.is_void_null_pointer_constant(from)
+    }
+
+    /// Whether `return expr;` in a function returning `to` is rejected
+    /// outright (see [`Self::rejects_address_space`]).
+    fn return_conversion_rejected(&self, from: &Expr, to: &CType) -> bool {
+        self.assignment_source_ctype(from)
+            .is_some_and(|from_ty| self.rejects_address_space(&from_ty, to, from))
+    }
+
+    /// Simple assignment and the conversions "as if by assignment"
+    /// (initialization, argument passing, `return`; C23 6.5.16.1p1) for a
+    /// record, `void` or `nullptr_t` operand. Whether it reported an error.
+    fn check_assignment_operand(
+        &self,
+        from: &Expr,
+        to: &CType,
+        span: Span,
+        ctx: IConvContext<'_>,
+    ) -> bool {
+        let Some(from_ty) = self.assignment_source_ctype(from) else {
+            return false;
         };
         // GCC 16.2's anchors for the conversion verdicts below (measured with
         // `-Wint-conversion`, `-Wincompatible-pointer-types` and
@@ -4961,14 +5027,7 @@ impl SemanticAnalyzer {
         // address-space constraint error. A mismatch below that level remains
         // GCC's controllable `-Wincompatible-pointer-types` diagnostic.
         let space_gap = first_space_mismatch(&from_ty, to).is_some();
-        let top_level_space_gap = matches!(
-            (&from_ty, to),
-            (
-                CType::Pointer(_, from_space),
-                CType::Pointer(_, to_space)
-            ) if from_space != to_space
-        );
-        if top_level_space_gap && !self.is_void_null_pointer_constant(from) {
+        if self.rejects_address_space(&from_ty, to, from) {
             let message = match ctx {
                 IConvContext::Initialization => {
                     "initialization from pointer to non-enclosed address space".to_string()

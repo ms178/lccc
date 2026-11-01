@@ -21,10 +21,14 @@ use crate::common::fx_hash::FxHashMap;
 // ── RISC-V relocation type constants ─────────────────────────────────────
 // Values from the RISC-V ELF psABI specification.
 
+pub const R_RISCV_NONE: u32 = 0;
 pub const R_RISCV_32: u32 = 1;
 pub const R_RISCV_64: u32 = 2;
 pub const R_RISCV_BRANCH: u32 = 16;
 pub const R_RISCV_JAL: u32 = 17;
+/// Deprecated by the psABI in favour of `CALL_PLT`, still emitted by older
+/// assemblers; resolved identically.
+pub const R_RISCV_CALL: u32 = 18;
 pub const R_RISCV_CALL_PLT: u32 = 19;
 pub const R_RISCV_GOT_HI20: u32 = 20;
 pub const R_RISCV_TLS_GOT_HI20: u32 = 21;
@@ -50,6 +54,13 @@ pub const R_RISCV_SUB64: u32 = 40;
 pub const R_RISCV_ALIGN: u32 = 43;
 pub const R_RISCV_RVC_BRANCH: u32 = 44;
 pub const R_RISCV_RVC_JUMP: u32 = 45;
+pub const R_RISCV_RVC_LUI: u32 = 46;
+/// 47-50 are reserved by the current psABI; GNU ld still produces them while
+/// relaxing (as `relax.rs` does) and accepts them from input, as lccc does.
+pub const R_RISCV_GPREL_I: u32 = 47;
+pub const R_RISCV_GPREL_S: u32 = 48;
+pub const R_RISCV_TPREL_I: u32 = 49;
+pub const R_RISCV_TPREL_S: u32 = 50;
 pub const R_RISCV_RELAX: u32 = 51;
 pub const R_RISCV_SET6: u32 = 53;
 pub const R_RISCV_SUB6: u32 = 52;
@@ -424,6 +435,13 @@ pub struct MergedSection {
     pub data: Vec<u8>,
     pub vaddr: u64,
     pub align: u64,
+    /// `sh_entsize` while the output keeps `SHF_MERGE` (GNU ld's rule,
+    /// `debug::gnu_merge_flags`); 0 otherwise.
+    pub entsize: u64,
+    /// `SHF_WRITE` comes from the script's placement alone (a `.sdata` that
+    /// only `.srodata` inputs fill sits in the RW segment): layout honours
+    /// it, the section header keeps the inputs' flags as GNU ld's does.
+    pub script_write: bool,
 }
 
 /// Tracks where each input section maps to in the merged output.
@@ -454,12 +472,17 @@ pub fn output_section_name(name: &str, sh_type: u32, sh_flags: u64) -> Option<St
     let prefixes = [
         (".text.", ".text"),
         (".rodata.", ".rodata"),
-        (".data.rel.ro", ".data"),
+        // Read-only after relocation: its own output section in the RELRO
+        // region, as in GNU ld's script (not writable `.data`).
+        (".data.rel.ro", ".data.rel.ro"),
         (".data.", ".data"),
         (".bss.", ".bss"),
         (".tdata.", ".tdata"),
         (".tbss.", ".tbss"),
-        // RISC-V specific: small data/bss sections
+        // RISC-V specific: small data/bss sections.  GNU ld's script puts the
+        // small read-only constants first in `.sdata` (`input_rank`), all of
+        // them within reach of gp.
+        (".srodata.", ".sdata"),
         (".sdata.", ".sdata"),
         (".sbss.", ".sbss"),
     ];
@@ -468,6 +491,10 @@ pub fn output_section_name(name: &str, sh_type: u32, sh_flags: u64) -> Option<St
         if name.starts_with(prefix) {
             return Some(output.to_string());
         }
+    }
+
+    if name == ".srodata" {
+        return Some(".sdata".to_string());
     }
 
     // Array sections: fold numbered variants (.init_array.65535 -> .init_array)
@@ -656,9 +683,59 @@ pub fn resolve_archive_members(
     }
 }
 
+const EF_RISCV_RVC: u32 = 0x1;
+const EF_RISCV_FLOAT_ABI: u32 = 0x6;
+const EF_RISCV_RVE: u32 = 0x8;
+const EF_RISCV_TSO: u32 = 0x10;
+
+/// The output `e_flags` (GNU ld `_bfd_riscv_elf_merge_private_bfd_data`).
+/// Objects without code cannot conflict and are skipped; the first one with
+/// code sets the flags.  Float ABIs and RVE must agree across the rest; RVC
+/// and TSO accumulate.  No object with code: 0.
+pub fn merged_e_flags(input_objs: &[(String, ElfObject)]) -> Result<u32, String> {
+    fn float_abi(flags: u32) -> &'static str {
+        match flags & EF_RISCV_FLOAT_ABI {
+            0x0 => "soft-float",
+            0x2 => "single-float",
+            0x4 => "double-float",
+            _ => "quad-float",
+        }
+    }
+    let mut merged: Option<u32> = None;
+    for (name, obj) in input_objs {
+        let has_code = obj.sections.iter().any(|sec| {
+            sec.sh_type != SHT_NOBITS
+                && sec.flags & SHF_ALLOC != 0
+                && sec.flags & SHF_EXECINSTR != 0
+        });
+        if !has_code {
+            continue;
+        }
+        let new = obj.e_flags;
+        let Some(old) = merged else {
+            merged = Some(new);
+            continue;
+        };
+        if (old ^ new) & EF_RISCV_FLOAT_ABI != 0 {
+            return Err(format!(
+                "{name}: can't link {} modules with {} modules",
+                float_abi(new),
+                float_abi(old)
+            ));
+        }
+        if (old ^ new) & EF_RISCV_RVE != 0 {
+            return Err(format!("{name}: can't link RVE with other target"));
+        }
+        merged = Some(old | (new & (EF_RISCV_RVC | EF_RISCV_TSO)));
+    }
+    Ok(merged.unwrap_or(0))
+}
+
 /// Canonical output section ordering for layout.
 pub fn section_order(name: &str, flags: u64) -> u64 {
     match name {
+        // First in the text segment (GNU ld's default script).
+        ".note.gnu.build-id" => 5,
         ".text" => 100,
         ".rodata" => 200,
         ".eh_frame_hdr" => 250,
@@ -669,6 +746,9 @@ pub fn section_order(name: &str, flags: u64) -> u64 {
         ".data" => 600,
         ".sdata" => 650,
         ".bss" | ".sbss" => 700,
+        // Orphan notes: GNU ld places them after the last read-only section
+        // of the text segment (after `.eh_frame`/`.gcc_except_table`).
+        _ if name.starts_with(".note.") && flags & (SHF_WRITE | SHF_EXECINSTR) == 0 => 390,
         _ if flags & SHF_EXECINSTR != 0 => 150,
         _ if flags & SHF_WRITE == 0 => 300,
         _ => 600,

@@ -1512,7 +1512,7 @@ fn replace_case_with_call(
             switch_cases.push(((i + 1) as i64, exit_bid));
         }
 
-        func.blocks[entry_idx].instructions = vec![call_inst];
+        func.blocks[entry_idx].replace_insts_synthesized(vec![call_inst]);
         if switch_cases.is_empty() {
             // Only has_return, no exit_blocks — just branch to end
             func.blocks[entry_idx].terminator = Terminator::Branch(end_block);
@@ -1552,7 +1552,7 @@ fn replace_case_with_call(
             },
         };
 
-        func.blocks[entry_idx].instructions = vec![call_inst];
+        func.blocks[entry_idx].replace_insts_synthesized(vec![call_inst]);
         func.blocks[entry_idx].terminator = Terminator::Branch(end_block);
     }
 
@@ -1563,7 +1563,7 @@ fn replace_case_with_call(
             continue; // Already replaced
         }
         if let Some(&idx) = block_map.get(&bid) {
-            func.blocks[idx].instructions.clear();
+            func.blocks[idx].clear_insts();
             func.blocks[idx].terminator = Terminator::Branch(end_block);
         }
     }
