@@ -204,7 +204,7 @@ Preprocessor warnings retain their occurrence's own settings. Source-name
 provenance for emitted markers is independent of user redefinitions of
 `__FILE__` and is restored across includes.
 
-The hosted warning gate also runs **58 scoped-diagnostic mode checks** against
+The hosted warning gate also runs **60 scoped-diagnostic mode checks** against
 GCC 16.2, checking severity and source line in compilation, syntax-only, and
 (where relevant) preprocessing modes. Coverage includes nested and unmatched
 pop, blanket `-w`, CLI promotion/demotion, macro keyword collisions, repeated
@@ -218,3 +218,14 @@ original Kbuild flags. The previous rejection of `bpf_rstat_flush` was caused
 by ignored GCC diagnostic scopes in the BPF hook macros; no BPF/weak-function
 exemption or warning-flag removal was introduced. This is frontend evidence,
 not a successful kernel codegen, final link, boot or performance result.
+
+Follow-up provenance control: combining a presumed `#line` filename with a
+user-redefined `__FILE__` and direct diagnostic pragmas previously reported
+line 909 instead of GCC's 906. The marker restoration now uses independent
+source provenance; the expanded 60-mode gate passes. Targeted Rust tests pass:
+eight warning/dialect/registry tests and three Microsoft wide-ABI IR tests.
+The latest compiler again passes the 31,024-byte boot gate and compiles the
+actual rstat translation unit to a native object with its original Kbuild
+flags (only private output/dependency paths changed). That object probe does
+not perform Kbuild's delayed whole-link objtool validation. Unsupported-option
+warnings, final linking and QEMU acceptance remain outstanding.

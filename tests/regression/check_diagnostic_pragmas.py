@@ -55,6 +55,8 @@ CASES = [
      '#undef __FILE__\n#define __FILE__ 123\n#include "empty.h"\n_Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \\"-Wmissing-prototypes\\"") int f(void) { return 0; }\n_Pragma("GCC diagnostic pop") int g(void) { return 0; } /*expect-W*/\n'),
     ('line-control', 'missing-prototypes', ['-Wmissing-prototypes'],
      '#line 900 "presumed.c"\n_Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \\"-Wmissing-prototypes\\"") int f(void) { return 0; }\n_Pragma("GCC diagnostic pop") int g(void) { return 0; }\n'),
+    ('line-control-file-macro', 'missing-prototypes', ['-Wmissing-prototypes'],
+     '#line 900 "presumed.c"\n#undef __FILE__\n#define __FILE__ 123\n#pragma GCC diagnostic push\n#pragma GCC diagnostic ignored "-Wmissing-prototypes"\nint f(void) { return 0; }\n#pragma GCC diagnostic pop\nint g(void) { return 0; }\n'),
     ('repeated-include', 'strict-prototypes', ['-Wstrict-prototypes'],
      'int f(void);\n#pragma GCC diagnostic push\n#pragma GCC diagnostic ignored "-Wstrict-prototypes"\n#include "repeat.h"\n#pragma GCC diagnostic pop\n#include "repeat.h"\n'),
     ('pp-repeated-include', 'undef', ['-Wundef'],
@@ -83,6 +85,8 @@ def run(lccc: list[str], gcc: list[str]) -> None:
                         for mark in re.findall(r'/\*expect-([WE])\*/', line)]
             if name in ('repeated-include', 'pp-repeated-include'):
                 expected = [(1, 'warning')]
+            if name == 'line-control-file-macro':
+                expected = [(906, 'warning')]
             if name == 'line-control':
                 expected = [(901, 'warning')]
             path = root / f'{name}.c'

@@ -711,12 +711,10 @@ impl Preprocessor {
         }
     }
 
-    /// The presumed file name as a line-marker operand: `__FILE__`'s
-    /// spelling, which `#line N "name"` sets and includes save and restore.
+    /// The presumed filename as a line-marker operand. Unlike __FILE__'s
+    /// macro body, provenance must survive a user #define/#undef of __FILE__.
     fn presumed_file_operand(&self) -> String {
-        self.macros
-            .get_file_body()
-            .map_or_else(|| format!("\"{}\"", self.filename), str::to_string)
+        self.macros.source_filename.clone()
     }
 
     /// The line marker a preceding `#line` made due, for the output line

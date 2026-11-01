@@ -109,3 +109,35 @@ the measured after compiler hash is
 These are local microbenchmark observations, not a statistical-significance
 claim and **not measured kernel runtime or whole-kernel code-size benefits**.
 Their relevance depends on whether such definitions occur on a real hot path.
+
+## Scoped warning gate evidence (2026-11-01)
+
+At revision `0dce6e6c7`, replaying **554 actual saved C compilation commands**
+from init/kernel/mm/arch/x86 with only the compile/output/dependency switches
+replaced by `-fsyntax-only` passed. This is not a code-generation, linker,
+whole-tree or QEMU result. The earlier rstat BPF failure is fixed by honoring
+GCC diagnostic push/ignore/pop scopes, not by exempting weak/BPF functions.
+The boot-only rebuild using that compiler independently passed at 31,024 bytes,
+with 24 ISA-clean objects and a GNU-linker byte-identical flat image. Its size
+is unchanged from the previous locally validated boot gate; no new size win
+is inferred from these diagnostic changes. Microsoft fixed/record/variadic
+interoperability gates also passed again.
+
+An inventory of **2,478 saved LCCC object commands**, including drivers already
+reached by the ongoing full build, found 56 warning-option spellings. Testing
+those spellings on an empty non-kernel TU in strict option mode still rejects
+these 16 positive spellings:
+
+- `-Wenum-conversion`, `-Werror=date-time`, `-Werror=designated-init`
+- `-Wframe-larger-than=2048`, `-Wvla-larger-than=1`, `-Wimplicit-fallthrough=5`
+- `-Wformat-overflow`, `-Wformat-truncation`, `-Wmissing-format-attribute`
+- `-Wmissing-include-dirs`, `-Wold-style-definition`, `-Wpacked-not-aligned`
+- `-Wrestrict`, `-Wstringop-truncation`, `-Wunused-but-set-variable`,
+  `-Wunused-const-variable`
+
+This is an observed saved-command subset, not a complete warning audit or
+proof that every accepted negative spelling has an implemented diagnostic.
+Unsupported optimization/security/debug options also remain visible. These
+warnings must not be hidden by deleting flags or relabeling no-ops as support.
+Final full-kernel link/boot, warning-free acceptance and measured runtime and
+code-size improvements remain outstanding.
