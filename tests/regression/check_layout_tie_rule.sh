@@ -171,6 +171,12 @@ fi
 tie_taken=$(taken_transfers "$tmp/tie.bin" "$tmp/tie.cg")
 orig_taken=$(taken_transfers "$tmp/orig.bin" "$tmp/orig.cg")
 say "jmp: tie=$tie_jmp historical=$orig_jmp; executed taken transfers: tie=$tie_taken historical=$orig_taken"
+if [[ $tie_taken -eq 0 ]]; then
+    tie_objects=$(grep '^ob=' "$tmp/tie.cg" | sort -u | head -n 8 | tr '\n' ';' || true)
+    tie_records=$(grep -m 8 -E '^(jcnd|jump)=' "$tmp/tie.cg" | tr '\n' ';' || true)
+    say "FAIL: Callgrind tie-arm objects: $tie_objects"
+    say "FAIL: Callgrind tie-arm transfer records: $tie_records"
+fi
 if [[ $tie_taken -eq 0 || $orig_taken -eq 0 ]]; then
     bad "callgrind recorded no jumps (tie=$tie_taken historical=$orig_taken); the measurement did not run"
 elif [[ $tie_taken -ge $orig_taken ]]; then
