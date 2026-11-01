@@ -370,9 +370,8 @@ pub(crate) fn unimplemented_names() -> impl Iterator<Item = &'static str> {
 //   ms_struct         changes layout      ms_struct       changes layout
 //   gcc_struct        silent, is default  gcc_struct      silent, is default
 //
-// Two of those verdicts deserve their reasoning spelled out, because "just
-// ignore it like gcc does" would be wrong for one and "just refuse it" would be
-// wrong for the other:
+// Three verdicts deserve their reasoning spelled out, because neither "ignore
+// it like gcc does" nor "refuse it" is right for all of them:
 //
 //   * `no_callee_saved_registers` / `preserve_none` change the caller's
 //     preservation obligations in GCC 16.2. `preserve_none` additionally passes
@@ -385,6 +384,10 @@ pub(crate) fn unimplemented_names() -> impl Iterator<Item = &'static str> {
 //     them. lccc cannot yet prove that of a body it emits (gcc enforces it by
 //     diagnosing forbidden `xmm`/`x87` use), so silently accepting it could
 //     hand a caller a clobbered register. It is refused instead of ignored.
+//   * `force_align_arg_pointer` is a realigning-prologue contract. gcc is
+//     silent about it, but lccc does not yet force entry-stack realignment;
+//     accepting it silently would ignore a prologue promise. It is refused
+//     until that codegen exists, a measured stricter-than-gcc deviation.
 //
 // `ms_struct` is the one verdict that rejects a program gcc accepts, and that is
 // deliberate rather than an unfinished edge. On a tag gcc really does apply the

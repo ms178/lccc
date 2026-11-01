@@ -29,9 +29,10 @@ static uint64_t bset64(uint64_t x, uint64_t n)    { return x | (1ul << n); }
 static uint64_t bclr64(uint64_t x, uint64_t n)    { return x & ~(1ul << n); }
 static int      btest64(uint64_t x, uint64_t n)   { return (x & (1ul << n)) != 0; }
 
-/* The same idioms at the sub-word widths the C frontend actually produces:
- * promotion means the shift happens at int width and the result is truncated,
- * which is why the fold refuses to create an 8/16-bit bit operation. */
+/* The same idioms at sub-word widths.  C promotion usually leaves the shift
+ * at int width and truncates the result, but the IR/backend contract also
+ * covers narrow BitSet/BitClear operations produced by truncation-aware folds;
+ * those are pinned by the backend width unit tests. */
 static unsigned char bset8(unsigned char x, unsigned n) { return (unsigned char)(x | (1u << n)); }
 static unsigned char bclr8(unsigned char x, unsigned n) { return (unsigned char)(x & ~(1u << n)); }
 static int btest8(unsigned char x, unsigned n) { return (x & (1u << n)) != 0; }

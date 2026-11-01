@@ -2954,6 +2954,14 @@ gate "arm-address-contract" fast \
 gate "arm-popcount-contract" fast \
     env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py
 
+# Mandatory freestanding AArch64/RISC-V single-bit runtime checksum. The hosted
+# shard runs it with --run; the local mirror compiles/links and executes when
+# QEMU is present, so a missing emulator is an explicit skip rather than a
+# silent pass. It must be a registered fast gate, not a stray command appended
+# to the previous gate, or the shard-partition audit correctly rejects it.
+gate "bit-width-runtime" fast \
+    python3 tests/regression/check_bit_width_runtime.py
+
 gate "popcount-loop-contract" fast \
     python3 tests/regression/check_popcount_loop_contract.py
 

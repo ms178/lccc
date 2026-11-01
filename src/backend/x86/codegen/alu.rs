@@ -2034,9 +2034,9 @@ impl X86Codegen {
         ty: IrType,
     ) -> bool {
         // 8/16-bit operations have no register-direct bit-modify form here:
-        // `btsw` masks modulo 16 but the shared `use_32bit`/sext plumbing is
-        // written for 32/64, and no pass creates those widths (see
-        // `IrBinOp::BitSet`).  The accumulator path owns them.
+        // the shared `use_32bit`/sext plumbing is written for 32/64.  The
+        // accumulator path owns the narrow widths and reduces the index modulo
+        // the operation width (see `IrBinOp::BitSet`).
         let use_32bit = match ty {
             IrType::I32 | IrType::U32 => true,
             IrType::I64 | IrType::U64 | IrType::Ptr => false,

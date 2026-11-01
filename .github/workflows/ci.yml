@@ -2532,6 +2532,10 @@ jobs:
         python3 tests/linker/check_rwx_segments.py
         bash tests/regression/check_map_i64_two_lane.sh
         env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py --run
+        # Single-bit selection must execute correctly on the non-host backends,
+        # not merely assemble: freestanding AArch64/RISC-V checksums under QEMU,
+        # with the fold enabled and disabled at every optimization level.
+        python3 tests/regression/check_bit_width_runtime.py --run
         # ZERO-REM-1: the map vectorizer's scalar remainder mirror must be
         # omitted (not merely unreachable) when a constant trip count makes
         # it dead, on every shape where that is provable and on none where

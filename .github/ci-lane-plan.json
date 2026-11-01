@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 444.24,
+      "predicted_gate_seconds": 446.02,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -270,6 +270,10 @@
         {
           "measured_s": 3.05,
           "name": "env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py --run"
+        },
+        {
+          "name": "python3 tests/regression/check_bit_width_runtime.py --run",
+          "measured_s": 1.78
         },
         {
           "measured_s": 5.61,
@@ -1698,7 +1702,7 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/costs.tsv",
-      "measured_seconds_total": 875.18,
+      "measured_seconds_total": 876.96,
       "source": "measured by scripts/ci_gate_costs.py"
     },
     "codegen": {
