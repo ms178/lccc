@@ -9,10 +9,18 @@ CCC=${CCC:-$root/target/fastbuild/lccc}
 work=$(mktemp -d "${TMPDIR:-/tmp}/lccc-vsmall-trace.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
-if ! "$CCC" -O2 -m32 -msse2 -g -no-pie \
+GCC=${GCC:-gcc-16}
+if ! "$CCC" -O2 -m32 -msse2 -g -c \
     "$root/tests/regression/diagnostics/vector_small_packed_wrappers_m32_trace.c" \
-    -o "$work/probe" >"$work/build.out" 2>&1; then
-    echo "::warning title=i686 vector trace unavailable::diagnostic build failed"
+    -o "$work/fixture.o" >"$work/build.out" 2>&1; then
+    echo "::warning title=i686 vector trace unavailable::LCCC fixture-object build failed"
+    tail -n 20 "$work/build.out"
+    exit 0
+fi
+if ! "$GCC" -m32 -g -no-pie \
+    "$root/tests/regression/diagnostics/vector_small_packed_wrappers_m32_signal.c" \
+    "$work/fixture.o" -o "$work/probe" >>"$work/build.out" 2>&1; then
+    echo "::warning title=i686 vector trace unavailable::GCC signal-harness link failed"
     tail -n 20 "$work/build.out"
     exit 0
 fi
