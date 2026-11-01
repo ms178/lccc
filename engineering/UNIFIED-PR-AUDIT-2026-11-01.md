@@ -15,9 +15,16 @@ optional patched-LLVM comparison was skipped, not passed. These runs are for
 
 The hosted CI lane reports warning-denied builds, formatting, Clippy, MSRV,
 GCC 16.2 / Clang 23.1.4 contracts and authenticated ICX 2026.2 integration.
-Local `cargo test --offline --locked --profile fastbuild` separately passed
-7,445 tests, with 10 ignored and 0 failures; it is not a replacement for the
-hosted multilib/cross-target suites.
+Before the rebase, local `cargo test --offline --locked --profile fastbuild`
+passed 7,445 tests, with 10 ignored and 0 failures; it is not a replacement for
+the hosted multilib/cross-target suites.
+
+After rebasing onto `9e93005b8`, the full fastbuild suite passed **7,448 tests,
+10 ignored, 0 failed** with the active 4 GiB swap. All-target Clippy with
+`-D warnings`, `cargo fmt --all -- --check`, the 30-cell ABI matrix against the
+cached GCC 16.2 oracle, and the attribute diagnostic shell gate also passed.
+These latest local receipts cover the rebased tree; hosted CI must be rerun on
+its new commit before the delivery claim is refreshed.
 
 
 ## Hosted-only validation update
@@ -501,8 +508,8 @@ probes and the census do not imply interoperability for ignored conventions.
 
 ### Current-tree checks and boundaries
 
-- `cargo test --offline --locked --profile fastbuild`: **7,445 passed, 10
-  ignored, 0 failed**.
+- `cargo test --offline --locked --profile fastbuild`: **7,448 passed, 10
+  ignored, 0 failed** after the latest-main rebase.
 - `python3 tests/regression/abi_attribute_matrix.py`: **30/30 GCC 16.2 cells
   passed**; `python3 scripts/audit_census.py --check` and `cargo fmt --all --
   --check`: PASS.
