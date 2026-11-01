@@ -45,7 +45,7 @@ emitted under a foreign-ABI declaration.
 `src/frontend/parser/attribute_registry.rs` now carries
 `ABI_VERDICTS: &[(&str, AbiEffect, AbiEffect)]` — one row per name, one column
 per x86 target — and the parser asks it *before* the classification funnel, so
-the funnel never sees these names. The four effects are
+the funnel never sees these names. The five effects are
 
 | effect | meaning | diagnostic |
 | --- | --- | --- |
@@ -63,10 +63,13 @@ means.
 
 Two verdicts are deliberately *not* "ignore it because gcc does":
 
-* `preserve_none` and `no_callee_saved_registers` are register-preservation
-  promises, and the safe side of the contract is "preserve everything", which
-  lccc already does unconditionally. Ignoring them costs speed, never
-  correctness, so `GccIgnored` is safe as well as compatible.
+* `preserve_none` and `no_callee_saved_registers` are refused on both x86
+  targets. Preserving extra registers is not a sufficient ABI proof: measured
+  GCC 16.2 x86-64 `preserve_none` passes the first arguments in R12/R13, not
+  the native RDI/RSI. Separate caller/callee translation units, identically
+  named functions, and EBX/ESI/EDI clobber controls expose contracts hidden by
+  arithmetic-only or differently named twins. Both preservation attributes
+  therefore select `Unsupported`, never `GccIgnored`.
 * `no_caller_saved_registers` is the opposite promise: the callee promises not
   to clobber caller-saved registers, and the caller may then stop saving them.
   lccc cannot yet prove that of a body it emits (gcc enforces it by diagnosing
@@ -83,10 +86,12 @@ the tag placement is a real layout decision, not a no-op. The parser raises a
 placement flag for exactly the tag-level attribute parse
 (`Parser::parse_record_attributes`), so the table can answer both positions.
 
-`ms_struct` is the one verdict that rejects a program gcc accepts. lccc has no
-Microsoft bit-field layout yet, and the alternative to refusing is emitting the
-SysV layout under an `ms_struct` tag — the exact silent miscompile this work
-removes. GCC's own behaviour on the conflicting-attribute form is recorded for
+Unsupported ABI/layout verdicts deliberately reject some programs GCC accepts.
+For example, lccc has no Microsoft bit-field layout yet; silently emitting the
+SysV layout under an `ms_struct` tag would reproduce the ABI failure this work
+removes. Likewise x86-64 `force_align_arg_pointer` is refused until entry-stack
+realignment is implemented. On x86-64 `regparm` is ignored with GCC's warning,
+not claimed as an implemented register-argument convention. GCC's own behaviour on the conflicting-attribute form is recorded for
 whoever implements the layout: first attribute wins, the later one produces
 `warning: 'ms_struct' incompatible attribute ignored`, exit status 0.
 

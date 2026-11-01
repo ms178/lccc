@@ -53,7 +53,11 @@ tests/corpus/clang-c/Sema/format-attr-missing.c
 tests/regression/verify_ir_bitfield_record.c
 tests/corpus/clang-c/Sema/mips16_attr_not_allowed.c
 tests/corpus/clang-c/Sema/pid_t.c
-tests/corpus/clang-c/Sema/preserve-none-call-conv.c
+# A preservation-convention negative fixture must not pretend to be an
+# accepted-code IR invariant test: GCC 16.2 preserve_none changes argument
+# registers as well as preservation. Refusal is pinned by the ABI matrix;
+# accepted native direct/forwarded/indirect calls exercise IR here instead.
+tests/regression/verify_ir_native_convention.c
 tests/corpus/clang-c/Sema/sign-conversion.c
 tests/corpus/clang-c/Sema/typedef-prototype.c
 tests/corpus/clang-c/Sema/vector_swizzle_length.c
