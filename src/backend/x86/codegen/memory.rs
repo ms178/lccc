@@ -108,6 +108,17 @@ impl X86Codegen {
     /// a genuine 64-bit value in place would truncate it, and an unknown type
     /// must not be gambled on. Refusals fall back to the `leaq` path, which
     /// reloads the index through the sext-aware operand machinery.
+    ///
+    /// INVARIANT — every symbol+index SIB in this file goes through here
+    /// first. The four sites are `indexed_sym_operand`, `emit_load_indexed_impl`
+    /// (and its store dual), the register-offset pair
+    /// `emit_load_indexed_sym_reg_base_impl` / `emit_store_indexed_sym_reg_base_impl`,
+    /// and `emit_leaq_sym_index_impl`. That last one is the newest and was the
+    /// one that skipped the call, which is how the same GEP came to lower two
+    /// different ways depending on which fold won; `tests/regression/
+    /// check_symbol_index_widths.sh` states the resulting value law end to end
+    /// and the unit tests below pin each arm. A new SIB site that needs a
+    /// symbol base must call this too, or it reinvents the defect.
     fn ensure_sib_index_form(&mut self, index: &Value) -> bool {
         // Freshness-gated (see home_fresh): a stale home must not feed a
         // SIB index; refusing the fold falls back to the reload path.

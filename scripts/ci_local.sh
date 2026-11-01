@@ -1748,6 +1748,12 @@ gate "leaf-caller-homes" fast \
 gate "narrow-alu-arithmetic" fast \
     bash tests/regression/check_narrow_alu_arithmetic.sh
 
+# A symbol+index SIB consumes the index's full register, so a narrow index must
+# be sign- or zero-extended before the SIB uses it. Four folds obey the law;
+# the LEA arm did not, so the same `base + i` lowered two different ways.
+gate "symbol-index-widths" fast \
+    bash tests/regression/check_symbol_index_widths.sh
+
 # The builtin linkers against gcc's link semantics: -shared startup files and
 # default libraries, user -l before the defaults, -rpath, as-needed libm.
 gate "builtin-dso-link" fast \
