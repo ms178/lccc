@@ -23,8 +23,23 @@ After rebasing onto `9e93005b8`, the full fastbuild suite passed **7,448 tests,
 10 ignored, 0 failed** with the active 4 GiB swap. All-target Clippy with
 `-D warnings`, `cargo fmt --all -- --check`, the 30-cell ABI matrix against the
 cached GCC 16.2 oracle, and the attribute diagnostic shell gate also passed.
-These latest local receipts cover the rebased tree; hosted CI must be rerun on
-its new commit before the delivery claim is refreshed.
+These latest local receipts cover the rebased tree. After pushing commit
+`9cc96bf2`, current-head hosted CI run `41319947104`, Debian oracle
+`41319947071`, relocation/PGO contracts `41319947043`, and IPA/LRS
+`41319947054` all completed successfully. The CI run passed its warning-denied
+build, format, Clippy, MSRV, assertion-enabled suite, ABI/frontend shards,
+codegen/runtime shards, assembler/linker contracts, benchmark shards, and
+aggregate benchmark report; authenticated ICX 2026.2 integration also passed.
+No current-head hosted job failed. The optional patched-LLVM comparison is not
+part of these runs and is not claimed as passed.
+
+Latest main already contains the compiler implementation from the merged
+#1056/#1063 work; after the rebase, this PR's incremental diff is the ABI
+oracle/test strengthening and its audit documentation, not a duplicate copy of
+those already-merged compiler changes. The current branch remains open as PR
+#1051. The exact cumulative local snapshot is saved at
+`engineering/snapshots/ms178-1.patch` (ignored by Git as a local recovery
+artifact).
 
 
 ## Hosted-only validation update
@@ -476,8 +491,10 @@ stated IR result 1, on BOTH targets. This is an emitter/model counterexample,
 not a claim that the entire PR was built. Review posted at
 https://github.com/ms178/lccc/pull/1063#issuecomment-6557857349 . Do not import
 that uncorrected feature or discard its valuable tests to manufacture acceptance.
-Its corrected integration and the remaining Chromium/LLVM work are outstanding;
-there is no universal-superiority or exhaustive-production-certification claim.
+The correction is now merged to main and is covered by the latest hosted
+cross-target contracts. The remaining Chromium/LLVM work is outstanding; there
+is no universal-superiority or exhaustive-production-certification claim.
+
 ## Final focused review and local evidence (2026-11-01)
 
 ### #1056 / #1062 compared with #1051
@@ -522,7 +539,41 @@ probes and the census do not imply interoperability for ignored conventions.
   stopped during `sysv-aggregate-abi`. This environment has no complete system
   32-bit runtime setup. Do not count this as a compiler regression or as an
   acceptance pass.
-- `gh pr view 1056` reports PR #1056 open against `main`, but its head is
-  `arena/b673aa4d-lccc` at `d8ded5e9`, not this working branch. Its retrieved
-  checks are successful on that separate head; they do not certify this tree.
-  Current-head hosted checks and a clean broad local run remain outstanding.
+- PR #1056 is now merged into main. Its compiler changes are in the rebased
+  base, not this PR's incremental diff. The current PR #1051 head is
+  `9cc96bf2`; its current-head CI, Debian, relocation/PGO, and IPA/LRS checks
+  all passed (run IDs above). The full local test suite also passed; the separate
+  local fast CI script remains incomplete only because its i686 tool invocation
+  did not set `LCCC_SYSROOT`.
+
+## Explicit disposition of the motivating follow-up list
+
+The three compiler-engineering items in the joint-pixel follow-up are present in
+the rebased main implementation and validated by hosted contracts: (1) exact
+three-/four-byte input footprints with no speculative fourth-byte read and
+register-only narrowing; (2) joint byte-store / unsigned horizontal-max and
+packed-return graphs with consumer-aware costing; and (3) refusal controls for
+volatile, overlapping, scattered, alias-unknown and externally-used cases.
+The six-configuration differential and legality gates and current-head codegen
+and runtime shards passed. This validates those named fixtures and paths, not
+all possible alias graphs or arbitrary programs.
+
+The remaining items are intentionally not marked fixed:
+
+- No real Firefox lighting or full Chromium/rasterflood browser build/workload
+  has been run. The available C witnesses are reduced shapes; extrapolating
+  their results to a browser would be unsupported. The `ClampTo8` fast-path
+  spelling `(unsigned)a < 256` followed by a negative test still emits a scalar
+  sequence in lccc's reduced witness. GCC 16.2 and Clang 23.1.4 produce shorter
+  sequences there, but this alone does not prove a safe generalized optimizer
+  rewrite or a runtime gain. This remains an identified code-quality gap.
+- The exact patched-LLVM SLP PR was not built or timed. The hosted job is
+  explicitly optional and was skipped. Clang's `-mllvm` comparison is not a
+  substitute for the patched compiler.
+- No all-browser, all-architecture, all-workload optimality proof or expert
+  endorsement is asserted. Such claims require the pinned full-source builds,
+  execution coverage and controlled end-to-end measurements that are absent.
+
+These limits are reported rather than disguised as completed work. In
+particular, the SLP candidate with no consistent eight-shape benchmark result
+was not retained as a performance optimization.
