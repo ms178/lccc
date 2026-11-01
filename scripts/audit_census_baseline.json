@@ -3,7 +3,7 @@
   "fns_over_300": 232,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 551,
+  "knob_literals": 552,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -367,6 +367,7 @@
     "CCC_NO_STORE_SINK",
     "CCC_NO_STRIDED_REDUCE",
     "CCC_NO_TIER2_GRAPH",
+    "CCC_NO_TRAMPOLINE_THREAD",
     "CCC_NO_TWO_BLOCK_UNROLL",
     "CCC_NO_UNIVSR",
     "CCC_NO_VA_ROOT_GUARD",

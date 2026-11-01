@@ -50,6 +50,12 @@
 //!     AArch64 extension folding and x86 upper-bit knowledge across unsigned
 //!     loads, constants, copies, comparisons, masks, logic and shifts; removes
 //!     both redundant byte masks and RV64 `slli 32; srli 32` zext.w pairs.
+//!
+//! 11. **Trampoline threading**: a local label whose body is a single
+//!     unconditional jump is bypassed (`jump .Ltramp, t6` -> `jump .Lreal, t6`)
+//!     with chains resolved once and cycles refused. The far `jump` pseudo is
+//!     retargeted freely; the near `j` form only under the same ±3 KB census
+//!     that gates the branch-over-jump fusion.
 
 // ── Line classification types ────────────────────────────────────────────────
 
@@ -667,6 +673,7 @@ pub fn peephole_optimize(asm: String) -> String {
         // functions remain eligible when their own ranges are visible.
         changed |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
+        changed |= thread_trampolines(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
         changed |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
@@ -880,6 +887,50 @@ fn rewrite_far_jumps_to_near(lines: &mut [String], kinds: &mut [LineKind], n: us
 // instruction as 32 bytes (the worst expansion of the pseudos emitted here)
 // and retain a generous 1 KiB linker/relaxation margin.  The deliberately
 // conservative bound trades a few missed folds for relocation-proof output.
+/// Is `target` reachable from `from` inside the ±3 KB budget the range-gated
+/// rewrites use?
+///
+/// The census charges a 32-byte worst case per line and fails closed on any
+/// interval that contains a directive, a global label (a function boundary) or
+/// an opaque line: `.space`, `.rept`, inline `.insn` and large alignments can
+/// contribute an unbounded number of bytes that a line census cannot estimate.
+/// A target that is not defined in this text has no census at all.
+fn interval_is_near(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    from: usize,
+    target: &str,
+) -> bool {
+    let mut target_pos = None;
+    for (m, kind) in kinds.iter().enumerate().take(n) {
+        if *kind == LineKind::Label && label_name(&lines[m]) == Some(target) {
+            target_pos = Some(m);
+            break;
+        }
+    }
+    let Some(to) = target_pos else {
+        return false;
+    };
+    let (a, b) = if from < to { (from, to) } else { (to, from) };
+    if (a + 1..b).any(|m| {
+        (kinds[m] == LineKind::Label && !label_name(&lines[m]).unwrap_or("").starts_with('.'))
+            || kinds[m] == LineKind::Directive
+            || lines[m] == OPAQUE_LINE
+    }) {
+        return false;
+    }
+    let insns = (a..=b)
+        .filter(|&m| {
+            !matches!(
+                kinds[m],
+                LineKind::Nop | LineKind::Label | LineKind::Directive
+            )
+        })
+        .count();
+    insns.saturating_mul(32) <= 3_000
+}
+
 fn fuse_branch_over_jump(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     if std::env::var("CCC_NO_BRANCH_OVER_JUMP").is_ok() {
         return false;
@@ -912,45 +963,9 @@ fn fuse_branch_over_jump(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         let Some(target) = jump_target(&lines[j]) else {
             continue;
         };
-        // Only local labels in this function are candidates.  Find the unique
-        // target without crossing a global symbol (a function boundary).
-        let mut target_pos = None;
-        let (lo, hi) = if target.starts_with(".L") {
-            (0, n)
-        } else {
-            continue;
-        };
-        for m in lo..hi {
-            if m != i && kinds[m] == LineKind::Label && label_name(&lines[m]) == Some(target) {
-                target_pos = Some(m);
-                break;
-            }
-        }
-        let Some(tp) = target_pos else { continue };
-        let a = i.min(tp);
-        let b = i.max(tp);
-        if (a + 1..b).any(|m| {
-            (kinds[m] == LineKind::Label
-                && !label_name(&lines[m]).unwrap_or("").starts_with('.'))
-                // `.space`, `.rept`, inline `.insn`, and large alignments can
-                // contribute an unbounded number of bytes that a line census
-                // cannot estimate. Fail closed rather than risk B-range
-                // relocation overflow. Opaque lines can hide the same
-                // directives and are therefore range barriers too.
-                || kinds[m] == LineKind::Directive
-                || lines[m] == OPAQUE_LINE
-        }) {
-            continue;
-        }
-        let insns = (a..=b)
-            .filter(|&m| {
-                !matches!(
-                    kinds[m],
-                    LineKind::Nop | LineKind::Label | LineKind::Directive
-                )
-            })
-            .count();
-        if insns.saturating_mul(32) > 3_000 {
+        // Only local labels in this function are candidates.  The census also
+        // refuses intervals that cross a global symbol (a function boundary).
+        if !target.starts_with(".L") || !interval_is_near(lines, kinds, n, i, target) {
             continue;
         }
         let inv = invert_branch_mnemonic(op).unwrap();
@@ -958,6 +973,135 @@ fn fuse_branch_over_jump(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         kinds[i] = LineKind::Branch;
         kinds[j] = LineKind::Nop;
         changed = true;
+    }
+    changed
+}
+
+// ── Pass 8c: Trampoline threading ────────────────────────────────────────────
+//
+// A local label whose body is nothing but an unconditional jump is a
+// trampoline: every branch to it pays an extra fetch and an extra taken jump.
+// Block shuffling, select lowering and identical-block merging leave these
+// behind. Redirect the jumps straight at the end of the chain.
+//
+// The far `jump` pseudo-op reaches the whole text, so retargeting it can never
+// change a range. The near `j` form is only retargeted when the same ±3 KB
+// instruction census that gates the branch-over-jump fusion proves the new
+// target reachable. The trampoline instruction itself is left in place:
+// deleting a block is a control-flow change (fall-through entry, `lla` label
+// identity) that the i686 donor pass proves with a module-wide reference
+// census. The unreachable copies are cleaned up by the dead-code passes of
+// later rounds.
+
+/// Maximum number of trampoline hops followed before a chain is given up on.
+const TRAMPOLINE_CHAIN_LIMIT: usize = 16;
+
+/// Follow trampolines forwards from `start` to the first label whose body is not
+/// a trampoline. Returns `None` for a chain that revisits itself.
+fn resolve_trampoline<'a>(start: &str, direct: &'a FxHashMap<&'a str, &'a str>) -> Option<&'a str> {
+    let mut current: &'a str = direct.get(start).copied()?;
+    for _ in 0..TRAMPOLINE_CHAIN_LIMIT {
+        if current == start {
+            // The chain came back to the label it started from.
+            return None;
+        }
+        match direct.get(current).copied() {
+            Some(further) => current = further,
+            None => return Some(current),
+        }
+    }
+    None
+}
+
+/// Replace the target of a `j` / `jump` line, keeping the far pseudo's register
+/// operand.
+fn retarget_jump_line(line: &str, new_target: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("jump ") {
+        let (_, tail) = rest.split_once(", ")?;
+        return Some(format!("    jump {}, {}", new_target, tail));
+    }
+    trimmed.strip_prefix("j ")?;
+    Some(format!("    j {}", new_target))
+}
+
+fn thread_trampolines(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_TRAMPOLINE_THREAD").is_ok() {
+        return false;
+    }
+    // The analysis only borrows the text; the rewrites are the only mutation.
+    let rewrites: Vec<(usize, String)> = {
+        // A name that is defined twice cannot be resolved locally.
+        let mut definitions: FxHashMap<&str, usize> = FxHashMap::default();
+        for i in 0..n {
+            if kinds[i] != LineKind::Label {
+                continue;
+            }
+            if let Some(name) = label_name(&lines[i]) {
+                *definitions.entry(name).or_insert(0) += 1;
+            }
+        }
+        // Local label -> the target of the single unconditional jump it guards.
+        let mut direct: FxHashMap<&str, &str> = FxHashMap::default();
+        for i in 0..n {
+            if kinds[i] != LineKind::Label {
+                continue;
+            }
+            let Some(name) = label_name(&lines[i]) else {
+                continue;
+            };
+            if !name.starts_with('.') || definitions.get(name) != Some(&1) {
+                continue;
+            }
+            let Some(j) = (i + 1..n).find(|&pos| kinds[pos] != LineKind::Nop) else {
+                continue;
+            };
+            if kinds[j] != LineKind::Jump {
+                continue;
+            }
+            let Some(target) = jump_target(&lines[j]) else {
+                continue;
+            };
+            if target != name {
+                direct.insert(name, target);
+            }
+        }
+        if direct.is_empty() {
+            return false;
+        }
+        let mut resolved: FxHashMap<&str, &str> = FxHashMap::default();
+        for &name in direct.keys() {
+            if let Some(final_target) = resolve_trampoline(name, &direct) {
+                resolved.insert(name, final_target);
+            }
+        }
+        let mut rewrites = Vec::new();
+        for i in 0..n {
+            if kinds[i] != LineKind::Jump {
+                continue;
+            }
+            let Some(target) = jump_target(&lines[i]) else {
+                continue;
+            };
+            let Some(final_target) = resolved.get(target).copied() else {
+                continue;
+            };
+            // The far `jump` pseudo reaches the whole text; the near `j` form
+            // must be proven to reach the new target by the same census that
+            // gates the branch-over-jump fusion.
+            let is_far_pseudo = lines[i].trim().starts_with("jump ");
+            if !is_far_pseudo && !interval_is_near(lines, kinds, n, i, final_target) {
+                continue;
+            }
+            if let Some(rewritten) = retarget_jump_line(&lines[i], final_target) {
+                rewrites.push((i, rewritten));
+            }
+        }
+        rewrites
+    };
+    let changed = !rewrites.is_empty();
+    for (i, text) in rewrites {
+        lines[i] = text;
     }
     changed
 }
@@ -1365,23 +1509,21 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
 fn eliminate_redundant_jumps(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     for i in 0..n {
-        if kinds[i] == LineKind::Jump {
-            // Get jump target
-            if let Some(target) = jump_target(&lines[i]) {
-                // Find next non-Nop line
-                let mut j = i + 1;
-                while j < n && kinds[j] == LineKind::Nop {
-                    j += 1;
-                }
-                if j < n && kinds[j] == LineKind::Label {
-                    if let Some(lbl) = label_name(&lines[j]) {
-                        if target == lbl {
-                            kinds[i] = LineKind::Nop;
-                            changed = true;
-                        }
-                    }
-                }
-            }
+        // A conditional branch to the label that immediately follows it reaches
+        // the same instruction whether it is taken or not, so the branch itself
+        // is dead (the same argument the unconditional `j` case uses).
+        let target = match kinds[i] {
+            LineKind::Jump => jump_target(&lines[i]),
+            LineKind::Branch => branch_parts(&lines[i]).map(|(_, _, target)| target),
+            _ => continue,
+        };
+        let Some(target) = target else { continue };
+        let Some(j) = (i + 1..n).find(|&pos| kinds[pos] != LineKind::Nop) else {
+            continue;
+        };
+        if kinds[j] == LineKind::Label && label_name(&lines[j]) == Some(target) {
+            kinds[i] = LineKind::Nop;
+            changed = true;
         }
     }
     changed
@@ -3327,5 +3469,80 @@ mod jump_near_tests {
         assert!(!implicitly_writes_rv("jal ra, .Ltail", REG_RA));
         assert!(!implicitly_writes_rv("ret", REG_RA));
         assert_eq!(classify_implicit_operands_rv("ret").0, ra);
+    }
+
+    #[test]
+    fn redundant_conditional_jump_to_its_own_fallthrough_is_removed() {
+        // `bnez t0, .Lnext` immediately followed by `.Lnext:` reaches the same
+        // instruction whether or not it is taken.
+        let asm = "f:\n    bnez t0, .Lnext\n.Lnext:\n    ret\n";
+        let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(eliminate_redundant_jumps(&lines, &mut kinds, n));
+        assert_eq!(kinds[0], LineKind::Label, "labels are never touched");
+        assert_eq!(kinds[1], LineKind::Nop);
+
+        // The same shape with a different target must survive: the branch is
+        // the only thing selecting between the two labels.
+        let asm = "f:\n    bnez t0, .Lother\n.Lnext:\n    ret\n";
+        let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!eliminate_redundant_jumps(&lines, &mut kinds, n));
+        assert_eq!(kinds[1], LineKind::Branch);
+    }
+
+    #[test]
+    fn trampolines_are_threaded_and_cycles_are_left_alone() {
+        // A two-hop chain: the entry jump must reach `.Lreal` in one step.
+        let asm = concat!(
+            "f:\n",
+            "    jump .Ltramp, t6\n",
+            "    ret\n",
+            ".Ltramp:\n",
+            "    jump .Lhop, t6\n",
+            ".Lother:\n",
+            "    li a0, 9\n",
+            "    ret\n",
+            ".Lhop:\n",
+            "    jump .Lreal, t6\n",
+            ".Lrest:\n",
+            "    li a0, 7\n",
+            "    ret\n",
+            ".Lreal:\n",
+            "    li a0, 3\n",
+            "    ret\n",
+        );
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(thread_trampolines(&mut lines, &mut kinds, n));
+        assert_eq!(lines[1], "    jump .Lreal, t6");
+        assert_eq!(lines[3], ".Ltramp:", "the label itself is never removed");
+
+        // A cyclic chain would loop forever whichever hop is taken; leave the
+        // text exactly as it was instead of picking a direction.
+        let asm = concat!(
+            "f:\n",
+            "    jump .La, t6\n",
+            "    ret\n",
+            ".La:\n",
+            "    jump .Lb, t6\n",
+            ".Lmid:\n",
+            "    li a0, 1\n",
+            "    ret\n",
+            ".Lb:\n",
+            "    jump .La, t6\n",
+            ".Lrest:\n",
+            "    li a0, 2\n",
+            "    ret\n",
+        );
+        let original: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut lines = original.clone();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!thread_trampolines(&mut lines, &mut kinds, n));
+        assert_eq!(lines, original);
     }
 }

@@ -339,6 +339,22 @@ impl ArmCodegen {
         }
     }
 
+    /// Convert a GP register name to its 32-bit (`w`) counterpart.
+    ///
+    /// `"x9"` -> `"w9"`, `"w9"` -> `"w9"`, `"x29"` -> `"w29"`. Used by the
+    /// `=@cc<cond>` flag-output materialisation: `CSET` is a 32-bit-only
+    /// alias, and writing `w<n>` also zeroes the upper half of `x<n>`, so the
+    /// 0/1 it produces is a well-defined 64-bit value for the store that
+    /// follows. Names that are already `w`-form (or not GP names at all, e.g.
+    /// a `v`-register that a mis-typed constraint put here) are returned
+    /// unchanged rather than mangled into invalid syntax.
+    pub(super) fn to_w_reg(reg: &str) -> String {
+        match reg.strip_prefix('x') {
+            Some(rest) => format!("w{rest}"),
+            None => reg.to_string(),
+        }
+    }
+
     /// Get the exclusive load/store instructions and register prefix for a type,
     /// with appropriate acquire/release semantics based on ordering.
     /// - Relaxed: ldxr/stxr (no ordering)
