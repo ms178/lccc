@@ -10,7 +10,11 @@ byte-domain maximum, and either a four-byte store or scalar packed return.
 It is not a Firefox/browser performance result, nor proof of superiority over
 a compiler built with LLVM PR 227303.
 
-Baseline is current main `5545d7125970f068def20f7184734eb9dbc9e595`.
+Measurement baseline is main `5545d7125970f068def20f7184734eb9dbc9e595`.
+Delivery was subsequently rebased on main `620e7e4`; intervening changes
+are CI/torture-runner infrastructure, not compiler implementation changes.
+The rebased CI lane-plan/artifact-mode checks and both six-configuration
+differential suites pass; hosted checks for the new head remain pending.
 The earlier component report deliberately remains historical evidence.
 
 ## Design and legality
