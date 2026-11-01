@@ -3617,6 +3617,38 @@ impl X86Codegen {
     }
 
     /// Capture-store a 64-bit GPR into the parameter home slot.
+    // Copy exactly the bytes of an indirect Microsoft record parameter.
+    // RAX is the source, R11 may hold an aligned destination, and no incoming
+    // argument register may be clobbered. Preserve R10's static-chain role.
+    fn emit_capture_byref_record(&mut self, dst: CaptureDst, size: usize) {
+        self.state.emit("    pushq %r10");
+        let mut offset = 0;
+        for (width, op, reg) in [
+            (8, "movq", "r10"),
+            (4, "movl", "r10d"),
+            (2, "movw", "r10w"),
+            (1, "movb", "r10b"),
+        ] {
+            while size - offset >= width {
+                self.state
+                    .emit_fmt(format_args!("    {} {}(%rax), %{}", op, offset, reg));
+                match dst {
+                    CaptureDst::Raw(base) => self.state.emit_fmt(format_args!(
+                        "    {} %{}, {}(%rbp)",
+                        op,
+                        reg,
+                        base + offset as i64
+                    )),
+                    CaptureDst::Aligned => self
+                        .state
+                        .emit_fmt(format_args!("    {} %{}, {}(%r11)", op, reg, offset)),
+                }
+                offset += width;
+            }
+        }
+        self.state.emit("    popq %r10");
+    }
+
     fn emit_capture_store_qword(&mut self, dst: CaptureDst, src_reg: &str, off: i64) {
         match dst {
             CaptureDst::Raw(b) => {
@@ -4206,11 +4238,20 @@ impl X86Codegen {
                         self.emit_capture_store_qword(dst, "rax", qi as i64 * 8);
                     }
                 }
+                ParamClass::LargeStructByRefReg { reg_idx, size } => {
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %rax", X86_ARG_REGS[reg_idx]));
+                    self.emit_capture_byref_record(dst, size);
+                }
+                ParamClass::LargeStructByRefStack { offset, size } => {
+                    self.state
+                        .out
+                        .emit_instr_rbp_reg("    movq", stack_base + offset, "rax");
+                    self.emit_capture_byref_record(dst, size);
+                }
                 ParamClass::F128FpReg { .. }
                 | ParamClass::F128GpPair { .. }
                 | ParamClass::F128Stack { .. }
-                | ParamClass::LargeStructByRefReg { .. }
-                | ParamClass::LargeStructByRefStack { .. }
                 | ParamClass::StructSplitRegStack { .. }
                 | ParamClass::ZeroSizeSkip => {}
                 // Homed at the top of the loop (no incoming register).

@@ -8,6 +8,10 @@ including typedefs, function pointers, composite types and indirect calls.
 
 - Four shared argument positions: RCX/RDX/R8/R9 or XMM0–3 by position.
 - Caller-owned 32-byte home area, overflow arguments and stack alignment.
+- C-record arguments/returns: integer carriers for 1/2/4/8-byte objects,
+  hidden return pointers otherwise, and 16-byte-aligned caller-owned copies
+  for indirect arguments. Callee copies read exactly the object bytes without
+  clobbering uncaptured incoming argument registers.
 - Floating-point return and variadic *callers*, including GP duplicates of FP
   register arguments. Microsoft variadic function definitions remain rejected.
 - Preservation of RDI/RSI and, when SSE is enabled, XMM6–15, with synthesized
@@ -55,9 +59,12 @@ the translation unit previously stopped by fourteen `ms_abi` diagnostics.
 
 ## Remaining acceptance criteria
 
-- Aggregate/by-reference, wide scalar, complex/vector ABI rules and Microsoft
-  variadic definitions require implementation; the current scalar guard rejects
-  unsupported signatures rather than pretending to implement them.
+- C-record interoperability now passes at O0/O2/Os for sizes 1..33/64/128,
+  including FP-field integer carriers, hidden return pointers, register/stack
+  indirect parameters and mutation isolation of caller-owned copies. The tested
+  executable is `/home/user/compiler-next/lccc`, not the running kernel compiler.
+- Wide scalar, complex/vector ABI rules and Microsoft variadic definitions
+  still require implementation; unsupported signatures remain rejected.
 - Parser attribute placement and inherited conventions need further adversarial
   coverage, including post-asm attributes and typedef-derived declarations.
 - Further kernel compiler/linker defects and unsupported-option warnings must

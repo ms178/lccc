@@ -792,8 +792,24 @@ fn classify_args_core(
             .iter()
             .enumerate()
             .map(|(slot, info)| {
+                if let Some(size) = info.struct_size {
+                    if !matches!(size, 1 | 2 | 4 | 8) {
+                        return if slot < 4 {
+                            CoreArgClass::LargeStructByRefReg {
+                                reg_idx: GP[slot],
+                                size,
+                            }
+                        } else {
+                            CoreArgClass::LargeStructByRefStack { size }
+                        };
+                    }
+                }
                 if slot >= 4 {
-                    return CoreArgClass::Stack;
+                    return if let Some(size) = info.struct_size {
+                        CoreArgClass::StructByValStack { size }
+                    } else {
+                        CoreArgClass::Stack
+                    };
                 }
                 if info.is_float && !info.is_long_double {
                     CoreArgClass::FloatReg { reg_idx: slot }

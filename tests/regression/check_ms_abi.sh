@@ -33,11 +33,10 @@ if grep -Eq '%[xyz]mm[0-9]' "$tmp/kernel.s"; then
 fi
 # Unsupported classes must still fail closed, never fall through to SysV.
 cat > "$tmp/unsupported.c" <<'C'
-struct record { long a,b,c; };
-struct record __attribute__((ms_abi)) f(struct record x) { return x; }
+__int128 __attribute__((ms_abi)) f(__int128 x) { return x; }
 C
 if "$CCC" -c "$tmp/unsupported.c" -o "$tmp/bad.o" > "$tmp/error" 2>&1; then
-  echo 'FAIL: accepted unimplemented Microsoft aggregate lowering' >&2; exit 1
+  echo 'FAIL: accepted unimplemented Microsoft wide-scalar lowering' >&2; exit 1
 fi
 grep -q 'refusing an incorrect ABI' "$tmp/error"
 for declarations in \
@@ -50,3 +49,4 @@ for declarations in \
   grep -q 'conflicting calling convention' "$tmp/error"
 done
 echo 'PASS Microsoft x64 ABI focused interoperability and fail-closed boundaries'
+bash "$HERE/check_ms_abi_records.sh"

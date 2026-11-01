@@ -1570,7 +1570,14 @@ impl Lowerer {
                         sret_size = Some(size);
                     }
                 } else {
-                    let abi = self.aggregate_return(&full_ret_ctype, size);
+                    let abi = self.aggregate_return(
+                        &full_ret_ctype,
+                        size,
+                        self.sema_functions
+                            .get(name)
+                            .map(|f| f.calling_convention)
+                            .unwrap_or_default(),
+                    );
                     sret_size = abi.sret_size;
                     two_reg_ret_size = abi.two_reg_size;
                     if abi.x87 || abi.x87_pair {

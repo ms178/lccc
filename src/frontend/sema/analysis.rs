@@ -686,7 +686,15 @@ impl SemanticAnalyzer {
                 CType::Void | CType::Pointer(..) | CType::Float | CType::Double
             ) || (ct.is_integer() && ct.size() <= 8)
         };
-        if !supported(ret) || params.iter().any(|(ct, _)| !supported(ct)) || variadic_definition {
+        let record_size =
+            |ct: &CType| ct.size_ctx(&*self.result.type_context.borrow_struct_layouts());
+        let supported_return = supported(ret) || (ret.is_struct_or_union() && record_size(ret) > 0);
+        let supported_parameter =
+            |ct: &CType| supported(ct) || (ct.is_struct_or_union() && record_size(ct) > 0);
+        if !supported_return
+            || params.iter().any(|(ct, _)| !supported_parameter(ct))
+            || variadic_definition
+        {
             self.diagnostics.borrow_mut().error("Microsoft x64 aggregate/wide-scalar and variadic-definition lowering is not implemented yet; refusing an incorrect ABI".to_string(), span);
         }
     }

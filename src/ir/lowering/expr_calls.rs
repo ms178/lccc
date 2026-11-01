@@ -1990,7 +1990,7 @@ impl Lowerer {
         &mut self,
         func: &Expr,
         dest: Value,
-        arg_vals: Vec<Operand>,
+        mut arg_vals: Vec<Operand>,
         arg_types: Vec<IrType>,
         struct_arg_sizes: Vec<Option<usize>>,
         struct_arg_aligns: Vec<Option<usize>>,
@@ -2012,6 +2012,25 @@ impl Lowerer {
                 _ => None,
             })
             .unwrap_or_default();
+        if calling_convention == crate::common::types::CallingConvention::MicrosoftX64 {
+            // Non-register records are passed through a caller-owned, 16-byte
+            // aligned COPY. Passing the source address would let a callee's
+            // parameter writes mutate the caller's object.
+            for (index, size) in struct_arg_sizes.iter().enumerate() {
+                if let Some(size) = *size {
+                    if !matches!(size, 1 | 2 | 4 | 8) {
+                        let copy = self.emit_entry_alloca(IrType::Ptr, size.max(1), 16, false);
+                        let source = self.operand_to_value(arg_vals[index].clone());
+                        self.emit(Instruction::Memcpy {
+                            dest: copy,
+                            src: source,
+                            size,
+                        });
+                        arg_vals[index] = Operand::Value(copy);
+                    }
+                }
+            }
+        }
         let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
         if ret_abi.two_reg_size.is_some() {
             indirect_ret_ty = IrType::I128;
