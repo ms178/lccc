@@ -114,10 +114,11 @@ impl RiscvCodegen {
             return;
         }
 
-        if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear) {
-            // Portable bit modify: `1 << (index mod W)` then OR it in, or
-            // complement the mask and AND it out.  RISC-V has no `bts`/`btr`
-            // (those are Zbs), and `sll`/`sllw` reduce the count modulo XLEN
+        if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle) {
+            // Portable bit modify: `1 << (index mod W)` then OR it in,
+            // complement the mask and AND it out, or XOR it in.  RISC-V has no
+            // `bts`/`btr`/`btc` (those are Zbs), and `sll`/`sllw` reduce the
+            // count modulo XLEN
             // rather than modulo the operation width, so the index is reduced
             // explicitly -- that reduction IS `IrBinOp::BitSet`'s contract, and
             // it keeps an index of W or more (an undefined C shift in dead
@@ -131,11 +132,13 @@ impl RiscvCodegen {
                 .emit_fmt(format_args!("    andi t2, t2, {mask_bits}"));
             self.state.emit("    li t0, 1");
             self.state.emit("    sll t0, t0, t2");
-            if op == IrBinOp::BitSet {
-                self.state.emit("    or t0, t1, t0");
-            } else {
-                self.state.emit("    xori t0, t0, -1");
-                self.state.emit("    and t0, t1, t0");
+            match op {
+                IrBinOp::BitSet => self.state.emit("    or t0, t1, t0"),
+                IrBinOp::BitClear => {
+                    self.state.emit("    xori t0, t0, -1");
+                    self.state.emit("    and t0, t1, t0");
+                }
+                _ => self.state.emit("    xor t0, t1, t0"),
             }
             self.store_t0_to(dest);
             return;
@@ -197,8 +200,8 @@ impl RiscvCodegen {
             (IrBinOp::LShr, false) => "srl",
             (IrBinOp::LShr, true) => "srlw",
             (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
-            (IrBinOp::BitSet | IrBinOp::BitClear, _) => {
-                unreachable!("BitSet/BitClear handled above")
+            (IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle, _) => {
+                unreachable!("BitSet/BitClear/BitToggle handled above")
             }
             (IrBinOp::Bzhi, _) => crate::ir::ops::bzhi_outside_x86_64(),
             (IrBinOp::UMulHigh, false) => "mulhu",
@@ -242,7 +245,7 @@ mod narrow_bit_modify_backend_tests {
             IrType::U64,
         ] {
             let bits = ty.size() * 8;
-            for op in [IrBinOp::BitSet, IrBinOp::BitClear] {
+            for op in [IrBinOp::BitSet, IrBinOp::BitClear, IrBinOp::BitToggle] {
                 for index in [0, bits - 1, bits, bits + 1, u64::MAX as usize] {
                     let mut cg = RiscvCodegen::new();
                     let base = if op == IrBinOp::BitSet { 0 } else { -1 };
@@ -260,7 +263,11 @@ mod narrow_bit_modify_backend_tests {
                     );
                     println!(
                         "BIT_MODIFY_RV|{bits}|{}|{index}\n{body}END_BIT_MODIFY",
-                        op == IrBinOp::BitSet
+                        match op {
+                            IrBinOp::BitSet => "set",
+                            IrBinOp::BitClear => "clear",
+                            _ => "toggle",
+                        }
                     );
                 }
             }

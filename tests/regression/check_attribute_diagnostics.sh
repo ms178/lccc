@@ -160,6 +160,13 @@ refuse() { # refuse <case> <source>
         echo "FAIL $name: refusal does not explain itself: $out" >&2
         fail=1
     }
+    # The verdict stays one sentence in the error; the escape hatch and the
+    # reason live in a note attached to the same location, so a reader sees a
+    # scannable error line and still gets the full explanation.
+    [[ $out == *'define CCC_ALLOW_UNSUPPORTED_ABI'* ]] || {
+        echo "FAIL $name: refusal has no escape-hatch note: $out" >&2
+        fail=1
+    }
     out=$(CCC_ALLOW_UNSUPPORTED_ABI=1 "$CCC" -fsyntax-only "$TMP/r.c" 2>&1)
     [[ $out == *CCC_ALLOW_UNSUPPORTED_ABI* ]] || {
         echo "FAIL $name: escape hatch does not downgrade the refusal: $out" >&2

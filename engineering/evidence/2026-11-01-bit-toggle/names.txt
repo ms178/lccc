@@ -1,0 +1,11 @@
+btog32
+btog64
+btog_masked
+btog_imm
+btog_mem
+btog_twice
+btog_swapped
+btog_offset
+keep_xor_two
+keep_xor_not
+keep_xor_hi

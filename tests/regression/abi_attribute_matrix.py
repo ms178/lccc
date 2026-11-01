@@ -49,6 +49,24 @@ ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = ROOT / 'src/frontend/parser/attribute_registry.rs'
 ENV = {**os.environ, 'LC_ALL': 'C'}
 
+# Every external process this gate starts is bounded. A hung or thrashing
+# compiler would otherwise burn the job's multi-hour budget and the gate would
+# report nothing at all -- the worst possible outcome for a check that exists to
+# prove a contract. A timeout is turned into a *failure with a reason*, never a
+# traceback: a gate that crashes names no cell.
+COMPILE_TIMEOUT = 120.0
+LINK_TIMEOUT = 60.0
+RUN_TIMEOUT = 30.0
+
+# The gcc release `ABI_VERDICTS` is pinned to. Cells are only *failed* on that
+# release or newer: gcc changes its mind about convention attributes between
+# releases (measured: `regparm` is silent on x86-64 in 12.2 and
+# `'regparm' attribute ignored` in 16.2), so following whatever gcc happens to
+# be on `$PATH` would make the contract flap. A newer gcc is still checked
+# strictly -- that is how oracle drift is caught -- while an older one turns the
+# disagreement into a note that names both verdicts.
+ORACLE_GCC = (16, 2)
+
 # Probes. Each one is two twins that differ only in the attribute, so any
 # difference in the emitted code is attributable to the attribute alone.
 INT_PROBE = """\
@@ -168,16 +186,45 @@ def abi_signature(probe_id: str, body: str) -> tuple:
     return (regs, ret)
 
 
+def run_bounded(cmd: list[str], *, timeout: float, **kwargs) -> subprocess.CompletedProcess:
+    """`subprocess.run` that reports a timeout as a 124 result, not a crash."""
+    kwargs.setdefault('capture_output', True)
+    kwargs.setdefault('text', True)
+    kwargs.setdefault('env', ENV)
+    try:
+        return subprocess.run(cmd, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmd, 124, '', f'{Path(cmd[0]).name} timed out after {timeout:g}s')
+    except OSError as error:
+        # A missing or non-executable compiler is a *result* here: the cell
+        # reports it instead of the whole gate dying on an unrelated traceback.
+        return subprocess.CompletedProcess(
+            cmd, 127, '', f'{Path(cmd[0]).name}: {error.strerror or error}')
+
+
 def compile_to(cc: str, source: str, flags: list[str]) -> tuple[int, str, str]:
+    """Compile one probe to an assembly listing on stdout."""
     with tempfile.NamedTemporaryFile('w', suffix='.c', delete=False) as handle:
         handle.write(source)
         path = handle.name
     try:
-        result = subprocess.run([cc, *flags, '-S', '-o', '-', '-x', 'c', path],
-                                capture_output=True, text=True, env=ENV)
+        result = run_bounded([cc, *flags, '-S', '-o', '-', '-x', 'c', path],
+                             timeout=COMPILE_TIMEOUT)
         return result.returncode, result.stdout, result.stderr
     finally:
         os.unlink(path)
+
+
+def gcc_version(gcc: str) -> tuple[int, int]:
+    """`(major, minor)` of `gcc`, or `(0, 0)` when it cannot be asked.
+
+    `(0, 0)` sorts below every pin, so an unreadable gcc degrades to the lenient
+    path instead of silently claiming the pinned release.
+    """
+    proc = run_bounded([gcc, '-dumpfullversion'], timeout=COMPILE_TIMEOUT)
+    match = re.match(r'(\d+)\.(\d+)', (proc.stdout or '').strip())
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
 
 
 def gcc_observation(gcc: str, name: str, target: str) -> tuple[str, str]:
@@ -187,6 +234,7 @@ def gcc_observation(gcc: str, name: str, target: str) -> tuple[str, str]:
     diagnostics: list[str] = []
     errors: list[str] = []
     changed = False
+    diffs: list[str] = []
     probe_ids = ['rec'] if name in RECORD_ONLY else ['int', 'fp', 'agg', 'preserve']
     for probe_id in probe_ids:
         first, second = _pair(probe_id)
@@ -210,9 +258,17 @@ def gcc_observation(gcc: str, name: str, target: str) -> tuple[str, str]:
         if first not in bodies or first not in references:
             errors.append(f'{probe_id} probe bodies missing from the listing')
             continue
-        if abi_signature(probe_id, bodies[first]) != abi_signature(probe_id, references[first]):
+        measured = abi_signature(probe_id, bodies[first])
+        reference_sig = abi_signature(probe_id, references[first])
+        if measured != reference_sig:
             changed = True
-    evidence = ' | '.join(errors or diagnostics) or 'silent'
+            diffs.append(f'{probe_id}: {attr_pair(measured, reference_sig)}')
+    # The same sentence is emitted once per probe; stating it four times in an
+    # annotation costs the reader three redundant lines.
+    unique = list(dict.fromkeys(errors or diagnostics))
+    evidence = ' | '.join(unique) or 'silent'
+    if changed and diffs:
+        evidence += ' | ' + '; '.join(diffs[:2])
     if errors:
         return 'rejects', evidence
     joined = ' '.join(diagnostics)
@@ -221,6 +277,24 @@ def gcc_observation(gcc: str, name: str, target: str) -> tuple[str, str]:
     if 'ignored' in joined:
         return ('ignored' if not changed else 'ignored-changed'), evidence
     return ('honours' if changed else 'inert'), evidence
+
+
+def _show_signature(part) -> str:
+    """Render one ABI signature component, however deeply nested."""
+    if isinstance(part, (tuple, list)):
+        return '[' + ' '.join(_show_signature(item) for item in part) + ']'
+    return str(part)
+
+
+def attr_pair(measured: tuple, reference: tuple) -> str:
+    """A short `attr=<...> plain=<...>` description of two ABI signatures.
+
+    `abi_signature` returns `(registers, return_forms)` for code probes, where
+    the return forms are themselves tuples, and a flat tuple of sizes for the
+    record-layout probe; the renderer therefore recurses instead of unpacking.
+    An annotation that says only 'honours' names a cell but no cause.
+    """
+    return f'attr={_show_signature(measured)} plain={_show_signature(reference)}'
 
 
 def _pair(probe_id: str) -> tuple[str, str]:
@@ -265,6 +339,14 @@ def registry_verdicts() -> dict[tuple[str, str], str]:
     names = [row[0] for row in rows]
     if len(names) != len(set(names)):
         raise ValueError('duplicate name in ABI_VERDICTS')
+    known = {'Default', 'GccIgnored', 'OnlyAvailable32Bit', 'Unsupported',
+             'Implemented'}
+    for row in rows:
+        for variant in row[1:]:
+            if variant not in known:
+                # A typo'd variant would otherwise travel through the gate as an
+                # opaque 'verdict' string and fail on an unrelated cell.
+                raise ValueError(f'unknown AbiEffect::{variant} for {row[0]}')
     table: dict[tuple[str, str], str] = {}
     for name, x86_64, i686 in rows:
         table[(name, 'x86-64')] = x86_64
@@ -277,6 +359,16 @@ def check_table_against_gcc(gcc: str, verdicts: dict[tuple[str, str], str],
     """Re-derive every cell from gcc and compare with the table."""
     failures: list[tuple] = []
     notes: list[str] = []
+    version = gcc_version(gcc)
+    strict = version >= ORACLE_GCC
+    if version == ORACLE_GCC:
+        kind = 'normative'
+    elif strict:
+        kind = 'newer than the pin'
+    else:
+        kind = 'predates the pin'
+    notes.append(f'oracle: {gcc}: GCC {".".join(map(str, version))} ({kind}; '
+                 f'table pinned to {ORACLE_GCC[0]}.{ORACLE_GCC[1]})')
     for (name, target), verdict in sorted(verdicts.items()):
         if target == 'i686' and not has_i686:
             notes.append(f'skipped {name}/i686 (gcc has no 32-bit multilib)')
@@ -299,8 +391,12 @@ def check_table_against_gcc(gcc: str, verdicts: dict[tuple[str, str], str],
                                  'not Unsupported', verdict))
             continue
         if expected != verdict:
-            failures.append((f'abi:{name}/{target}', 'verdict disagrees with gcc',
-                             (expected, observation), (verdict, evidence)))
+            if strict:
+                failures.append((f'abi:{name}/{target}', 'verdict disagrees with gcc',
+                                 (expected, observation), (verdict, evidence)))
+            else:
+                notes.append(f'pre-oracle gcc observes {observation} for '
+                             f'{name}/{target} (table: {verdict}): {evidence}')
     return failures, notes
 
 
@@ -309,8 +405,10 @@ def _driver() -> Path:
 
     The same binary serves both targets (`check_asm_goto_outputs.sh` drives
     `-m32` through it), so the gate needs no second artifact to be meaningful.
+    A caller that has already resolved the driver (the CI step, or `--lccc`)
+    passes it in instead of letting this module guess a second time.
     """
-    return ROOT / 'target/fastbuild/lccc'
+    return Path(os.environ.get('LCCC') or ROOT / 'target/fastbuild/lccc')
 
 
 def _arch_flags(target: str) -> list[str]:
@@ -324,8 +422,8 @@ def _syntax_only(driver: Path, source: str, flags: list[str],
         handle.write(source)
         path = handle.name
     try:
-        proc = subprocess.run([str(driver), *flags, '-fsyntax-only', path],
-                              capture_output=True, text=True, env=env)
+        proc = run_bounded([str(driver), *flags, '-fsyntax-only', path],
+                           timeout=COMPILE_TIMEOUT, env=env)
     finally:
         os.unlink(path)
     return proc, first_diag(proc.stderr)
@@ -338,16 +436,19 @@ def first_diag(stderr: str) -> str:
     return ''
 
 
-def check_lccc(verdicts: dict[tuple[str, str], str]) -> tuple[list[tuple], list[str]]:
+def check_lccc(verdicts: dict[tuple[str, str], str],
+               driver: Path | None = None) -> tuple[list[tuple], list[str]]:
     """Prove lccc's side of every cell, including the runtime sentinel."""
     failures: list[tuple] = []
     notes: list[str] = []
     checked = 0
+    driver = Path(driver) if driver is not None else _driver()
+    built = driver.exists()
+    if not built:
+        notes.append(f'skipped lccc cells ({driver.name} not built)')
     for (name, target), verdict in sorted(verdicts.items()):
-        driver = _driver()
-        if not driver.exists():
-            notes.append(f'skipped lccc {name}/{target} ({driver.name} not built)')
-            continue
+        if not built:
+            break
         if (name, target) in LCCC_IMPLEMENTS:
             continue  # proved end-to-end by the sentinel below
         source = BODIES['rec' if name in RECORD_ONLY else 'int'].format(
@@ -385,18 +486,20 @@ def check_lccc(verdicts: dict[tuple[str, str], str]) -> tuple[list[tuple], list[
                                  'escape hatch does not downgrade the refusal',
                                  'warning + success',
                                  (again.returncode, first_diag(again.stderr))))
+    if not built:
+        return failures, notes
     # The convention funnel must not swallow malformed argument lists, even
     # for an ignored/default convention. Exercise both GNU attribute spellings.
     for target in ('x86-64', 'i686'):
         for spelling in ('sysv_abi(1)', 'cdecl(1)', 'ms_abi(1)',
                          'regparm()', 'regparm(1,2)', 'regparm'):
             for attr in (f'__attribute__(({spelling}))', f'[[gnu::{spelling}]]'):
-                proc, _ = _syntax_only(_driver(), f'int {attr} f(void);',
+                proc, _ = _syntax_only(driver, f'int {attr} f(void);',
                                        _arch_flags(target), ENV)
                 if proc.returncode == 0:
                     failures.append((f'abi:arity/{target}', 'malformed attribute accepted',
                                      'nonzero exit', attr))
-    sentinel_failures, sentinel_notes = check_sentinels()
+    sentinel_failures, sentinel_notes = check_sentinels(driver)
     return failures + sentinel_failures, notes + sentinel_notes
 
 
@@ -417,11 +520,18 @@ void _start(void) {{
 SENTINELS = ('fastcall', 'regparm(3)')
 
 
-def check_sentinels() -> tuple[list[tuple], list[str]]:
+def check_sentinels(driver: Path | None = None,
+                    gcc: str | None = None) -> tuple[list[tuple], list[str]]:
+    """Cross-compiler runtime sentinel for the two i686 conventions.
+
+    `gcc` defaults to `$GCC` and only then to `gcc` on `$PATH`: the sentinel's
+    claim is 'agrees with the *pinned oracle*', so resolving a different gcc
+    than the one the table was measured against would weaken the claim.
+    """
     failures: list[tuple] = []
     notes: list[str] = []
-    lccc = _driver()
-    gcc = shutil.which('gcc')
+    lccc = Path(driver) if driver is not None else _driver()
+    gcc = gcc or os.environ.get('GCC') or shutil.which('gcc')
     if not lccc.exists() or not gcc:
         return failures, ['skipped i686 ABI runtime sentinels '
                           f'({lccc.name} or gcc missing)']
@@ -446,7 +556,7 @@ def check_sentinels() -> tuple[list[tuple], list[str]]:
                     # create, and neither one pulls in a libc call.
                     cmd = [cc, '-m32', '-O2', '-ffreestanding', '-fno-pie', '-c',
                            str(tmpdir / f'{stem}.c'), '-o', str(obj)]
-                    proc = subprocess.run(cmd, capture_output=True, text=True, env=ENV)
+                    proc = run_bounded(cmd, timeout=COMPILE_TIMEOUT)
                     if proc.returncode != 0:
                         failures.append((f'sentinel:{spelling}',
                                          f'{label} {stem} did not build',
@@ -457,15 +567,14 @@ def check_sentinels() -> tuple[list[tuple], list[str]]:
                 if not built:
                     continue
                 exe = tmpdir / 'prog'
-                link = subprocess.run(
+                link = run_bounded(
                     [gcc, '-m32', '-nostdlib', '-static', '-no-pie', '-Wl,-e,_start',
-                     *objects, '-o', str(exe)],
-                    capture_output=True, text=True, env=ENV)
+                     *objects, '-o', str(exe)], timeout=LINK_TIMEOUT)
                 if link.returncode != 0:
                     notes.append(f'skipped sentinel {spelling} ({label}): 32-bit link '
                                  f'unavailable ({link.stderr.strip().splitlines()[:1]})')
                     continue
-                code = subprocess.run([str(exe)], capture_output=True).returncode
+                code = run_bounded([str(exe)], timeout=RUN_TIMEOUT).returncode
                 if code != 123:
                     failures.append((f'sentinel:{spelling}', f'{label} disagrees on the ABI',
                                      123, code))
@@ -477,9 +586,9 @@ def main() -> int:
     if not gcc:
         print('SKIP: no gcc found')
         return 1
-    has_i686 = subprocess.run([gcc, '-m32', '-E', '-x', 'c', '-', '-o', os.devnull],
-                              input='int x;\n', capture_output=True,
-                              text=True).returncode == 0
+    has_i686 = run_bounded([gcc, '-m32', '-E', '-x', 'c', '-', '-o', os.devnull],
+                           timeout=COMPILE_TIMEOUT,
+                           input='int x;\n').returncode == 0
     verdicts = registry_verdicts()
     failures, notes = check_table_against_gcc(gcc, verdicts, has_i686)
     lccc_failures, lccc_notes = check_lccc(verdicts)

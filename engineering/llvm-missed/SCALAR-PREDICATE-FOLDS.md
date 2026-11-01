@@ -38,7 +38,7 @@ in the tree is called a batch:
 | matcher (`bit_idioms.rs`) | `fold_shift_pair_into_mask` | `(x << k) >>u k` → `x & (2^(W-k)-1)` |
 | matcher (`bit_idioms.rs`) | `fold_unit_interval_test` | `(x == 0) \| (x == 1)` → `x <=u 1` |
 | matcher (`bit_idioms_compare_dominance.rs`) | `fold_compare_dominance` | `(x != 0) & (x > 4)` → `x > 4`; a join of two comparisons of one value is its stronger (or weaker) operand |
-| matcher (`bit_idioms_bit_select.rs`) | `fold_bit_select` | `x \| 1 << n` → `BitSet`, `x & ~(1 << n)` → `BitClear`, `(x & 1 << n) != 0` → `BitTest` |
+| matcher (`bit_idioms_bit_select.rs`) | `fold_bit_select` | `x \| 1 << n` → `BitSet`, `x & ~(1 << n)` → `BitClear`, `x ^ 1 << n` → `BitToggle`, `(x & 1 << n) != 0` → `BitTest`, and `(x ^ m) ^ m` → `x` |
 | matcher (`bit_idioms.rs`) | `fold_lowest_set_bit` | `1 << Ctz(~x)` → `(x + 1) & ~x`, plus the exact `~x == 0` arm |
 | rule (`simplify.rs`) | `zeroneg` | `0 - x` → `Neg x` (the modular negate, canonically spelled) |
 | rule (`simplify.rs`) | `negcast` | `(i32)(-(i64)(i32)v)` → `-(i32)v` (a truncation distributes over a negate) |
@@ -371,27 +371,40 @@ that never widened) pin that.
 ```c
 unsigned set(unsigned x, unsigned n)   { return x | (1u << n); }        /* 6 -> 3 */
 unsigned clr(unsigned x, unsigned n)   { return x & ~(1u << n); }       /* 8 -> 3 */
+unsigned tog(unsigned x, unsigned n)   { return x ^ (1u << n); }        /* 6 -> 3 */
 int      test(unsigned x, unsigned n)  { return (x & (1u << n)) != 0; } /* 7 -> 4 */
 ```
 
 §11's shape ends in a truncation, and its last paragraph named the remaining gap
 as instruction selection. It was: `x | 1u << n` reaches the backend as a
 materialized constant, a variable shift pinned to `%cl`, and the logic op, and
-no IR operation said "set bit n". `IrBinOp` now has `BitSet` and `BitClear`
-next to the existing `BitTest`, all three with the same contract — the index is
-taken **modulo the operand width**, so an index of W or more (an undefined C
-shift that may sit in dead code) still compiles and still agrees with the
-constant folder, and they are typed I32/U32/I64/U64 with the wide-int pair path
-refusing 64-bit operations on a 32-bit target.
+no IR operation said "set bit n". `IrBinOp` now has `BitSet`, `BitClear` and
+`BitToggle` next to the existing `BitTest`, all four with the same contract —
+the index is taken **modulo the operand width**, so an index of W or more (an
+undefined C shift that may sit in dead code) still compiles and still agrees
+with the constant folder, and they are typed I32/U32/I64/U64 with the wide-int
+pair path refusing 64-bit operations on a 32-bit target. `BitToggle` arrived a
+round later than the other two: it is the third *modify* spelling, and the one
+whose x86 mnemonic (`btc`) the first round left on the table.
 
 `fold_bit_select` creates them, and it only ever replaces the instruction it
 matched: the shift (and the complement above it) must be single-use, so DCE
 deletes them and nothing needs the pass's producer-repurposing bookkeeping. All
-three shapes are accepted in both operand orders, the complement may be spelled
+four shapes are accepted in both operand orders, the complement may be spelled
 `Not` or `Xor -1`, and the index is read *through* integer casts — `index mod W`
 survives any of them (a narrowing cast drops bits that are multiples of 2^8, a
 sign-extending one adds 2^(8k-1), and every W here divides those), which is what
 removes the count's widened copy (`movslq %esi, %rdx`) from the 64-bit forms.
+
+The toggle has one shape the other three do not: its own inverse. `x ^ m ^ m` is
+`x`, and the earlier XOR of that pair has usually been folded to a `BitToggle`
+before the outer one is reached, so the boolean pass that cancels `a ^ a` would
+see two *different* operations. Folding both XORs is arithmetically right and
+still a pessimisation — the shape measured 2 instructions before the fold and 5
+after — so the matcher folds `BitToggle(BitToggle(x, n), n)` to a **copy of `x`**
+and lets DCE finish it: 2 before, 2 after, pinned by the gate. The two masks have
+to be the same `n` for that: `x ^ (1u << n) ^ (1u << (n + 1))` is not an identity
+and stays two toggles.
 
 The equality direction, `(x & 1 << n) == 0`, is deliberately *not* folded:
 `BitTest` is a 0/1 value, so the negated form needs a second instruction on top
@@ -401,11 +414,11 @@ section's probe corpus that stays at its old count, and the gate pins it.
 
 Backend lowerings, all of them measured in this section's probe corpus:
 
-| Target | `BitSet` | `BitClear` | Note |
-| --- | --- | --- | --- |
-| x86-64, i686 | `bts` | `btr` | one instruction in place of the base; the register-direct form refuses the shapes where staging the base would destroy the index, and the accumulator form covers the rest (8-bit has no `btsb`, so it reduces the index and uses the 64-bit form) |
-| AArch64 | `mov w3, #1` + `lsl` + `orr` | … + `bic` | three instructions, the same count the shift/OR spelling costs, and the base is read in place from its home |
-| RISC-V | `andi` (index mod W) + `li` + `sll` + `or` | … + `xori` + `and` | no `bts`/`btr` (Zbs), so the portable sequence with the index reduced explicitly |
+| Target | `BitSet` | `BitClear` | `BitToggle` | Note |
+| --- | --- | --- | --- | --- |
+| x86-64, i686 | `bts` | `btr` | `btc` | one instruction in place of the base; the register-direct form refuses the shapes where staging the base would destroy the index, and the accumulator form covers the rest (8-bit has no `btsb`/`btcb`, so it reduces the index and uses the 64-bit form) |
+| AArch64 | `mov w3, #1` + `lsl` + `orr` | … + `bic` | … + `eor` | three instructions, the same count the shift/OR spelling costs, which is why the toggle's AArch64 counts do not move: the win there is the eliminated shift, not the mnemonic |
+| RISC-V | `andi` (index mod W) + `li` + `sll` + `or` | … + `xori` + `and` | … + `xor` | no `bts`/`btr`/`btc` (Zbs), so the portable sequence with the index reduced explicitly |
 
 ## Measurements
 
@@ -469,8 +482,10 @@ accident.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --profile fastbuild --locked --lib` | **7,177 passed, 0 failed, 10 ignored** (round 3: +16) |
+| `cargo test --lib` | **7,206 passed, 0 failed, 10 ignored** after round 4 (+29), plus the toggle's 4 matcher/fold tests in round 5 |
 | `check_compare_dominance_fold.sh` | PASS — four dominant shapes in both directions, 8/16/32/64-bit widths, `CCC_NO_COMPARE_DOMINANCE=1` restores every one of them, the two non-dominant shapes pinned at 9 in both builds, `-O0`…`-O3` + the switch + GCC agree on a 65,536-row checksum |
+| `check_bit_select_fold.sh` | PASS — set/clear/toggle/test at 8/16/32/64 bits and both operand orders, the dead `shl`/`not`/`xor` producers, `CCC_NO_BIT_SELECT=1` restoring every count, the non-single-bit controls pinned in both builds, never-longer lengths on i686/AArch64/RISC-V, and `-O0`…`-Os` + the switch + GCC agreeing on an executed checksum |
+| `bit_idioms_bit_select_tests.rs` | 16 tests — the four shapes over every ring and both operand orders, the `Not`/`Xor -1` complement spellings, the cast-peeled index, the shift-at-another-width refusal, and the toggle involution |
 | `bit_idioms_compare_dominance_tests.rs` | 14 tests — exhaustive 8-bit product of all ten comparison kinds × six constants in both joins, a reduced 16-bit product, and the refusal tables (different value, different width, mixed ordering, non-comparison operand, float) |
 | `notcast` unit tests | `truncated_complement_of_an_extension_folds_to_the_narrow_complement`, `truncated_complement_controls` (widening cast, different-width extension, already-narrow operand) |
 | `check_predicate_differences_and_ranges.py` | PASS — values at `-O0`…`-O3`, per-fold mechanism, five controls, attribution, GCC 16.2 length oracle (1.7 s) |
@@ -520,6 +535,36 @@ as the only difference, once per rule:
 | net instruction change | **−10** | **−1** |
 | the file | `predicate_differences_and_ranges.c` −10 | `bb_slp_unary_demote.c` −1 |
 
+Round 4 repeats it for the single-bit selection fold, which is switched off as a
+whole by `CCC_NO_BIT_SELECT=1`, over every `.c` file under `tests/` and
+`engineering/`:
+
+| target | files compiled both ways | shorter | longer | verdict changes | net instructions |
+|---|---|---|---|---|---|
+| x86-64 | 3,078 | **3** | 0 | 0 | **−47** |
+| i686 | 3,078 | 1 | 0 | 0 | −33 |
+| AArch64 | 3,078 | 1 | 0 | 0 | −11 |
+
+Round 5 adds the toggle to the same fold and repeats the sweep:
+
+| target | files compiled both ways | shorter | longer | verdict changes | net instructions |
+|---|---|---|---|---|---|
+| x86-64 | 3,079 | **6** | 0 | 0 | **−68** |
+| i686 | 3,079 | 2 | 0 | 0 | −57 |
+| AArch64 | 3,079 | 1 | 0 | 0 | −11 |
+
+The x86-64 wins beyond the probes are `tests/regression/simd_avx2_defer_chain.c`
+(178 → 164), `tests/benchmark/programs/glibc_memcmp.c` (158 → 156) and
+`tests/benchmark/programs/linux_find_bit.c` (123 → 122) — real code that spells
+the idiom, which is the point: the fold is a parity fix for code that already
+asks for `bts`/`btr`/`btc`, not a transformation that fires everywhere. `both
+reject` (775 / 1,808 / 1,853) is corpus noise that fails identically in both
+builds — missing `-I` paths, `-m32`, target intrinsics — and `verdict: 0` is the
+invariant the sweep exists to keep. Lists, scripts and per-function tables:
+[`engineering/evidence/2026-11-01-bit-selection/`](../evidence/2026-11-01-bit-selection/README.md)
+and
+[`engineering/evidence/2026-11-01-bit-toggle/`](../evidence/2026-11-01-bit-toggle/README.md).
+
 Both are honest near-zeroes on this corpus, and the reason is the corpus, not
 the rules: the test tree is 2,086 single-function files whose guards are written
 as `&&` (already if-converted into branches by `cfg_simplify`) rather than as
@@ -548,12 +593,13 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
 
 ## What is not done
 
-* **`btc` (bit toggle)** — `x ^ (1 << n)` is the fourth single-bit idiom, and
-  both oracles select the one-instruction `btc` for it (3 instructions against
-  LCCC's 6). It needs a fourth IR operation with a fourth lowering in every
-  backend; §12's recognition is one arm away from it, but nothing in the probe
-  corpus or the 3,016-file sweep carries the shape, so it is not added
-  speculatively.
+* **`(x ^ 1 << n) ^ 1 << n` as a *fold* rather than a copy** — handled at 2
+  instructions (see §12), but only when the two masks are the same value. A
+  spelling whose two `1u << n` are not CSE'd produces two `BitToggle`s that the
+  identity would cancel; recognising them needs a structural index comparison
+  (`BitToggle(BitToggle(x, a), b)` with `a == b` by value, not by SSA id), which
+  no pass in this tree has. Rare enough to leave documented rather than to add a
+  new value-equality mechanism for.
 * **`__builtin_popcount` / parity below `-mpopcnt`** — the remaining gap is a
   linking decision, not a fold, and the numbers say so. With `-mpopcnt` LCCC
   already selects the instruction: `pop32` is `popcntl; mov; ret` (3, equal to

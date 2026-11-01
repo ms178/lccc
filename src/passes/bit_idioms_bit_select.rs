@@ -1,13 +1,16 @@
-//! Single-bit selection: `x | 1 << n`, `x & ~(1 << n)`, `(x & 1 << n) != 0`.
+//! Single-bit selection: `x | 1 << n`, `x & ~(1 << n)`, `x ^ 1 << n` and
+//! `(x & 1 << n) != 0`.
 //!
-//! These three shapes are how portable C spells "set bit n", "clear bit n" and
-//! "test bit n".  Spelled out they cost a materialized constant, a variable
+//! These four shapes are how portable C spells "set bit n", "clear bit n",
+//! "toggle bit n" and "test bit n".  Spelled out they cost a materialized
+//! constant, a variable
 //! shift pinned to `%cl` and the logic op; every ISA this compiler targets has
 //! a one- or two-instruction form of the *whole* idiom instead (x86
-//! `bts`/`btr`/`bt`, AArch64 `orr`/`bic` with an `lsl`, RISC-V `or`/`and`
-//! against a shifted one).  The IR forms are [`IrBinOp::BitSet`],
-//! [`IrBinOp::BitClear`] and the already-existing [`IrBinOp::BitTest`], whose
-//! `index mod W` contract these two share.
+//! `bts`/`btr`/`btc`/`bt`, AArch64 `orr`/`bic`/`eor` with an `lsl`, RISC-V
+//! `or`/`and`/`xor` against a shifted one).  The IR forms are
+//! [`IrBinOp::BitSet`], [`IrBinOp::BitClear`], [`IrBinOp::BitToggle`] and the
+//! already-existing [`IrBinOp::BitTest`], whose `index mod W` contract all
+//! four share.
 //!
 //! Every rewrite here replaces only the instruction it matches and leaves the
 //! producers (`1 << n`, and the `~` above it) to DCE, which is why each one
@@ -23,9 +26,10 @@
 //!   (`xor $1`) that the `setnc` GCC and Clang emit does not; folding the
 //!   producer would still leave the compare.  The inequality direction folds
 //!   because `BitTest`'s 0/1 result *is* the answer.
-//! * `x ^ 1 << n` (bit toggle, `btc`).  It would need a fourth IR operation and
-//!   a fourth lowering in every backend for a shape this pass's corpus does not
-//!   carry; the recognition would be one line next to `BitSet`'s when it does.
+//! * `x ^ 1u << n` with the shifted operand used twice, and the seven other
+//!   spellings the controls in `check_bit_select_fold.sh` pin.  The single-use
+//!   rule is what keeps a toggle from duplicating the shift, exactly as it does
+//!   for `BitSet`/`BitClear`.
 
 use super::*;
 
@@ -33,7 +37,13 @@ use super::*;
 /// no lowering, and on a 32-bit target neither does a 64-bit operation (its
 /// "native" width is a register pair the bit emitters do not handle) -- the
 /// same legality rule `simplify`'s `BitTest` producer applies, kept here in one
-/// place for the three shapes below.
+/// place for the four shapes below.
+///
+/// The backends also lower 8/16-bit bit operations (the C frontend never asks
+/// for one, because the integer promotions widen both operands to `int`, but
+/// the IR contract allows them and the ARM/RISC-V narrow paths are tested
+/// directly).  This recognizer only creates what its own shapes produce, so the
+/// narrow widths are simply out of reach here.
 fn native_bit_width(ty: IrType) -> bool {
     ty.is_integer()
         && !ty.is_128bit()
@@ -117,6 +127,31 @@ fn not_of_shift_of_one(
     Some((index, shifted.0, shift_ty))
 }
 
+/// The inner base of `(x ^ m) ^ m`, i.e. `x` when `base` is a `BitToggle` (or
+/// the pre-fold `Xor`) of the same index operand.  Used to keep the toggle's
+/// involution from being *worse* than the shape it replaces: the two masks in
+/// `x ^ (1u << n) ^ (1u << n)` are the same CSE'd value, so the outer XOR here
+/// is `BitToggle(BitToggle(x, n), n)` and its answer is `x`.
+fn toggle_involution(
+    base: Operand,
+    index: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
+    let Operand::Value(v) = peel_copies(base, defs) else {
+        return None;
+    };
+    let (inner_base, inner_index) = match defs.get(v.0 as usize).and_then(Option::as_ref)? {
+        Instruction::BinOp {
+            op: IrBinOp::BitToggle,
+            lhs,
+            rhs,
+            ..
+        } => (*lhs, *rhs),
+        _ => return None,
+    };
+    (peel_copies(inner_index, defs) == peel_copies(index, defs)).then_some(inner_base)
+}
+
 /// Whether an operand's producer is used exactly once, i.e. dies when the
 /// matched instruction stops reading it.  `uses` is the running count at this
 /// point of the scan, so a use by an *earlier* instruction is already gone.
@@ -192,6 +227,44 @@ pub(super) fn fold_bit_select(
             Some(Instruction::BinOp {
                 dest: *dest,
                 op: IrBinOp::BitClear,
+                lhs: base,
+                rhs: index,
+                ty: *ty,
+            })
+        }
+        // `x ^ (1 << n)` -> `BitToggle(x, n)`
+        //
+        // The third member of the family: `btc` on x86, `eor` behind an `lsl`
+        // elsewhere.  Accepted in both operand orders like `BitSet`, and the
+        // shift must die here too.
+        Instruction::BinOp {
+            dest,
+            op: IrBinOp::Xor,
+            lhs,
+            rhs,
+            ty,
+        } if native_bit_width(*ty) => {
+            let (shifted, base, index, shift_ty) = split_shift(*lhs, *rhs, defs)?;
+            if shift_ty != *ty || !single_use(shifted, defs, uses) {
+                return None;
+            }
+            // `(x ^ m) ^ m` is `x`, and the toggle is its own inverse.  The
+            // earlier XOR of that pair has usually been folded to a `BitToggle`
+            // by the time this one is reached, and the pass that would cancel
+            // `a ^ a` sees two different operations afterwards -- so folding
+            // BOTH would turn a 2-instruction identity into two `btc`s
+            // (`x ^ (1u << n) ^ (1u << n)` measured 2 before this fold and 5
+            // after).  Catch it here instead: the result is a plain copy of the
+            // inner base, which DCE turns into the identity.
+            if let Some(inner_base) = toggle_involution(base, index, defs) {
+                return Some(Instruction::Copy {
+                    dest: *dest,
+                    src: inner_base,
+                });
+            }
+            Some(Instruction::BinOp {
+                dest: *dest,
+                op: IrBinOp::BitToggle,
                 lhs: base,
                 rhs: index,
                 ty: *ty,

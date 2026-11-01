@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
-# Single-bit selection: `x | 1 << n`, `x & ~(1 << n)`, `(x & 1 << n) != 0`.
+# Single-bit selection: `x | 1 << n`, `x & ~(1 << n)`, `x ^ 1 << n`,
+# `(x & 1 << n) != 0`.
 #
 #   x | (1u << n)          is   bts      set bit n
 #   x & ~(1u << n)         is   btr      clear bit n
+#   x ^ (1u << n)          is   btc      toggle bit n
 #   (x & (1u << n)) != 0   is   bt       test bit n
 #
-# Portable C spells these three everywhere (bitmaps, atomics masks, allocator
+# Portable C spells these four everywhere (bitmaps, atomics masks, allocator
 # free lists, `1u << (n & 31)` in hash tables).  Spelled out they cost a
 # materialized constant, a variable shift pinned to `%cl` and the logic op;
-# both oracles emit one instruction for the set/clear and two for the test, and
-# LCCC emitted 6, 8 and 7 where they emit 3, 3 and 4.
+# both oracles emit one instruction for the set/clear/toggle and two for the
+# test, and LCCC emitted 6, 8, 6 and 7 where they emit 3, 3, 3 and 4.
 #
-# The IR gained `BitSet` and `BitClear` (the existing `BitTest` covers the
-# third) and `bit_idioms` creates them from those shapes.  This gate pins six
+# The IR gained `BitSet`, `BitClear` and `BitToggle` (the existing `BitTest`
+# covers the test) and `bit_idioms` creates them from those shapes.  The
+# toggle came a round later than the other three: `btc` is the one mnemonic of
+# the family x86 has that the first round did not lower.  This gate pins six
 # things, because an instruction-count win that changes answers is worthless:
 #
 #   1. every folded shape selects the bit instruction at 32 and 64 bits, with
 #      the constant folded away (the shift and the complement are gone),
 #   2. the controls keep their exact counts in both builds: a two-bit mask
-#      (`3u << n`), the toggle (`x ^ 1 << n`), a mask compared against a
+#      (`3u << n`, under both `|` and `^`), a mask compared against a
 #      non-zero constant, and a shift whose result is used twice,
 #   3. the equality direction, `(x & 1 << n) == 0`, keeps its count: `BitTest`
 #      is a 0/1 value, so the negated form needs a second instruction and the
@@ -50,10 +54,17 @@ u32 bclr32(u32 x, u32 n)     { return x & ~(1u << n); }
 u64 bclr64(u64 x, u64 n)     { return x & ~(1ul << n); }
 int btest32(u32 x, u32 n)    { return (x & (1u << n)) != 0; }
 int btest64(u64 x, u64 n)    { return (x & (1ul << n)) != 0; }
+u32 btog32(u32 x, u32 n)     { return x ^ (1u << n); }
+u64 btog64(u64 x, u64 n)     { return x ^ (1ul << n); }
+/* The toggle's involution: `(x ^ m) ^ m` is `x`, and folding both XORs
+   without noticing that would turn a 2-instruction identity into two
+   `btc`s, which is exactly the pessimisation this row pins. */
+u32 btog_twice(u32 x, u32 n) { return x ^ (1u << n) ^ (1u << n); }
 
 /* Controls: none of these is a single-bit operation on the base. */
 u32 keep_two(u32 x, u32 n)   { return x & (3u << n); }
-u32 keep_xor(u32 x, u32 n)   { return x ^ (1u << n); }
+u32 keep_xor_two(u32 x, u32 n) { return x ^ (3u << n); }
+u32 keep_xor_not(u32 x, u32 n) { return x ^ ~(1u << n); }
 u32 keep_shl(u32 x, u32 n)   { return (x << n) | x; }
 int keep_eq4(u32 x, u32 n)   { return (x & (1u << n)) == 4; }
 int btest32z(u32 x, u32 n)   { return (x & (1u << n)) == 0; }
@@ -103,23 +114,34 @@ expect bclr32 3 on.s
 expect bclr64 3 on.s
 expect btest32 4 on.s
 expect btest64 4 on.s
+expect btog32 3 on.s
+expect btog64 3 on.s
+# The involution stays an identity instead of becoming two bit instructions.
+expect btog_twice 2 on.s
+expect btog_twice 2 off.s
+refuse on.s btog_twice 'btc' "(x ^ 1 << n) ^ (1 << n) must cancel"
 want on.s bset32 'bts[lq][[:space:]]'
 want on.s bset64 'bts[lq][[:space:]]'
 want on.s bclr32 'btr[lq][[:space:]]'
 want on.s bclr64 'btr[lq][[:space:]]'
 want on.s btest32 'bt[lq][[:space:]]'
 want on.s btest64 'bt[lq][[:space:]]'
+want on.s btog32 'btc[lq][[:space:]]'
+want on.s btog64 'btc[lq][[:space:]]'
 # The producers are gone, not merely shadowed by the bit instruction.
 refuse on.s bset32 'sh[lq][[:space:]]' "the constant shift must be dead"
 refuse on.s bclr32 'sh[lq][[:space:]]' "the constant shift must be dead"
 refuse on.s bclr32 'not[lq][[:space:]]' "the complement must be dead"
 refuse on.s btest32 'sh[lq][[:space:]]' "the constant shift must be dead"
 refuse on.s btest32 'and[lq][[:space:]]' "the mask must be dead"
+refuse on.s btog32 'sh[lq][[:space:]]' "the constant shift must be dead"
+refuse on.s btog32 'xor[lq][[:space:]]' "the XOR must be the bit instruction"
 
 # ── 2. Controls keep their shape in BOTH builds ────────────────────────────
 for build in on.s off.s; do
     expect keep_two 6 "$build"
-    expect keep_xor 6 "$build"
+    expect keep_xor_two 6 "$build"
+    expect keep_xor_not 8 "$build"
     expect keep_shl 5 "$build"
     expect keep_eq4 8 "$build"
 done
@@ -136,7 +158,9 @@ expect bclr32 8 off.s
 expect bclr64 8 off.s
 expect btest32 7 off.s
 expect btest64 7 off.s
-for label in bset32 bset64 bclr32 bclr64 btest32 btest64; do
+expect btog32 6 off.s
+expect btog64 6 off.s
+for label in bset32 bset64 bclr32 bclr64 btest32 btest64 btog32 btog64; do
     refuse off.s "$label" '(^|[[:space:]])bt[s]?[lq]?[[:space:]]' \
         "CCC_NO_BIT_SELECT must remove the bit instruction"
 done
@@ -167,10 +191,12 @@ if [ -x "$bindir/lccc-i686" ]; then
     cross_length_check "$bindir/lccc-i686" i686
     want i686-on.s bset32 'btsl[[:space:]]'
     want i686-on.s bclr32 'btrl[[:space:]]'
+    want i686-on.s btog32 'btcl[[:space:]]'
 fi
 if [ -x "$bindir/lccc-arm" ]; then
     cross_length_check "$bindir/lccc-arm" arm
     want arm-on.s bclr32 'bic[[:space:]]'
+    want arm-on.s btog32 'eor[[:space:]]'
 fi
 if [ -x "$bindir/lccc-riscv" ]; then
     cross_length_check "$bindir/lccc-riscv" riscv
@@ -190,8 +216,11 @@ static int btestz(u32 x, u32 n)   { return (x & (1u << n)) == 0; }
 static u64 bset64(u64 x, u64 n)   { return x | (1ul << n); }
 static u64 bclr64(u64 x, u64 n)   { return x & ~(1ul << n); }
 static int btest64(u64 x, u64 n)  { return (x & (1ul << n)) != 0; }
+static u32 btog(u32 x, u32 n)     { return x ^ (1u << n); }
+static u64 btog64(u64 x, u64 n)   { return x ^ (1ul << n); }
 static u32 keep_two(u32 x, u32 n) { return x & (3u << n); }
-static u32 keep_xor(u32 x, u32 n) { return x ^ (1u << n); }
+static u32 keep_xor_two(u32 x, u32 n) { return x ^ (3u << n); }
+static u32 keep_xor_not(u32 x, u32 n) { return x ^ ~(1u << n); }
 static int keep_eq4(u32 x, u32 n) { return (x & (1u << n)) == 4; }
 
 static unsigned h = 2166136261u;
@@ -205,7 +234,10 @@ int main(void) {
         u32 x = pat[p];
         for (u32 n = 0; n < 32; n++) {
             mix(bset(x, n)); mix(bclr(x, n)); mix((unsigned)btest(x, n));
-            mix((unsigned)btestz(x, n)); mix(keep_two(x, n)); mix(keep_xor(x, n));
+            mix((unsigned)btestz(x, n)); mix(keep_two(x, n)); mix(keep_xor_two(x, n));
+            mix(btog(x, n)); mix(btog(btog(x, n), n));
+            mix(x ^ (1u << n) ^ (1u << n));
+            mix((unsigned)keep_xor_not(x, n));
             mix((unsigned)keep_eq4(x, n));
         }
     }
@@ -213,6 +245,7 @@ int main(void) {
         u64 x = ((u64)pat[p] << 32) | (u64)pat[p];
         for (u64 n = 0; n < 64; n++) {
             mix(bset64(x, n)); mix(bclr64(x, n)); mix((unsigned)btest64(x, n));
+            mix(btog64(x, n)); mix(btog64(btog64(x, n), n));
         }
     }
     printf("%08x\n", h);

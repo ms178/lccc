@@ -1144,8 +1144,8 @@ impl X86Codegen {
                     return;
                 }
             }
-            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear) {
-                // BTS/BTR write the base back, so the register-direct form
+            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle) {
+                // BTS/BTR/BTC write the base back, so the register-direct form
                 // only claims the cases where staging the base into
                 // dest_phys cannot destroy the index (see the emitter); every
                 // other shape takes the accumulator path below, which stages
@@ -1978,7 +1978,9 @@ impl X86Codegen {
                 }
             }
             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
-            IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify_acc(op, ty),
+            IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
+                self.emit_bit_modify_acc(op, ty)
+            }
             IrBinOp::Bzhi => self.emit_bzhi_acc(use_32bit),
             IrBinOp::UMulHigh | IrBinOp::SMulHigh => self.emit_mul_high_acc(op, use_32bit),
             // Rotates of every integer width are emitted above
@@ -1998,7 +2000,19 @@ impl X86Codegen {
         }
     }
 
-    /// `BitSet`/`BitClear` register-direct: stage the base into `dest_phys`
+    /// The x86 mnemonic for one of the three bit-modify operations.  `bts`,
+    /// `btr` and `btc` all write the base operand back and all read the index
+    /// modulo the operand width, so the only difference between the three
+    /// lowerings is this table.
+    fn bit_modify_mnemonic(op: IrBinOp) -> &'static str {
+        match op {
+            IrBinOp::BitSet => "bts",
+            IrBinOp::BitClear => "btr",
+            _ => "btc",
+        }
+    }
+
+    /// `BitSet`/`BitClear`/`BitToggle` register-direct: stage the base into `dest_phys`
     /// and let `bts`/`btr` write the modified base there.  Unlike BT — which
     /// only reads its base and writes CF — the bit-modify forms write the
     /// base operand, so the staging move must not destroy the index:
@@ -2054,7 +2068,7 @@ impl X86Codegen {
             return false;
         }
         self.operand_to_callee_reg(base, dest_phys);
-        let mnemonic = if op == IrBinOp::BitSet { "bts" } else { "btr" };
+        let mnemonic = Self::bit_modify_mnemonic(op);
         if let Some(imm) = Self::const_as_imm32(index) {
             // Reduce explicitly: an index of W or more is defined by the
             // operation's contract, and the emitted immediate then documents
@@ -2112,7 +2126,7 @@ impl X86Codegen {
     /// container garbage the pre-existing shift/OR sequence left there (every
     /// consumer of an I8 value reads it through its truncating name).
     fn emit_bit_modify_acc(&mut self, op: IrBinOp, ty: IrType) {
-        let mnemonic = if op == IrBinOp::BitSet { "bts" } else { "btr" };
+        let mnemonic = Self::bit_modify_mnemonic(op);
         match ty.size() {
             8 => self
                 .state

@@ -1129,46 +1129,63 @@ jobs:
     - name: GCC 16.2 diagnostic severity parity
       run: |
         set -euo pipefail
-        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_gcc162_diagnostic_severity.sh
-        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_operand_diagnostics.sh
-        python3 tests/regression/check_c23_inventory.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16 \
-          --json "$RUNNER_TEMP/c23-inventory.json" \
-          --markdown "$RUNNER_TEMP/c23-inventory.md"
-        python3 tests/regression/check_warning_compat.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        python3 tests/regression/check_warning_precedence.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        python3 tests/regression/check_macro_parity.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        python3 tests/regression/check_include_next_search.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        env CCC=target/fastbuild/lccc GCC=gcc-16 \
-          bash tests/regression/check_macro_parity.sh
-        python3 tests/regression/check_has_builtin_features.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        python3 tests/regression/check_asm_constraints.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        python3 tests/regression/check_driver_queries.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        python3 tests/regression/check_option_effect_ledger.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        env GCC=gcc-16 python3 tests/regression/check_attribute_diagnostics.py
-        python3 tests/regression/check_qualifier_conversions.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        python3 tests/regression/test_qualifier_gate.py
-        # Guard the newly added i686 ABI and optimizer contracts in hosted CI,
-        # not only in ci_local.sh.
-        python3 tests/regression/check_call_arg_staging.py \
-          --lccc target/fastbuild/lccc --seed-list 1,2,3,4,5,6,11,14,16,26,30
-        python3 tests/regression/check_licm_global_speculation.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16
-        python3 tests/regression/check_return_local_addr.py \
-          --lccc target/fastbuild/lccc --gcc gcc-16 --m32
-        python3 tests/regression/check_qualifier_composition.py \
-          --lccc target/fastbuild/lccc --lccc target/fastbuild/lccc-i686 \
-          --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
-          --gcc gcc-16
+        # Every gate in this step is independent, and a bare `exit 1` in the
+        # check UI names none of them -- three debugging rounds on this branch
+        # were spent guessing which contract had broken, with the log
+        # unreadable from a branch. `run_gate` re-prints the gate's whole log
+        # and adds one annotation naming it with the log's tail; the annotation
+        # budget (ten per step) is therefore spent on failures only.
+        run_gate() {
+          local label=$1
+          shift
+          local log rc=0
+          log=$("$@" 2>&1) || rc=$?
+          printf '%s\n' "$log"
+          if ((rc)); then
+            echo "::error::gate '$label' failed (exit $rc): $(printf '%s\n' "$log" | tail -n 12 | tr '\n' '|' | cut -c1-600)"
+            return "$rc"
+          fi
+        }
+        run_gate gcc162_diagnostic_severity env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_gcc162_diagnostic_severity.sh
+        run_gate operand_diagnostics env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_operand_diagnostics.sh
+        run_gate c23_inventory python3 tests/regression/check_c23_inventory.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16 \
+        --json "$RUNNER_TEMP/c23-inventory.json" \
+        --markdown "$RUNNER_TEMP/c23-inventory.md"
+        run_gate warning_compat python3 tests/regression/check_warning_compat.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate warning_precedence python3 tests/regression/check_warning_precedence.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate macro_parity python3 tests/regression/check_macro_parity.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate include_next_search python3 tests/regression/check_include_next_search.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate macro_parity env CCC=target/fastbuild/lccc GCC=gcc-16 \
+        bash tests/regression/check_macro_parity.sh
+        run_gate has_builtin_features python3 tests/regression/check_has_builtin_features.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate asm_constraints python3 tests/regression/check_asm_constraints.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate driver_queries python3 tests/regression/check_driver_queries.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate option_effect_ledger python3 tests/regression/check_option_effect_ledger.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate attribute_diagnostics env GCC=gcc-16 python3 tests/regression/check_attribute_diagnostics.py
+        run_gate qualifier_conversions python3 tests/regression/check_qualifier_conversions.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate test_qualifier_gate python3 tests/regression/test_qualifier_gate.py
+        run_gate gate # Guard the newly added i686 ABI and optimizer contracts in hosted CI,
+        run_gate gate # not only in ci_local.sh.
+        run_gate call_arg_staging python3 tests/regression/check_call_arg_staging.py \
+        --lccc target/fastbuild/lccc --seed-list 1,2,3,4,5,6,11,14,16,26,30
+        run_gate licm_global_speculation python3 tests/regression/check_licm_global_speculation.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16
+        run_gate return_local_addr python3 tests/regression/check_return_local_addr.py \
+        --lccc target/fastbuild/lccc --gcc gcc-16 --m32
+        run_gate qualifier_composition python3 tests/regression/check_qualifier_composition.py \
+        --lccc target/fastbuild/lccc --lccc target/fastbuild/lccc-i686 \
+        --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
+        --gcc gcc-16
     - name: Cargo gate resource isolation
       run: python3 scripts/test_ci_resources.py
     - name: Verify local oracle identity and ICX provisioning (offline, mock only)
