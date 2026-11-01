@@ -8,6 +8,11 @@ on:
       - 'scripts/build_kernel_full.sh'
       - 'scripts/prepare_kernel_tree.sh'
   workflow_dispatch:
+    inputs:
+      export_host_prerequisites:
+        description: Export Debian host tools for a GitHub-only development sandbox
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,7 +26,7 @@ jobs:
     # A GitHub-only transport for network-restricted development sandboxes.
     # Unreferenced, content-addressed Git blobs never change a branch or tag;
     # the notice records their IDs and a SHA256 manifest authenticates parts.
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name == 'workflow_dispatch' && inputs.export_host_prerequisites) || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'kernel-host-prerequisites'))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -32,7 +37,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/kernel-host-debs"
           docker run --rm -v "$RUNNER_TEMP/kernel-host-debs:/out" debian:bookworm bash -euc '
             apt-get update -qq
-            apt-get -y --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 busybox-static file
+            apt-get -y --no-install-recommends --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 busybox-static file
             cp /var/cache/apt/archives/*.deb /out/
           '
           cd "$RUNNER_TEMP/kernel-host-debs"
@@ -44,12 +49,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sha256sum "$RUNNER_TEMP/kernel-host-debs.tar.xz"
+          printf 'archive %s\n' "$(sha256sum "$RUNNER_TEMP/kernel-host-debs.tar.xz" | cut -d' ' -f1)" > "$RUNNER_TEMP/host-manifest"
           for part in "$RUNNER_TEMP"/kernel-host-part-*; do
             base64 -w0 "$part" > "$RUNNER_TEMP/blob.base64"
             id=$(gh api "repos/$GITHUB_REPOSITORY/git/blobs" -X POST -f encoding=base64 -F content=@"$RUNNER_TEMP/blob.base64" --jq .sha)
-            echo "::notice title=Kernel host prerequisite blob::$(basename "$part") $id $(sha256sum "$part" | cut -d' ' -f1)"
+            echo "$(basename "$part") $id $(sha256sum "$part" | cut -d' ' -f1)" >> "$RUNNER_TEMP/host-manifest"
           done
+          # Checks retain only ten notices per step. Publish the WHOLE manifest,
+          # not ten full-sized prefix parts of a truncated compressed archive.
+          python3 - "$RUNNER_TEMP/host-manifest" <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'scripts') if Path('scripts').is_dir() else None
+          text = Path(sys.argv[1]).read_text()
+          lines = text.splitlines()
+          for start in range(0, len(lines), 20):
+              chunk = '\n'.join(lines[start:start + 20])
+              message = chunk.replace('%', '%25').replace('\n', '%0A')
+              print(f'::notice title=Kernel host prerequisite manifest::{message}')
+          PY
   kernel:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -75,7 +93,9 @@ jobs:
       - name: Build LCCC and lccc-ld (fastbuild)
         run: bash scripts/build_lccc_fast.sh
       - name: Apply package patches and prepare with LCCC
-        run: bash scripts/prepare_kernel_tree.sh
+        run: |
+          set -euo pipefail
+          bash scripts/prepare_kernel_tree.sh 2>&1 | tee "$RUNNER_TEMP/kernel-prepare.log"
       - name: Select x86-64 defconfig using LCCC
         run: |
           set -euo pipefail
@@ -85,6 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           OUT="$RUNNER_TEMP/kernel-boot" bash scripts/build_kernel_boot.sh 2>&1 | tee "$RUNNER_TEMP/kernel-boot.log"
+          echo "::notice title=Kernel setup size::$(grep '32 KiB gate:' "$RUNNER_TEMP/kernel-boot.log")"
       - name: Full defconfig bzImage with LCCC and lccc-ld
         run: |
           set -euo pipefail
@@ -93,6 +114,13 @@ jobs:
         run: |
           K=$(bash scripts/kernel_version.sh --default-dir)
           BOOT_LOG="$RUNNER_TEMP/kernel-qemu.log" bash scripts/qemu_defconfig_smoke.sh "$K/arch/x86/boot/bzImage"
+      - name: Surface kernel diagnostics in the Checks API
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP"/kernel-*.log; do
+            test -f "$log" || continue
+            python3 scripts/ci_annotate_log.py --title "Kernel $(basename "$log")" --max 2 --context 8 "$log"
+          done
       - name: Retain logs, configuration and provenance
         if: always()
         uses: actions/upload-artifact@v7
