@@ -105,11 +105,17 @@ EOF
 #   padding, so max is the effective alignment -- see trap 1 above.
 window_of() {
     awk -v fn="$1" '
+        # Metadata-section alignment must not leak into text placement.
+        /^[[:space:]]*\.(section|pushsection|popsection|previous|text|data|bss)([[:space:]]|$)/ { buf = ""; next }
         /^[[:space:]]*\.(p2align|align)[[:space:]]/ { buf = buf $2 " "; next }
         /^[A-Za-z_.][A-Za-z0-9_.]*:$/ {
             if ($0 == fn ":") { print buf; exit }
-            buf = ""
+            # A zero-byte patch-entry alias does not advance the location.
+            # Instructions below DO reset the window (including leading NOPs).
+            if ($0 !~ /^\.LPFE[0-9]+:$/) buf = ""
+            next
         }
+        /^[[:space:]]*[A-Za-z][A-Za-z0-9.]*([[:space:]]|$)/ { buf = "" }
     ' "$2"
 }
 
@@ -124,6 +130,28 @@ effective_align_of() {
     echo "${v:-0}"
 }
 directive_count_of() { window_of "$1" "$2" | wc -w | tr -d ' '; }
+
+# Adversarial checks for the measurement itself: aliases occupy zero bytes,
+# but a leading NOP or another section must not carry an alignment through.
+cat > "$tmp/window.s" <<'ASM'
+.section __patchable_function_entries,"awo",@progbits,.LPFE0
+.align 8
+.quad .LPFE0
+.section .text.probe,"ax",@progbits
+.p2align 4
+.LPFE0:
+probe:
+.p2align 6
+.LPFE1:
+nop
+probe_bad:
+.p2align 6
+.section .text.other,"ax",@progbits
+probe_other:
+ASM
+[[ $(effective_align_of probe "$tmp/window.s") == 4 ]]
+[[ $(effective_align_of probe_bad "$tmp/window.s") == 0 ]]
+[[ $(effective_align_of probe_other "$tmp/window.s") == 0 ]]
 
 fail=0
 expect() { # expect <fn> <log2> <why>

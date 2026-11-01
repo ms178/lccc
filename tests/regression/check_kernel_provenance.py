@@ -78,11 +78,21 @@ def main() -> int:
         cc.write_text('#!/bin/sh\necho "lccc test 1.0"\n')
         cc.chmod(0o755)
         hostcc = bindir / "hostcc"
-        hostcc.write_text('#!/bin/sh\nexit 0\n')
+        hostcc.write_text(
+            '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n'
+            '  if [ "$1" = -o ]; then shift;\n'
+            "    printf '#!/bin/sh\\necho generated-cpustr\\n' > \"$1\"; chmod +x \"$1\"; exit 0; fi\n"
+            '  shift\ndone\nexit 1\n'
+        )
         hostcc.chmod(0o755)
         make = bindir / "make"
         make.write_text(
             '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_MAKE_LOG"\n'
+            'case " $* " in *" clean "*)\n'
+            '  rm -f include/generated/utsversion.h arch/x86/kernel/cpu/capflags.c '
+            'arch/x86/boot/cpustr.h arch/x86/boot/zoffset.h arch/x86/boot/voffset.h;;\n'
+            'esac\n'
+            'case " $* " in *" olddefconfig "*) [ "${TEST_FAIL_PREPARE:-0}" != 1 ] || exit 7;; esac\n'
         )
         make.chmod(0o755)
         # Mock only preflight tools that are genuinely absent so the test does
@@ -102,12 +112,17 @@ def main() -> int:
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text("canary\n")
 
+        (kdir / "arch/x86/kernel/cpu/mkcapflags.sh").write_text(
+            '#!/bin/sh\necho generated-capflags > "$1"\n'
+        )
+
         env = dict(
             os.environ,
             PATH=f"{bindir}:{os.environ['PATH']}",
             PKGDIR=str(pkg),
             KERNEL_WORK=str(tmp),
             LCCC=str(cc),
+            LCCC_LD=str(cc),
             HOSTCC=str(hostcc),
             TEST_MAKE_LOG=str(tmp / "make.log"),
             LCCC_KERNEL_SOURCE_MODE="tarball",
@@ -144,6 +159,9 @@ def main() -> int:
         assert "compiler content changed" in result.stdout, result.stdout
         log = (tmp / "make.log").read_text()
         assert "clean" in log and "olddefconfig" in log and "prepare" in log, log
+        assert f"LD={cc} AS={cc}" in log, log
+        assert all((kdir / name).is_file() for name in CANARIES)
+        assert "generated-cpustr" in (kdir / "arch/x86/boot/cpustr.h").read_text()
         new = (kdir / ".lccc-prepared").read_text()
         assert f"recipe-sha256={recipe}" in new
         assert "config-input-sha256=original" in new
@@ -155,6 +173,20 @@ def main() -> int:
         (kdir / CANARIES[-1]).unlink()
         result = run(env, kdir, expect=3)
         assert "LCCC_REPREPARE=1" in result.stderr, result.stderr
+
+        # Neither Kconfig failure nor a failed boot host generator may publish
+        # the new compiler identity. Clean really removes the boot headers.
+        (kdir / CANARIES[-1]).write_text("canary\n")
+        cc.write_text(cc.read_text() + "# another compiler change\n")
+        run(dict(env, TEST_FAIL_PREPARE="1"), kdir, expect=7)
+        assert (kdir / ".lccc-prepared").read_text() == new
+        for name in CANARIES:
+            (kdir / name).write_text("canary\n")
+        hostcc.write_text('#!/bin/sh\nexit 1\n')
+        run(env, kdir, expect=1)
+        assert (kdir / ".lccc-prepared").read_text() == new
+        for name in CANARIES:
+            (kdir / name).write_text("canary\n")
 
         # LCCC_REPREPARE=1 is honored even when the canaries are intact but the
         # recipe changed: the fast path must fall through to replacement rather
@@ -170,7 +202,7 @@ def main() -> int:
         assert "LCCC_REPREPARE=1 replaces owned tree" in result.stderr, result.stderr
 
     print("PASS kernel provenance: mismatch refusal, no-op, config identity, "
-          "compiler invalidation, metadata preservation, damaged-tree guard, "
+          "compiler invalidation, metadata preservation, failure atomicity, damaged-tree guard, "
           "explicit reprepare")
     return 0
 
