@@ -179,7 +179,11 @@ impl Interval {
     /// and `[7, 7]` spans 1.
     fn width(&self) -> u64 {
         let bits = bits_of(self.ty);
-        let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
         self.upper.wrapping_sub(self.lower_bound).wrapping_add(1) & mask
     }
 }
@@ -730,7 +734,11 @@ mod tests {
             assert_eq!(run(&mut func), 1, "{ty:?}: crossing window not folded");
             let unsigned = unsigned_of(ty).unwrap();
             let bits = bits_of(ty);
-            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
             let placed = Interval {
                 lower_bound: (-7i64 as u64) & mask,
                 upper: 7u64 & mask,

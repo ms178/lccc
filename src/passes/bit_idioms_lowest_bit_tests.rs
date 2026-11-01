@@ -51,12 +51,7 @@ impl Graph {
     }
 
     fn un(&mut self, op: IrUnaryOp, src: Operand, ty: IrType) -> Operand {
-        self.put(|dest| Instruction::UnaryOp {
-            dest,
-            op,
-            src,
-            ty,
-        })
+        self.put(|dest| Instruction::UnaryOp { dest, op, src, ty })
     }
 
     fn function(self, result: Operand, ty: IrType) -> IrFunction {
@@ -130,7 +125,13 @@ fn reference(y: u64, bits: u32) -> u64 {
 fn evaluate(f: &IrFunction, x: u64) -> u64 {
     use crate::ir::reexports::IrConst;
     let width = f.return_type.size() as u32 * 8;
-    let mask = |v: u64| if width == 64 { v } else { v & ((1u64 << width) - 1) };
+    let mask = |v: u64| {
+        if width == 64 {
+            v
+        } else {
+            v & ((1u64 << width) - 1)
+        }
+    };
     let mut vals: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     let get = |vals: &std::collections::HashMap<u32, u64>, op: &Operand| -> u64 {
         match op {
@@ -292,10 +293,13 @@ fn plain_source_is_left_alone() {
         let mut f = fixture(ty, false);
         recognize_function(&mut f, false, 0, 0, false, false);
         assert!(
-            f.blocks[0]
-                .instructions
-                .iter()
-                .any(|i| matches!(i, Instruction::BinOp { op: IrBinOp::Shl, .. })),
+            f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp {
+                    op: IrBinOp::Shl,
+                    ..
+                }
+            )),
             "{ty:?}: the plain count form must keep its shift"
         );
         assert!(
@@ -309,7 +313,11 @@ fn plain_source_is_left_alone() {
             "{ty:?}: the plain count form must keep its count"
         );
         let bits = ty.size() as u32 * 8;
-        let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
         for y in probe_values(bits) {
             let got = evaluate(&f, y) & mask;
             assert_eq!(got, reference(y, bits), "{ty:?}: 1 << Ctz({y:#x})");
@@ -328,10 +336,13 @@ fn lowest_set_bit_matches_reference_for_complemented_source() {
         // The complement identity is only sound if `-~x` really became
         // `x + 1`: an `Add` must be present and no `Neg`/`Shl` may be.
         assert!(
-            f.blocks[0]
-                .instructions
-                .iter()
-                .any(|i| matches!(i, Instruction::BinOp { op: IrBinOp::Add, .. })),
+            f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    ..
+                }
+            )),
             "{ty:?}: the complemented form did not fold the negate into `x + 1`"
         );
         assert!(
@@ -376,7 +387,12 @@ fn lowest_set_bit_matches_reference_for_complemented_source() {
         }
         let bits = ty.size() as u32 * 8;
         for x in probe_values(bits) {
-            let got = evaluate(&f, x) & if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let got = evaluate(&f, x)
+                & if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                };
             // `evaluate` feeds the parameter, which the block complements
             // itself, so the reference must apply the same `Not`.
             let y = !x;
@@ -400,7 +416,11 @@ fn zero_operand_yields_one_not_zero() {
         let bits = ty.size() as u32 * 8;
         let mut f = fixture(ty, true);
         recognize_function(&mut f, false, 0, 0, false, false);
-        let all_ones = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let all_ones = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
         assert_eq!(
             evaluate(&f, all_ones),
             1,
@@ -418,14 +438,22 @@ fn mismatched_count_width_is_not_rewritten() {
         "a 32-bit count feeding a 64-bit shift must not become `y & -y`"
     );
     assert!(
-        f.blocks[0]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::BinOp { op: IrBinOp::Shl, .. })),
+        f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::BinOp {
+                op: IrBinOp::Shl,
+                ..
+            }
+        )),
         "the declined shape must keep its shift"
     );
 }
 
+// The identity under test IS `y & -y`, so it is spelled that way rather than
+// with `isolate_lowest_one()`: the point of the assertion is that the intrinsic
+// and the two-instruction idiom agree, and calling the intrinsic on both sides
+// would test nothing.
+#[allow(clippy::manual_isolate_lowest_one)]
 #[test]
 fn nonzero_operands_are_the_isolated_bit() {
     // Spot-check the documented identity in the common case, independently of
@@ -445,4 +473,3 @@ fn nonzero_operands_are_the_isolated_bit() {
         }
     }
 }
-
