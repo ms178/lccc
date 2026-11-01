@@ -3,6 +3,10 @@
 //! Common functions for writing ELF64 section headers, program headers,
 //! and performing alignment/padding. Used by x86, RISC-V, and ARM linkers.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
 /// Write a 64-byte ELF64 section header to the buffer.
 pub fn write_elf64_shdr(
     elf: &mut Vec<u8>,
@@ -264,4 +268,350 @@ pub fn format_memory_usage_table(regions: &[(String, u64, u64)]) -> String {
         );
     }
     out
+}
+
+/// Diagnostic-only ELF inspection: does any `PT_LOAD` carry both `PF_W` and
+/// `PF_X`?
+///
+/// The reader is streaming and uses O(1) memory. A kernel `vmlinux` can be
+/// hundreds of MiB; slurping it just to look at a handful of program headers
+/// would add avoidable page-cache pressure and I/O to every link. Only the
+/// ELF header, the optional extended-numbering section header, and the program
+/// header table are read. Every offset/size computation is checked, every read
+/// is exact, and malformed or truncated output fails closed instead of being
+/// silently treated as "no RWX segment".
+///
+/// LCCC emits little-endian ELF32/ELF64 only. Big-endian or unknown classes are
+/// rejected rather than byte-swapped on a guess.
+fn elf_has_rwx_load<R: Read + Seek>(input: &mut R) -> Result<bool, String> {
+    let invalid = || "invalid ELF output while checking RWX segments".to_string();
+
+    let file_len = input.seek(SeekFrom::End(0)).map_err(|_| invalid())?;
+    input.seek(SeekFrom::Start(0)).map_err(|_| invalid())?;
+
+    let mut header = [0u8; 64];
+    input.read_exact(&mut header[..16]).map_err(|_| invalid())?;
+    if &header[..4] != b"\x7fELF" || header[5] != 1 || header[6] != 1 {
+        return Err(invalid());
+    }
+    let wide = match header[4] {
+        1 => false,
+        2 => true,
+        _ => return Err(invalid()),
+    };
+    let header_len: u64 = if wide { 64 } else { 52 };
+    input
+        .read_exact(&mut header[16..header_len as usize])
+        .map_err(|_| invalid())?;
+
+    let u16_at = |off: usize| -> u16 { u16::from_le_bytes([header[off], header[off + 1]]) };
+    let u32_at = |off: usize| -> u32 {
+        u32::from_le_bytes([
+            header[off],
+            header[off + 1],
+            header[off + 2],
+            header[off + 3],
+        ])
+    };
+    let offset_at = |off: usize| -> u64 {
+        if wide {
+            u64::from_le_bytes([
+                header[off],
+                header[off + 1],
+                header[off + 2],
+                header[off + 3],
+                header[off + 4],
+                header[off + 5],
+                header[off + 6],
+                header[off + 7],
+            ])
+        } else {
+            u64::from(u32_at(off))
+        }
+    };
+
+    // e_version and e_ehsize must describe the header we just parsed.
+    if u32_at(20) != 1 || u64::from(u16_at(if wide { 52 } else { 40 })) != header_len {
+        return Err(invalid());
+    }
+
+    let phoff = offset_at(if wide { 32 } else { 28 });
+    let phentsize = u64::from(u16_at(if wide { 54 } else { 42 }));
+    let mut phnum = u64::from(u16_at(if wide { 56 } else { 44 }));
+    let min_phentsize: u64 = if wide { 56 } else { 32 };
+
+    if phnum == 0 {
+        return Ok(false);
+    }
+    if phoff == 0 || phentsize < min_phentsize {
+        return Err(invalid());
+    }
+
+    // PN_XNUM: the real program-header count lives in section header 0's
+    // sh_info. Validate that section header before trusting the count.
+    if phnum == 0xffff {
+        let shoff = offset_at(if wide { 40 } else { 32 });
+        let shentsize = u64::from(u16_at(if wide { 58 } else { 46 }));
+        let min_shentsize: u64 = if wide { 64 } else { 44 };
+        let sh_info_off: u64 = if wide { 44 } else { 28 };
+        if shoff == 0 || shentsize < min_shentsize {
+            return Err(invalid());
+        }
+        let sh_end = shoff.checked_add(shentsize).ok_or_else(invalid)?;
+        if sh_end > file_len {
+            return Err(invalid());
+        }
+        let mut info = [0u8; 4];
+        input
+            .seek(SeekFrom::Start(shoff + sh_info_off))
+            .map_err(|_| invalid())?;
+        input.read_exact(&mut info).map_err(|_| invalid())?;
+        phnum = u64::from(u32::from_le_bytes(info));
+        if phnum == 0 {
+            return Ok(false);
+        }
+    }
+
+    let table_size = phnum.checked_mul(phentsize).ok_or_else(invalid)?;
+    let table_end = phoff.checked_add(table_size).ok_or_else(invalid)?;
+    if table_end > file_len {
+        return Err(invalid());
+    }
+
+    let flags_off = if wide { 4usize } else { 24usize };
+    let read_len = min_phentsize as usize;
+    let mut phdr = [0u8; 56];
+    let mut off = phoff;
+    for _ in 0..phnum {
+        input.seek(SeekFrom::Start(off)).map_err(|_| invalid())?;
+        input
+            .read_exact(&mut phdr[..read_len])
+            .map_err(|_| invalid())?;
+        let p_type = u32::from_le_bytes([phdr[0], phdr[1], phdr[2], phdr[3]]);
+        let p_flags = u32::from_le_bytes([
+            phdr[flags_off],
+            phdr[flags_off + 1],
+            phdr[flags_off + 2],
+            phdr[flags_off + 3],
+        ]);
+        // PF_W | PF_X == 3. Other permission bits (and processor-specific
+        // bits) do not affect this diagnostic.
+        if p_type == 1 && p_flags & 3 == 3 {
+            return Ok(true);
+        }
+        // table_end <= file_len bounds every stride; checked_add keeps the
+        // invariant explicit and host-width independent.
+        off = off.checked_add(phentsize).ok_or_else(invalid)?;
+    }
+    Ok(false)
+}
+
+/// GNU ld's default RWX LOAD-segment warning, checked BEFORE flat-binary
+/// conversion so `--oformat=binary` cannot hide the diagnostic by destroying
+/// the program headers. Like bfd, a fatal diagnostic retains the completed
+/// ELF output; callers must not use that file after a failed link.
+///
+/// Suppression (`warn == false`) performs no I/O at all.
+pub fn check_rwx_segments(path: impl AsRef<Path>, warn: bool, fatal: bool) -> Result<(), String> {
+    if !warn {
+        return Ok(());
+    }
+    let path = path.as_ref();
+    let mut file =
+        File::open(path).map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    if elf_has_rwx_load(&mut file)? {
+        eprintln!(
+            "lccc-ld: warning: {} has a LOAD segment with RWX permissions",
+            path.display()
+        );
+        if fatal {
+            return Err("warning treated as error: LOAD segment with RWX permissions".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod rwx_tests {
+    use super::elf_has_rwx_load;
+    use std::io::Cursor;
+
+    fn image(wide: bool, flags: u32) -> Vec<u8> {
+        let header_len = if wide { 64 } else { 52 };
+        let phentsize = if wide { 56 } else { 32 };
+        let mut elf = vec![0u8; header_len + phentsize];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = if wide { 2 } else { 1 };
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        if wide {
+            elf[32..40].copy_from_slice(&(header_len as u64).to_le_bytes());
+            elf[52..54].copy_from_slice(&(header_len as u16).to_le_bytes());
+            elf[54..56].copy_from_slice(&(phentsize as u16).to_le_bytes());
+            elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        } else {
+            elf[28..32].copy_from_slice(&(header_len as u32).to_le_bytes());
+            elf[40..42].copy_from_slice(&(header_len as u16).to_le_bytes());
+            elf[42..44].copy_from_slice(&(phentsize as u16).to_le_bytes());
+            elf[44..46].copy_from_slice(&1u16.to_le_bytes());
+        }
+        let phoff = header_len;
+        elf[phoff..phoff + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        let f = phoff + if wide { 4 } else { 24 };
+        elf[f..f + 4].copy_from_slice(&flags.to_le_bytes());
+        elf
+    }
+
+    fn has(elf: &[u8]) -> Result<bool, String> {
+        elf_has_rwx_load(&mut Cursor::new(elf))
+    }
+
+    #[test]
+    fn classes_and_permissions() {
+        for wide in [false, true] {
+            for flags in 0..8 {
+                assert_eq!(has(&image(wide, flags)).unwrap(), flags & 3 == 3);
+            }
+            // Only PT_LOAD is diagnosed; a writable+executable GNU_STACK
+            // note is a different diagnostic (--warn-execstack).
+            let mut elf = image(wide, 7);
+            let phoff = if wide { 64 } else { 52 };
+            elf[phoff..phoff + 4].copy_from_slice(&0x6474e551u32.to_le_bytes());
+            assert!(!has(&elf).unwrap());
+        }
+    }
+
+    #[test]
+    fn truncation_fails_closed() {
+        for wide in [false, true] {
+            let elf = image(wide, 7);
+            for len in 0..elf.len() {
+                assert!(has(&elf[..len]).is_err(), "wide={wide} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn extended_phnum() {
+        for wide in [false, true] {
+            let header_len = if wide { 64 } else { 52 };
+            let phentsize = if wide { 56 } else { 32 };
+            let shentsize = if wide { 64 } else { 44 };
+            let shoff = header_len + phentsize;
+            let mut elf = image(wide, 7);
+            elf.resize(shoff + shentsize, 0);
+            if wide {
+                elf[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+                elf[56..58].copy_from_slice(&0xffffu16.to_le_bytes());
+                elf[58..60].copy_from_slice(&(shentsize as u16).to_le_bytes());
+                elf[60..62].copy_from_slice(&1u16.to_le_bytes());
+                elf[shoff + 44..shoff + 48].copy_from_slice(&1u32.to_le_bytes());
+            } else {
+                elf[32..36].copy_from_slice(&(shoff as u32).to_le_bytes());
+                elf[44..46].copy_from_slice(&0xffffu16.to_le_bytes());
+                elf[46..48].copy_from_slice(&(shentsize as u16).to_le_bytes());
+                elf[48..50].copy_from_slice(&1u16.to_le_bytes());
+                elf[shoff + 28..shoff + 32].copy_from_slice(&1u32.to_le_bytes());
+            }
+            assert!(has(&elf).unwrap());
+            let info = shoff + if wide { 44 } else { 28 };
+            elf[info..info + 4].fill(0);
+            assert!(!has(&elf).unwrap());
+            // A truncated section header must not be trusted.
+            assert!(has(&elf[..shoff + shentsize - 1]).is_err());
+        }
+    }
+
+    #[test]
+    fn overflow_and_malformed_headers_fail_closed() {
+        for wide in [false, true] {
+            let mut elf = image(wide, 7);
+            let phoff_field = if wide { 32 } else { 28 };
+            let phnum_field = if wide { 56 } else { 44 };
+            let phentsize_field = if wide { 54 } else { 42 };
+            // phoff + phnum*phentsize overflows u64.
+            if wide {
+                elf[phoff_field..phoff_field + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            } else {
+                elf[phoff_field..phoff_field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            }
+            elf[phnum_field..phnum_field + 2].copy_from_slice(&2u16.to_le_bytes());
+            assert!(has(&elf).is_err());
+
+            let mut elf = image(wide, 7);
+            elf[phentsize_field..phentsize_field + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+            elf[phnum_field..phnum_field + 2].copy_from_slice(&0xfffeu16.to_le_bytes());
+            assert!(has(&elf).is_err());
+
+            let mut elf = image(wide, 7);
+            elf[phentsize_field..phentsize_field + 2].copy_from_slice(&1u16.to_le_bytes());
+            assert!(has(&elf).is_err());
+
+            let mut elf = image(wide, 7);
+            elf[4] = 3; // invalid EI_CLASS
+            assert!(has(&elf).is_err());
+            let mut elf = image(wide, 7);
+            elf[5] = 2; // big-endian: not an LCCC output class
+            assert!(has(&elf).is_err());
+            let mut elf = image(wide, 7);
+            elf[20..24].fill(0); // invalid e_version
+            assert!(has(&elf).is_err());
+            let mut elf = image(wide, 7);
+            let ehsize = if wide { 52 } else { 40 };
+            elf[ehsize..ehsize + 2].fill(0);
+            assert!(has(&elf).is_err());
+        }
+    }
+
+    #[test]
+    fn multiple_headers_with_stride() {
+        for wide in [false, true] {
+            let header_len = if wide { 64 } else { 52 };
+            let min = if wide { 56 } else { 32 };
+            let stride = min + 8;
+            let mut elf = vec![0u8; header_len + 2 * stride];
+            elf[..4].copy_from_slice(b"\x7fELF");
+            elf[4] = if wide { 2 } else { 1 };
+            elf[5] = 1;
+            elf[6] = 1;
+            elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+            if wide {
+                elf[32..40].copy_from_slice(&(header_len as u64).to_le_bytes());
+                elf[52..54].copy_from_slice(&(header_len as u16).to_le_bytes());
+                elf[54..56].copy_from_slice(&(stride as u16).to_le_bytes());
+                elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+            } else {
+                elf[28..32].copy_from_slice(&(header_len as u32).to_le_bytes());
+                elf[40..42].copy_from_slice(&(header_len as u16).to_le_bytes());
+                elf[42..44].copy_from_slice(&(stride as u16).to_le_bytes());
+                elf[44..46].copy_from_slice(&2u16.to_le_bytes());
+            }
+            let flags_off = if wide { 4 } else { 24 };
+            // First header is PT_NULL with RWX flags: must be ignored.
+            let first = header_len;
+            elf[first..first + 4].fill(0);
+            elf[first + flags_off..first + flags_off + 4].copy_from_slice(&7u32.to_le_bytes());
+            // Second header is PT_LOAD; only its flags decide the verdict.
+            let second = header_len + stride;
+            elf[second..second + 4].copy_from_slice(&1u32.to_le_bytes());
+            elf[second + flags_off..second + flags_off + 4].copy_from_slice(&7u32.to_le_bytes());
+            assert!(has(&elf).unwrap());
+            elf[second + flags_off..second + flags_off + 4].copy_from_slice(&5u32.to_le_bytes());
+            assert!(!has(&elf).unwrap());
+        }
+    }
+
+    #[test]
+    fn no_program_headers_is_not_rwx() {
+        for wide in [false, true] {
+            let header_len = if wide { 64 } else { 52 };
+            let mut elf = image(wide, 7);
+            elf.truncate(header_len);
+            let phnum = if wide { 56 } else { 44 };
+            elf[phnum..phnum + 2].fill(0);
+            assert!(!has(&elf).unwrap());
+        }
+    }
 }

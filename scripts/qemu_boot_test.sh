@@ -67,7 +67,17 @@ mount -t devtmpfs devtmpfs /dev
 mount -t debugfs debugfs /sys/kernel/debug
 echo "==== LCCC KERNEL BOOT VALIDATION BEGIN ===="
 echo "--- version ---"; cat /proc/version
-echo "--- config ---"; zcat /proc/config.gz | grep -E '^(CONFIG_(SCHED_BORE|SCHED_CACHE|HZ_800|HZ|CACHY|TCP_CONG_BBR|PREEMPT|SMP|KERNEL_ZSTD|SCHED_DEBUG))=' | sort
+echo "--- config ---"; zcat /proc/config.gz | grep -E '^(CONFIG_(SCHED_BORE|SCHED_CACHE|SCHED_CLASS_EXT|HZ_800|HZ|CACHY|TCP_CONG_BBR|PREEMPT|SMP|KERNEL_ZSTD|SCHED_DEBUG|IKCONFIG|IKCONFIG_PROC))=' | sort
+if [ -r /proc/config.gz ]; then
+  zcat /proc/config.gz | sha256sum | sed 's/^/guest-config-sha256: /'
+else
+  echo "guest-config-missing: /proc/config.gz not available"
+fi
+if [ -d /sys/kernel/sched_ext ]; then
+  echo "scx-sysfs-ok: /sys/kernel/sched_ext"
+else
+  echo "scx-sysfs-absent: SCHED_CLASS_EXT not enabled or initialization failed"
+fi
 echo "--- congestion control ---"; cat /proc/sys/net/ipv4/tcp_available_congestion_control
 echo "--- cache-aware sched features ---"; grep -i cache_hot_buddy /sys/kernel/debug/sched/features
 echo "--- BORE stats ---"
@@ -224,7 +234,16 @@ expect "SCHED_BORE compiled in"            "CONFIG_SCHED_BORE=y"
 expect "BORE init banner in dmesg"        "BORE CPU Scheduler"
 expect "SCHED_CACHE compiled in"           "CONFIG_SCHED_CACHE=y"
 expect "CACHE_HOT_BUDDY sched feature"    "CACHE_HOT_BUDDY"
-expect "HZ_800 compiled in"                "CONFIG_HZ_800=y"
+hz=$(sed -n 's/^CONFIG_HZ=//p' "$K/.config")
+[[ $hz =~ ^[1-9][0-9]*$ ]] || { echo "invalid CONFIG_HZ in $K/.config" >&2; exit 1; }
+expect "configured HZ compiled in"          "CONFIG_HZ=$hz"
+config_hash=$(sha256sum "$K/.config" | cut -d' ' -f1)
+expect "guest config equals build config"   "guest-config-sha256: $config_hash"
+if grep -q '^CONFIG_SCHED_CLASS_EXT=y' "$K/.config"; then
+  expect "sched-ext sysfs ABI"              "^scx-sysfs-ok:"
+else
+  echo "NOT CONFIGURED: SCHED_CLASS_EXT (sched-ext sysfs check not applicable)"
+fi
 expect "CACHY compiled in"                 "CONFIG_CACHY=y"
 expect "TCP_CONG_BBR (BBRv3) compiled in"  "CONFIG_TCP_CONG_BBR=y"
 expect "PREEMPT compiled in"               "CONFIG_PREEMPT=y"

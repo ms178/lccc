@@ -1213,7 +1213,8 @@ fn link_builtin_native(
     // `-Wl,--oformat=binary` and then store an ELF image under the requested
     // name -- a zero exit status with the wrong artifact, which is worse than
     // a refusal because the build never notices.
-    let oformat = crate::backend::linker_common::parse_linker_args(user_args).oformat;
+    let link_args = crate::backend::linker_common::parse_linker_args(user_args);
+    let oformat = link_args.oformat.clone();
     let native = match arch.elf_machine {
         EM_X86_64 => "elf64-x86-64",
         EM_386 => "elf32-i386",
@@ -1263,7 +1264,7 @@ fn link_builtin_native(
         } else {
             &["gcc", "gcc_s", "c"]
         };
-        return match arch.elf_machine {
+        let linked = match arch.elf_machine {
             EM_X86_64 => x86::linker::link_shared(
                 object_files,
                 &[], // the driver's own objects: `input_as_needed`
@@ -1308,6 +1309,13 @@ fn link_builtin_native(
                 arch.arch_name, arch.elf_machine
             )),
         };
+        linked?;
+        crate::backend::linker_common::check_rwx_segments(
+            output_path,
+            link_args.warn_rwx_segments,
+            link_args.fatal_warnings,
+        )?;
+        return Ok(());
     }
 
     let mut setup = resolve_builtin_link_setup(arch, user_args, is_nostdlib, is_static);
@@ -1368,6 +1376,11 @@ fn link_builtin_native(
         )),
     };
     linked?;
+    crate::backend::linker_common::check_rwx_segments(
+        output_path,
+        link_args.warn_rwx_segments,
+        link_args.fatal_warnings,
+    )?;
     if oformat.as_deref() == Some("binary") {
         crate::backend::linker_common::convert_elf_file_to_flat_binary(output_path)?;
     }

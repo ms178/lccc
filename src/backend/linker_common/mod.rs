@@ -161,7 +161,7 @@ pub use resolve_lib::{
 
 // write.rs
 pub use write::{
-    align_up_64, convert_elf_file_to_flat_binary, extract_flat_binary_from_elf,
+    align_up_64, check_rwx_segments, convert_elf_file_to_flat_binary, extract_flat_binary_from_elf,
     format_memory_usage_table, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr,
 };
 
