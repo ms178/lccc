@@ -1794,6 +1794,9 @@ mod dialect_severity_redteam_tests {
             WarningKind::Undeclared,
             WarningKind::ImplicitFunctionDeclaration,
             WarningKind::Cpp,
+            WarningKind::Undef,
+            WarningKind::MissingPrototypes,
+            WarningKind::MissingDeclarations,
             WarningKind::ReturnType,
             WarningKind::IncompatiblePointerTypes,
             WarningKind::Attributes,
@@ -1814,11 +1817,14 @@ mod dialect_severity_redteam_tests {
             WarningKind::Pedantic,
             WarningKind::Vla,
             WarningKind::Multichar,
-            WarningKind::DivByZero,
-            WarningKind::StrictPrototypes,
             WarningKind::ReturnLocalAddr,
         ];
         let expected: HashSet<_> = kinds.into_iter().collect();
+        assert_eq!(
+            kinds.len(),
+            expected.len(),
+            "duplicate expected warning kind"
+        );
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
         // The registry must be a bijection onto the measured warning kinds:
