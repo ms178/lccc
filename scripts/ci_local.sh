@@ -449,6 +449,29 @@ gate "ra-holdout-differential" fast \
 gate "reg-off-sym-fold" fast \
     env CCC="$LCCC" bash tests/regression/check_reg_off_sym_fold.sh
 
+# A linked PIE (ET_DYN) may be loaded above 4 GiB, so no address may be
+# narrowed to 32 bits. The inliner's argument bridge picked a callee's
+# "parameter alloca" positionally; after a dead home was dropped the first N
+# allocas were the callee's locals, and gzip's `memcpy(&v, p, sizeof v)` stored
+# the POINTER into `unsigned int v` with `ty: U32` -- invisible in ET_EXEC,
+# SIGSEGV under `-pie`. Rows: the kernel self-checks under `-pie` and matches
+# gcc and the `-fpie` build, a struct-by-value program keeps working, and
+# `CCC_VERIFY_IR=1` stays silent.
+gate "pie-link-execution" fast \
+    env CCC="$LCCC" bash tests/regression/check_pie_link_execution.sh
+
+# A parameter's home is written where the callee reads it. A memory-passed
+# parameter (`__int128`, `__float128`, a vector, a struct) is read out of its
+# home in the entry block, before the callee's last alloca; a bridge inserted
+# "after the allocas" wrote the argument after that read and a switch on an
+# `__int128` argument read an unwritten slot. The store now follows the alloca
+# defining its own home, an unsatisfiable site declines the inline, and a
+# synthesized home owns the whole value. Rows compare against gcc AND against
+# lccc with CCC_DISABLE_PASSES=inline, with a coverage row proving the inliner
+# fires.
+gate "inline-param-home" fast \
+    env CCC="$LCCC" bash tests/regression/check_inline_param_home.sh
+
 # Array-bound contract: a bad bound is diagnosed (never wrapped), a byte size
 # that cannot exist is rejected instead of wrapping into a bogus section, and a
 # huge `.bss` object is emitted sparsely under a hard RLIMIT_AS rather than

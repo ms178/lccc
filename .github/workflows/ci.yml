@@ -2790,6 +2790,31 @@ jobs:
         # program's output must equal GCC's.  Mirrored in scripts/ci_local.sh
         # (parity-checked).
         bash tests/regression/check_reg_off_sym_fold.sh
+        # A linked PIE (ET_DYN) is loaded wherever the loader likes, so an
+        # address may not be narrowed to 32 bits.  The inliner's argument
+        # bridge used to pick a callee's "parameter alloca" POSITIONALLY; once
+        # a dead home was dropped, the first N allocas were the callee's
+        # locals, and gzip's `memcpy(&v, p, sizeof v)` stored the POINTER into
+        # `unsigned int v` with `ty: U32` (`mov %r15d,%r15d` before the
+        # dereference).  ET_EXEC hid it below 4 GiB; `-pie` read 0xaac8a202
+        # and died.  Rows: the kernel self-checks under `-pie` and matches
+        # gcc and the `-fpie` build, a struct-by-value program keeps working,
+        # and `CCC_VERIFY_IR=1` stays silent.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_pie_link_execution.sh
+        # A parameter's home is written where the callee READS it.  A
+        # memory-passed parameter (__int128, __float128, a vector, a struct) is
+        # read straight out of its home in the entry block, before the callee's
+        # last alloca; a bridge inserted "after the allocas" then wrote the
+        # argument after the read, and a switch on an __int128 argument read an
+        # unwritten slot.  The store now follows the alloca that defines its own
+        # home, a site that cannot satisfy "after the definition, before the
+        # first read" declines the inline, and a synthesized home owns the whole
+        # value (16 bytes, not a word).  Rows: i128 / float128 / vector-ABI
+        # programs at -O1..-Os must equal gcc AND equal lccc with
+        # CCC_DISABLE_PASSES=inline, plus a coverage row proving the inliner
+        # really fires.  Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_inline_param_home.sh
         # Plain-`char` signedness must be one answer, not three: the type
         # system, `__CHAR_UNSIGNED__`, lccc's predefined CHAR_MIN/CHAR_MAX and
         # glibc's `<limits.h>` (which derives from that macro) all follow
