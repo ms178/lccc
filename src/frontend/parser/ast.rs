@@ -851,13 +851,6 @@ pub struct DeclAttributes {
         crate::common::source::Span,
         crate::frontend::parser::attribute_registry::AttributeTarget,
     )>,
-    /// Whether the attribute list being parsed sits on a `struct`/`union` tag.
-    /// The two record-layout attributes (`ms_struct`, `gcc_struct`) mean
-    /// different things there than anywhere else — gcc honours them on a tag
-    /// and ignores them with a warning on a function — so the placement has to
-    /// reach `attribute_registry::abi_effect`. Set only around the tag-level
-    /// attribute parse (`Parser::parse_record_attributes`).
-    pub parsing_record_attributes: bool,
     /// Whether the specifiers are `restrict`-qualified (a typedef'd pointer
     /// base: `restrict ip *p`), so the pointee of `p`'s first star is.
     pub base_restrict: bool,
@@ -1430,7 +1423,6 @@ mod declarator_law_tests {
             pointer_const: false,
             pointer_quals: Vec::new(),
             base_restrict: false,
-            parsing_record_attributes: false,
             paren_star_quals: Vec::new(),
             adjusted_cvr: 0,
         }

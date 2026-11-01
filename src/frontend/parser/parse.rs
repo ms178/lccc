@@ -234,6 +234,14 @@ pub(super) struct ParsedDeclAttrs {
         crate::common::source::Span,
         super::attribute_registry::AttributeTarget,
     )>,
+    /// Whether the attribute list being parsed sits on a `struct`/`union` tag.
+    /// The two record-layout attributes (`ms_struct`, `gcc_struct`) mean
+    /// different things there than anywhere else — gcc honours them on a tag
+    /// and ignores them with a warning on a function — so the placement has to
+    /// reach `attribute_registry::abi_effect`. Raised only around the
+    /// tag-level attribute parse (`Parser::parse_record_attributes`).
+    pub(super) parsing_record_attributes: bool,
+
     /// Location of the declarator name being parsed, when it is a plain
     /// identifier. GCC reports `-Wstrict-prototypes` for a *definition* at
     /// the name (`int k() {}` → the `k`), unlike a declaration, which it
