@@ -45,10 +45,12 @@ on:
 permissions:
   contents: read
 
-# Keep a running measurement experiment when a follow-up commit is pushed.
+# PR evidence for a superseded tree must not occupy runners for another
+# 45+ minutes while the replacement waits. Explicit manual experiments keep
+# their own group so a PR push cannot cancel a requested measurement.
 concurrency:
-  group: compiler-research-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: true
+  group: compiler-research-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   cache-contract:

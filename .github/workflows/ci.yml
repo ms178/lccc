@@ -129,6 +129,8 @@ jobs:
       with:
         name: lccc-fast-${{ github.sha }}
         path: lccc-fast.tar.gz
+        # Already gzip-compressed: avoid compressing the compiler bundle twice.
+        compression-level: 0
         if-no-files-found: error
         retention-days: 3
   # The test suite used to run inside `build`, which made every consumer lane

@@ -1,5 +1,24 @@
 # Unified PR audit — 2026-11-01
 
+## Hosted-only validation update
+
+At the user's direction, the local full-suite process was stopped before
+completion; no local CI pass is claimed for this revision. Latest main
+`734290ddb` was fetched and the merge-preserving rebase completed cleanly.
+Compiler fixes were pushed as `26bb52730` to PR #1056. All further validation
+and defect follow-up is delegated to GitHub Actions.
+
+The last completed main CI run (`41308567453`) took 15 minutes: its build job
+ran 3m32s, with substantial downstream queueing. The existing contract shards
+already run independently; increasing shard count blindly would consume more
+setup time and runner slots. Two low-risk efficiency changes preserve coverage:
+
+- Superseded PR research runs now share a per-PR concurrency group and cancel,
+  rather than continuing a 45-minute obsolete experiment per commit. Explicit
+  manual measurement runs retain independent groups and are not canceled by PRs.
+- The shared compiler artifact disables redundant upload compression because
+  its payload is already gzip-compressed. Hash/commit verification is unchanged.
+
 ## Latest integration checkpoint (supersedes older revision status below)
 
 - All five hosted workflows for `6d2b5c78a` completed successfully, including
