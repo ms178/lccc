@@ -172,4 +172,37 @@ if [ "$fail" -ne 0 ]; then
     grep -vE '^\s*\.(cfi|loc|file|size|type|ident|weak)' "$tmp/a.s" >&2
     exit 1
 fi
+# Unlike the optimization hint, GCC 16's hard minimum applies at -O0 and
+# -Os, to cold functions, and even to an explicit aligned(1). Non-power-of-two
+# values round DOWN: measured GCC 16.2, 3 -> 2 and 17 -> 16.
+cat > "$tmp/min.c" <<'MIN'
+int __attribute__((aligned(1),noinline)) minimum_low(int x) { return x+1; }
+int __attribute__((cold,noinline)) minimum_cold(int x) { return x+2; }
+int __attribute__((aligned(64),noinline)) minimum_high(int x) { return x+3; }
+MIN
+for opt in -O0 -O2 -Os; do
+  for spec in 0:0 1:0 3:1 16:4 17:4 64:6; do
+    bytes=${spec%:*}; log2=${spec#*:}
+    "$CCC" "$opt" -fno-align-functions -fmin-function-alignment="$bytes" \
+      -S "$tmp/min.c" -o "$tmp/a.s"
+    expect "$log2" minimum_low "hard minimum survives aligned(1) at $opt"
+    expect "$log2" minimum_cold "hard minimum survives cold at $opt"
+    expect 6 minimum_high "minimum never lowers aligned(64)"
+  done
+ done
+"$CCC" -Os -fmin-function-alignment=16 -fno-align-functions \
+  -ffunction-sections -fpatchable-function-entry=2,0 -S "$tmp/min.c" -o "$tmp/a.s"
+expect 4 minimum_low "hard minimum survives function sections and patchable entry"
+expect 4 minimum_cold "hard minimum survives patchable cold entry"
+"$CCC" -Os -fmin-function-alignment=16 -fmin-function-alignment=0 \
+  -S "$tmp/min.c" -o "$tmp/a.s"
+expect 0 minimum_low "last minimum option wins"
+for invalid in -1 bogus 16:8 2147483648; do
+  if "$CCC" -fmin-function-alignment="$invalid" -S "$tmp/min.c" -o "$tmp/a.s" >"$tmp/error" 2>&1; then
+    echo "FAIL: accepted invalid hard function alignment $invalid" >&2
+    exit 1
+  fi
+  grep -q 'fmin-function-alignment' "$tmp/error"
+done
+if [ "$fail" -ne 0 ]; then exit 1; fi
 echo "check_function_alignment_definition: ok"

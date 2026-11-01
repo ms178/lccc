@@ -74,6 +74,8 @@ pub struct Driver {
     /// `-falign-functions[=N[:M]]` / `-fno-align-functions` control of
     /// function-entry alignment.
     pub(super) align_functions: crate::passes::loop_align::AlignControl,
+    /// Hard entry alignment floor, independent of size optimization and attributes.
+    pub(super) min_function_alignment: u32,
     /// Permit transformations that reassociate floating-point operations.
     /// False by default: ordinary -O levels preserve source evaluation order.
     /// Enabled explicitly by -ffast-math/-fassociative-math.
@@ -622,6 +624,7 @@ impl Driver {
             align_loops: crate::passes::loop_align::AlignControl::Auto,
             align_jumps: crate::passes::loop_align::AlignControl::Auto,
             align_functions: crate::passes::loop_align::AlignControl::Auto,
+            min_function_alignment: 0,
             fp_reassoc: false,
             math_errno: true,
             // Contraction default for C: FAST, matching GCC's C default
@@ -3831,6 +3834,7 @@ impl Driver {
             // section alignment keeps following GNU as semantics.
             // `-falign-functions[=N]`/`-fno-align-functions` override: a
             // custom alignment must be a power of two (validated at parse).
+            min_function_alignment: self.min_function_alignment,
             function_alignment: match self.align_functions {
                 crate::passes::loop_align::AlignControl::Off => 0,
                 crate::passes::loop_align::AlignControl::Custom { align, .. } => align,

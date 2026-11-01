@@ -5574,9 +5574,18 @@ pub(crate) fn x86_inline_memset_len(func: &str, info: &CallInfo) -> Option<usize
 /// `-fpatchable-function-entry` with and without a leading pad, and the
 /// non-function-section path -- goes through here.
 fn fn_entry_align_log2(cg: &dyn ArchCodegen, attr: Option<Option<u32>>) -> Option<u32> {
-    match attr {
+    let preferred = match attr {
         Some(fixed) => fixed,
         None => cg.function_alignment_log2(),
+    };
+    let minimum = cg.state_ref().min_function_alignment;
+    // GCC 16 rounds this option DOWN to a power of two (17 means 16),
+    // unlike the optimization hint's alignment grammar. An explicit aligned(1)
+    // suppresses the hint, but cannot suppress this unconditional floor.
+    if minimum > 1 {
+        preferred.max(Some(minimum.ilog2()))
+    } else {
+        preferred
     }
 }
 

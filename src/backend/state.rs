@@ -786,6 +786,8 @@ pub struct CodegenState {
     pub uses_sret: bool,
     /// Whether to place each function in its own section (-ffunction-sections).
     pub function_sections: bool,
+    /// Hard alignment floor for every generated function, in bytes (0/1 = none).
+    pub min_function_alignment: u32,
     /// Whether to place each data object in its own section (-fdata-sections).
     pub data_sections: bool,
     /// Whether any 64-bit division/modulo runtime helper (i686: lccc's private
@@ -1027,6 +1029,7 @@ impl CodegenState {
             vec_param_preloaded: FxHashSet::default(),
             uses_sret: false,
             function_sections: false,
+            min_function_alignment: 0,
             data_sections: false,
             needs_divdi3_helpers: false,
             emit_cfi: true,
