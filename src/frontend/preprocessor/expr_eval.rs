@@ -142,7 +142,7 @@ impl Preprocessor {
         // option name is only a WARNING (it must not reject the TU).
         macro_rules! warn {
             ($msg:expr) => {
-                self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+                self.push_warning(super::pipeline::PreprocessorDiagnostic {
                     kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: diag_line,

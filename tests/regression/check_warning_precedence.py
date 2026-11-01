@@ -11,6 +11,35 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = {
+    'cast_fn_0': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int); typedef int (*Target)(double); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_1': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int); typedef int (*Target)(unsigned); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_2': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef long (*Source)(int); typedef long long (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_3': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(void*); typedef int (*Target)(char*); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_4': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int); typedef void (*Target)(void); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_5': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(void); typedef int (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_6': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int,...); typedef int (*Target)(int,double); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_7': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int); typedef int (*Target)(int,...); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_8': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(); typedef int (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_9': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int); typedef int (*Target)(); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_10': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef long (*Source)(); typedef int (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_11': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef float (*Source)(int); typedef double (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_12': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(short); typedef int (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_13': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(void (*)(int)); typedef int (*Target)(void*); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_14': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef _Bool (*Source)(int); typedef unsigned char (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_15': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef void (*Source)(); typedef int (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_16': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef void (*Source)(void); typedef int (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_17': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int,...); typedef int (*Target)(double,int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_18': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int,int,...); typedef int (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_19': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int* (*Source)(int); typedef void* (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_20': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int); typedef int (*Target)(int,int,...); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_21': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int,...); typedef int (*Target)(int,int,...); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_22': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(int,int,...); typedef int (*Target)(int,...); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_23': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(enum E); typedef int (*Target)(unsigned); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_24': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(enum E); typedef int (*Target)(enum F); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_25': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef struct S (*Source)(int); typedef struct T (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_26': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef int (*Source)(char); typedef int (*Target)(signed char); Target convert(Source value) { return (Target)value; }\n',
+    'cast_fn_27': 'enum E { E0 }; enum F { F0 }; struct S { int x; }; struct T { int x; };\ntypedef double (*Source)(int); typedef long double (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
+    'cast_long_int': 'typedef long (*Source)(int); typedef int (*Target)(int); Target convert(Source value) { return (Target)value; }\n',
     'prototype_missing': 'int f(void) { return 0; }\n',
     'prototype_old': 'int f(); int f(void) { return 0; }\n',
     'prototype_present': 'int f(void); int f(void) { return 0; }\n',
@@ -44,6 +73,43 @@ FIXTURES = {
 }
 # name, source, dialect, options, leaf label, expected classification
 CASES = (
+    ('cast-function-0', 'cast_fn_0', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-1', 'cast_fn_1', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-2', 'cast_fn_2', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-3', 'cast_fn_3', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-4', 'cast_fn_4', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-5', 'cast_fn_5', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-6', 'cast_fn_6', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-7', 'cast_fn_7', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-8', 'cast_fn_8', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-9', 'cast_fn_9', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-10', 'cast_fn_10', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-11', 'cast_fn_11', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-12', 'cast_fn_12', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-13', 'cast_fn_13', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-14', 'cast_fn_14', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-15', 'cast_fn_15', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-16', 'cast_fn_16', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-17', 'cast_fn_17', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-18', 'cast_fn_18', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-19', 'cast_fn_19', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-20', 'cast_fn_20', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-21', 'cast_fn_21', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-22', 'cast_fn_22', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-23', 'cast_fn_23', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-24', 'cast_fn_24', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-25', 'cast_fn_25', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-function-26', 'cast_fn_26', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', '-'),
+    ('cast-function-27', 'cast_fn_27', 'gnu18', ('-Wcast-function-type',), 'cast-function-type', 'W'),
+    ('cast-width-lp64', 'cast_long_int', 'gnu18', ('-m64', '-Wcast-function-type'), 'cast-function-type', 'W'),
+    ('cast-width-ilp32', 'cast_long_int', 'gnu18', ('-m32', '-Wcast-function-type'), 'cast-function-type', '-'),
+    ('cast-function-default', 'cast_fn_0', 'gnu18', (), 'cast-function-type', '-'),
+    ('cast-function-wall', 'cast_fn_0', 'gnu18', ('-Wall',), 'cast-function-type', '-'),
+    ('cast-function-extra', 'cast_fn_0', 'gnu18', ('-Wextra',), 'cast-function-type', 'W'),
+    ('cast-function-error', 'cast_fn_0', 'gnu18', ('-Werror=cast-function-type',), 'cast-function-type', 'E'),
+    ('cast-function-leaf-disabled', 'cast_fn_0', 'gnu18', ('-Wextra', '-Wno-cast-function-type'), 'cast-function-type', '-'),
+    ('cast-function-demoted', 'cast_fn_0', 'gnu18', ('-Werror=cast-function-type', '-Wno-error=cast-function-type'), 'cast-function-type', 'W'),
+    ('cast-function-global-error', 'cast_fn_0', 'gnu18', ('-Wextra', '-Werror'), 'cast-function-type', 'E'),
     ('missing-prototypes-default', 'prototype_missing', 'gnu18', (), 'missing-prototypes', '-'),
     ('missing-prototypes-groups', 'prototype_missing', 'gnu18', ('-Wall', '-Wextra'), 'missing-prototypes', '-'),
     ('missing-prototypes-on', 'prototype_missing', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', 'W'),
@@ -180,7 +246,7 @@ def main() -> int:
         src=Path(tmp)/'probe.c'
         obj=Path(tmp)/'probe.o'
         for label, fixture, dialect, flags, leaf, expected in CASES:
-            modes = ('-c', '-E', '-fsyntax-only') if leaf == 'undef' else (('-c', '-fsyntax-only') if leaf.startswith('missing-') else ('-c',))
+            modes = ('-c', '-E', '-fsyntax-only') if leaf == 'undef' else (('-c', '-fsyntax-only') if leaf.startswith('missing-') or leaf == 'cast-function-type' else ('-c',))
             for mode in modes:
                 src.write_text(FIXTURES[fixture], encoding='utf-8')
                 results={}
@@ -201,6 +267,8 @@ def main() -> int:
     if failures:
         raise RuntimeError(f'{len(failures)}/{len(CASES)} cases failed:\n' + '\n'.join(failures))
     print(f'warning precedence: PASS ({len(CASES)} cases against GCC {version})')
+    from check_diagnostic_pragmas import run as check_scopes
+    check_scopes(lccc, gcc)
     return 0
 
 

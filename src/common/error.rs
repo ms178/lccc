@@ -104,6 +104,8 @@ pub enum WarningKind {
     MissingPrototypes,
     /// An externally visible definition lacks a previous file-scope declaration.
     MissingDeclarations,
+    /// A function-pointer cast changes significant return/parameter types.
+    CastFunctionType,
     /// Control reaches end of non-void function, or non-void function does
     /// not return a value in all control paths.
     /// GCC flag: -Wreturn-type
@@ -343,6 +345,14 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [Extra],
         false,
         "mixed-sign integer comparison"
+    ),
+    warning!(
+        CastFunctionType,
+        "cast-function-type",
+        false,
+        [Extra],
+        false,
+        "cast between incompatible function types"
     ),
     warning!(
         DivByZero,
@@ -985,6 +995,7 @@ pub struct DiagnosticEngine {
     /// Warning configuration: controls which warnings are enabled and
     /// which are promoted to errors.
     warning_config: WarningConfig,
+    warning_scopes: Vec<(usize, WarningConfig, WarningConfig)>,
     /// Reference to the source manager for span resolution and snippet display.
     /// Set after the preprocessing/lexing phase creates the SourceManager.
     source_manager: Option<std::rc::Rc<SourceManager>>,
@@ -1049,6 +1060,7 @@ impl DiagnosticEngine {
             error_count: 0,
             warning_count: 0,
             warning_config: WarningConfig::new(),
+            warning_scopes: Vec::new(),
             source_manager: None,
             use_color: ColorMode::Auto.use_color(),
             last_include_trace_file: None,
@@ -1133,14 +1145,85 @@ impl DiagnosticEngine {
     /// expensive analysis for that warning category.
     pub fn warning_enabled(&self, kind: WarningKind) -> bool {
         self.warning_config.is_enabled(kind)
+            || self
+                .warning_scopes
+                .iter()
+                .any(|(_, config, _)| config.is_enabled(kind))
+    }
+
+    /// Select by preprocessed byte offset, not original file/line: repeated
+    /// includes and same-line _Pragma operators may have different settings.
+    pub fn warning_enabled_at(&self, kind: WarningKind, span: Span) -> bool {
+        // GCC's positive pragma classifications enable analysis from this
+        // point onward; ignored/pop only change reporting classifications.
+        // In particular, ignoring missing-prototypes must not accidentally
+        // fall through to missing-declarations when its analysis is enabled.
+        let index = self
+            .warning_scopes
+            .partition_point(|(offset, _, _)| *offset <= span.start as usize);
+        if span.file_id != 0 || index == 0 {
+            self.warning_config.is_enabled(kind)
+        } else {
+            self.warning_scopes[index - 1].2.is_enabled(kind)
+        }
+    }
+
+    fn warning_config_at(&self, span: Span) -> &WarningConfig {
+        if span.file_id != 0 {
+            return &self.warning_config;
+        }
+        let index = self
+            .warning_scopes
+            .partition_point(|(offset, _, _)| *offset <= span.start as usize);
+        if index == 0 {
+            &self.warning_config
+        } else {
+            &self.warning_scopes[index - 1].1
+        }
+    }
+
+    /// Call only with preprocessed source attached (comments already removed).
+    pub fn build_warning_scopes(&mut self) {
+        self.warning_scopes.clear();
+        let Some(sm) = &self.source_manager else {
+            return;
+        };
+        let mut state =
+            super::diagnostic_pragma::DiagnosticPragmas::new(self.warning_config.clone());
+        let mut offset = 0;
+        for line in sm.get_content(0).split_inclusive('\n') {
+            if let Some(text) = line
+                .trim_start()
+                .strip_prefix('#')
+                .and_then(|s| s.trim_start().strip_prefix("pragma"))
+                .filter(|s| s.starts_with(char::is_whitespace))
+            {
+                if state.apply(text.trim()) {
+                    self.warning_scopes.push((
+                        offset + line.len(),
+                        state.current.clone(),
+                        state.analysis.clone(),
+                    ));
+                }
+            }
+            offset += line.len();
+        }
+    }
+
+    /// Preprocessor diagnostics have explicit locations rather than spans; the
+    /// preprocessor records their configuration at the actual occurrence.
+    pub fn emit_with_warning_config(&mut self, diag: &Diagnostic, config: &WarningConfig) {
+        let old = std::mem::replace(&mut self.warning_config, config.clone());
+        self.emit_inner(diag);
+        self.warning_config = old;
     }
 
     /// Whether the user asked for this warning class with a positive
     /// `-W<name>` or `-Werror=<name>` flag (not merely its default state).
     /// Used by the attribute inventory: GCC-known-but-unimplemented
     /// attributes diagnose only on an explicit `-Wattributes` request.
-    pub fn warning_explicitly_requested(&self, kind: WarningKind) -> bool {
-        self.warning_config.is_explicitly_requested(kind)
+    pub fn warning_explicitly_requested_at(&self, kind: WarningKind, span: Span) -> bool {
+        self.warning_config_at(span).is_explicitly_requested(kind)
     }
 
     /// Set the source manager for span resolution and snippet display.
@@ -1179,6 +1262,17 @@ impl DiagnosticEngine {
     /// - If -Werror or -Werror=<name> applies, it is promoted to an error.
     /// - The GCC-style `[-W<name>]` suffix is appended to the message.
     pub fn emit(&mut self, diag: &Diagnostic) {
+        if let Some(span) = diag.span {
+            if !self.warning_scopes.is_empty() {
+                let config = self.warning_config_at(span).clone();
+                self.emit_with_warning_config(diag, &config);
+                return;
+            }
+        }
+        self.emit_inner(diag);
+    }
+
+    fn emit_inner(&mut self, diag: &Diagnostic) {
         // GCC suppresses diagnostics that come from a system header unless
         // -Wsystem-headers asks for them; the suppression applies to warnings
         // only. Without this, a project that merely includes <pthread.h>
@@ -1802,6 +1896,7 @@ mod dialect_severity_redteam_tests {
             WarningKind::Attributes,
             WarningKind::UnusedVariable,
             WarningKind::SignCompare,
+            WarningKind::CastFunctionType,
             WarningKind::DivByZero,
             WarningKind::StrictPrototypes,
             WarningKind::Format,
@@ -1962,7 +2057,7 @@ mod dialect_severity_redteam_tests {
             .filter(|entry| !entry.default_on && entry.groups.contains(&WarningGroup::Extra))
             .map(|entry| entry.name)
             .collect();
-        assert_eq!(wextra, ["sign-compare"]);
+        assert_eq!(wextra, ["sign-compare", "cast-function-type"]);
         assert!(
             !WARNING_REGISTRY
                 .iter()

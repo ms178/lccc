@@ -43,6 +43,10 @@ impl Preprocessor {
         col: usize,
     ) -> Option<String> {
         let rest = rest.trim();
+        if self.diagnostic_pragmas.apply(rest) {
+            // Keep the directive at its exact output position for parser/sema.
+            return Some(format!("#pragma {rest}\n"));
+        }
         if rest.starts_with("STDC") && rest.split_whitespace().eq(["STDC", "FENV_ACCESS", "ON"]) {
             self.fenv_access_requested = true;
             return None;
@@ -187,7 +191,7 @@ impl Preprocessor {
                     filename, message
                 )
             };
-            self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+            self.push_warning(super::pipeline::PreprocessorDiagnostic {
                 kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,

@@ -2406,9 +2406,10 @@ impl Parser {
         explicit_only: bool,
     ) {
         if explicit_only
-            && !self
-                .diagnostics
-                .warning_explicitly_requested(crate::common::error::WarningKind::Attributes)
+            && !self.diagnostics.warning_explicitly_requested_at(
+                crate::common::error::WarningKind::Attributes,
+                span,
+            )
         {
             return;
         }

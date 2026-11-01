@@ -68,6 +68,8 @@ pub struct Preprocessor {
     pub(super) errors: Vec<PreprocessorDiagnostic>,
     /// Collected preprocessor warnings (e.g., #warning directives).
     pub(super) warnings: Vec<PreprocessorDiagnostic>,
+    pub(super) diagnostic_pragmas: crate::common::diagnostic_pragma::DiagnosticPragmas,
+    warning_configs: Vec<crate::common::error::WarningConfig>,
     /// Include search paths (from -I flags)
     pub(super) include_paths: Vec<PathBuf>,
     /// Quote include paths (from -iquote flags), searched only for #include "..."
@@ -168,6 +170,10 @@ impl Preprocessor {
             filename: String::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
+            diagnostic_pragmas: crate::common::diagnostic_pragma::DiagnosticPragmas::new(
+                crate::common::error::WarningConfig::new(),
+            ),
+            warning_configs: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
             isystem_include_paths: Vec::new(),
@@ -1063,6 +1069,20 @@ impl Preprocessor {
         &self.errors
     }
 
+    pub fn set_warning_config(&mut self, config: crate::common::error::WarningConfig) {
+        self.diagnostic_pragmas = crate::common::diagnostic_pragma::DiagnosticPragmas::new(config);
+    }
+
+    pub fn warning_config_at(&self, index: usize) -> &crate::common::error::WarningConfig {
+        &self.warning_configs[index]
+    }
+
+    pub(super) fn push_warning(&mut self, warning: PreprocessorDiagnostic) {
+        self.warning_configs
+            .push(self.diagnostic_pragmas.current.clone());
+        self.warnings.push(warning);
+    }
+
     /// Get preprocessing warnings.
     pub fn warnings(&self) -> &[PreprocessorDiagnostic] {
         &self.warnings
@@ -1230,6 +1250,7 @@ impl Preprocessor {
         self.include_origins.push(origin);
 
         // Save and set __FILE__ (uses set_file to avoid full MacroDef allocation)
+        let old_source_filename = self.macros.source_filename.clone();
         let old_file = self.macros.get_file_body().map(|s| s.to_string());
         self.macros.set_file(format!("\"{}\"", resolved.display()));
 
@@ -1249,6 +1270,7 @@ impl Preprocessor {
         if let Some(old) = old_file {
             self.macros.set_file(old);
         }
+        self.macros.source_filename = old_source_filename;
 
         // Pop include stack and its matching search provenance.
         self.include_stack.pop();
@@ -1372,7 +1394,7 @@ impl Preprocessor {
             }
             "warning" => {
                 // GCC extension, collect warning for structured diagnostic output
-                self.warnings.push(PreprocessorDiagnostic {
+                self.push_warning(PreprocessorDiagnostic {
                     kind: crate::common::error::WarningKind::Cpp,
                     file: self.current_file(),
                     line: line_num,
@@ -1397,7 +1419,7 @@ impl Preprocessor {
                     // hard errors.  Warn so typos like `#defin` and `#inclde`
                     // are visible while preserving compatibility with projects
                     // that intentionally use vendor-specific directives.
-                    self.warnings.push(PreprocessorDiagnostic {
+                    self.push_warning(PreprocessorDiagnostic {
                         kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
@@ -1613,7 +1635,7 @@ impl Preprocessor {
     fn evaluate_pp_condition(&mut self, expr: &str, line: usize) -> bool {
         let (value, undefined) = evaluate_condition(expr, &self.macros);
         for name in undefined {
-            self.warnings.push(PreprocessorDiagnostic {
+            self.push_warning(PreprocessorDiagnostic {
                 kind: crate::common::error::WarningKind::Undef,
                 file: self.current_file(),
                 line,

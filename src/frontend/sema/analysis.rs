@@ -714,7 +714,7 @@ impl SemanticAnalyzer {
             // GCC diagnoses only the more specific prototype condition when
             // both leaves are enabled, including independent -Werror controls.
             if !prior.unwrap_or(false)
-                && diagnostics.warning_enabled(WarningKind::MissingPrototypes)
+                && diagnostics.warning_enabled_at(WarningKind::MissingPrototypes, func.span)
             {
                 diagnostics.warning_with_kind(
                     format!("no previous prototype for '{}'", func.name),
@@ -3771,6 +3771,16 @@ impl SemanticAnalyzer {
                 let checker = self.expr_type_checker();
                 if let Some(inner_ty) = checker.infer_expr_ctype(inner) {
                     let target_ty = self.type_spec_to_ctype(ts);
+                    if super::function_pointer_cast::incompatible(&inner_ty, &target_ty) {
+                        self.diagnostics.borrow_mut().warning_with_kind(
+                            format!(
+                                "cast between incompatible function types from '{}' to '{}'",
+                                inner_ty, target_ty
+                            ),
+                            *span,
+                            crate::common::error::WarningKind::CastFunctionType,
+                        );
+                    }
                     if Self::is_vector_scalar_size_mismatch(&inner_ty, &target_ty) {
                         // GCC's two messages: scalar -> vector is "cannot
                         // convert a value of type 'int' to vector type

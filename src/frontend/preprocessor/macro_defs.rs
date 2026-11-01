@@ -166,6 +166,7 @@ fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'
 #[derive(Debug, Clone)]
 pub struct MacroTable {
     macros: FxHashMap<String, MacroDef>,
+    pub(super) source_filename: String,
     /// Counter for the __COUNTER__ built-in macro. Increments on each expansion.
     counter: Cell<usize>,
     /// Per-line __LINE__ resolver: maps a byte offset within the line being
@@ -219,6 +220,7 @@ impl MacroTable {
     pub fn new() -> Self {
         Self {
             macros: FxHashMap::default(),
+            source_filename: "\"<stdin>\"".to_string(),
             counter: Cell::new(0),
             line_resolver: std::cell::RefCell::new(super::text_processing::LineResolver::Flat(1)),
             line_offset_base: Cell::new(0),
@@ -314,6 +316,7 @@ impl MacroTable {
     /// Otherwise, a new entry is created.
     /// This avoids 2 full MacroDef allocations per #include directive.
     pub fn set_file(&mut self, body: String) {
+        self.source_filename = body.clone();
         if let Some(existing) = self.macros.get_mut("__FILE__") {
             existing.body = body;
         } else {
@@ -935,6 +938,19 @@ impl MacroTable {
         // this queued pragma point at the `_Pragma` site, not line 0.
         let op_start = i.saturating_sub(ident.len());
         let line = self.resolve_line(op_start);
+        if crate::common::diagnostic_pragma::is_diagnostic_pragma(content.trim()) {
+            // Blue-paint the directive keywords: the replacement is rescanned,
+            // but a user macro named GCC/diagnostic/push must not rewrite it.
+            result.push_str("\n#\x01pragma ");
+            for word in content.split_whitespace() {
+                if !word.starts_with('"') {
+                    result.push(BLUE_PAINT_MARKER as char);
+                }
+                result.push_str(word);
+                result.push(' ');
+            }
+            result.push_str(&format!("\n# {line} {}\n", self.source_filename));
+        }
         self.pending_pragmas.borrow_mut().push((content, line));
         k + 1
     }

@@ -670,6 +670,7 @@ impl Preprocessor {
                     let display_path = format_path_for_line_directive(&resolved_path);
 
                     // Update __FILE__ (uses set_file to avoid full MacroDef allocation)
+                    let old_source_filename = self.macros.source_filename.clone();
                     let old_file = self.macros.get_file_body().map(|s| s.to_string());
                     self.macros.set_file(format!("\"{}\"", display_path));
 
@@ -746,6 +747,7 @@ impl Preprocessor {
                     if let Some(old) = old_file {
                         self.macros.set_file(old);
                     }
+                    self.macros.source_filename = old_source_filename;
 
                     // Pop include stack and its search provenance.
                     self.include_stack.pop();
@@ -874,6 +876,7 @@ impl Preprocessor {
                     // Format path for line directive (relative when under cwd, matching GCC)
                     let display_path = format_path_for_line_directive(&resolved_path);
 
+                    let old_source_filename = self.macros.source_filename.clone();
                     let old_file = self.macros.get_file_body().map(|s| s.to_string());
                     self.macros.set_file(format!("\"{}\"", display_path));
 
@@ -886,6 +889,7 @@ impl Preprocessor {
                     if let Some(old) = old_file {
                         self.macros.set_file(old);
                     }
+                    self.macros.source_filename = old_source_filename;
 
                     self.include_stack.pop();
                     self.include_origins.pop();

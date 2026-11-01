@@ -1228,13 +1228,13 @@ impl Driver {
         preprocessor: &Preprocessor,
         diagnostics: &mut DiagnosticEngine,
     ) {
-        for warn in preprocessor.warnings() {
+        for (index, warn) in preprocessor.warnings().iter().enumerate() {
             let diag = crate::common::error::Diagnostic::warning_with_kind(
                 warn.message.clone(),
                 warn.kind,
             )
             .with_location(&warn.file, warn.line, warn.col);
-            diagnostics.emit(&diag);
+            diagnostics.emit_with_warning_config(&diag, preprocessor.warning_config_at(index));
         }
     }
 
@@ -1313,6 +1313,7 @@ impl Driver {
             diagnostics.set_warning_config(self.effective_warning_config());
             diagnostics.set_color_mode(self.color_mode);
             diagnostics.set_source_manager(source_manager);
+            diagnostics.build_warning_scopes();
             // Drain preprocessor warnings through the engine with their own
             // kind — the full compile path does this, and without it
             // `-fsyntax-only` dropped `#warning` entirely (measured against
@@ -1827,6 +1828,7 @@ impl Driver {
 
     /// Configure the preprocessor with CLI-defined macros and target.
     pub(super) fn configure_preprocessor(&self, preprocessor: &mut Preprocessor) {
+        preprocessor.set_warning_config(self.effective_warning_config());
         // Set target architecture macros
         match self.target {
             Target::Aarch64 => preprocessor.set_target("aarch64"),
@@ -2334,6 +2336,7 @@ impl Driver {
         // backward-compatible span_to_location() calls.
         let t2 = std::time::Instant::now();
         diagnostics.set_source_manager(source_manager);
+        diagnostics.build_warning_scopes();
         // Surface lexer diagnostics after the source manager is attached so
         // spans resolve to file:line:col.
         self.emit_lexer_diagnostics(&mut lexer, &mut diagnostics);

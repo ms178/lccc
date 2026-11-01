@@ -186,3 +186,35 @@ must be private because callees may overwrite them. The current callee capture
 is deliberately conservative; copy elision and nonvolatile-save pruning still
 need alias/provenance, debug/unwind and performance evidence. No optimality or
 kernel runtime/code-size benefit is claimed from this ABI extension alone.
+
+## Scoped diagnostics and function-pointer casts
+
+The warning gate now passes **146 warning-precedence cases** against GCC 16.2,
+including 37 additional function-pointer cast cases. `-Wcast-function-type`
+uses GCC's deliberately permissive predicate, not strict C compatibility:
+equal-width non-boolean integers, pointer parameters, old-style signatures,
+variadic prefixes and the `void (*)(void)` wildcard have distinct rules.
+LP64 and ILP32 syntax-only cases check width-dependent decisions.
+
+GCC diagnostic push/pop, ignored, warning and error classifications are now
+preserved in preprocessed output, including at the exact position of a
+same-line `_Pragma`. Parser/sema/lexer reporting selects settings by
+preprocessed byte offset, not a possibly repeated original file/line.
+Preprocessor warnings retain their occurrence's own settings. Source-name
+provenance for emitted markers is independent of user redefinitions of
+`__FILE__` and is restored across includes.
+
+The hosted warning gate also runs **58 scoped-diagnostic mode checks** against
+GCC 16.2, checking severity and source line in compilation, syntax-only, and
+(where relevant) preprocessing modes. Coverage includes nested and unmatched
+pop, blanket `-w`, CLI promotion/demotion, macro keyword collisions, repeated
+includes, scopes crossing includes, and `#line`. GCC's positive-classification
+analysis flags are sticky: an ignored prototype warning must not spuriously
+fall through to a declaration warning. Unknown pragma-option diagnostics and
+other pragma families are not claimed as complete.
+
+The actual `kernel/cgroup/rstat.c` command now passes syntax-only with its
+original Kbuild flags. The previous rejection of `bpf_rstat_flush` was caused
+by ignored GCC diagnostic scopes in the BPF hook macros; no BPF/weak-function
+exemption or warning-flag removal was introduced. This is frontend evidence,
+not a successful kernel codegen, final link, boot or performance result.
