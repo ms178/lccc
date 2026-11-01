@@ -918,6 +918,16 @@ pub(super) fn compare_dominance_disabled() -> bool {
 /// `x ^ 1 << n` -> `BitToggle`, `(x & 1 << n) != 0` -> `BitTest`) without a
 /// second binary, and so a miscompile can be bisected to those four rules in a
 /// single run.
+/// Predicate-materialization kill switch (`c ? 1 : 0` -> `c != 0`).
+///
+/// Unset by default; `CCC_NO_PREDICATE_MATERIALIZE=1` restores the select
+/// lowering for A/B measurement and bisection.
+pub(super) fn predicate_disabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_PREDICATE_MATERIALIZE").is_some());
+    *FLAG
+}
+
 pub(super) fn bit_select_disabled() -> bool {
     static FLAG: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_BIT_SELECT").is_some());

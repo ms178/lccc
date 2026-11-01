@@ -2619,6 +2619,15 @@ jobs:
         # knob-off build) and -O0..-O3 agreement against GCC.  Mirrored in
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_bit_select_fold.sh
+        # Predicate materialization: `c ? 1 : 0` is `c != 0` and `c ? 0 : 1`
+        # is `c == 0` (5 -> 4), and `(a != 0) | (b != 0)` is `(a | b) != 0`
+        # (9 -> 4).  Pins the folded shapes and their missing `cmov`, the
+        # refusals (`(a != 0) & (b != 0)`, `(a == 0) | (b == 0)`, non-0/1
+        # arms), the CCC_NO_PREDICATE_MATERIALIZE ownership, the
+        # i686/AArch64/RISC-V lengths, -O0..-O3 agreement against GCC, and the
+        # vectorizer's mask store (a stored comparison is 0/1, a stored lane
+        # mask is 0/-1).  Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_predicate_materialize.sh
         # Predicate differences and ranges: difference compares, interval and
         # membership tests, sign-magnitude selects, five near-miss controls.
         python3 tests/regression/check_predicate_differences_and_ranges.py

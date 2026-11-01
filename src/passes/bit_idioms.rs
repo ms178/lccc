@@ -2850,6 +2850,49 @@ fn retarget_use_counts(old: &Instruction, new: &Instruction, use_counts: &mut [u
     note_instruction_uses(new, use_counts, true);
 }
 
+/// Queue the `(a != 0) | (b != 0)` mask merge for one instruction.
+///
+/// The merge needs a value of its own for the disjunction, and the scan forbids
+/// inserting values under coordinates it still has to visit, so the pair is
+/// queued as an [`Expansion`] and spliced in after the scan.  `defs` and
+/// `use_counts` are updated immediately so every later matcher in the same run
+/// resolves structure against the post-rewrite truth.
+///
+/// Returns false (and touches nothing) when the shape is not the merge.
+fn queue_predicate_merge(
+    block_bi: usize,
+    index: usize,
+    inst: &Instruction,
+    defs: &mut [Option<Instruction>],
+    use_counts: &mut [u32],
+    next_value_id: &mut u32,
+    expansions: &mut Vec<Expansion>,
+) -> bool {
+    let Some((prelude, result)) =
+        predicate::fold_predicate_merge(inst, defs, use_counts, Value(*next_value_id))
+    else {
+        return false;
+    };
+    let Some(dest) = result.dest() else {
+        return false;
+    };
+    // The marker reads the two comparisons (removed) and one of the two tested
+    // values (kept); the splice reads both tested values and the disjunction.
+    retarget_use_counts(inst, &result, use_counts);
+    for inst in &prelude {
+        note_instruction_uses(inst, use_counts, true);
+    }
+    defs[dest.0 as usize] = Some(result.clone());
+    *next_value_id = next_value_id.saturating_add(1);
+    expansions.push(Expansion {
+        block: block_bi,
+        index,
+        dest,
+        replacement: prelude.into_iter().chain(std::iter::once(result)).collect(),
+    });
+    true
+}
+
 /// Add every read `inst` performs to the use counts (`add`), or remove them
 /// (`!add`).  The 1 -> N expansions have to account for each written
 /// instruction individually, so the visit is exposed separately.
@@ -2887,6 +2930,7 @@ pub(crate) fn recognize_function(
     min_rotate_bits: u32,
     has_scalar_andn: bool,
     native_bswap: bool,
+    predicate_folds: bool,
 ) -> usize {
     let pre_changes = canonicalize_narrow_crc_casts(func);
     let mut defs = vec![None; func.max_value_id() as usize + 1];
@@ -2932,6 +2976,15 @@ pub(crate) fn recognize_function(
     // Comparison-dominance kill switch (`(x != 0) & (x > 4)` -> `x > 4`).
     let compare_dominance_disabled = facts::compare_dominance_disabled();
     let bit_select_disabled = facts::bit_select_disabled();
+    // Predicate materialization (`c ? 1 : 0` -> `c != 0`).  Only the
+    // post-if-conversion invocation runs it: the select `c ? 1 : 0` is a shape
+    // the earlier passes consume (constant-folding it into a neighbouring
+    // select's arms turns `t + 1` into a second arm constant), so converting
+    // it before they have had their turn loses more than it gains.  The knob
+    // and the invocation flag share the same gate.
+    //
+    // Kill switch: `CCC_NO_PREDICATE_MATERIALIZE`.
+    let predicate_disabled = !predicate_folds || facts::predicate_disabled();
     // Deferred cross-block rewrites (mask distribution): the producer and
     // consumer may live in different blocks; both mutations are applied
     // after the scan ends so no &mut borrow of `func.blocks` overlaps the
@@ -3263,7 +3316,33 @@ pub(crate) fn recognize_function(
                 }
             }
 
-            if let Some(new) = fold_same_condition_select(&block.instructions[index], &defs)
+            // `(a != 0) | (b != 0)` -> `(a | b) != 0` needs a value of its own
+            // for the disjunction, so it is spliced in after the scan (the
+            // coordinates below still refer to the original layout).  Both
+            // selector comparisons are discharged here, which is what lets
+            // the two of them die once the disjunction exists.
+            if !predicate_disabled
+                && queue_predicate_merge(
+                    block_bi,
+                    index,
+                    &block.instructions[index],
+                    &mut defs,
+                    &mut use_counts,
+                    &mut next_value_id,
+                    &mut expansions,
+                )
+            {
+                changes += 1;
+                index += 1;
+                continue;
+            }
+
+            if let Some(new) = (!predicate_disabled)
+                .then(|| {
+                    predicate::fold_predicate_select(&block.instructions[index], &defs, &use_counts)
+                })
+                .flatten()
+                .or_else(|| fold_same_condition_select(&block.instructions[index], &defs))
                 .or_else(|| fold_sign_choice_zero(&block.instructions[index], &defs))
                 .or_else(|| fold_shift_pair_into_mask(&block.instructions[index], &defs))
                 .or_else(|| {
@@ -3994,7 +4073,10 @@ mod tests {
             source_spans: spans,
             terminator: Terminator::Return(Some(outputs[1])),
         });
-        assert_eq!(recognize_function(&mut func, false, 64, 8, false, true), 2);
+        assert_eq!(
+            recognize_function(&mut func, false, 64, 8, false, true, true),
+            2
+        );
         let b = &func.blocks[0];
         assert_eq!(b.instructions.len(), old_len + 2);
         assert_eq!(b.source_spans.len(), b.instructions.len());
@@ -4014,7 +4096,10 @@ mod tests {
             }
         }
         assert_eq!(seen, outputs);
-        assert_eq!(recognize_function(&mut func, false, 64, 8, false, true), 0);
+        assert_eq!(
+            recognize_function(&mut func, false, 64, 8, false, true, true),
+            0
+        );
     }
 
     #[test]
@@ -6497,6 +6582,13 @@ mod compare_dominance;
 
 #[path = "bit_idioms_bit_select.rs"]
 mod bit_select;
+
+#[path = "bit_idioms_predicate.rs"]
+mod predicate;
+
+#[cfg(test)]
+#[path = "bit_idioms_predicate_tests.rs"]
+mod predicate_tests;
 
 #[path = "bit_idioms_observe.rs"]
 mod observe;

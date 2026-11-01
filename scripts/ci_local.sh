@@ -1920,6 +1920,15 @@ gate "compare-dominance-fold" fast \
 gate "bit-select-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bit_select_fold.sh
 
+# `c ? 1 : 0` is `c != 0` and `c ? 0 : 1` is `c == 0` (5 -> 4), and
+# `(a != 0) | (b != 0)` is `(a | b) != 0` (9 -> 4).  Pins the folded shapes
+# and their missing `cmov`, the refusals, the CCC_NO_PREDICATE_MATERIALIZE
+# ownership, the i686/AArch64/RISC-V lengths, -O0..-O3 agreement against GCC,
+# and the vectorizer's mask store (a stored comparison is 0/1, a stored lane
+# mask is 0/-1).
+gate "predicate-materialize" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_predicate_materialize.sh
+
 # Observable-access gates.  Three instruments, because each catches a
 # different way the `volatile` contract gets broken and each was proved to do
 # so by mutation (reintroducing the guard deletion in licm.rs):

@@ -1,0 +1,51 @@
+# x86-64: function off -> on (unchanged rows omitted)
+  and_eq 9 -> 4
+  from_cmp 5 -> 4
+  from_cmp_neg 5 -> 4
+  from_lt 5 -> 4
+  from_lt_neg 5 -> 4
+  mask_of_sign 5 -> 4
+  one_or_zero 5 -> 4
+  or3 13 -> 5
+  or_or 9 -> 4
+  zero_or_one 5 -> 4
+  zero_or_one64 5 -> 4
+# 7 of 18 function(s) unchanged on this target
+# i686: function off -> on (unchanged rows omitted)
+  and_eq 19 -> 13
+  from_cmp 11 -> 9
+  from_cmp_neg 11 -> 9
+  from_lt 11 -> 9
+  from_lt_neg 11 -> 9
+  mask_of_sign 8 -> 6
+  one_or_zero 11 -> 6
+  or3 24 -> 16
+  or_or 19 -> 13
+  zero_or_one 12 -> 6
+  zero_or_one64 19 -> 13
+# 7 of 18 function(s) unchanged on this target
+# arm: function off -> on (unchanged rows omitted)
+  and_eq 16 -> 11
+  from_cmp 13 -> 10
+  from_cmp_neg 13 -> 10
+  from_lt 13 -> 10
+  from_lt_neg 13 -> 10
+  mask_of_sign 12 -> 9
+  one_or_zero 12 -> 9
+  or3 23 -> 15
+  or_or 16 -> 11
+  zero_or_one 12 -> 9
+  zero_or_one64 12 -> 9
+# 7 of 18 function(s) unchanged on this target
+# riscv: function off -> on (unchanged rows omitted)
+  and_eq 20 -> 14
+  from_cmp 16 -> 9
+  from_cmp_neg 16 -> 9
+  from_lt 15 -> 8
+  from_lt_neg 15 -> 9
+  mask_of_sign 16 -> 11
+  one_or_zero 11 -> 9
+  or3 30 -> 18
+  or_or 20 -> 14
+  zero_or_one64 10 -> 8
+# 8 of 18 function(s) unchanged on this target
