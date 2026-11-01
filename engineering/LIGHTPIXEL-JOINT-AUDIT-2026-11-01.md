@@ -2,6 +2,12 @@
 
 ## Status and scope
 
+**Historical milestone, not current unified acceptance:** the hosted run for
+this milestone subsequently failed. The integration defects, current evidence
+and outstanding acceptance gates are tracked in
+[the unified audit](UNIFIED-PR-AUDIT-2026-11-01.md). The receipts below describe
+their recorded revisions, not an assertion that hosted CI is green.
+
 This supersedes the *component-only* outcome in
 `LIGHTPIXEL-AUDIT-2026-11-01.md`. The new implementation vectorizes the complete
 integer LightPixel tail, including the packed-by-value result used by Firefox:
