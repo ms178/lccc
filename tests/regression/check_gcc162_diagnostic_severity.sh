@@ -40,7 +40,9 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-gcc162-severity.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 cd "$tmp"
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# The message also becomes a GitHub annotation, so a red step names its own
+# failure in the check UI instead of only in a log the branch cannot read.
+fail() { echo "FAIL: $*" >&2; echo "::error::$*"; exit 1; }
 
 # run_exit <compiler> <file> <std> -> prints the exit code, stderr in <file>.err
 run_exit() {

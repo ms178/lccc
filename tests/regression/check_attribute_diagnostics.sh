@@ -13,9 +13,16 @@
 #
 # Expectations measured against gcc 16.2 (x86-64):
 #   unknown name                  ->  warning: 'x' attribute directive ignored
-#   GCC name, ABI/layout changing  ->  silence by default (gcc implements
-#                                      it); 'x' attribute ignored under an
-#                                      explicit -Wattributes
+#   GCC name, semantics not applied->  'x' attribute ignored under an explicit
+#                                      -Wattributes (gcc is silent on the
+#                                      valid use, so a default-on warning
+#                                      would fire on correct programs)
+#   calling convention             ->  gcc's own verdict for this target: silent
+#                                      when it names the convention already
+#                                      emitted, 'x' attribute ignored when gcc
+#                                      itself ignores it, and a loud refusal
+#                                      when it is a real ABI this compiler
+#                                      cannot lower (class 3)
 #   implemented / benign           ->  no diagnostic
 #   C23 [[x]] unknown              ->  warning: 'x' attribute ignored
 set -uo pipefail
@@ -101,22 +108,72 @@ for a in format nonnull warn_unused_result deprecated sentinel \
     expect "silent-benign:$a" EMPTY "$src"
 done
 
-# --- class 3: GCC attribute we do not implement ----------------------------
-# Measured on gcc-16.2.0: gcc *implements* every name below, so it is silent
-# on a valid use and a default-on warning here would fire on correct programs
-# (Windows-ABI headers, sqlite, ...) and would diverge from gcc's own output.
-# lccc therefore keeps gcc's default silence and reports the inventory only
-# under an explicit -Wattributes, which is what keeps a silently ignored
-# ABI-changing attribute discoverable without inventing a diagnostic.
-for a in ms_abi cdecl stdcall thiscall sseregparm ms_struct gcc_struct \
-         interrupt musttail returns_twice target_version; do
-    expect "silent-unimplemented:$a" EMPTY \
-        "int f(void) __attribute__(($a));"
-    expect "inventory:$a" "'$a' attribute ignored" \
-        "int f(void) __attribute__(($a));" -Wattributes
-    expect "inventory-off:$a" EMPTY \
-        "int f(void) __attribute__(($a));" -Wattributes -Wno-attributes
+# --- class 3: calling conventions (silent / gcc's wording / refused) --------
+# A convention is not interchangeable with a benign attribute. A caller and a
+# callee that disagree about where the arguments live still link and still run;
+# they just return garbage. So each name gets exactly the answer gcc gives on
+# this target (measured on gcc-16.2.0, x86-64), and the ones that are a real
+# foreign ABI are refused instead of ignored.
+#   sysv_abi                     -> this target's own convention: silent
+#   cdecl stdcall thiscall fastcall sseregparm -> gcc ignores them here
+#   preserve_none no_callee_saved_registers    -> gcc's "directive ignored"
+#   callee_pop_aggregate_return  -> gcc's "only available for 32-bit"
+#   ms_abi no_caller_saved_registers           -> refused
+for a in sysv_abi; do
+    expect "convention-default:$a" EMPTY "int f(void) __attribute__(($a));"
 done
+for a in cdecl stdcall thiscall fastcall sseregparm; do
+    expect "convention-ignored:$a" "'$a' attribute ignored" \
+        "int f(void) __attribute__(($a));"
+done
+for a in preserve_none no_callee_saved_registers; do
+    expect "convention-ignored:$a" "'$a' attribute directive ignored" \
+        "int f(void) __attribute__(($a));"
+done
+expect "convention-only32" \
+    "'callee_pop_aggregate_return' attribute only available for 32-bit" \
+    "int f(void) __attribute__((callee_pop_aggregate_return(0)));"
+# The record-layout names mean something on a struct/union tag and nothing
+# anywhere else, and gcc says so in each position: honoured on the tag
+# (`gcc_struct` is the default layout, so silence), ignored on a function.
+expect "convention-layout-default" EMPTY \
+    'struct __attribute__((gcc_struct)) S { char c; int b : 3; };'
+expect "convention-layout-ignored" "'ms_struct' attribute ignored" \
+    'int f(void) __attribute__((ms_struct));'
+
+# Refusals. The sentence has to name the attribute and the convention, because
+# it is the only thing standing between the program and a wrong answer at run
+# time; and the documented escape hatch must downgrade it, not disable it.
+refuse() { # refuse <case> <source>
+    local name=$1 src=$2 out
+    printf '%s\n' "$src" >"$TMP/r.c"
+    if "$CCC" -fsyntax-only "$TMP/r.c" >/dev/null 2>&1; then
+        echo "FAIL $name: a foreign convention was accepted silently" >&2
+        fail=1
+        return
+    fi
+    out=$("$CCC" -fsyntax-only "$TMP/r.c" 2>&1)
+    [[ $out == *"'$name'"* ]] || {
+        echo "FAIL $name: refusal does not name the attribute: $out" >&2
+        fail=1
+    }
+    [[ $out == *'does not implement'* ]] || {
+        echo "FAIL $name: refusal does not explain itself: $out" >&2
+        fail=1
+    }
+    out=$(CCC_ALLOW_UNSUPPORTED_ABI=1 "$CCC" -fsyntax-only "$TMP/r.c" 2>&1)
+    [[ $out == *CCC_ALLOW_UNSUPPORTED_ABI* ]] || {
+        echo "FAIL $name: escape hatch does not downgrade the refusal: $out" >&2
+        fail=1
+    }
+    if ! CCC_ALLOW_UNSUPPORTED_ABI=1 "$CCC" -fsyntax-only "$TMP/r.c" >/dev/null 2>&1; then
+        echo "FAIL $name: escape hatch still fails the compile" >&2
+        fail=1
+    fi
+}
+refuse ms_abi 'int f(void) __attribute__((ms_abi));'
+refuse no_caller_saved_registers 'int f(void) __attribute__((no_caller_saved_registers));'
+refuse ms_struct 'struct __attribute__((ms_struct)) S { char c; int b : 3; };'
 
 # --- class 4: not a GCC attribute -> "attribute directive ignored" ---------
 # `nodiscard`/`maybe_unused`/`unused_result` are C23 *standard* attributes:
@@ -128,8 +185,8 @@ for a in frobnicate nosuchthing quick_maths nodiscard maybe_unused unused_result
 done
 
 # --- class 5: the __name__ spelling is normalized in the message -----------
-expect "spelling:normalized" "'ms_abi' attribute ignored" \
-    'int f(void) __attribute__((__ms_abi__));' -Wattributes
+expect "spelling:normalized" "'stdcall' attribute ignored" \
+    'int f(void) __attribute__((__stdcall__));' 
 
 # --- class 6: C23 [[...]] -------------------------------------------------
 expect "c23:unknown" "'frobnicate' attribute ignored" \
@@ -139,7 +196,7 @@ expect "c23:deprecated" EMPTY 'int q [[deprecated]];'
 # --- the inventory diagnostic is tagged -Wattributes -----------------------
 # -Werror=attributes is itself an explicit request, so it must promote the
 # inventory warning to an error; -Wno-attributes after it silences the class.
-printf '%s\n' 'int f(void) __attribute__((ms_abi));' >"$TMP/t.c"
+printf '%s\n' 'int f(void) __attribute__((stdcall));' >"$TMP/t.c"
 if "$CCC" -fsyntax-only -Werror=attributes "$TMP/t.c" >/dev/null 2>&1; then
     echo "FAIL: -Werror=attributes did not make the inventory an error" >&2
     fail=1

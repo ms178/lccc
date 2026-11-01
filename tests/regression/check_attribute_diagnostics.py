@@ -27,6 +27,9 @@ ENV = {**os.environ, 'LC_ALL': 'C'}
 ROOT = Path(__file__).resolve().parents[2]
 LCCC = ROOT / 'target/fastbuild/lccc'
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import abi_attribute_matrix as abi_matrix  # noqa: E402
+
 def find_gcc():
     cands = [os.environ.get('GCC', ''), 'gcc-16', 'gcc']
     for cand in cands:
@@ -151,17 +154,17 @@ PROBES = [
 # dispatcher gaining a handler (the gate re-probes both directions).
 UNIMPLEMENTED = sorted(set("""
 access alloc_align alloc_size artificial assume assume_aligned btf_decl_tag btf_type_tag
-callee_pop_aggregate_return cdecl cf_check copy deprecated designated_init expected_throw
-fallthrough fd_arg fd_arg_read fd_arg_write flag_enum flatten force_align_arg_pointer format
-format_arg gcc_struct hardbool hot indirect_branch indirect_return interrupt leaf malloc
-may_alias ms_abi ms_hook_prologue ms_struct musttail no_address_safety_analysis
-no_callee_saved_registers no_caller_saved_registers no_icf no_profile_instrument_function
+cf_check copy deprecated designated_init expected_throw
+fallthrough fd_arg fd_arg_read fd_arg_write flag_enum flatten format
+format_arg hardbool hot indirect_branch indirect_return interrupt leaf malloc
+may_alias ms_hook_prologue musttail no_address_safety_analysis
+no_icf no_profile_instrument_function
 no_reorder no_sanitize_address no_sanitize_coverage no_sanitize_thread no_split_stack
 no_stack_limit nocf_check noclone nodirect_extern_access noipa nonnull nonnull_if_nonzero
 nonstring nothrow null_terminated_string_arg objc_nullability objc_root_class
-patchable_function_entry preserve_none reproducible returns_nonnull returns_twice sentinel
-signed_bool_precision simd sseregparm stdcall strict_flex_array strub sysv_abi tainted_args
-target_version thiscall transaction_callable transaction_may_cancel_outer transaction_pure
+patchable_function_entry reproducible returns_nonnull returns_twice sentinel
+signed_bool_precision simd strict_flex_array strub tainted_args
+target_version transaction_callable transaction_may_cancel_outer transaction_pure
 transaction_safe transaction_safe_dynamic transaction_unsafe unavailable unsequenced
 vector_mask warn_if_not_aligned warn_unused warn_unused_result
 """.split()))
@@ -190,7 +193,22 @@ def registry_unimplemented() -> list[str]:
     known = names('GCC_KNOWN')
     if known != sorted(known):
         raise ValueError('GCC_KNOWN must be sorted')
-    return sorted(set(known) - set(names('IMPLEMENTED')))
+    # Convention attributes never appear in this inventory: their verdict is
+    # decided by `abi_effect` before the classification funnel, and the ABI
+    # half of this gate (abi_attribute_matrix) owns them.
+    return sorted(set(known) - set(names('IMPLEMENTED')) - set(registry_abi_names()))
+
+
+def registry_abi_names() -> list[str]:
+    """Names carrying a calling-convention verdict (parsed from ABI_VERDICTS)."""
+    return sorted({name for (name, _target) in abi_matrix.registry_verdicts()})
+
+
+def has_multilib(gcc: str) -> bool:
+    """Whether this gcc can target i686 at all (the -m32 half of the table)."""
+    return subprocess.run([gcc, '-m32', '-E', '-x', 'c', '-', '-o', os.devnull],
+                          input='int x;\n', capture_output=True, text=True,
+                          env=ENV).returncode == 0
 
 
 def first_diag(stderr: str) -> str:
@@ -245,6 +263,19 @@ def main() -> int:
                 rc, err = run(cc, src, [opt, '-Wall', '-Wextra', '-Werror'])
                 if rc or err:
                     failures.append((name, f'{label} {opt} header probe must be silent', 0, (rc, err)))
+    # Convention attributes: the table in the registry must agree with what
+    # this gcc actually does (re-measured, not trusted), and lccc must honour
+    # every cell — silence for `Default`, gcc's own sentence for the ignored
+    # classes, a refusal for the conventions it cannot lower. The two it does
+    # lower are proved end-to-end by a cross-compiler runtime sentinel.
+    abi_failures, abi_notes = abi_matrix.check_table_against_gcc(
+        gcc, abi_matrix.registry_verdicts(), has_multilib(gcc))
+    abi_lccc_failures, abi_lccc_notes = abi_matrix.check_lccc(
+        abi_matrix.registry_verdicts())
+    for note in abi_notes + abi_lccc_notes:
+        print(f'  note: {note}')
+    failures.extend(abi_failures)
+    failures.extend(abi_lccc_failures)
     # Inventory: explicit -Wattributes reports each pinned name; gcc stays
     # silent on the valid-target probe (the delta is exactly the pin).
     for n in UNIMPLEMENTED:
@@ -270,7 +301,8 @@ def main() -> int:
         return 1
     print(f'PASS: attribute diagnostics match gcc-16.2 '
           f'({len(PROBES)} probes + {len(HEADER_PROBES)} headers x 4 optimization levels + '
-          f'{len(UNIMPLEMENTED)} pinned inventory names)')
+          f'{len(UNIMPLEMENTED)} pinned inventory names + '
+          f'{len(abi_matrix.registry_verdicts())} ABI convention cells)')
     return 0
 
 if __name__ == '__main__':
