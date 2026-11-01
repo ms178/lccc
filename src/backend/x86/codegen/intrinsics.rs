@@ -5908,6 +5908,96 @@ impl X86Codegen {
                     self.sse_store_dest(d, "xmm0");
                 }
             }
+            IntrinsicOp::VecWidenByteFieldsI32x4 => {
+                assert!(
+                    self.isa.sse41 && args.len() == 2,
+                    "byte fields require SSE4.1 and two operands"
+                );
+                let pattern = match &args[1] {
+                    Operand::Const(c) => c
+                        .to_i64()
+                        .filter(|v| (0..=255).contains(v))
+                        .expect("invalid byte-field pattern"),
+                    _ => panic!("byte-field pattern must be constant"),
+                };
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.operand_to_reg(&args[0], "rax");
+                let prefix = if self.avx2_enabled { "v" } else { "" };
+                self.state
+                    .emit_fmt(format_args!("    {}movd %eax, %xmm0", prefix));
+                self.state
+                    .emit_fmt(format_args!("    {}pmovzxbd %xmm0, %xmm0", prefix));
+                if pattern != 0xe4 {
+                    self.state.emit_fmt(format_args!(
+                        "    {}pshufd ${}, %xmm0, %xmm0",
+                        prefix, pattern
+                    ));
+                }
+                if let Some(d) = dest {
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
+            IntrinsicOp::VecLoadWidenU8ToI32x4 => {
+                assert!(
+                    self.isa.sse41 && args.len() == 5,
+                    "three-byte widening requires SSE4.1 and four operands"
+                );
+                let pattern = match &args[3] {
+                    Operand::Const(c) => c
+                        .to_i64()
+                        .filter(|v| (0..=255).contains(v))
+                        .expect("invalid three-byte shuffle"),
+                    _ => panic!("three-byte shuffle must be constant"),
+                };
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let disp = Self::vec_disp_arg(args, 2);
+                let count = match &args[4] {
+                    Operand::Const(c) => c
+                        .to_i64()
+                        .filter(|v| (3..=4).contains(v))
+                        .expect("invalid widening byte count"),
+                    _ => panic!("widening byte count must be constant"),
+                };
+                let prefix = if self.avx2_enabled { "v" } else { "" };
+                if count == 4 {
+                    let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                    self.state
+                        .emit_fmt(format_args!("    {}pmovzxbd {}, %xmm0", prefix, mem));
+                } else {
+                    let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                    self.state
+                        .emit_fmt(format_args!("    movzwl {}, %eax", mem));
+                    self.state
+                        .emit_fmt(format_args!("    {}movd %eax, %xmm0", prefix));
+                    // Re-evaluate after EAX staging: slot-homed pointers may
+                    // themselves use RAX as temporary address scratch.
+                    let mem = self.vec_mem_operand(
+                        &args[0],
+                        &args[1],
+                        disp.checked_add(2).expect("widening displacement overflow"),
+                    );
+                    if self.avx2_enabled {
+                        self.state
+                            .emit_fmt(format_args!("    vpinsrb $2, {}, %xmm0, %xmm0", mem));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    pinsrb $2, {}, %xmm0", mem));
+                    }
+                    self.state
+                        .emit_fmt(format_args!("    {}pmovzxbd %xmm0, %xmm0", prefix));
+                }
+                if pattern != 0xe4 {
+                    self.state.emit_fmt(format_args!(
+                        "    {}pshufd ${}, %xmm0, %xmm0",
+                        prefix, pattern
+                    ));
+                }
+                if let Some(d) = dest {
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
             IntrinsicOp::VecLoadI32x4Pair => {
                 // HALF-WIDE dword-pair load: two consecutive dwords into
                 // lanes 0/1, upper 64 bits ZEROED (MOVQ xmm, m64 clears
@@ -5944,6 +6034,62 @@ impl X86Codegen {
                     if !loaded_home {
                         self.sse_store_dest(d, "xmm0");
                     }
+                }
+            }
+            IntrinsicOp::VecStoreNarrowMaxU8x4 | IntrinsicOp::VecNarrowMaxU8x4 => {
+                let store = *op == IntrinsicOp::VecStoreNarrowMaxU8x4;
+                assert!(
+                    self.isa.sse41 && args.len() == if store { 5 } else { 2 },
+                    "joint narrow/max store requires SSE4.1 and five operands"
+                );
+                let control = match args.last() {
+                    Some(Operand::Const(c)) => c
+                        .to_i64()
+                        .filter(|v| (0..8).contains(v))
+                        .expect("invalid joint store control"),
+                    _ => panic!("joint store control must be constant"),
+                };
+                self.flush_pending_vec_store_impl();
+                self.sse_load_arg(&args[0], "xmm0");
+                self.state.invalidate_vec_peephole();
+                // Range proof belongs to the producer. In [0,255], signed
+                // dword->unsigned word and signed word->unsigned byte packing
+                // are exact, and byte-domain max commutes with narrowing.
+                if self.avx2_enabled {
+                    self.state.emit("    vpackusdw %xmm0, %xmm0, %xmm0");
+                    self.state.emit("    vpackuswb %xmm0, %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    packusdw %xmm0, %xmm0");
+                    self.state.emit("    packuswb %xmm0, %xmm0");
+                }
+                let alpha = control as usize & 3;
+                let independent = control & 4 != 0;
+                let mut lanes = (0..4).filter(|i| *i != alpha);
+                if !independent {
+                    lanes.next();
+                } // producer duplicated this lane
+                for lane in lanes {
+                    let mut mask: Vec<u8> = (0..16).collect();
+                    mask[alpha] = lane as u8;
+                    let label = self.state.get_vec_const_label(&mask);
+                    if self.avx2_enabled {
+                        self.state
+                            .emit_fmt(format_args!("    vpshufb {}(%rip), %xmm0, %xmm1", label));
+                        self.state.emit("    vpmaxub %xmm1, %xmm0, %xmm0");
+                    } else {
+                        self.state.emit("    movdqa %xmm0, %xmm1");
+                        self.state
+                            .emit_fmt(format_args!("    pshufb {}(%rip), %xmm1", label));
+                        self.state.emit("    pmaxub %xmm1, %xmm0");
+                    }
+                }
+                let mnemonic = if self.avx2_enabled { "vmovd" } else { "movd" };
+                if store {
+                    self.emit_vec_store_addr(args, dest_ptr, mnemonic, "xmm0");
+                } else if let Some(d) = dest {
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, %eax", mnemonic));
+                    self.store_rax_to(d);
                 }
             }
             IntrinsicOp::VecStoreI32x4Pair => {

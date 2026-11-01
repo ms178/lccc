@@ -39,6 +39,8 @@
 //! -O2+ (not -Os/-Oz), kill switches `CCC_NO_BB_SLP` /
 //! `CCC_DISABLE_PASSES=slp`, debug `LCCC_DEBUG_SLP=1`.
 
+mod joint;
+
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, IrType};
@@ -1555,7 +1557,13 @@ enum PackKind {
     /// pointer VALUE of lane i (lane 0's anchors the access); `offs[i]`
     /// its stream byte offset (offs[i] = offs[0] + i*size — re-asserted
     /// by the run builder).
-    MemLoad { ptrs: Vec<Value>, offs: Vec<i64> },
+    MemLoad {
+        ptrs: Vec<Value>,
+        offs: Vec<i64>,
+        /// Exact three-byte widening endpoint; the pointer is its lowest
+        /// byte, the immediate maps those bytes into four dword lanes.
+        byte3: Option<(Value, i32, u8)>,
+    },
     /// The lanes are lane-extracts of ONE existing vector value at
     /// consecutive indices 0..width-1 — the pack IS that vector. This is
     /// the CHAINED-SEED forward: a second seed whose operand tree reads
@@ -1606,6 +1614,8 @@ enum PackKind {
     },
     /// 4-lane gather (VecPackI32x4).
     Gather4 { ops: Vec<Operand> },
+    /// Four byte fields of one packed scalar, widened without a GPR gather.
+    ByteFields { src: Operand, pattern: i32 },
     /// Packed lane shift by a uniform CONSTANT amount:
     /// `dest = vec_op(val, amount)`. Two shapes share the kind:
     /// plain scalar shift lanes (lane_vals = the shift defs, removed by
@@ -1689,6 +1699,8 @@ struct SeedCandidate {
     /// Lowest-offset store's pointer value — the vector store anchor.
     anchor_ptr: Value,
     width: usize,
+    joint: Option<joint::Tail>,
+    value_sink: Option<Value>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2081,6 +2093,31 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
             continue;
         }
         entries.sort_by_key(|(off, idx, _, _)| (*off, *idx));
+        if ty == IrType::U8 && x86_sse41_available_pub() {
+            // Joint seeds use the LAST store to each byte; overwritten stores
+            // are retired only after the complete use/access proof below.
+            let mut last = Vec::new();
+            for e in &entries {
+                if last
+                    .last()
+                    .is_some_and(|p: &(i64, usize, Operand, Value)| p.0 == e.0)
+                {
+                    last.pop();
+                }
+                last.push(e.clone());
+            }
+            for window in last.windows(4) {
+                if window
+                    .windows(2)
+                    .all(|w| w[1].0.checked_sub(w[0].0) == Some(1))
+                {
+                    if let Some(seed) = joint::seed(ctx, window) {
+                        candidates.push(seed);
+                    }
+                }
+            }
+        }
+
         let size = ty.size() as i64;
         if size <= 0 {
             continue;
@@ -2106,6 +2143,8 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
                             ty,
                             anchor_ptr: run[0].3,
                             width,
+                            joint: None,
+                            value_sink: None,
                         });
                         // Fallback sub-window candidates: the full-width
                         // seed takes the first `width` stores of the run,
@@ -2140,6 +2179,8 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
                                     ty,
                                     anchor_ptr: chunk[0].3,
                                     width: cw,
+                                    joint: None,
+                                    value_sink: None,
                                 });
                             }
                         }
@@ -2159,6 +2200,9 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
             run.push(entry.clone());
         }
         flush(&mut run, &mut candidates);
+    }
+    if let Some(seed) = joint::value_seed(ctx) {
+        candidates.push(seed);
     }
     // Longest chains first; ties by earliest position.
     candidates.sort_by(|a, b| {
@@ -2971,6 +3015,16 @@ fn build_pack(
         .collect();
 
     if let Some(vals) = as_values {
+        if width == 4 && matches!(ty, IrType::I32 | IrType::U32) && x86_sse41_available_pub() {
+            if let Some(pack) =
+                joint::byte_load_pack(ctx, &vals).or_else(|| joint::byte_field_pack(ctx, &vals))
+            {
+                let idx = packs.len();
+                packs.push(pack);
+                dedup.insert(key, idx);
+                return Some(idx);
+            }
+        }
         // 1a-F. FORWARD: every lane is a lane-extract of ONE existing
         // vector at consecutive indices 0..width-1 — the pack IS that
         // vector (see `PackKind::Forward`). The extract must be THIS
@@ -3801,7 +3855,9 @@ fn build_pack(
                 let a0 = &addrs[0];
                 if let Some(prior) = packs.iter().position(|p| {
                     let PackKind::MemLoad {
-                        ptrs: pp, offs: po, ..
+                        ptrs: pp,
+                        offs: po,
+                        byte3: None,
                     } = &p.kind
                     else {
                         return false;
@@ -3928,6 +3984,7 @@ fn build_pack(
                 let idx = packs.len();
                 packs.push(Pack {
                     kind: PackKind::MemLoad {
+                        byte3: None,
                         ptrs,
                         offs: addrs.iter().map(|a| a.off).collect(),
                     },
@@ -5078,6 +5135,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     let block = ctx.block;
     let width = cand.width;
     let fam = family_for(cand.ty, width)?;
+    let store_size = if cand.joint.is_some() { 1 } else { fam.size };
     // Preserve the scalar form for the later loop-carried forwarding pass
     // when both the stream displacement and loop step match the pack size.
     if closes_loop_carried_recurrence(ctx, cand) {
@@ -5354,6 +5412,31 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         removed.insert(i);
     }
 
+    if cand.joint.is_some() {
+        // Earlier writes to an overwritten sink byte are candidates, not a
+        // license to discard observable stores. Remaining readers are checked
+        // after dead-scaffolding closure and before any mutation.
+        for (i, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Store {
+                ptr,
+                ty: IrType::U8,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let Some(a) = eval_sym_addr(block, &ctx.def_pos, *ptr) else {
+                continue;
+            };
+            if cand.store_idx.iter().any(|&j| j > i && matches!(&block.instructions[j],
+                Instruction::Store { ptr, .. } if eval_sym_addr(block, &ctx.def_pos, *ptr).as_ref() == Some(&a))) {
+                removed.insert(i);
+            }
+        }
+    }
+
     // Transitive dead-lane cleanup: the promotion rewrite's zext/mul chain
     // (and any other pure lane-feeding computation) whose EVERY use is a
     // removed lane position is itself dead — DCE would remove it anyway.
@@ -5371,7 +5454,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     let mut keep_operands: FxHashSet<u32> = FxHashSet::default();
     for p in packs.iter() {
         match &p.kind {
-            PackKind::Splat { src, .. } => {
+            PackKind::Splat { src, .. } | PackKind::ByteFields { src, .. } => {
                 if let Operand::Value(v) = src {
                     keep_operands.insert(v.0);
                 }
@@ -5424,15 +5507,26 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             // removed it is dead by the identical argument — no side
             // effects, no external uses, not a kept operand — and leaving
             // it in place costs the whole seed.
-            if !matches!(
-                inst,
-                Instruction::Cast { .. }
-                    | Instruction::BinOp { .. }
-                    | Instruction::Select { .. }
-                    | Instruction::Cmp { .. }
-                    | Instruction::Copy { .. }
-                    | Instruction::UnaryOp { .. }
-            ) {
+            let dead_joint_load = cand.joint.is_some()
+                && matches!(
+                    inst,
+                    Instruction::Load {
+                        volatile: false,
+                        seg_override: AddressSpace::Default,
+                        ..
+                    }
+                );
+            if !dead_joint_load
+                && !matches!(
+                    inst,
+                    Instruction::Cast { .. }
+                        | Instruction::BinOp { .. }
+                        | Instruction::Select { .. }
+                        | Instruction::Cmp { .. }
+                        | Instruction::Copy { .. }
+                        | Instruction::UnaryOp { .. }
+                )
+            {
                 continue;
             }
             let Some(d) = inst.dest() else { continue };
@@ -5453,6 +5547,22 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         }
         if !added {
             break;
+        }
+    }
+
+    if cand.joint.is_some() {
+        for &i in &removed {
+            if cand.store_idx.contains(&i)
+                || !matches!(block.instructions[i], Instruction::Store { .. })
+            {
+                continue;
+            }
+            let last = *cand.store_idx.iter().max()?;
+            if (i + 1..last)
+                .any(|q| !removed.contains(&q) && joint::memory_access(&block.instructions[q]))
+            {
+                return None;
+            }
         }
     }
 
@@ -5528,7 +5638,8 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         // the restrict contract / global / alloca object identity.
         // Anything not a plain Store (calls, atomics, asm, vector
         // intrinsics) keeps the conservative rejection.
-        if let PackKind::MemLoad { ptrs, offs, .. } = &p.kind {
+        if let PackKind::MemLoad { ptrs, offs, byte3 } = &p.kind {
+            let load_size = if byte3.is_some() { 1 } else { fam.size };
             let positions: Vec<usize> = p.lane_vals.iter().map(|v| ctx.def_pos[&v.0]).collect();
             let hi = *positions.iter().max().unwrap();
             let lane_addr = eval_sym_addr(block, &ctx.def_pos, ptrs[0]);
@@ -5536,7 +5647,10 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 let pk = positions[li];
                 let lane_off = offs[li];
                 for q in pk + 1..hi {
-                    if !is_memory_write(&block.instructions[q]) || removed.contains(&q) {
+                    if !(is_memory_write(&block.instructions[q])
+                        || (cand.joint.is_some() && joint::barrier(&block.instructions[q])))
+                        || removed.contains(&q)
+                    {
                         continue;
                     }
                     let (ptr, acc_size) = match &block.instructions[q] {
@@ -5547,13 +5661,13 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                         (Some(la), Some(wa))
                             if la.base == wa.base && la.var == wa.var && la.mult == wa.mult =>
                         {
-                            byte_ranges_overlap(lane_off, fam.size as i64, wa.off, acc_size as i64)
+                            byte_ranges_overlap(lane_off, load_size as i64, wa.off, acc_size as i64)
                         }
                         (Some(la), Some(wa)) if la.base == wa.base && la.mult == wa.mult => {
                             !field_disjoint(
                                 la.mult,
                                 lane_off,
-                                fam.size as i64,
+                                load_size as i64,
                                 wa.off,
                                 acc_size as i64,
                             )
@@ -5597,7 +5711,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             continue;
         }
         let inst = &block.instructions[q];
-        if !is_memory_access(inst) {
+        if !(is_memory_access(inst) || (cand.joint.is_some() && joint::barrier(inst))) {
             continue;
         }
         let (ptr, acc_size) = match inst {
@@ -5613,16 +5727,22 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             }
             let lane_off = seed_addr
                 .as_ref()
-                .map(|sa| sa.off + li as i64 * fam.size as i64)
+                .map(|sa| sa.off + li as i64 * store_size as i64)
                 .unwrap_or(0);
             let touches_lane = match (&seed_addr, &access_addr) {
                 (Some(sa), Some(aa))
                     if sa.base == aa.base && sa.var == aa.var && sa.mult == aa.mult =>
                 {
-                    byte_ranges_overlap(lane_off, fam.size as i64, aa.off, acc_size as i64)
+                    byte_ranges_overlap(lane_off, store_size as i64, aa.off, acc_size as i64)
                 }
                 (Some(sa), Some(aa)) if sa.base == aa.base && sa.mult == aa.mult => {
-                    !field_disjoint(sa.mult, lane_off, fam.size as i64, aa.off, acc_size as i64)
+                    !field_disjoint(
+                        sa.mult,
+                        lane_off,
+                        store_size as i64,
+                        aa.off,
+                        acc_size as i64,
+                    )
                 }
                 (Some(sa), Some(aa)) => !bases.disjoint(sa.base.0, aa.base.0),
                 _ => true,
@@ -5653,9 +5773,10 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         let seed_addr = eval_sym_addr(block, &ctx.def_pos, cand.anchor_ptr);
         let seed_stream = seed_addr.as_ref().map(|a| (a.base, a.var, a.mult));
         for p in packs.iter() {
-            let PackKind::MemLoad { ptrs, offs, .. } = &p.kind else {
+            let PackKind::MemLoad { ptrs, offs, byte3 } = &p.kind else {
                 continue;
             };
+            let load_size = if byte3.is_some() { 1 } else { fam.size };
             let lane_stream =
                 eval_sym_addr(block, &ctx.def_pos, ptrs[0]).map(|a| (a.base, a.var, a.mult));
             for (li, &v) in p.lane_vals.iter().enumerate() {
@@ -5668,9 +5789,10 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                         // Same stream: byte-range overlap (i128 so the
                         // pathological-offset subtraction cannot wrap).
                         (Some(sa), Some(_)) if seed_stream == lane_stream => {
-                            let store_off = sa.off as i128 + si as i128 * fam.size as i128;
+                            let store_off = sa.off as i128 + si as i128 * store_size as i128;
                             let lane_off = offs[li] as i128;
-                            (store_off - lane_off).abs() < fam.size as i128
+                            store_off < lane_off + load_size as i128
+                                && lane_off < store_off + store_size as i128
                         }
                         // FIELD-DISJOINTNESS THEOREM: same base and byte
                         // stride with a DIFFERENT index variable — the
@@ -5682,13 +5804,13 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                         (Some(sa), Some((lb_base, _, lb_mult)))
                             if sa.base == *lb_base && sa.mult == *lb_mult =>
                         {
-                            let store_off = sa.off + si as i64 * fam.size as i64;
+                            let store_off = sa.off + si as i64 * store_size as i64;
                             !field_disjoint(
                                 sa.mult,
                                 store_off,
-                                fam.size as i64,
+                                store_size as i64,
                                 offs[li],
-                                fam.size as i64,
+                                load_size as i64,
                             )
                         }
                         // Restrict escape (C11 6.7.3.1): distinct bases
@@ -5709,6 +5831,12 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 }
             }
         }
+    }
+
+    if cand.joint.is_some()
+        && !joint::removed_stores_preserve_loads(ctx, &packs, &removed, bases, fam.size)
+    {
+        return None;
     }
 
     // ── Extract map ────────────────────────────────────────────────────
@@ -5739,6 +5867,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     let mut benefit: i64 = width as i64 - 1; // seed stores: W → 1
     for p in &packs {
         match &p.kind {
+            PackKind::MemLoad { byte3: Some(_), .. } => benefit -= 3,
             PackKind::MemLoad { .. } | PackKind::BinOp { .. } => {
                 benefit += width as i64 - 1;
             }
@@ -5764,6 +5893,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             }
             PackKind::Gather2 { .. } => benefit -= 3,
             PackKind::Gather4 { .. } => benefit -= 7,
+            PackKind::ByteFields { .. } => benefit += 1,
             // The FP min/max fold replaces W Selects AND their W Cmps with
             // one packed op; counted conservatively as one BinOp-level
             // replacement (the cmp removal is uncounted headroom).
@@ -5798,6 +5928,35 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     let half_lanes = width / 2;
     for (_, (_, li)) in &extract_of {
         benefit -= 1 + (is_256 && *li >= half_lanes) as i64;
+    }
+    if let Some(tail) = cand.joint {
+        let scalar = removed
+            .iter()
+            .filter(|&&i| {
+                matches!(
+                    block.instructions[i],
+                    Instruction::BinOp { .. }
+                        | Instruction::Cmp { .. }
+                        | Instruction::Select { .. }
+                        | Instruction::Cast { .. }
+                        | Instruction::Load { .. }
+                        | Instruction::Store { .. }
+                )
+            })
+            .count() as i64;
+        let vector: i64 = packs
+            .iter()
+            .map(|p| match p.kind {
+                PackKind::Forward { .. } => 0,
+                PackKind::Gather4 { .. } => 7,
+                PackKind::ByteFields { .. } => 4,
+                PackKind::MemLoad { byte3: Some(_), .. } => 6,
+                PackKind::Gather2 { .. } => 3,
+                PackKind::Splat { .. } | PackKind::CmpBlendv { .. } => 2,
+                _ => 1,
+            })
+            .sum();
+        benefit = scalar - vector - tail.cost() - extract_of.len() as i64;
     }
     if benefit < 1 {
         return None;
@@ -5988,6 +6147,12 @@ fn apply_plan(
         extract_dest.insert(vid, Value(next_value_id));
         next_value_id += 1;
     }
+    let scalar_sink_dest = cand.value_sink.map(|old| {
+        let new = Value(next_value_id);
+        next_value_id += 1;
+        extract_dest.insert(old.0, new);
+        new
+    });
     // FORWARD packs emit no instruction: their vector result IS the
     // forwarded value (the pre-wasted fresh id above is simply unused).
     // Overriding `vec_dest` here makes every consumer's
@@ -6038,7 +6203,10 @@ fn apply_plan(
         let mut streams_stage: Vec<Option<(Value, Value, u64, i64)>> = vec![None; plan.packs.len()];
         let mut anchor_stage: Option<(Value, Value, u64, i64)> = None;
         for (pi, p) in plan.packs.iter().enumerate() {
-            let PackKind::MemLoad { ptrs, .. } = &p.kind else {
+            let PackKind::MemLoad {
+                ptrs, byte3: None, ..
+            } = &p.kind
+            else {
                 continue;
             };
             let Some(a) = eval_sym_addr(block_snapshot, &def_pos_local, ptrs[0]) else {
@@ -6211,6 +6379,27 @@ fn apply_plan(
                     Operand::Value(vec_dest[*acc]),
                 ],
             },
+            PackKind::ByteFields { src, pattern } => Instruction::Intrinsic {
+                dest: Some(dest),
+                op: IntrinsicOp::VecWidenByteFieldsI32x4,
+                dest_ptr: None,
+                args: vec![src.clone(), Operand::Const(IrConst::I32(*pattern))],
+            },
+            PackKind::MemLoad {
+                byte3: Some((ptr, pattern, count)),
+                ..
+            } => Instruction::Intrinsic {
+                dest: Some(dest),
+                op: IntrinsicOp::VecLoadWidenU8ToI32x4,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(*ptr),
+                    Operand::Const(IrConst::I64(0)),
+                    Operand::Const(IrConst::I64(0)),
+                    Operand::Const(IrConst::I32(*pattern)),
+                    Operand::Const(IrConst::I32(*count as i32)),
+                ],
+            },
             PackKind::MemLoad { ptrs, .. } => {
                 // SIB form when the stream decomposed: (base, idx, disp)
                 // folds into `disp(%base,%idx)` in the back end; otherwise
@@ -6240,7 +6429,21 @@ fn apply_plan(
                 dest_ptr: None,
                 args: vec![
                     Operand::Value(vec_dest[*lhs]),
-                    Operand::Value(vec_dest[*rhs]),
+                    // Integer dword arithmetic already accepts a lane constant
+                    // as its r/m operand. Keep it literal instead of forcing a
+                    // broadcast register (DCE retires an otherwise unused splat).
+                    // Other lane sizes must retain their own width semantics.
+                    match &plan.packs[*rhs].kind {
+                        PackKind::Splat {
+                            src: Operand::Const(c),
+                            ..
+                        } if matches!(cand.ty, IrType::I32 | IrType::U32)
+                            && c.to_i64().is_some() =>
+                        {
+                            Operand::Const(IrConst::I32(c.to_i64().unwrap() as i32))
+                        }
+                        _ => Operand::Value(vec_dest[*rhs]),
+                    },
                 ],
             },
             PackKind::Splat { src, is_zero } => Instruction::Intrinsic {
@@ -6368,7 +6571,7 @@ fn apply_plan(
     // decomposed anchor the args become the SIB 4-arg form
     // [vector, base, index, disp] — `emit_vec_store_addr`'s ≥3-arg path
     // folds it to `disp(%base,%index)`, and the anchor GEP chain dies.
-    let store_args = match anchor_out {
+    let mut store_args = match anchor_out {
         Some((base, idx, disp)) => vec![
             Operand::Value(vec_dest[plan.root]),
             Operand::Value(base),
@@ -6381,14 +6584,36 @@ fn apply_plan(
             Operand::Const(IrConst::I64(0)),
         ],
     };
+    if let Some(tail) = cand.joint {
+        if store_args.len() == 3 {
+            store_args.push(Operand::Const(IrConst::I64(0)));
+        }
+        store_args.push(Operand::Const(IrConst::I32(tail.control())));
+    }
     inserts.push((
         *cand.store_idx.iter().max().unwrap(),
         10_000,
-        Instruction::Intrinsic {
-            dest: None,
-            op: fam.store,
-            dest_ptr: Some(cand.anchor_ptr),
-            args: store_args,
+        if let Some(dest) = scalar_sink_dest {
+            Instruction::Intrinsic {
+                dest: Some(dest),
+                op: IntrinsicOp::VecNarrowMaxU8x4,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(vec_dest[plan.root]),
+                    Operand::Const(IrConst::I32(cand.joint.unwrap().control())),
+                ],
+            }
+        } else {
+            Instruction::Intrinsic {
+                dest: None,
+                op: if cand.joint.is_some() {
+                    IntrinsicOp::VecStoreNarrowMaxU8x4
+                } else {
+                    fam.store
+                },
+                dest_ptr: Some(cand.anchor_ptr),
+                args: store_args,
+            }
         },
     ));
 
@@ -6511,6 +6736,7 @@ fn apply_plan(
                 PackKind::Splat { .. } => "Splat".into(),
                 PackKind::Gather2 { .. } => "Gather2".into(),
                 PackKind::Gather4 { .. } => "Gather4".into(),
+                PackKind::ByteFields { .. } => "ByteFields".into(),
                 PackKind::ShiftImm { val, amount, .. } => {
                     format!("ShiftImm(v{} ${})", val, amount)
                 }

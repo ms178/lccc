@@ -7831,6 +7831,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecLoadStrided2I32x8
                 | O::VecLoadStrided2I32x4
                 | O::VecLoadStrided2CompactI32x4
+                | O::VecWidenByteFieldsI32x4
+                | O::VecLoadWidenU8ToI32x4
                 | O::VecLoadI32x4Pair
                 | O::VecPackI32x4Pair
                 | O::VecLoadI8x32
@@ -9425,7 +9427,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // I32x4 family (the intermediate ops ARE the I32x4
             // intrinsics), so the load/store/gather endpoints join
             // class 6 to keep the web connected.
-            O::VecLoadI32x4Pair | O::VecStoreI32x4Pair | O::VecPackI32x4Pair => Some(6),
+            O::VecWidenByteFieldsI32x4
+            | O::VecLoadWidenU8ToI32x4
+            | O::VecLoadI32x4Pair
+            | O::VecStoreI32x4Pair
+            | O::VecStoreNarrowMaxU8x4
+            | O::VecPackI32x4Pair => Some(6),
             // ARX / packed-DAG lane ops (rotate/shuffle/sub/bitwise): class 6 (I32x4 family).
             O::VecRotlI32x4
             | O::VecShufdI32x4
@@ -9641,6 +9648,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // HALF-WIDE dword-pair store: same register-home
                     // source path (vec_store_source_128).
                     | O::VecStoreI32x4Pair
+                    | O::VecStoreNarrowMaxU8x4
                     // BB-SLP lane extract: xmm1-only staging.
                     | O::VecExtractLaneI32x4
             ),
@@ -10692,6 +10700,8 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecXorI16x8
         // HALF-WIDE dword-pair endpoints (the ops between them are
         // the ordinary I32x4 intrinsics above).
+        | O::VecWidenByteFieldsI32x4
+        | O::VecLoadWidenU8ToI32x4
         | O::VecLoadI32x4Pair
         | O::VecPackI32x4Pair => Some(6),
         _ => None,
@@ -10847,6 +10857,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecStoreI8x32
                     | O::VecStoreI32x4
                     | O::VecStoreI32x4Pair
+                    | O::VecStoreNarrowMaxU8x4
                     // BB-SLP 256-bit packed lane shifts: the immediate
                     // forms read the homed YMM source in place.
                     | O::VecShlI16x16

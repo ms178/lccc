@@ -1672,6 +1672,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadI64x4
             | O::VecLoadI16x8
             | O::VecLoadI8x16
+            | O::VecLoadWidenU8ToI32x4
             | O::VecLoadI32x4Pair
             | O::VecLoadWidenI32ToI64x2
             | O::VecHorizontalAddF64x2
@@ -2153,6 +2154,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecXorI8x16
             | O::VecPackI64x2
             | O::VecPackF64x2
+            | O::VecLoadWidenU8ToI32x4
             | O::VecLoadI32x4Pair
             | O::VecPackI32x4Pair
             | O::VecZeroI64x2
@@ -2331,6 +2333,7 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
             | O::VecLoadF32x4
             | O::VecLoadI32x4
             | O::VecLoadI64x2
+            | O::VecLoadWidenU8ToI32x4
             | O::VecLoadI32x4Pair
             | O::VecLoadI64x4
             | O::VecLoadI16x8

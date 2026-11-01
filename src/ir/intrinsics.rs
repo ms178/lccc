@@ -839,12 +839,30 @@ pub enum IntrinsicOp {
     /// `vpsrld/vpxor/vpaddd`). args = [base, offset-const] like every
     /// `VecLoad*`.
     VecLoadI32x4Pair,
+    /// Read exactly args[4] consecutive bytes (constant 3 or 4), widen
+    /// unsigned bytes to dwords, then permute using args[3]'s PSHUFD immediate.
+    /// args = [base,index,disp,pattern,count]. Three-byte accesses use 2+1
+    /// bytes, never an overreading dword load; physical lane 3 is then zero.
+    VecLoadWidenU8ToI32x4,
     /// HALF-WIDE store: writes lanes 0/1 of the I32x4-shaped source
     /// register to memory as 8 bytes (`movq` xmm, m64; the upper lanes
     /// are never observable). The BB-SLP seed-store sink for 2-lane
     /// dword runs. args = [vector, base, offset-const] (SIB form) or
     /// dest_ptr + args = [vector].
     VecStoreI32x4Pair,
+    /// Joint four-byte store from four dwords proven in [0,255]. Control
+    /// (args[4]) selects the reduction/output lane (bits 0..1) and whether
+    /// it has an independent fourth input (bit 2). Otherwise that lane is
+    /// a duplicate of the first non-reduction lane. args = [vec,base,index,disp,control].
+    /// Write exactly four bytes; never a full vector-width memory access.
+    VecStoreNarrowMaxU8x4,
+    /// Register-result counterpart of the joint byte store: pack four
+    /// byte-bounded dwords, replace the selected byte by their max, return
+    /// the packed U32 in a GPR. args = [vector, control].
+    VecNarrowMaxU8x4,
+    /// Widen four byte fields of one scalar U32, then PSHUFD by args[1].
+    /// args = [scalar,pattern]; result is four zero-extended U32 lanes.
+    VecWidenByteFieldsI32x4,
     /// HALF-WIDE gather: two scalar dwords into lanes 0/1 with the upper
     /// 64 bits zeroed (`movd` clears bits 32..127, then `pinsrd $1`).
     /// args = [lo, hi]. The 2-lane fallback for dword seeds whose lanes
@@ -1970,8 +1988,9 @@ impl PrefetchHint {
 }
 
 #[cfg(test)]
-pub(crate) const VECTOR_STORES: [IntrinsicOp; 13] = [
+pub(crate) const VECTOR_STORES: [IntrinsicOp; 14] = [
     IntrinsicOp::VecStoreI32x4Pair,
+    IntrinsicOp::VecStoreNarrowMaxU8x4,
     IntrinsicOp::VecStoreI32x4,
     IntrinsicOp::VecStoreI32x8,
     IntrinsicOp::VecStoreF32x4,
@@ -2304,7 +2323,7 @@ impl IntrinsicOp {
             | VecLoadI16x8 | VecAndI16x8 | VecOrI16x8 | VecXorI16x8
             | VecLoadI8x16 | VecAndI8x16 | VecOrI8x16 | VecXorI8x16
             | VecPackI64x2 | VecPackF64x2
-            | VecLoadI32x4Pair | VecStoreI32x4Pair | VecPackI32x4Pair
+            | VecWidenByteFieldsI32x4 | VecLoadWidenU8ToI32x4 | VecLoadI32x4Pair | VecStoreI32x4Pair | VecStoreNarrowMaxU8x4 | VecPackI32x4Pair
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
@@ -2327,7 +2346,8 @@ impl IntrinsicOp {
     pub fn is_horizontal_vector_reduce(&self) -> bool {
         matches!(
             self,
-            IntrinsicOp::VecHorizontalAddI32x8
+            IntrinsicOp::VecNarrowMaxU8x4
+                | IntrinsicOp::VecHorizontalAddI32x8
                 | IntrinsicOp::VecHorizontalAddI32x4
                 | IntrinsicOp::VecHorizontalAddI64x4
                 | IntrinsicOp::VecHorizontalAddI64x2
@@ -2433,7 +2453,7 @@ impl IntrinsicOp {
         self.produces_vector_value()
             || matches!(
                 self,
-                IntrinsicOp::VecExtractLaneI32x4
+                IntrinsicOp::VecNarrowMaxU8x4 | IntrinsicOp::VecExtractLaneI32x4
                     | IntrinsicOp::VecExtractLaneI64x2
                     | IntrinsicOp::VecExtractLaneF64x2
                     | IntrinsicOp::VecExtractLaneI64x4
@@ -2513,6 +2533,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecStoreI64x2
                 | IntrinsicOp::VecStoreI64x4
                 | IntrinsicOp::VecStoreI32x4Pair
+                | IntrinsicOp::VecStoreNarrowMaxU8x4
                 | IntrinsicOp::VecStoreI16x8
                 | IntrinsicOp::VecStoreI8x16
                 | IntrinsicOp::VecStoreI8x32
@@ -2560,6 +2581,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadWidenI32ToI64x2
                 | IntrinsicOp::VecLoadI64x2
                 | IntrinsicOp::VecLoadI32x4Pair
+                | IntrinsicOp::VecLoadWidenU8ToI32x4
                 | IntrinsicOp::VecLoadI64x4
                 | IntrinsicOp::VecLoadI16x8
                 | IntrinsicOp::VecLoadI8x16
@@ -2621,6 +2643,7 @@ impl IntrinsicOp {
             | IntrinsicOp::VecLoadI16x8
             | IntrinsicOp::VecLoadI8x16
             | IntrinsicOp::VecLoadWidenI32ToI64x2
+            | IntrinsicOp::VecLoadWidenU8ToI32x4
             | IntrinsicOp::VecLoadI32x4Pair => Some(1),
             // `VecStore*(src, base, index[, disp])`.
             IntrinsicOp::VecStoreI32x4
@@ -2635,6 +2658,7 @@ impl IntrinsicOp {
             | IntrinsicOp::VecStoreI64x4
             | IntrinsicOp::VecStoreI8x32
             | IntrinsicOp::VecStoreI16x16
+            | IntrinsicOp::VecStoreNarrowMaxU8x4
             | IntrinsicOp::VecStoreI32x4Pair => Some(2),
             _ => None,
         }
@@ -2806,6 +2830,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadWidenI32ToI64x2
                 | IntrinsicOp::VecLoadI64x2
                 | IntrinsicOp::VecLoadI32x4Pair
+                | IntrinsicOp::VecWidenByteFieldsI32x4
+                | IntrinsicOp::VecLoadWidenU8ToI32x4
                 | IntrinsicOp::VecAddI64x2
                 | IntrinsicOp::VecSadbwU8x16
                 | IntrinsicOp::VecMulI64x2
@@ -3162,7 +3188,8 @@ mod vector_width_tests {
                     // width its vector operand lives in (the I32x4 shape,
                     // 16 bytes) — the homing web keys on it, exactly the
                     // VecStoreI64x2 precedent (register-shaped stores).
-                    && name != "VecStoreI32x4Pair")
+                    && name != "VecStoreI32x4Pair"
+                    && name != "VecStoreNarrowMaxU8x4")
                 || name.starts_with("VecSadalp")
                 || name.starts_with("VecSmlal")
              // Reads a 128-bit vector, extracts ONE lane into a GPR:
@@ -3441,7 +3468,11 @@ mod vector_width_tests {
             "VecXorI8x16" => IntrinsicOp::VecXorI8x16,
             "VecPackI64x2" => IntrinsicOp::VecPackI64x2,
             "VecLoadI32x4Pair" => IntrinsicOp::VecLoadI32x4Pair,
+            "VecLoadWidenU8ToI32x4" => IntrinsicOp::VecLoadWidenU8ToI32x4,
             "VecStoreI32x4Pair" => IntrinsicOp::VecStoreI32x4Pair,
+            "VecStoreNarrowMaxU8x4" => IntrinsicOp::VecStoreNarrowMaxU8x4,
+            "VecNarrowMaxU8x4" => IntrinsicOp::VecNarrowMaxU8x4,
+            "VecWidenByteFieldsI32x4" => IntrinsicOp::VecWidenByteFieldsI32x4,
             "VecPackI32x4Pair" => IntrinsicOp::VecPackI32x4Pair,
             "VecPackF64x2" => IntrinsicOp::VecPackF64x2,
             "VecExtractLaneI64x4" => IntrinsicOp::VecExtractLaneI64x4,

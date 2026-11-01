@@ -2,6 +2,11 @@
 
 ## Scope and outcome
 
+**Historical component-only report.** See
+[the joint graph follow-up](LIGHTPIXEL-JOINT-AUDIT-2026-11-01.md) for the
+subsequent complete integer tail implementation and current measurements.
+The results below describe the earlier implementation, not the current one.
+
 This is a **component improvement, not a completed implementation of LLVM's
 three-lane reduction/store profitability optimization**. The exact RGB clamp
 and alpha-max shape remains scalar in lccc. No Firefox/rasterflood-svg browser
