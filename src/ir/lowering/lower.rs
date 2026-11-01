@@ -1138,6 +1138,27 @@ impl Lowerer {
         }
 
         // Collect constructor/destructor/alias attributes from function definitions and declarations
+        //
+        // An init/fini entry names a FUNCTION the loader calls. Two gates follow
+        // from that, both measured against GCC 16.2:
+        //  - the declarator must declare a function. GCC ignores the attribute
+        //    on anything else (`'constructor' attribute ignored`), and honouring
+        //    it on `void (*fp)(void) __attribute__((constructor)) = c;` put the
+        //    address of a DATA object into `.init_array`; the loader called it
+        //    and the program died with SIGSEGV before reaching main.
+        //  - the function must be DEFINED in this translation unit: the entry
+        //    belongs to the TU that defines the function, and a declaration
+        //    alone must not leave a dangling `.quad f` behind. GCC emits no
+        //    entry for `void f(void) __attribute__((constructor));` without a
+        //    definition, and one when the definition follows the declaration.
+        let defined_functions: crate::common::fx_hash::FxHashSet<&str> = tu
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                ExternalDecl::FunctionDef(func) => Some(func.name.as_str()),
+                _ => None,
+            })
+            .collect();
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
@@ -1167,14 +1188,24 @@ impl Lowerer {
                 }
                 ExternalDecl::Declaration(decl) => {
                     for declarator in &decl.declarators {
-                        if declarator.attrs.is_constructor()
+                        // A function *type*, as opposed to an object of
+                        // function-pointer type (see `declares_function`).
+                        let declares_fn = DerivedDeclarator::declares_function(&declarator.derived)
+                            || (declarator.derived.is_empty()
+                                && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
+                                    if self.types.function_typedefs.contains_key(name)));
+                        let init_entry_target = declares_fn
+                            && !decl.is_typedef()
                             && !declarator.name.is_empty()
+                            && defined_functions.contains(declarator.name.as_str());
+                        if declarator.attrs.is_constructor()
+                            && init_entry_target
                             && !self.module.constructors.contains(&declarator.name)
                         {
                             self.module.constructors.push(declarator.name.clone());
                         }
                         if declarator.attrs.is_destructor()
-                            && !declarator.name.is_empty()
+                            && init_entry_target
                             && !self.module.destructors.contains(&declarator.name)
                         {
                             self.module.destructors.push(declarator.name.clone());

@@ -233,6 +233,13 @@ gate "lexer-extensions" fast \
     env CCC="$LCCC" bash tests/regression/check_lexer_extensions.sh
 gate "ucn-identifier-table" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_ucn_identifier_table.sh
+# A character constant's TYPE decides what its text means — `u'\U0001F600'` is
+# the low surrogate 0xDE00, `u8'\u00e9'` is an error, `u'ab'` keeps its last
+# character — so this gate compiles and runs each case under both compilers and
+# compares value, sizeof and the ordered diagnostic stream.
+gate "char-literal-encoding" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" \
+    python3 tests/regression/check_char_literal_encoding.py
 gate "asm-operand-diagnostics" fast \
     env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm \
     CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 \

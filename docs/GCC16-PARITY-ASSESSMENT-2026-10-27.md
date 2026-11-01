@@ -13,6 +13,253 @@ from documentation or inferred from a neighbouring measurement.
 
 ---
 
+## Current bounded update (2026-11-01)
+
+The campaign's feature work now runs off a checked-in differential probe,
+`scripts/gcc16_feature_probe.py`: 79 self-contained C programs, each compiled,
+linked and executed by lccc, GCC 16.2.0 and Clang 23.1.4, comparing exit
+statuses rather than acceptance alone. A *gap* is lccc rejecting source GCC
+accepts, or both building but disagreeing at runtime; lccc accepting what GCC
+rejects is recorded as a *permissive* divergence. Current score on this tree:
+**79 cases, 3 gaps, 3 permissive divergences** (the five `\N{…}` cases in
+§2.4 were added to the probe with the character-constant work). All three gaps
+are `_BitInt`
+(`bitint-17`, `bitint-unsigned-128`, `bitint-add`); the permissive cases are
+`cleanup`, `fp16` and `attr-access`, where lccc accepts and GCC rejects.
+
+Three defects the probe found are fixed in this session, each with a
+regression fixture under `tests/regression/` that was **verified to fail on the
+pre-fix compiler** and pass after it:
+
+* **Narrow-literal escaping** (`ucn_escape_bytes.c`). A universal character
+  name names a *character* and is UTF-8 encoded; `\xHH` and `\NNN` name a
+  *byte*. lccc chose between the rules by magnitude ("above 0xFF means UTF-8"),
+  which is wrong for exactly U+0080..U+00FF: `"\u00e9"` produced one byte
+  (`E9 00`, length 1) where GCC produces two (`C3 A9`, length 2), and
+  `'\u00e9'` was `-23` where GCC's multi-character reading is `0xC3A9`. The
+  rule is now the escape letter, so `"\xe9"` stays one byte and
+  `"\U0001F600"` stays four. Lexer unit tests pin all four families plus the
+  wide path (code points, not UTF-8).
+* **`_Float128` classification builtins** (`f128_classify_builtins.c`).
+  `__builtin_isnan(nan)` returned 0, `__builtin_isinf(inf)` returned 0 and
+  `__builtin_isfinite(inf)` returned 1 for binary128. Root cause: `_Float128`
+  and `long double` are both 16 bytes but different formats (binary128 in an
+  SSE register versus x87 extended in a memory slot), and `_Float128` reaches
+  the IR in a `U128` carrier, so the builtins either called the libc `__*l`
+  long-double classifiers or fell into the `f64` mask path. All seven
+  (`isnan`, `isinf`, `isfinite`, `isnormal`, `signbit`, `isinf_sign`,
+  `fpclassify`) are now computed from the raw 128-bit pattern with unsigned
+  128-bit operations: exact, libc-free, no FP conversion. `long double` keeps
+  its libc path (a different format) and was re-verified.
+* **`constructor`/`destructor` on a non-function** (`ctor_attr_on_object_is_ignored.c`,
+  was a crash). lccc honoured the attribute on any declaration, so
+  `void (*fp)(void) __attribute__((constructor)) = c;` emitted
+  `.init_array: .quad fp` — the address of a *data object* — and the loader
+  called it before `main`: **SIGSEGV, exit −11**, against GCC's 251. GCC
+  ignores the attribute there (`'constructor' attribute ignored`, which lccc
+  already diagnosed). Init/fini entries now require the declarator to declare a
+  function *and* that function to be defined in the translation unit, which
+  also fixes a dangling `.quad f` for a declared-but-undefined function that
+  GCC does not emit. Genuine constructors and destructors, including one whose
+  attribute is written on an earlier prototype, were re-verified.
+
+`_BitInt` (GP-06) stays open and is deliberately **not** half-implemented.
+Measured GCC 16.2 behaviour to build against: `__BITINT_MAXWIDTH__` is 65535;
+storage is the next power-of-two byte size (`sizeof(_BitInt(7))` = 1,
+`(17)` = 4, `(33)` = 8, `(65)` = 16, `(128)` = 16) with matching alignment;
+signed `_BitInt` requires a width of at least 2, unsigned may be 1. Doing it
+correctly means a new type kind across the whole tree (`src/common/types.rs`
+alone has 541 `CType::` references and exhaustive matches in sema, lowering and
+codegen), value wrapping at the declared width after every operation,
+promotion and conversion rules, ABI classification, `va_arg`, and constant
+folding. Mapping it onto the nearest standard integer type would *silently
+miscompile* every width that is not 8/16/32/64/128 bits, so the item stays a
+gap with a plan rather than a wrong answer: (1) `CType` bit-precise kind with
+size/alignment/promotion, (2) masked arithmetic and extension, (3) ABI and
+`va_arg`, (4) widths above 128 as a documented boundary.
+
+---
+
+## Current bounded update (2026-11-01, second pass)
+
+### 2.1 C23 named universal character escapes — `\N{NAME}` implemented
+
+Both oracles accept `\N{NAME}` (`\N{LATIN SMALL LETTER E WITH ACUTE}`). lccc
+did not *reject* it: it silently produced the literal text
+`4e 7b 4c 41 54 49 4e ... 7d` (`N{LATIN ...}`) where GCC 16.2 and Clang 23.1.4
+produce `c3 a9`. Silent wrong bytes for valid source, in every language mode,
+from the front of the pipeline — the worst class of defect in this campaign.
+
+Implemented as data + three decoders, not as a hash table:
+
+| Part | Content | Size in the binary |
+|---|---|---:|
+| `HEX_FAMILIES` | 8 prefixes + assigned ranges (`CJK UNIFIED IDEOGRAPH-`, `CJK COMPATIBILITY IDEOGRAPH-`, `TANGUT IDEOGRAPH-`, `KHITAN SMALL SCRIPT CHARACTER-`, `NUSHU CHARACTER-`, `EGYPTIAN HIEROGLYPH-`, `JURCHEN CHARACTER-`, `SMALL SEAL CHARACTER-`) | 126,285 code points, no per-name bytes |
+| `HANGUL_L/V/T` | 19 + 21 + 28 jamo names, composed as `HANGUL SYLLABLE <L><V><T>` | 11,172 code points, 67 short strings |
+| `NAMES_BLOB` + `BLOCK_FIRST_NAME` + `CODEPOINTS` | the remaining 35,351 names, sorted and front-coded against the previous name, binary-searched through a 16-entry block index | 317,038 B blob + 8,840 B index + 141,404 B code points |
+| **total** | **172,808 named code points** | **467,282 B** |
+
+For scale: the same names spelled out in one blob are 907,308 B (front coding
+removes 590,270 B), and a word dictionary measured 861,669 B of dictionary
+*alone* before any token stream — the rejected design. The exact count,
+172,808, is itself a check: it is the number of named code points in Unicode
+18.0.0.
+
+Correctness is not asserted, it is measured, at three levels:
+
+* **Exhaustive, in-tree (unit tests).** All 35,351 explicit names round-trip to
+  their code point; all 126,285 family names round-trip; all 11,172 Hangul
+  syllables round-trip; the blob is walked once to prove it is sorted, unique,
+  NUL-terminated and block-aligned. This is what found the one real bug in the
+  decoder: the destination-buffer bound was computed from the *previous* name's
+  length instead of the prefix length, so every name longer than its
+  predecessor was rejected (`... MAKSURA FINAL FORM` after `... ZAIN FINAL
+  FORM`). A sample-based test would have missed it; 35,351 names did not.
+* **Exhaustive, cross-compiler.** All 172,713 names that do not spell a basic
+  source character (Clang enforces C11 6.4.3p2 and refuses those 95) were
+  spelled into translation units, compiled and **run** by lccc and by each
+  oracle, and the emitted bytes compared: **identical to Clang 23.1.4 on all
+  160,439 names it accepts, and identical to GCC 16.2 on all 159,800 names it
+  accepts**.
+* **Differential, in CI.** `tests/regression/check_ucn_named_escapes.py`
+  re-decodes the checked-in table, samples 1,103 names (stride 41 through the
+  front-coded table, both ends of every assigned range of every family, a
+  stride through all Hangul syllables), compares the emitted bytes against
+  `gcc-16`, and then compares the *diagnostics* for eleven malformed cases.
+  Runtime ~1.4 s.
+
+Diagnostics were matched word for word against GCC, including the recovery GCC
+performs (`"\N{LATIN SMALL LETTER A"` reports `'\N{' not terminated with '}'
+after \N{LATIN SMALL LETTER A`, `\N` alone reports two errors, and `\N{BOGUS}`
+falls back to the stray-character path). In an identifier, `\N{...}` is
+rejected as a unit (`universal character \N{SNOWMAN} is not valid in an
+identifier`), which required teaching the identifier lexer the `\N` spelling
+rather than letting it report a stray backslash.
+
+Measured against the oracles:
+
+| Fact | Measurement |
+|---|---|
+| GCC 16.2's name table | rejects **13,008 of 172,713** names (7.5 %): 757 of the 35,351 explicit names -- `ALCHEMICAL SYMBOL FOR MOON-JUPITER` (Unicode 18) but also old ones such as `CUNEIFORM NUMERIC SIGN FOUR N18` -- plus **all** 914 `JURCHEN CHARACTER-` (Unicode 16) and **all** 11,328 `SMALL SEAL CHARACTER-` (Unicode 17) names, 6 Khitan characters, 2 Tangut ideographs and 1 CJK ideograph. |
+| Clang 23.1.4's name table | rejects **12,274 of 172,713** (7.1 %): all 914 Jurchen and all 11,328 Small Seal names (its family ranges are hardcoded and were not updated), plus the last 32 Tangut ideographs (`TANGUT IDEOGRAPH-187F8` ...). Its *explicit* names are complete, including Unicode 18. |
+| Who is right | Both oracles lag the Unicode data: `JURCHEN CHARACTER-18E00` and `SMALL SEAL CHARACTER-3D000` exist in Unicode 16 and 17. lccc accepts all 172,808 names of Unicode 18.0.0; the check script asserts that direction so the deviation cannot silently invert. |
+| Hex-family spelling | GCC accepts exactly four or five uppercase hex digits and pads a four-digit name to five with one leading zero (`...-04E00` is U+4E00) but rejects `...-004E00`. lccc reproduces that rule exactly (measured, not guessed) and the generator refuses any family that would need a sixth digit. |
+| Diagnostic wording | GCC quotes the whole escape (`'\N{CJK UNIFIED IDEOGRAPH-4e00}' is not a valid universal character`); Clang quotes the bare name (`'JURCHEN CHARACTER-18E00' is not a valid Unicode character name`). lccc follows **GCC**, whose wording the campaign contract pins. |
+| `-pedantic` | GCC warns `named universal character escapes are only valid in C++23` — the escape is a **C++23** feature that GCC and Clang also accept in C as an extension. lccc accepts it in every mode like they do; there is no `-pedantic` in lccc yet (GP-09). |
+| Warning channel | GCC's C front end does not use `-Wunicode` for rejected names, but it does warn `'\N{BOGUS}' is not a valid universal character; treating it as separate tokens` and continues. lccc's lexer has **no warning channel** (its `diagnostics` vector is error-only), so that one warning is missing while the same program is still rejected via `stray '\'`. New register item GP-25. |
+
+### 2.2 `_Float128` classification codegen — 200-byte frame to 88
+
+The classifier fix in the previous section was correct but naive: it built
+128-bit masks and compared them in memory. Rewritten as a two-64-bit-word
+split (`bits(U128)` -> `LShr 64` -> `Trunc`) so the exponent is
+`hi & 0x7FFF0000_0000_0000`, the mantissa is `(hi & 0xFFFF_FFFF_FFFF) | lo`,
+and every predicate is one 64-bit `and`/`or`/compare:
+
+| `int f(_Float128 x) { return __builtin_isnan(x); }` at `-O2` | before | after |
+|---|---|---|
+| stack frame | `subq $200` | `subq $88` |
+| arithmetic instructions | ~25 | 11 |
+| 128-bit arithmetic | yes (pairs of `andq`/`orq`/`xorq` on spilled `U128`) | none |
+
+The remaining 88-byte frame is the ABI register spill of the `_Float128`
+argument (`movdqu %xmm0, 32(%rsp)`), not the classifier. Verified against an
+independent IEEE-754 field-rule oracle (not against any compiler):
+`tests/regression/f128_classify_truth_table.c` builds 19 boundary patterns
+(+/-0, min/max subnormal, min normal, +/-1, +/-max finite, +/-inf, qNaN, sNaN,
+all-bits NaN, 2.0, 0.5, mantissa-hi/lo) from `U128(hi, lo)` halves and checks
+all seven builtins: **lccc PASS, GCC 16.2 PASS, Clang 23.1.4 PASS**
+(through `__float128`; Clang 23.1.4 does not implement the C23 spelling
+`_Float128` at all).
+
+### 2.3 New register items from this pass
+
+| ID | Class | Finding | Measurement |
+|---|---|---|---|
+| GP-25 | D — **fixed for literals** | The lexer had no warning channel: every `emit_lex_diag` was an error. It now records one ordered `Vec<Diagnostic>` of errors *and* warnings (§2.4); attribute diagnostics have their own path and are unaffected. GCC warns and continues for `'\N{BOGUS}' is not a valid universal character; treating it as separate tokens`, and several `-Wattributes` messages below are warnings with a specific wording. | One gap, no false verdicts: the program is rejected on both sides. |
+| GP-26 | D | C23 `[[...]]` attribute placement diagnostics. Measured matrix (lccc vs GCC 16.2, 24 cells): `[[gnu::X]]` after a function-pointer declarator — GCC `'X' attribute does not apply to types`, lccc silent or generic; `[[nodiscard]] int x;` — GCC `'nodiscard' attribute can only be applied to functions or to structure, union or enumeration types`, lccc generic `attribute ignored`; `void (*fp)(void) [[maybe_unused]]` — GCC warns, lccc silent; `[[gnu::foobar]]` — GCC `'gnu::foobar' scoped attribute directive ignored`, lccc drops the `gnu::` scope. | 8 of 24 cells differ, all diagnostics-only. |
+| GP-27 | D — **fixed** | `u8'\u00e9'`: GCC rejects (`character not encodable in a single code unit`), lccc accepted and yielded 233. Now rejected, and `u8` constants also refuse multi-character literals and source characters that need two code units. | 1 case → 5 cases in §2.4. |
+| GP-28 | F | `\uXXXX`/`\UXXXXXXXX` still do not enforce the C11 6.4.3p2 class rule in *literals* (lccc and GCC both accept `"\u0026"`; Clang errors). Kept as an explicit decision; the surrogate and out-of-codespace halves of the same clause **are** enforced now, with GCC's exact wording (§2.4). | 3 cases; matches GCC, so not a gap. |
+| GP-29 | D | A *string* literal above U+10FFFF (`"\U00110000"`): GCC warns `\U00110000 is outside the UCS codespace` and accepts, keeping generalized UTF-8 (`F4 90 80 80`); lccc rejects, because a string's payload is a Rust `String`. Character constants above U+10FFFF are fully supported. | 1 case; pinned in `check_char_literal_encoding.py`'s deviation table. |
+| GP-30 | D | Location of a string-literal escape-range warning: GCC points one past the literal's closing quote (`"\x1FF"` underlines the `;`), lccc points at the escape. Message text and severity match. | 4 cases, cosmetic. |
+
+### 2.4 Character constants: encoding, width and diagnostics
+
+A character constant is the one place in C where the literal's *type* decides
+what its text means, and lccc got three of those decisions wrong and reported
+none of the nine diagnostics GCC prints. Every number below was measured on this
+tree against gcc-16.2 (x86-64-linux-gnu); the before column is the
+`target/fastbuild/lccc` of `013983d`.
+
+Wrong values (silent, so a warning-only test would have missed all of them):
+
+| Literal | lccc before | GCC 16.2 (now matched) |
+|---|---|---|
+| `u'\U0001F600'` | `0xF600`, silent | `0xDE00` (the LOW SURROGATE) + `character not encodable in a single code unit` |
+| `u'\U00010000'` | `0x0000`, silent | `0xDC00` + the same warning |
+| `u'\U0010FFFF'` | `0xFFFF`, silent | `0xDFFF` + the same warning |
+| `u'ab'`, `U'ab'`, `L'ab'` | `0x61` (first character) | `0x62` (LAST character) + `multi-character literal cannot have an encoding prefix` |
+| `u'a\U0001F600'` | `0xF600` | `0xDE00` |
+| `u'\x100'` | `0x00` | `0x100` (a byte escape is clamped to the element width, 16 bits here) |
+| `'\U00110000'` | rejected | `F4 90 80 80` (generalized UTF-8) + `\U00110000 is outside the UCS codespace` |
+| `'\U00200000'` | rejected | `F8 88 80 80 80`, five characters, `multi-character literal with 5 characters exceeds 'int' size of 4 bytes` |
+
+Missing diagnostics (all nine are now emitted with GCC's exact wording, severity
+and *kind*, in GCC's order):
+
+| Literal | GCC 16.2 | Flags |
+|---|---|---|
+| `'ab'`, `'abcd'`, `'\u00e9'`, `'é'` | `multi-character character constant` | `-Wmultichar` (new registry entry, on by default; `-Wno-multichar` silenced it, `-Werror=multichar` promotes it — `-Wmultichar` was previously "tolerated but not implemented") |
+| `'abcde'` … `'abcdefgh'` | `multi-character literal with N characters exceeds 'int' size of 4 bytes` | none: `-Wno-multichar` does **not** silence it |
+| `''`, `u''`, `U''`, `L''`, `u8''` | `empty character constant` (error) | — |
+| `'\x100'`, `'\400'`, `u'\x10000'`, `U'\x100000000'`, `u8'\x100'` | `hex`/`octal escape sequence out of range` | none |
+| `u8'\u00e9'`, `u8'\U0001F600'`, `u8'é'` | `character not encodable in a single code unit` (**error**) | — |
+| `u8'ab'` | `multi-character literal cannot have an encoding prefix` (**error**) | — |
+| `u'\U00110000'` | `… is outside the UCS codespace` + `converting UCN to execution character set: Invalid or incomplete multibyte or wide character` (error) | — |
+| `'\uD800'`, `U'\UFFFFFFFF'` | `\uD800 is not a valid universal character` (error; previously `invalid universal character name U+D800`) | — |
+| `'\u12'`, `'\U1234'` | `incomplete universal character name \u12` (previously `universal character name expects 4 hex digits, got 2`) | — |
+
+The delimited C2y escapes (`\x{…}`, `\o{…}`, `\u{…}`) also follow GCC's
+lookahead model now: digits then `}` is a delimited escape, `{}` is
+`empty delimited escape sequence`, and anything else makes the braces ordinary
+characters after `'\x' used with no following hex digits` or the echoed
+`'\x{' not terminated with '}' after \x{4` (which is what `\o{8}`, `\o{7x}`
+and `\u{12z}` report). `\o` without its brace is `'\o' not followed by '{'`.
+
+Two pieces of machinery were needed. The lexer had **no warning channel** (GP-25):
+`emit_lex_diag` was error-only, so it now records one ordered
+`Vec<Diagnostic>` — errors and warnings alike — that the driver hands to the
+`DiagnosticEngine`, which owns `-W` selection, `-w`, `-Werror[=…]` and the
+system-header filter. One stream rather than two because GCC interleaves the
+severities by scan position: `u8'\xc3\xa9a'` warns about the escape range
+before it errors about the prefix, and `'\U00110000'` warns about the codespace
+before it warns about the character count — sorting by span gets both backwards.
+Second, the escape reader keeps each escape's *full numeric value*, because GCC
+decides what fits from the literal's width, not from the escape: `u'\x100'` is
+0x100 while `'\x100'` is 0 with the range warning.
+
+Evidence. `tests/regression/check_char_literal_encoding.py` is differential: it
+compiles and **runs** every case under both compilers and compares the value,
+`sizeof`, and the ordered `warning:`/`error:` stream — 343 checks over 120
+literals in {`c23`, `gnu23`, `gnu17`} (17 of them C23-only) plus five flag sets
+(`-Wno-multichar`, `-Werror=multichar`, `-w`, `-Werror` and a clean run), `0`
+differences, plus one pinned deviation (GP-29).
+Two further sweeps were run during the fix: 84 literals x 4 flag sets (336
+checks) and 420 randomly composed literals drawn from a prefix x content grammar
+over 31 atoms (raw ASCII, raw multibyte, simple/hex/octal/UCN/named/delimited
+escapes) — `0` differences in both. Nine new lexer unit tests pin the values and
+categories without needing the oracle, and two older lexer tests that asserted
+silence for `'\u00e9'` and `'\N{…}'` now assert the `-Wmultichar` warning GCC
+prints.
+
+Two documented deviations remain (GP-29, GP-30 in
+[backlog §12](../backlog.md#120-bounded-gp-01gp-24-sentinel-verdicts-2026-10-28)):
+a *string* literal above U+10FFFF (`"\U00110000"`) is rejected where GCC warns
+and accepts, because a string's payload is a Rust `String`; and the location
+GCC prints for a string-literal escape-range warning is one past the closing
+quote (measured), where lccc points at the escape. Character constants are at
+full parity, including the caret spans GCC underlines.
+
 ## Current bounded update (2026-10-28)
 
 The scorecard and prose below record the **2026-10-27** tree; they are not a

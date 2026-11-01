@@ -1236,6 +1236,21 @@ impl Driver {
         }
     }
 
+    /// Report everything the lexer recorded, in the order it recorded it.
+    ///
+    /// The lexer emits one ordered stream of [`crate::common::error::Diagnostic`]s
+    /// (errors and warnings alike) and cannot report them itself: warning
+    /// selection (`-Wmultichar`, `-Wno-…`, `-w`, `-Werror[=…]`), the
+    /// system-header filter and per-location dedupe live in the engine, which
+    /// needs the source manager the lexing phase was still building. Handing
+    /// them over in order keeps the output identical to GCC's, which also
+    /// interleaves the two severities as it scans.
+    fn emit_lexer_diagnostics(&self, lexer: &mut Lexer, diagnostics: &mut DiagnosticEngine) {
+        for diag in std::mem::take(&mut lexer.diagnostics) {
+            diagnostics.emit(&diag);
+        }
+    }
+
     fn run_syntax_only(&self) -> Result<(), String> {
         for input_file in &self.input_files {
             if Self::is_object_or_archive(input_file) {
@@ -1290,7 +1305,6 @@ impl Driver {
             lexer.set_gnu_extensions(self.gnu_extensions);
             lexer.set_c23(self.c23_dialect());
             let tokens = lexer.tokenize();
-            let lexer_diags = std::mem::take(&mut lexer.diagnostics);
 
             // Parse.
             let mut diagnostics = DiagnosticEngine::new();
@@ -1304,9 +1318,7 @@ impl Driver {
             // included; `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control it here
             // for the same reason they do there).
             self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
-            for (msg, span) in lexer_diags {
-                diagnostics.error(msg, span);
-            }
+            self.emit_lexer_diagnostics(&mut lexer, &mut diagnostics);
             let mut parser = Parser::new(tokens);
             parser.set_diagnostics(diagnostics);
             parser.set_c23(self.c23_dialect());
@@ -2311,7 +2323,6 @@ impl Driver {
         lexer.set_gnu_extensions(self.gnu_extensions);
         lexer.set_c23(self.c23_dialect());
         let tokens = lexer.tokenize();
-        let lexer_diags = std::mem::take(&mut lexer.diagnostics);
         if time_phases {
             eprintln!(
                 "[TIME] lex: {:.3}s ({} tokens)",
@@ -2331,9 +2342,7 @@ impl Driver {
         diagnostics.set_source_manager(source_manager);
         // Surface lexer diagnostics after the source manager is attached so
         // spans resolve to file:line:col.
-        for (msg, span) in lexer_diags {
-            diagnostics.error(msg, span);
-        }
+        self.emit_lexer_diagnostics(&mut lexer, &mut diagnostics);
         let mut parser = Parser::new(tokens);
         parser.set_diagnostics(diagnostics);
         parser.set_c23(self.c23_dialect());
