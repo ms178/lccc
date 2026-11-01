@@ -98,7 +98,7 @@ review obligations, and measured non-kernel variadic-home-save improvements.
 - Parser attribute placement and inherited conventions need further adversarial
   coverage, including post-asm attributes and typedef-derived declarations.
 - `-Wundef` now has evaluated-operand diagnostics, not option silencing.
-  The warning-precedence gate passes 75 GCC 16.2 differential cases, with
+  The warning-precedence gate passes 109 GCC 16.2 differential cases, with
   its 18 undef cases checked in compilation, preprocessing and syntax-only
   modes. The frozen kernel6 compiler predates this warning implementation;
   its warning stream is not claimed clean.
@@ -127,3 +127,21 @@ disabled. The record and Microsoft variadic gates also pass unchanged.
 These tests are not kernel runtime or code-size measurements. The running
 full6 build intentionally uses the frozen compiler and does not include this
 extension or the later warning changes.
+
+## Additional warning implementation
+
+`-Wmissing-prototypes` and `-Wmissing-declarations` now diagnose externally
+visible function definitions against explicit prior file-scope declarations.
+Implicit builtin knowledge and unrelated block-scope declarations do not
+silence them. Static/inline definitions, main, old-style declarations, prior
+prototypes and combined warning-leaf precedence are checked against GCC 16.2.
+The expanded gate passes 109 cases: 34 new declaration/prototype cases each in
+compilation and syntax-only modes, plus the previous warning cases. Actual
+i915 syntax-only compilation with its original kernel flags passes too.
+
+The driver core contract passes. A separately attempted full driver gate
+passed its 64-bit trapv matrix (910 expected traps, zero mismatches), but its
+32-bit leg failed because this sandbox lacks the required 32-bit libc headers.
+It is not counted as a full-driver pass. This does not relax hosted coverage.
+The full6 kernel compiler predates these diagnostics, so its tolerated-option
+warnings remain explicitly outstanding.

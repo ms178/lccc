@@ -11,6 +11,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = {
+    'prototype_missing': 'int f(void) { return 0; }\n',
+    'prototype_old': 'int f(); int f(void) { return 0; }\n',
+    'prototype_present': 'int f(void); int f(void) { return 0; }\n',
+    'prototype_static': 'static int f(void) { return 0; }\n',
+    'prototype_inherited_static': 'static int f(); int f(void) { return 0; }\n',
+    'prototype_inline': 'inline int f(void) { return 0; }\n',
+    'prototype_extern_inline': 'extern inline int f(void) { return 0; }\n',
+    'prototype_main': 'int main(void) { return 0; }\n',
+    'prototype_builtin': 'void *malloc(unsigned long n) { return (void*)0; }\n',
+    'prototype_nested': 'int outer(void); int outer(void) { int inner(void) { return 1; } return inner(); }\n',
+    'prototype_block': 'void g(void); void g(void) { extern int f(void); } int f(void) { return 0; }\n',
+
     'undef': '#if MISSING\nint x;\n#endif\nint y;\n',
     'undef_macro': '#define ALIAS MISSING\n#if ALIAS\n#endif\nint y;\n',
     'undef_short': '#if 0 && QUIET_A\n#endif\n#if 1 || QUIET_B\n#endif\nint y;\n',
@@ -32,6 +44,40 @@ FIXTURES = {
 }
 # name, source, dialect, options, leaf label, expected classification
 CASES = (
+    ('missing-prototypes-default', 'prototype_missing', 'gnu18', (), 'missing-prototypes', '-'),
+    ('missing-prototypes-groups', 'prototype_missing', 'gnu18', ('-Wall', '-Wextra'), 'missing-prototypes', '-'),
+    ('missing-prototypes-on', 'prototype_missing', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', 'W'),
+    ('missing-prototypes-error', 'prototype_missing', 'gnu18', ('-Werror=missing-prototypes',), 'missing-prototypes', 'E'),
+    ('missing-prototypes-off', 'prototype_missing', 'gnu18', ('-Wmissing-prototypes', '-Wno-missing-prototypes'), 'missing-prototypes', '-'),
+    ('missing-prototypes-demote', 'prototype_missing', 'gnu18', ('-Werror=missing-prototypes', '-Wno-error=missing-prototypes'), 'missing-prototypes', 'W'),
+    ('missing-prototypes-declared', 'prototype_present', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', '-'),
+    ('missing-prototypes-old', 'prototype_old', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', 'W'),
+    ('missing-prototypes-static', 'prototype_static', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', '-'),
+    ('missing-prototypes-inherited-static', 'prototype_inherited_static', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', 'W'),
+    ('missing-prototypes-inline', 'prototype_inline', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', '-'),
+    ('missing-prototypes-extern-inline', 'prototype_extern_inline', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', '-'),
+    ('missing-prototypes-main', 'prototype_main', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', '-'),
+    ('missing-prototypes-builtin', 'prototype_builtin', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', 'W'),
+    ('missing-prototypes-nested', 'prototype_nested', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', '-'),
+    ('missing-prototypes-block', 'prototype_block', 'gnu18', ('-Wmissing-prototypes',), 'missing-prototypes', 'W'),
+    ('missing-declarations-default', 'prototype_missing', 'gnu18', (), 'missing-declarations', '-'),
+    ('missing-declarations-groups', 'prototype_missing', 'gnu18', ('-Wall', '-Wextra'), 'missing-declarations', '-'),
+    ('missing-declarations-on', 'prototype_missing', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', 'W'),
+    ('missing-declarations-error', 'prototype_missing', 'gnu18', ('-Werror=missing-declarations',), 'missing-declarations', 'E'),
+    ('missing-declarations-off', 'prototype_missing', 'gnu18', ('-Wmissing-declarations', '-Wno-missing-declarations'), 'missing-declarations', '-'),
+    ('missing-declarations-demote', 'prototype_missing', 'gnu18', ('-Werror=missing-declarations', '-Wno-error=missing-declarations'), 'missing-declarations', 'W'),
+    ('missing-declarations-declared', 'prototype_present', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', '-'),
+    ('missing-declarations-old', 'prototype_old', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', '-'),
+    ('missing-declarations-static', 'prototype_static', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', '-'),
+    ('missing-declarations-inherited-static', 'prototype_inherited_static', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', '-'),
+    ('missing-declarations-inline', 'prototype_inline', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', '-'),
+    ('missing-declarations-extern-inline', 'prototype_extern_inline', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', '-'),
+    ('missing-declarations-main', 'prototype_main', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', '-'),
+    ('missing-declarations-builtin', 'prototype_builtin', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', 'W'),
+    ('missing-declarations-nested', 'prototype_nested', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', '-'),
+    ('missing-declarations-block', 'prototype_block', 'gnu18', ('-Wmissing-declarations',), 'missing-declarations', 'W'),
+    ('prototype-preferred', 'prototype_missing', 'gnu18', ('-Wmissing-prototypes', '-Wmissing-declarations'), 'missing-prototypes', 'W'),
+    ('declaration-suppressed', 'prototype_missing', 'gnu18', ('-Wmissing-prototypes', '-Wmissing-declarations'), 'missing-declarations', '-'),
     ('undef-default-off', 'undef', 'gnu23', (), 'undef', '-'),
     ('undef-wall-does-not-enable', 'undef', 'gnu23', ('-Wall', '-Wextra'), 'undef', '-'),
     ('undef-enabled', 'undef', 'gnu23', ('-Wundef',), 'undef', 'W'),
@@ -134,7 +180,7 @@ def main() -> int:
         src=Path(tmp)/'probe.c'
         obj=Path(tmp)/'probe.o'
         for label, fixture, dialect, flags, leaf, expected in CASES:
-            modes = ('-c', '-E', '-fsyntax-only') if leaf == 'undef' else ('-c',)
+            modes = ('-c', '-E', '-fsyntax-only') if leaf == 'undef' else (('-c', '-fsyntax-only') if leaf.startswith('missing-') else ('-c',))
             for mode in modes:
                 src.write_text(FIXTURES[fixture], encoding='utf-8')
                 results={}

@@ -100,6 +100,10 @@ pub enum WarningKind {
     Cpp,
     /// An evaluated #if/#elif operand names an undefined identifier.
     Undef,
+    /// An externally visible definition lacks a previous file-scope prototype.
+    MissingPrototypes,
+    /// An externally visible definition lacks a previous file-scope declaration.
+    MissingDeclarations,
     /// Control reaches end of non-void function, or non-void function does
     /// not return a value in all control paths.
     /// GCC flag: -Wreturn-type
@@ -275,6 +279,22 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "undefined preprocessor conditional identifier"
+    ),
+    warning!(
+        MissingPrototypes,
+        "missing-prototypes",
+        false,
+        [],
+        false,
+        "external function definition without a prior prototype"
+    ),
+    warning!(
+        MissingDeclarations,
+        "missing-declarations",
+        false,
+        [],
+        false,
+        "external function definition without a prior declaration"
     ),
     warning!(
         ReturnType,

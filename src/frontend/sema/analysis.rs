@@ -262,6 +262,10 @@ pub struct SemanticAnalyzer {
     /// block-scope declaration finds the nested entity it belongs to instead of
     /// writing through the shared basename.
     function_nesting_stack: Vec<String>,
+    /// Explicit file-scope function declarations: name -> has prototype.
+    /// Implicit library knowledge and declarations inside another function
+    /// must not silence missing-declaration warnings.
+    prior_file_function_decls: FxHashMap<String, bool>,
     /// Whether ordinary hosted-library builtin folds are disabled.
     no_builtins: bool,
     builtin_policy: crate::common::pass_policy::BuiltinFlags,
@@ -321,6 +325,7 @@ impl SemanticAnalyzer {
             typeof_seen: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             function_nesting_stack: Vec::new(),
+            prior_file_function_decls: FxHashMap::default(),
             no_builtins: false,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             pre_c99: false,
@@ -699,6 +704,28 @@ impl SemanticAnalyzer {
     }
 
     fn analyze_function_def_inner(&mut self, func: &FunctionDef) {
+        use crate::common::error::WarningKind;
+        let prior = self.prior_file_function_decls.get(&func.name).copied();
+        if func.name != "main" && !func.attrs.is_static() && !func.attrs.is_inline() {
+            let mut diagnostics = self.diagnostics.borrow_mut();
+            // GCC diagnoses only the more specific prototype condition when
+            // both leaves are enabled, including independent -Werror controls.
+            if !prior.unwrap_or(false)
+                && diagnostics.warning_enabled(WarningKind::MissingPrototypes)
+            {
+                diagnostics.warning_with_kind(
+                    format!("no previous prototype for '{}'", func.name),
+                    func.span,
+                    WarningKind::MissingPrototypes,
+                );
+            } else if prior.is_none() {
+                diagnostics.warning_with_kind(
+                    format!("no previous declaration for '{}'", func.name),
+                    func.span,
+                    WarningKind::MissingDeclarations,
+                );
+            }
+        }
         let calling_convention = self.function_definition_cc(func);
         let return_type = self.function_def_return_ctype(func);
         if func.is_kr {
@@ -1520,6 +1547,13 @@ impl SemanticAnalyzer {
 
             // Check if this is a function declaration (prototype)
             if let CType::Function(ref ft) = full_type {
+                if is_global {
+                    let entry = self
+                        .prior_file_function_decls
+                        .entry(init_decl.name.clone())
+                        .or_default();
+                    *entry |= ft.has_prototype;
+                }
                 let is_noreturn = init_decl.attrs.is_noreturn();
                 let prototype = ft.has_prototype.then(|| ft.as_ref().clone());
                 // A declaration inside a function body describes that body's view of
