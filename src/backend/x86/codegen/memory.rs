@@ -2945,6 +2945,24 @@ impl X86Codegen {
         if is_xmm_reg(x) {
             return false;
         }
+        // SOUNDNESS — the sibling law. Every other symbol+index fold in this
+        // file (`indexed_sym_operand`, `emit_load_indexed_impl`, and the
+        // register-offset pair `emit_load_indexed_sym_reg_base_impl` /
+        // `emit_store_indexed_sym_reg_base_impl`) normalises the index through
+        // `ensure_sib_index_form` before it reaches a SIB. A SIB consumes the
+        // FULL 64-bit register, so a narrow index — the I32 byte offset from
+        // `int *p; p + i`, a U16 element index, a packed-bit lane — whose home
+        // is canonical only in its low half would address with garbage above
+        // bit 31, and a STALE home would address with an already-clobbered
+        // value. This arm did neither: the same GEP shape therefore lowered
+        // correctly through the load arm and incorrectly through the LEA arm,
+        // which is the symptom class the function's own `value_types` lookup
+        // exists to prevent. Refusing falls back to `emit_gep`, whose
+        // register-offset path reloads the index through the sext-aware
+        // operand machinery.
+        if !self.ensure_sib_index_form(index) {
+            return false;
+        }
         let index_name = phys_reg_name(x);
         let mem = if self.state.pic_mode {
             self.state
@@ -5053,11 +5071,76 @@ mod indexed_fold_contract_tests {
         }
     }
 
+    // ── the LEA half of the symbol+index fold obeys the same index law ─────
+
+    /// Every symbol+index SIB consumes the index's FULL register, so the LEA
+    /// arm must extend a narrow index in place exactly as the load and store
+    /// arms do. This test would have passed on the load arm and failed here
+    /// before the guard was added: the same GEP lowered two different ways.
+    #[test]
+    fn leaq_sym_index_extends_a_narrow_index_before_the_sib() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(3, PhysReg(4)); // %r14 as the index home
+        cg.reg_assignments.insert(4, PhysReg(1)); // %rbx as the dest home
+        cg.value_types.insert(3, IrType::I32);
+        assert!(
+            cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 2, 0),
+            "a narrow index must be extended, not refused"
+        );
+        let buf = &cg.state.out.buf;
+        assert!(
+            buf.contains("movslq %r14d, %r14"),
+            "I32 index must be sign-extended into its 64-bit form, got: {buf:?}"
+        );
+        assert!(
+            buf.contains("leaq scratch(, %r14, 4), %rbx"),
+            "the SIB must consume the extended index, got: {buf:?}"
+        );
+    }
+
+    /// A 64-bit index needs no extension, so the fold costs exactly one LEA —
+    /// the guard must not make the common shape pay for the rare one.
+    #[test]
+    fn leaq_sym_index_leaves_a_64_bit_index_alone() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(3, PhysReg(4));
+        cg.reg_assignments.insert(4, PhysReg(1));
+        cg.value_types.insert(3, IrType::I64);
+        assert!(cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 0, 8));
+        let buf = &cg.state.out.buf;
+        assert!(!buf.contains("movslq"), "no extension for a 64-bit index: {buf:?}");
+        assert!(
+            buf.contains("leaq scratch+8(, %r14), %rbx"),
+            "one LEA with the displacement, got: {buf:?}"
+        );
+    }
+
+    /// The raw `reg_assignments` lookup this arm used bypassed the freshness
+    /// refusal every sibling applies: a clobbered home must make the fold
+    /// refuse, so `emit_gep` reloads the index from its stack home instead of
+    /// addressing through a value the register no longer holds.
+    #[test]
+    fn leaq_sym_index_refuses_a_stale_index_home() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(3, PhysReg(4));
+        cg.reg_assignments.insert(4, PhysReg(1));
+        cg.value_types.insert(3, IrType::I64);
+        cg.home_clobbered.insert(3);
+        assert!(
+            !cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 0, 0),
+            "a clobbered index home must not feed a SIB"
+        );
+        assert!(
+            cg.state.out.buf.is_empty(),
+            "a refusal must emit nothing, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+
     // ── the emitter half: D32/D64 reach the SSE arms width-exactly ─────────
 
     #[test]
-    fn d32_indexed_load_and_store_move_like_f32() {
-        // Load: dest homed in an XMM register, value lands there width-exactly.
+    fn d32_indexed_load_and_store_move_like_f32() {        // Load: dest homed in an XMM register, value lands there width-exactly.
         let mut cg = X86Codegen::new();
         xmm_home(&mut cg, 100);
         assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 2, IrType::D32, mem4()));
