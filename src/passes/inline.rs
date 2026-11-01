@@ -11088,20 +11088,22 @@ mod param_home_tests {
     #[test]
     fn a_deleted_home_is_synthesized_not_taken_from_a_later_temporary() {
         for record in [vec![Value(0)], Vec::new()] {
-            deleted_home_case(record);
+            for param_value in [1, 115] {
+                deleted_home_case(record.clone(), param_value);
+            }
         }
     }
 
-    fn deleted_home_case(record: Vec<Value>) {
+    fn deleted_home_case(record: Vec<Value>, param_value: u32) {
         let body = vec![
             Instruction::ParamRef {
-                dest: Value(1),
+                dest: Value(param_value),
                 param_idx: 0,
                 ty: IrType::I32,
             },
             alloca(2, IrType::Ptr, 8),
             Instruction::Store {
-                val: Operand::Value(Value(1)),
+                val: Operand::Value(Value(param_value)),
                 ptr: Value(2),
                 ty: IrType::I32,
                 seg_override: AddressSpace::Default,
@@ -11208,6 +11210,32 @@ mod param_home_tests {
             2,
             "the same-typed local and the fresh parameter home stay distinct"
         );
+    }
+
+    #[test]
+    fn a_recorded_home_with_the_wrong_abi_shape_is_rejected() {
+        let f = callee(
+            "wrong_shape",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, IrType::Ptr, 8),
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 0,
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            )],
+            vec![Value(0)],
+            2,
+        );
+        let mut module = IrModule::new();
+        module.functions.push(f);
+        let map = build_callee_map(&module);
+        let data = &map["wrong_shape"];
+        assert!(inlined_param_homes(data, &data.blocks, 0).is_none());
     }
 
     /// A recorded home behind a non-alloca is hoisted ahead of the bridge.

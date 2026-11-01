@@ -2672,6 +2672,7 @@ fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<I
         &[],
         &[],
         &[],
+        &[],
     )
 }
 
@@ -9258,6 +9259,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("the truncated negate of an extension must fold");
         assert!(
@@ -9300,7 +9302,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                &[]
+                &[],
+                &[],
             )
             .is_none(),
             "widening the negate must not fold to a narrow negate"
@@ -9334,7 +9337,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                &[]
+                &[],
+                &[],
             )
             .is_none(),
             "the 32 -> 16 shape must stay put"
@@ -9367,7 +9371,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                &[]
+                &[],
+                &[],
             )
             .is_none(),
             "an extension from a different width must stay put"
@@ -9417,6 +9422,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("the truncated complement of an extension must fold");
         assert!(
@@ -9461,6 +9467,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
             )
             .is_none(),
             "a widening cast must keep the wide complement"
@@ -9495,6 +9502,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
             )
             .is_none(),
             "an extension from a different width must stay put"
@@ -9523,6 +9531,7 @@ mod tests {
             &direct_not,
             &[],
             &wide,
+            &[],
             &[],
             &[],
         )
