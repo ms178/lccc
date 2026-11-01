@@ -410,6 +410,10 @@ jobs:
           echo '== tested compiler =='
           sha256sum target/fastbuild/lccc target/fastbuild/lccc-ld
         } | tee ci-regression-environment.txt
+    - name: Diagnose i686 small-vector runtime failures
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/trace_vector_small_packed_wrappers_m32.sh
     - name: Run regression corpus with SSA validation
       env:
         CCC_VALIDATE_SSA: '1'
@@ -1149,6 +1153,14 @@ jobs:
         python3 tests/regression/check_qualifier_conversions.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
         python3 tests/regression/test_qualifier_gate.py
+        # Guard the newly added i686 ABI and optimizer contracts in hosted CI,
+        # not only in ci_local.sh.
+        python3 tests/regression/check_call_arg_staging.py \
+          --lccc target/fastbuild/lccc --seed-list 1,2,3,4,5,6,11,14,16,26,30
+        python3 tests/regression/check_licm_global_speculation.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_return_local_addr.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16 --m32
         python3 tests/regression/check_qualifier_composition.py \
           --lccc target/fastbuild/lccc --lccc target/fastbuild/lccc-i686 \
           --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
@@ -1764,6 +1776,13 @@ jobs:
       env:
         LCCC_CROSS_DEB_DIR: /home/runner/.cache/lccc-cross-debs
       run: bash scripts/ci_provision_cross.sh
+    - name: Cache GNU ld 2.47 for RISC-V relaxation
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/bfd-ld-2.47-riscv64-linux-gnu
+        key: ${{ runner.os }}-bfd-ld-2.47-riscv64-${{ hashFiles('scripts/ensure_riscv_ld_247.sh', 'scripts/ensure_gas_247.sh') }}
+    - name: Install GNU ld 2.47 for the RISC-V relaxation oracle
+      run: bash scripts/ensure_riscv_ld_247.sh
     - name: Cache Clang 23 oracle
       uses: actions/cache@v6
       with:
@@ -1798,6 +1817,8 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Check RISC-V relaxation against pinned BFD
+      run: python3 tests/regression/check_riscv_relax_bfd.py --require
     - name: Execute switch and memory contracts on AArch64 and RISC-V
       run: python3 tests/regression/check_switch_cross_execute.py
     - name: Run destructive-path guard regression
