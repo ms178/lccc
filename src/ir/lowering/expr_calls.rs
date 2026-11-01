@@ -2097,7 +2097,8 @@ impl Lowerer {
                     }
                     let is_pure = self.pure_functions.contains(name.as_str());
                     let is_const = self.const_functions.contains(name.as_str());
-                    let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
+                    let call_ret_is_f128_sse =
+                        ret_abi.one_xmm || sig.is_some_and(|s| s.ret_is_f128_sse);
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {
@@ -2243,7 +2244,8 @@ impl Lowerer {
                     }
                     let is_pure = self.pure_functions.contains(call_name.as_str());
                     let is_const = self.const_functions.contains(call_name.as_str());
-                    let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
+                    let call_ret_is_f128_sse =
+                        ret_abi.one_xmm || sig.is_some_and(|s| s.ret_is_f128_sse);
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {

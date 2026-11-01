@@ -688,7 +688,9 @@ impl SemanticAnalyzer {
         };
         let record_size =
             |ct: &CType| ct.size_ctx(&*self.result.type_context.borrow_struct_layouts());
-        let supported_return = supported(ret) || (ret.is_struct_or_union() && record_size(ret) > 0);
+        let supported_return = supported(ret)
+            || matches!(ret, CType::Int128 | CType::UInt128)
+            || (ret.is_struct_or_union() && record_size(ret) > 0);
         let supported_parameter =
             |ct: &CType| supported(ct) || (ct.is_struct_or_union() && record_size(ct) > 0);
         if !supported_return || params.iter().any(|(ct, _)| !supported_parameter(ct)) {

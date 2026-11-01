@@ -1614,42 +1614,50 @@ impl Lowerer {
         // Compute SysV eightbyte classification for two-register struct returns.
         // _Float128 returns are 16-byte SSE-class values (SysV psABI): ONE XMM
         // register (xmm0).
-        let mut ret_is_f128_sse = full_ret_ctype.is_half_float();
-        let ret_eightbyte_classes =
-            if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
-                ret_is_f128_sse = true;
-                vec![
-                    crate::common::types::EightbyteClass::Sse,
-                    crate::common::types::EightbyteClass::Sse,
-                ]
-            } else if let Some(classes) = crate::common::types::target_is_32bit()
-                .then(|| full_ret_ctype.i686_ext_vector_ret_carrier())
-                .flatten()
-                .map(|(_, classes)| classes)
-                .filter(|classes| !classes.is_empty())
-            {
-                // i686 carrier markers (x86-64 uses real eightbytes): three
-                // INTEGER classes encode the EAX:EDX:ECX lane-word bundle,
-                // `[Sse, SseUp]` a vector returned in %xmm0.
-                classes
-            } else if let Some(abi) = ret_aggregate_abi.as_ref().filter(|a| !a.classes.is_empty()) {
-                // x86-64 register return of an aggregate, any size up to 16:
-                // the psABI classes (`[Sse, SseUp]` = ONE %xmm0).
-                ret_is_f128_sse = abi.one_xmm;
-                abi.classes.clone()
-            } else if two_reg_ret_size.is_some() && ptr_count == 0 {
-                if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
-                    if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
-                        layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
-                    } else {
-                        Vec::new()
-                    }
+        let ms_integer128_return = matches!(full_ret_ctype, CType::Int128 | CType::UInt128)
+            && self.sema_functions.get(name).is_some_and(|f| {
+                f.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+            });
+        let mut ret_is_f128_sse = full_ret_ctype.is_half_float() || ms_integer128_return;
+        let ret_eightbyte_classes = if ms_integer128_return {
+            vec![
+                crate::common::types::EightbyteClass::Sse,
+                crate::common::types::EightbyteClass::SseUp,
+            ]
+        } else if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
+            ret_is_f128_sse = true;
+            vec![
+                crate::common::types::EightbyteClass::Sse,
+                crate::common::types::EightbyteClass::Sse,
+            ]
+        } else if let Some(classes) = crate::common::types::target_is_32bit()
+            .then(|| full_ret_ctype.i686_ext_vector_ret_carrier())
+            .flatten()
+            .map(|(_, classes)| classes)
+            .filter(|classes| !classes.is_empty())
+        {
+            // i686 carrier markers (x86-64 uses real eightbytes): three
+            // INTEGER classes encode the EAX:EDX:ECX lane-word bundle,
+            // `[Sse, SseUp]` a vector returned in %xmm0.
+            classes
+        } else if let Some(abi) = ret_aggregate_abi.as_ref().filter(|a| !a.classes.is_empty()) {
+            // x86-64 register return of an aggregate, any size up to 16:
+            // the psABI classes (`[Sse, SseUp]` = ONE %xmm0).
+            ret_is_f128_sse = abi.one_xmm;
+            abi.classes.clone()
+        } else if two_reg_ret_size.is_some() && ptr_count == 0 {
+            if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
+                if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
+                    layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                 } else {
                     Vec::new()
                 }
             } else {
                 Vec::new()
-            };
+            }
+        } else {
+            Vec::new()
+        };
 
         // A K&R definition needs the declared body types before default
         // promotions. A prototype declaration instead needs its callable

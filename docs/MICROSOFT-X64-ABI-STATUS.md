@@ -12,6 +12,9 @@ including typedefs, function pointers, composite types and indirect calls.
   hidden return pointers otherwise, and 16-byte-aligned caller-owned copies
   for indirect arguments. Callee copies read exactly the object bytes without
   clobbering uncaptured incoming argument registers.
+- Signed/unsigned integer128 returns use the GNU Microsoft ABI single-XMM0
+  carrier while retaining integer128 semantic IR types. Fixed integer128
+  arguments remain rejected.
 - Floating-point return and variadic callers, including GP duplicates of FP
   register arguments. Microsoft variadic definitions use GP home slots and
   eight-byte char-pointer cursors, separate from the 24-byte SysV va_list
@@ -87,8 +90,9 @@ review obligations, and measured non-kernel variadic-home-save improvements.
   including FP-field integer carriers, hidden return pointers, register/stack
   indirect parameters and mutation isolation of caller-owned copies. The tested
   executable is `/home/user/compiler-next/lccc`, not the running kernel compiler.
-- Fixed wide scalar and complex/vector ABI signatures, and LCCC wide
-  variadic callers, still require implementation; these remain rejected.
+- Fixed wide scalar arguments, wide returns other than integer128,
+  complex/vector ABI signatures and LCCC wide variadic callers still require
+  implementation; these remain rejected.
   Fetching those payloads in Microsoft variadic definitions is separately
   tested and does not remove that guard.
 - Parser attribute placement and inherited conventions need further adversarial
@@ -110,3 +114,16 @@ review obligations, and measured non-kernel variadic-home-save improvements.
 - A complete kernel link, QEMU boot and green hosted CI remain required before
   production readiness. No full-kernel success or performance improvement is
   asserted by the scalar tests.
+
+## Integer128 return extension
+
+The existing `check_ms_abi.sh` gate also checks 25 full-width signed/unsigned
+bit patterns at O0/O2/Os against non-kernel GCC 16.2 oracle objects. Direct and
+volatile indirect returns, callback parameters, dereferenced and computed
+function pointers, mixed GP/FP register and overflow arguments,
+Microsoft-to-Microsoft and SysV crossings, and Microsoft
+variadic definitions are covered. Return emission fails closed when SSE is
+disabled. The record and Microsoft variadic gates also pass unchanged.
+These tests are not kernel runtime or code-size measurements. The running
+full6 build intentionally uses the frozen compiler and does not include this
+extension or the later warning changes.

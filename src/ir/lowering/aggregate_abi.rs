@@ -239,6 +239,16 @@ impl Lowerer {
                     let size = self.resolve_ctype_size(&ct);
                     self.aggregate_return(&ct, size, self.callee_calling_convention(callee))
                 }
+                Some(CType::Int128 | CType::UInt128)
+                    if self.callee_calling_convention(callee)
+                        == CallingConvention::MicrosoftX64 =>
+                {
+                    AggregateReturn {
+                        one_xmm: true,
+                        classes: vec![EightbyteClass::Sse, EightbyteClass::SseUp],
+                        ..AggregateReturn::default()
+                    }
+                }
                 Some(ct) if ct.is_half_float() => AggregateReturn {
                     one_xmm: true,
                     ..AggregateReturn::default()
