@@ -1,0 +1,106 @@
+{
+ "level": "-O2",
+ "files": 3118,
+ "shorter": [
+  [
+   "tests/regression/cfi_unwind/unwind.c",
+   257,
+   260
+  ],
+  [
+   "tests/regression/cmp_replay.c",
+   96,
+   99
+  ],
+  [
+   "tests/regression/fixtures/riscv-volatile/probe.c",
+   179,
+   180
+  ],
+  [
+   "tests/regression/fnptr_param_assign.c",
+   32,
+   34
+  ],
+  [
+   "tests/regression/fnptr_result_shadows_void_function.c",
+   209,
+   216
+  ],
+  [
+   "tests/regression/fnptr_return_declarator.c",
+   40,
+   43
+  ],
+  [
+   "tests/regression/gnu89_extern_inline_redef_alias.c",
+   60,
+   63
+  ],
+  [
+   "tests/regression/i686_double_param_high_word.c",
+   51,
+   63
+  ],
+  [
+   "tests/regression/i686_gep_fold_reg_base.c",
+   53,
+   56
+  ],
+  [
+   "tests/regression/i686_over_aligned_struct_arg.c",
+   369,
+   370
+  ],
+  [
+   "tests/regression/nested_functions.c",
+   353,
+   356
+  ],
+  [
+   "tests/regression/os_nested_loop_transitive_inline.c",
+   117,
+   120
+  ],
+  [
+   "tests/regression/os_postinline_size_policy.c",
+   193,
+   195
+  ],
+  [
+   "tests/regression/push_rsp_leaq_dedup.c",
+   98,
+   101
+  ],
+  [
+   "tests/regression/unroll_const4_ptr_walk.c",
+   25,
+   28
+  ],
+  [
+   "tests/regression/unroll_const4_tri.c",
+   29,
+   32
+  ],
+  [
+   "tests/regression/unroll_const4_volatile_ok.c",
+   15,
+   18
+  ],
+  [
+   "tests/regression/verify_ir_bitfield_record.c",
+   66,
+   69
+  ],
+  [
+   "engineering/evidence/2026-11-01-predicate-materialization/predicate-materialize.c",
+   206,
+   248
+  ]
+ ],
+ "same": 1217,
+ "longer": [],
+ "both_reject": 1882,
+ "verdict": [],
+ "net_delta": -103
+}

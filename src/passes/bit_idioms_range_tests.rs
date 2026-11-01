@@ -196,7 +196,7 @@ fn both_crc_callers_fail_closed_for_ambiguous_dependencies() {
                 let mut f = crc(Some(duplicate), cast_form, bounded_last);
                 let before = format!("{:?}", f.blocks);
                 assert_eq!(
-                    recognize_function(&mut f, false, 64, 8, false, true),
+                    recognize_function(&mut f, false, 64, 8, false, true, true),
                     0,
                     "cast={cast_form} duplicate={duplicate} bounded_last={bounded_last}"
                 );
@@ -204,7 +204,7 @@ fn both_crc_callers_fail_closed_for_ambiguous_dependencies() {
             }
         }
         let mut positive = crc(None, cast_form, false);
-        assert!(recognize_function(&mut positive, false, 64, 8, false, true) > 0);
+        assert!(recognize_function(&mut positive, false, 64, 8, false, true, true) > 0);
         assert!(matches!(
             positive.blocks[0].instructions[4],
             Instruction::BinOp {
