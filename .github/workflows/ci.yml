@@ -2293,10 +2293,10 @@ jobs:
     # steps are a partition: tests/regression/check_ci_shard_partition.py
     # fails if a gate appears in both, disappears from both, or reappears in a
     # third step.
-    # lane-split: 87 of 191 independent gate invocations from the
+    # lane-split: 89 of 193 independent gate invocations from the
     # lane-split: single step that used to run them all in sequence, assigned by
-    # lane-split: longest-processing-time over measured per-gate cost (438 s of
-    # lane-split: 875 s). The shards are a partition:
+    # lane-split: longest-processing-time over measured per-gate cost (440 s of
+    # lane-split: 878 s). The shards are a partition:
     # lane-split: tests/regression/check_ci_shard_partition.py fails if a gate appears in
     # lane-split: both, disappears from both, or reappears in a third step, and
     # lane-split: tests/regression/check_ci_lane_plan.py fails if a shard drifts from
@@ -2512,6 +2512,18 @@ jobs:
         # and the -fwrapv INT_MIN contract.  Mirrored in
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_iabs_cmp_fold.sh
+        # Lowest-set-bit recognition (1 << Ctz(y) -> y & -y with the exact
+        # y == 0 arm) and the `0 - x` -> Neg canonicalisation: emitted shapes,
+        # kill-switch ownership (CCC_NO_LOWEST_SET_BIT / zeroneg) and -O0/-O2/
+        # -O3 agreement over every boundary value.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_lowest_set_bit_fold.sh
+        # The narrow negate: `(T)(-(W)(T)v)` is `-(T)v` (the extension dies in
+        # the truncation) and `0 - x` is a `Neg`.  Pins the emitted shapes, the
+        # CCC_SIMPLIFY_SKIP=negcast/zeroneg ownership, the widening and float
+        # controls, and bit-exact -O0..-O3 agreement over every 8/16-bit input.
+        # Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_narrow_negate_fold.sh
         # Predicate differences and ranges: difference compares, interval and
         # membership tests, sign-magnitude selects, five near-miss controls.
         python3 tests/regression/check_predicate_differences_and_ranges.py
