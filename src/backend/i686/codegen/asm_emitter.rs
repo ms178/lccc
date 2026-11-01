@@ -5,7 +5,7 @@
 //! calling conventions (cdecl, ILP32).
 
 use super::emit::I686Codegen;
-use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
+use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter, RegView};
 use crate::backend::state::CodegenState;
 use crate::common::types::IrType;
 use crate::emit;
@@ -297,6 +297,86 @@ impl InlineAsmEmitter for I686Codegen {
             // All registers excluded — return empty to signal spill-to-memory.
             String::new()
         }
+    }
+
+    /// Allocate for an operand the template prints through a byte view, or for
+    /// a byte-typed operand (which i686 prints in its byte form by default), or
+    /// for a `=@cc` output (which `setCC` must write through an 8-bit name).
+    ///
+    /// IA-32 has four byte-addressable registers and nothing else: `sil`,
+    /// `dil`, `bpl` and `r8b`-`r15b` are REX encodings that exist only in
+    /// 64-bit mode, so `esi`, `edi` and `ebp` have no 8-bit view under any
+    /// name. The general pool is `["ecx", "edx", "esi", "edi", "eax", "ebx"]`,
+    /// so the third byte-printed operand used to be handed `esi`: `reg_to_8l`
+    /// has no 32-bit byte name for it and passes the name through unchanged,
+    /// the template printed `%esi`, and the assembler rejected the line
+    /// outright. GCC's i386 port never makes that choice -- it restricts a
+    /// byte operand to `eax`/`ebx`/`ecx`/`edx` up front, which is what this
+    /// does.
+    ///
+    /// The order inside the four mirrors the general pool's policy: `ecx`/`edx`
+    /// are pure caller-saved scratch, `eax` is the accumulator that several
+    /// emitters use as an implicit operand, and `ebx` is `-fPIC`-reserved.
+    fn assign_scratch_reg_for_view(
+        &mut self,
+        kind: &AsmOperandKind,
+        operand_type: IrType,
+        view: RegView,
+        excluded: &[String],
+    ) -> String {
+        const BYTE_GP: &[&str] = &["ecx", "edx", "eax", "ebx"];
+        // FP/SIMD and x87 operands have their own register files: the byte
+        // question does not apply to them.
+        let uniform_file = matches!(
+            kind,
+            AsmOperandKind::FpReg | AsmOperandKind::X87St0 | AsmOperandKind::X87St1
+        );
+        let needs_byte = view != RegView::Full
+            || matches!(operand_type, IrType::I8 | IrType::U8)
+            || matches!(kind, AsmOperandKind::ConditionCode(_));
+        if uniform_file || !needs_byte {
+            return self.assign_scratch_reg(kind, excluded);
+        }
+        // Two passes, like `assign_scratch_reg`: registers that are not RA homes
+        // first, RA homes only when every candidate is taken -- taking a home
+        // forces the value to be spilled around the asm.
+        for allow_ra_home in [false, true] {
+            for &reg_name in BYTE_GP {
+                // The GOT is a backend-owned live value, not an SSA RA home;
+                // generic asm scratch honours the same reservation as RA.
+                if self.pic_got_live && reg_name == "ebx" {
+                    continue;
+                }
+                if excluded.iter().any(|e| e == reg_name) {
+                    continue;
+                }
+                let in_ra = self
+                    .reg_assignments
+                    .values()
+                    .any(|&p| super::emit::phys_reg_name(p) == reg_name);
+                if in_ra != allow_ra_home {
+                    continue;
+                }
+                return reg_name.to_string();
+            }
+        }
+        // More byte-printed operands than IA-32 has byte-addressable registers.
+        // GCC rejects such a program with `impossible constraint in 'asm'`;
+        // this layer has no diagnostic channel, so the general allocator is the
+        // best remaining answer -- whatever it returns, the assembler rejects
+        // the unaddressable name, so the outcome is a build error rather than
+        // silently wrong code. IA-32 encodes at most four byte operands, so no
+        // valid program reaches this.
+        self.assign_scratch_reg(kind, excluded)
+    }
+
+    /// A register home is only reusable for an operand printed through a byte
+    /// view -- explicitly, or by the type default -- when it has a byte view of
+    /// its own.
+    fn home_reg_usable_for_view(&self, home: &str, view: RegView, operand_type: IrType) -> bool {
+        const BYTE_GP: &[&str] = &["ecx", "edx", "eax", "ebx"];
+        let needs_byte = view != RegView::Full || matches!(operand_type, IrType::I8 | IrType::U8);
+        !needs_byte || BYTE_GP.contains(&home)
     }
 
     fn load_input_to_reg(
@@ -953,6 +1033,100 @@ impl I686Codegen {
             IrType::I8 | IrType::U8 => Self::reg_to_8l(reg),
             IrType::I16 | IrType::U16 => Self::reg_to_16(reg),
             _ => Self::reg_to_32(reg),
+        }
+    }
+}
+
+#[cfg(test)]
+mod reg_view_tests {
+    use super::*;
+
+    /// The only IA-32 registers that have an 8-bit name: `al`, `bl`, `cl` and
+    /// `dl`. `esi`/`edi`/`ebp` never do -- `sil`/`dil`/`bpl` are REX encodings
+    /// that exist in 64-bit mode only.
+    const BYTE_GP: &[&str] = &["ecx", "edx", "eax", "ebx"];
+
+    /// Allocate for four operands in a row, excluding each register before
+    /// asking for the next one -- the maximum IA-32 can serve.
+    fn allocate_four(
+        cg: &mut I686Codegen,
+        kind: &AsmOperandKind,
+        ty: IrType,
+        view: RegView,
+    ) -> Vec<String> {
+        let mut excluded: Vec<String> = Vec::new();
+        for _ in 0..BYTE_GP.len() {
+            let reg = cg.assign_scratch_reg_for_view(kind, ty, view, &excluded);
+            excluded.push(reg);
+        }
+        excluded
+    }
+
+    #[test]
+    fn byte_viewed_operands_stay_inside_the_byte_register_file() {
+        for ty in [IrType::I8, IrType::U8, IrType::I32, IrType::I64] {
+            for view in [RegView::Byte, RegView::HighByte] {
+                let mut cg = I686Codegen::new();
+                for reg in allocate_four(&mut cg, &AsmOperandKind::GpReg, ty, view) {
+                    assert!(BYTE_GP.contains(&reg.as_str()), "{ty:?} {view:?}: {reg}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn byte_typed_operands_stay_inside_the_byte_register_file() {
+        // `i686_default_modifier_for_type` prints an `I8`/`U8` operand through
+        // its byte name, so the type alone demands a byte-addressable register.
+        for ty in [IrType::I8, IrType::U8] {
+            let mut cg = I686Codegen::new();
+            for reg in allocate_four(&mut cg, &AsmOperandKind::GpReg, ty, RegView::Full) {
+                assert!(BYTE_GP.contains(&reg.as_str()), "{ty:?}: {reg}");
+            }
+        }
+    }
+
+    #[test]
+    fn condition_code_outputs_stay_inside_the_byte_register_file() {
+        // `store_condition_code_output` writes the boolean with `setCC` through
+        // the register's byte name.
+        let mut cg = I686Codegen::new();
+        let kind = AsmOperandKind::ConditionCode("e".to_string());
+        for reg in allocate_four(&mut cg, &kind, IrType::I8, RegView::Full) {
+            assert!(BYTE_GP.contains(&reg.as_str()), "cc output: {reg}");
+        }
+    }
+
+    #[test]
+    fn full_width_operands_still_reach_the_whole_register_file() {
+        let mut cg = I686Codegen::new();
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..6 {
+            let reg = cg.assign_scratch_reg_for_view(
+                &AsmOperandKind::GpReg,
+                IrType::I32,
+                RegView::Full,
+                &[],
+            );
+            seen.push(reg);
+        }
+        for reg in ["eax", "esi", "edi", "ebx"] {
+            assert!(seen.iter().any(|s| s == reg), "{reg} missing from {seen:?}");
+        }
+    }
+
+    #[test]
+    fn only_byte_addressable_homes_serve_byte_operands() {
+        let cg = I686Codegen::new();
+        for &home in BYTE_GP {
+            assert!(cg.home_reg_usable_for_view(home, RegView::Byte, IrType::I32));
+            assert!(cg.home_reg_usable_for_view(home, RegView::HighByte, IrType::I32));
+        }
+        for home in ["esi", "edi", "ebp"] {
+            assert!(!cg.home_reg_usable_for_view(home, RegView::Byte, IrType::I32));
+            assert!(!cg.home_reg_usable_for_view(home, RegView::HighByte, IrType::I32));
+            assert!(!cg.home_reg_usable_for_view(home, RegView::Full, IrType::U8));
+            assert!(cg.home_reg_usable_for_view(home, RegView::Full, IrType::I32));
         }
     }
 }

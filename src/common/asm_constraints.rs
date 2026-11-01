@@ -211,7 +211,10 @@ pub const AARCH64_FLAG_CONDITIONS: [&str; 16] = [
 /// comparisons, executed once per flag-output operand: cheaper than building a
 /// match with sixteen arms and identical in effect.
 pub fn aarch64_flag_condition(suffix: &str) -> Option<&'static str> {
-    AARCH64_FLAG_CONDITIONS.iter().find(|c| **c == suffix).copied()
+    AARCH64_FLAG_CONDITIONS
+        .iter()
+        .find(|c| **c == suffix)
+        .copied()
 }
 
 /// Invert a full `jcc` mnemonic (`"je"` -> `"jne"`, `"jc"` -> `"jnc"`, ...).
@@ -260,7 +263,10 @@ mod tests {
         // `nl`, `nle`, `ng`, `np` are x86-only.)
         for x86_only in ["z", "nz", "nbe", "nae", "nl", "nle", "ng", "np"] {
             assert_eq!(aarch64_flag_condition(x86_only), None, "{x86_only}");
-            assert!(cond_code(x86_only).is_some(), "{x86_only} must stay an x86 suffix");
+            assert!(
+                cond_code(x86_only).is_some(),
+                "{x86_only} must stay an x86 suffix"
+            );
         }
     }
 

@@ -2,7 +2,7 @@
 //! allocation, operand loading/storing, and template substitution for inline asm.
 
 use super::emit::X86Codegen;
-use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
+use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter, RegView};
 use crate::backend::state::CodegenState;
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
@@ -368,6 +368,35 @@ impl InlineAsmEmitter for X86Codegen {
             // constraints fall back to memory (`fallback_scratch_reg` handles pure `"r"`).
             String::new()
         }
+    }
+
+    /// Allocate for an operand the template prints through a byte view.
+    ///
+    /// `%b` is free here: every x86-64 register has a low-byte name, including
+    /// the REX-only `sil`/`dil`/`bpl`/`spl` and `r8b`-`r15b`. `%h` is not: the
+    /// high byte exists only for the four legacy accumulator-family registers
+    /// (`ah`, `bh`, `ch`, `dh`), which is exactly the `Q` class this back end
+    /// already models for the `Q` constraint. Before this, `%h` on a plain `r`
+    /// operand could be given `r12` and printed as `r12b` -- the LOW byte of a
+    /// register with no high byte at all, i.e. silent wrong code.
+    fn assign_scratch_reg_for_view(
+        &mut self,
+        kind: &AsmOperandKind,
+        _operand_type: IrType,
+        view: RegView,
+        excluded: &[String],
+    ) -> String {
+        if view == RegView::HighByte {
+            return self.assign_scratch_reg(&AsmOperandKind::QReg, excluded);
+        }
+        self.assign_scratch_reg(kind, excluded)
+    }
+
+    /// A register home is reusable for a high-byte operand only when it is one
+    /// of the four legacy registers: `rsi`/`rdi`/`r8`-`r15` have no high byte,
+    /// and `reg_to_8h` would answer with their *low* byte name.
+    fn home_reg_usable_for_view(&self, home: &str, view: RegView, _operand_type: IrType) -> bool {
+        view != RegView::HighByte || matches!(home, "rax" | "rbx" | "rcx" | "rdx")
     }
 
     fn load_input_to_reg(
@@ -1320,5 +1349,67 @@ mod tied_operand_no_slot_tests {
         cg.load_input_to_reg(&op, &Operand::Value(Value(7)), "0", &[]);
         let text = emitted(&cg);
         assert_eq!(text, "movq %r13, %rcx");
+    }
+}
+
+/// x86-64 view tests: every register has a low byte, only four have a high
+/// byte, so `%h` restricts the register file and `%b` does not.
+#[cfg(test)]
+mod reg_view_tests {
+    use super::*;
+
+    #[test]
+    fn high_byte_view_never_allocates_a_register_without_a_high_byte() {
+        let mut cg = X86Codegen::new();
+        let mut excluded: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            let reg = cg.assign_scratch_reg_for_view(
+                &AsmOperandKind::GpReg,
+                IrType::I32,
+                RegView::HighByte,
+                &excluded,
+            );
+            assert!(matches!(reg.as_str(), "rax" | "rbx" | "rcx" | "rdx"), "{reg}");
+            excluded.push(reg);
+        }
+    }
+
+    #[test]
+    fn byte_view_imposes_no_restriction_in_64_bit_mode() {
+        // `sil`, `dil`, `bpl`, `spl` and `r8b`-`r15b` are REX encodings, so the
+        // byte view must reach exactly the registers the natural view reaches.
+        let mut plain = X86Codegen::new();
+        let mut byte = X86Codegen::new();
+        let mut excluded: Vec<String> = Vec::new();
+        for _ in 0..X86_GP_SCRATCH.len() {
+            let natural = plain.assign_scratch_reg_for_view(
+                &AsmOperandKind::GpReg,
+                IrType::I64,
+                RegView::Full,
+                &excluded,
+            );
+            let narrow = byte.assign_scratch_reg_for_view(
+                &AsmOperandKind::GpReg,
+                IrType::U8,
+                RegView::Byte,
+                &excluded,
+            );
+            assert!(!natural.is_empty());
+            assert_eq!(natural, narrow);
+            excluded.push(natural);
+        }
+    }
+
+    #[test]
+    fn homes_without_a_high_byte_are_not_reused_for_high_byte_operands() {
+        let cg = X86Codegen::new();
+        for home in ["rax", "rbx", "rcx", "rdx"] {
+            assert!(cg.home_reg_usable_for_view(home, RegView::HighByte, IrType::I32));
+        }
+        for home in ["rsi", "rdi", "rbp", "rsp", "r8", "r15"] {
+            assert!(!cg.home_reg_usable_for_view(home, RegView::HighByte, IrType::I32));
+            assert!(cg.home_reg_usable_for_view(home, RegView::Byte, IrType::I8));
+            assert!(cg.home_reg_usable_for_view(home, RegView::Full, IrType::I32));
+        }
     }
 }
