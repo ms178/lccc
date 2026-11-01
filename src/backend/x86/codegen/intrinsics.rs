@@ -17,6 +17,22 @@ use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
+/// Decode bounded internal vector controls without truncating wide constants.
+/// A malformed producer must fail closed, not silently change a shuffle/store.
+fn checked_vec_control(
+    arg: Option<&Operand>,
+    range: std::ops::RangeInclusive<i64>,
+    name: &str,
+) -> i64 {
+    let value = match arg {
+        Some(Operand::Const(c)) => c.to_i128().and_then(|v| i64::try_from(v).ok()),
+        _ => None,
+    };
+    value
+        .filter(|v| range.contains(v))
+        .unwrap_or_else(|| panic!("invalid {name}: expected an integer constant in {range:?}"))
+}
+
 /// Result destination of a value-producing intrinsic.  Source-level `_mm_`
 /// intrinsics write through a memory result slot (`dest_ptr`); internal pass
 /// emission uses the SSA form (`dest`).  Both spellings name the same result,
@@ -5929,13 +5945,7 @@ impl X86Codegen {
                     self.isa.sse41 && args.len() == 2,
                     "byte fields require SSE4.1 and two operands"
                 );
-                let pattern = match &args[1] {
-                    Operand::Const(c) => c
-                        .to_i64()
-                        .filter(|v| (0..=255).contains(v))
-                        .expect("invalid byte-field pattern"),
-                    _ => panic!("byte-field pattern must be constant"),
-                };
+                let pattern = checked_vec_control(args.get(1), 0..=255, "byte-field pattern");
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 self.operand_to_reg(&args[0], "rax");
@@ -5957,25 +5967,13 @@ impl X86Codegen {
             IntrinsicOp::VecLoadWidenU8ToI32x4 => {
                 assert!(
                     self.isa.sse41 && args.len() == 5,
-                    "three-byte widening requires SSE4.1 and four operands"
+                    "byte widening requires SSE4.1 and five operands"
                 );
-                let pattern = match &args[3] {
-                    Operand::Const(c) => c
-                        .to_i64()
-                        .filter(|v| (0..=255).contains(v))
-                        .expect("invalid three-byte shuffle"),
-                    _ => panic!("three-byte shuffle must be constant"),
-                };
+                let pattern = checked_vec_control(args.get(3), 0..=255, "three-byte shuffle");
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 let disp = Self::vec_disp_arg(args, 2);
-                let count = match &args[4] {
-                    Operand::Const(c) => c
-                        .to_i64()
-                        .filter(|v| (3..=4).contains(v))
-                        .expect("invalid widening byte count"),
-                    _ => panic!("widening byte count must be constant"),
-                };
+                let count = checked_vec_control(args.get(4), 3..=4, "widening byte count");
                 let prefix = if self.avx2_enabled { "v" } else { "" };
                 if count == 4 {
                     let mem = self.vec_mem_operand(&args[0], &args[1], disp);
@@ -6058,13 +6056,7 @@ impl X86Codegen {
                     self.isa.sse41 && args.len() == if store { 5 } else { 2 },
                     "joint narrow/max store requires SSE4.1 and five operands"
                 );
-                let control = match args.last() {
-                    Some(Operand::Const(c)) => c
-                        .to_i64()
-                        .filter(|v| (0..8).contains(v))
-                        .expect("invalid joint store control"),
-                    _ => panic!("joint store control must be constant"),
-                };
+                let control = checked_vec_control(args.last(), 0..=7, "joint store control");
                 self.flush_pending_vec_store_impl();
                 self.sse_load_arg(&args[0], "xmm0");
                 self.state.invalidate_vec_peephole();
@@ -13584,5 +13576,49 @@ mod scalar_saturation_cache_tests {
         cg.operand_to_reg(&Operand::Value(Value(0)), "rcx");
         assert!(cg.state.reg_cache.sec_has(0, false));
         assert_eq!(cg.state.out.buf, "");
+    }
+}
+
+#[cfg(test)]
+mod bounded_vector_control_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_controls_accept_all_encodings_and_reject_bad_metadata() {
+        for range in [0..=255, 3..=4, 0..=7] {
+            for n in range.clone() {
+                assert_eq!(
+                    checked_vec_control(
+                        Some(&Operand::Const(IrConst::I64(n))),
+                        range.clone(),
+                        "test"
+                    ),
+                    n
+                );
+            }
+            let mut bad = vec![
+                None,
+                Some(Operand::Value(Value(1))),
+                Some(Operand::Const(IrConst::F64(0.0))),
+                Some(Operand::Const(IrConst::I64(*range.start() - 1))),
+                Some(Operand::Const(IrConst::I64(*range.end() + 1))),
+            ];
+            for low in range.clone() {
+                bad.push(Some(Operand::Const(IrConst::I128(
+                    (1_i128 << 64) + i128::from(low),
+                ))));
+            }
+            for arg in &bad {
+                assert!(
+                    std::panic::catch_unwind(|| checked_vec_control(
+                        arg.as_ref(),
+                        range.clone(),
+                        "test"
+                    ))
+                    .is_err(),
+                    "accepted {arg:?} for {range:?}"
+                );
+            }
+        }
     }
 }

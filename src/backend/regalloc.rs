@@ -14119,7 +14119,7 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             // an earlier call argument read that register before the latch copy
             // ever initializes it (i686 vector sret pointer corruption).
             if matches!(
-                func.blocks[source_block].instructions[source_def_idx],
+                func.blocks[source_block].instructions[cand_def_idx],
                 Instruction::Alloca { .. }
             ) {
                 continue;
@@ -14791,6 +14791,39 @@ mod phi_coalesce_tests {
             detect_phi_coalesce_groups(&func, &live)
                 .iter()
                 .all(|c| c.backedge_src != 1)
+        );
+        // Same CFG, but a genuinely emitted definition remains coalescible.
+        // This positive control prevents a vacuous "reject all pointers" fix.
+        func.blocks[1].instructions[0] = Instruction::Cast {
+            dest: Value(1),
+            src: Operand::Const(IrConst::I64(0)),
+            from_ty: IrType::I64,
+            to_ty: IrType::Ptr,
+        };
+        let live = compute_live_intervals(&func);
+        assert!(
+            detect_phi_coalesce_groups(&func, &live)
+                .iter()
+                .any(|c| c.backedge_src == 1)
+        );
+    }
+
+    #[test]
+    fn materialized_copy_of_alloca_remains_coalescible() {
+        let cands = part2_shape(|blocks| {
+            blocks[3].instructions[2] = Instruction::Alloca {
+                dest: Value(6),
+                ty: IrType::Ptr,
+                size: 8,
+                align: 8,
+                volatile: false,
+                semantic_volatile: false,
+            };
+        });
+        assert!(cands.iter().all(|c| c.backedge_src != 6));
+        assert!(
+            cands.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 7),
+            "the emitted Copy, unlike the underlying Alloca, defines its register: {cands:?}"
         );
     }
 
