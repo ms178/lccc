@@ -117,15 +117,33 @@ g:
         assert sib["stack_operands"] == 4, sib
         assert sib["loads"] == 3 and sib["stores"] == 3, sib
 
+        # GCC's cached front end supports UBSan even when its optional
+        # libubsan runtime is not shipped. Trap every enabled check instead of
+        # borrowing an unrelated older runtime or silently skipping sanitizing.
+        sanitizer_flags = ["-fsanitize=undefined,float-cast-overflow",
+                           "-fsanitize-trap=undefined,float-cast-overflow",
+                           "-fno-sanitize-recover=all"]
+        for name, body in (
+            ("signed_overflow", "volatile int x = 2147483647; return x + 1;"),
+            ("float_cast_overflow", "volatile double x = 1e100; return (int)x;"),
+        ):
+            bad = root / f"intentional_{name}.c"
+            bad.write_text(f"int main(void) {{ {body} }}\n")
+            try:
+                scorer.check_correctness("gcc", bad, "2", sanitizer_flags)
+            except RuntimeError as error:
+                assert "program failed" in str(error), str(error)
+            else:
+                raise AssertionError(f"UBSan failed to trap intentional {name}")
+
         levels = ("0", "1", "2", "3") if args.full else ("0", "2")
         for src in files_a:
             reference = scorer.check_correctness("gcc", src, "0", [])
             for opt in levels:
                 result = scorer.check_correctness("gcc", src, opt, [], reference)
                 assert result == reference
-            sanitizer_flags = ["-fsanitize=undefined,float-cast-overflow", "-fno-sanitize-recover=all"]
             scorer.check_correctness("gcc", src, "2", sanitizer_flags, reference)
-    print(f"PASS: deterministic 20-kernel corpus, assembly counters, GCC checksum matrix {levels}, UBSan O2")
+    print(f"PASS: deterministic 20-kernel corpus, assembly counters, GCC checksum matrix {levels}, UBSan trap O2 (two intentional-UB controls)")
     return 0
 
 if __name__ == "__main__":
