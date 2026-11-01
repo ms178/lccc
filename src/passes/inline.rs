@@ -11023,11 +11023,11 @@ mod param_home_tests {
         assert!(!calls(caller, "set1"), "the call must still inline");
         assert_eq!(violations(caller), Vec::<String>::new());
         // The temporary (the only Ptr alloca) never receives the argument.
-        let temp = caller
+        let ptr_allocas: Vec<_> = caller
             .blocks
             .iter()
             .flat_map(|b| &b.instructions)
-            .find_map(|i| match i {
+            .filter_map(|i| match i {
                 Instruction::Alloca {
                     dest,
                     ty: IrType::Ptr,
@@ -11035,9 +11035,10 @@ mod param_home_tests {
                 } => Some(*dest),
                 _ => None,
             })
-            .expect("temporary survives");
+            .collect();
+        assert!(!ptr_allocas.is_empty(), "temporary survives");
         let stores_arg_into_temp = caller.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
-            matches!(i, Instruction::Store { val: Operand::Value(Value(0)), ptr, .. } if *ptr == temp)
+            matches!(i, Instruction::Store { val: Operand::Value(Value(0)), ptr, .. } if ptr_allocas.contains(ptr))
         });
         assert!(!stores_arg_into_temp);
     }

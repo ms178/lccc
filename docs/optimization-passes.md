@@ -635,7 +635,8 @@ whether one function uniquely dominates the runner-up — the gate that keeps a
 
 ```bash
 CCC_INLINE_DEBUG=1          # explain inliner decisions
-LCCC_DEBUG_LAYOUT=1         # layout decisions
+CCC_INLINE_PARAMREF_DEBUG=1  # trace parameter-reference remapping during inlining
+LCCC_DEBUG_LAYOUT=1          # layout decisions
 LCCC_DEBUG_PROMOTE=1        # devirtualization decisions
 LCCC_PGO_NO_LAYOUT=1        # disable PGO layout
 LCCC_PGO_PROMOTE_STABLE=95  # top-share % treated as "already predicted"

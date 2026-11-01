@@ -2757,6 +2757,11 @@ gate "fma-peel-invariant" fast \
 gate "env-test-hygiene" fast \
     bash tests/regression/check_env_test_hygiene.sh
 
+# Best-effort EIP diagnostics for the known i686 small-vector runtime crash;
+# the standard regression corpus remains the authoritative correctness gate.
+gate "i686-small-vector-crash-diagnostic" fast \
+    bash tests/regression/trace_vector_small_packed_wrappers_m32.sh
+
 # `LCCC_IFCONV_ARM_BUDGET` is an A/B lever, and its contract is what keeps the
 # numbers comparable: =1 tightens, off/full disable, an unparsable value is
 # inert.  The gate also pins that the switch is resolved at the pipeline
