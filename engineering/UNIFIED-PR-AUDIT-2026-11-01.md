@@ -2,12 +2,11 @@
 
 ## Scope and acceptance status
 
-The requested consolidation covers #1050 (`a62b7d708`), #1051 (updated to
-`2bb4e69e2`), and #1056, on `arena/b673aa4d-lccc`. Both other heads are ancestors
+The requested consolidation now covers #1050 (`a62b7d708`), #1051 (updated to
+`130f9e0cb`), #1060 (`d26a1ab63`), and #1056, on `arena/b673aa4d-lccc`. All three other heads are ancestors
 of this branch. `git fetch origin main` and `git rebase --rebase-merges
-origin/main` were run against main `013983d6a`. A newly opened #1060 is outside
-this originally enumerated set; it has not been folded in or represented as
-audited here.
+origin/main` were run against main `013983d6a`. The renewed all-open-PR request adds the newly opened #1060; its
+modern-toolchain ABI review is recorded below.
 
 **This is an in-progress audit, not a production-readiness certificate.** The
 previous #1056 hosted run was red. Full local gates and a new hosted run are
@@ -135,3 +134,51 @@ pixel microbenchmark. The existing codegen-mode follow-up records its landed
 non-PIC fix and its GCC/kill-switch runtime regression separately from its
 remaining profitability questions. No unsupported memory-width, alignment,
 strict-FP, overflow or whole-browser performance claim is made here.
+
+## Renewed all-open-PR audit: modern ABI evidence
+
+The main compiler and all comparison oracles use the hash-cache's Rust 1.99.1,
+GCC 16.2, Clang 23.1.4 and binutils 2.47. Unversioned C/C++ compiler commands
+are explicitly routed to those versions. No performance conclusion uses the
+system GCC 12 or the separately declared Rust compatibility floor.
+
+The initial #1060 table was based on GCC 12. GCC 16.2 honors
+`no_callee_saved_registers` and `preserve_none` on both x86 targets. On x86-64,
+`preserve_none` also changes integer argument registers (R12/R13). Ignoring
+these attributes is unsafe in an lccc caller of a GCC callee, even if an lccc
+callee preserves more registers than required. The table now refuses them
+until function types and call-clobber lowering implement those contracts.
+
+The oracle now compiles identically named functions in separate translation
+units; differently named twins permitted incidental register choices to look
+like ABI differences. An explicit EBX/ESI/EDI clobber probe exposes register
+preservation independently of arithmetic register pressure. It also proves
+that `force_align_arg_pointer` can affect a real x86-64 prologue; it cannot be
+classified as universally inert. All 28 table cells match modern GCC after
+these changes. Malformed ABI argument lists are tested in both GNU syntaxes
+and word sizes; an initially missed C23 `regparm(1,2)` case was detected and
+corrected before acceptance.
+
+`CCC_ALLOW_UNSUPPORTED_ABI` is the explicit, warning-producing compatibility
+escape introduced by #1060. Presence enables it; absence (the default) refuses
+unsupported ABI/layout declarations. It is **not** an interoperability mode or
+a production-safety guarantee. Objects built under it must not rely on the
+ignored foreign calling convention, preservation contract, layout or stack
+realignment promise, including assembly and external-library boundaries.
+This new, documented switch adds one literal knob, not an undocumented one.
+
+Additional integration evidence before adding #1060: SSA validation corpus
+**1,326 passed, 0 failed, 3 skipped comparisons, 0 skipped executions**;
+AArch64/RV64 freestanding execution **52/52 passed**; real i686 packed-wrapper
+matrix **15/15 passed** across O0/O1/O2/O3/Os, default/no-phi/no-inline.
+The skipped GCC floor-float comparison was traced to a missing `-lm` sidecar
+and repaired; it must be re-run, not silently counted as a comparison pass.
+
+The first complete-local attempt exposed two environment/header boundaries:
+Memcheck needed the matching cached libc debug package (installed and its
+startup probe repaired), while i686 Linux UAPI headers need Debian's shared
+multiarch `asm/` tree. The latter is a compiler search-path defect, not a
+reason to install random headers or weaken the trapv test. The fix admits the
+shared tree only when its explicit `gnu/stubs-32.h` support marker exists
+inside the selected sysroot, retains i386 precedence, and adds a real UAPI
+width regression.

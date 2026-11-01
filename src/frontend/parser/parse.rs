@@ -2272,9 +2272,9 @@ impl Parser {
             AbiPlacement::Other
         };
         let target = abi_target();
-        let Some(effect) = abi_effect(name, target, placement) else {
+        if target == super::attribute_registry::AbiTarget::Other {
             return false;
-        };
+        }
         let is_32bit = target == super::attribute_registry::AbiTarget::I686;
         let spelling = super::attribute_registry::canonical(name).to_string();
         // Even a target-ignored convention must obey the attribute grammar.
@@ -2293,6 +2293,9 @@ impl Parser {
                 .note(format!("expected {expected}, found {found}"), span);
             return true;
         }
+        let Some(effect) = abi_effect(name, target, placement) else {
+            return false;
+        };
         match effect {
             // The attribute names the convention this target already emits.
             // Applying nothing is the whole implementation, and gcc is silent
