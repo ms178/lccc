@@ -14811,7 +14811,8 @@ mod phi_coalesce_tests {
     #[test]
     fn materialized_copy_of_alloca_remains_coalescible() {
         let cands = part2_shape(|blocks| {
-            blocks[3].instructions[2] = Instruction::Alloca {
+            assert_eq!(blocks[3].instructions[1].dest(), Some(Value(6)));
+            blocks[3].instructions[1] = Instruction::Alloca {
                 dest: Value(6),
                 ty: IrType::Ptr,
                 size: 8,

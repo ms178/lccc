@@ -3280,6 +3280,31 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Cache the GCC 16.2 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/gcc-oracle
+        key: lccc-gcc-oracle-${{ runner.os }}-16.2-${{ hashFiles('scripts/ci_install_gcc_oracle.sh') }}
+    - name: Install the GCC 16.2 oracle
+      run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
+    - name: Cache the Clang 23.1.4 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/clang-oracle
+        key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
+    - name: Install the Clang 23.1.4 oracle
+      run: bash scripts/ci_install_clang_oracle.sh
+    - name: Select exact modern oracles for vendor comparisons
+      run: |
+        set -euo pipefail
+        test "$(gcc-16 -dumpfullversion)" = 16.2.0
+        test "$(clang -dumpversion)" = 23.1.4
+        mkdir -p "$RUNNER_TEMP/lccc-modern-oracles"
+        ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-modern-oracles/gcc"
+        ln -s "$(command -v g++-16)" "$RUNNER_TEMP/lccc-modern-oracles/g++"
+        echo "$RUNNER_TEMP/lccc-modern-oracles" >> "$GITHUB_PATH"
+        echo "GCC16=$(command -v gcc-16)" >> "$GITHUB_ENV"
+        echo "CLANG=$(command -v clang)" >> "$GITHUB_ENV"
     - name: Provision authenticated vendor compiler snapshot
       run: |
         set -euo pipefail
@@ -3314,11 +3339,10 @@ jobs:
         # The full differential gate runs here too, where a real authenticated
         # ICX 2026.2 binary exists; its local mirror skips ICX only when the
         # vendor snapshot is unavailable on the host.
-        # This lane's primary oracle is ICX; its GCC leg uses the runner
-        # default.  The pinned GCC 16.2 differential runs in
-        # backend-contracts-b, which provisions that exact oracle.
+        # All three comparison oracles are exact: authenticated ICX 2026.2,
+        # cached GCC 16.2 and cached Clang 23.1.4; never the runner defaults.
         env CCC=target/fastbuild/lccc \
-          GCC_SIGN_CMOV="${GCC16:-gcc}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
+          GCC_SIGN_CMOV="$GCC16" CLANG_SIGN_CMOV="$CLANG" \
           ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
           bash tests/regression/check_sign_test_cmov.sh
         # Same-host, correctness-gated SHA-256 comparison. The saved report is
