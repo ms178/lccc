@@ -3280,6 +3280,13 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision multilib prerequisites for exact modern oracles
+      run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Cache the GCC 16.2 oracle
       uses: actions/cache@v6
       with:
@@ -3298,13 +3305,13 @@ jobs:
       run: |
         set -euo pipefail
         test "$(gcc-16 -dumpfullversion)" = 16.2.0
-        test "$(clang -dumpversion)" = 23.1.4
+        test "$("$CLANG" -dumpversion)" = 23.1.4
         mkdir -p "$RUNNER_TEMP/lccc-modern-oracles"
         ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-modern-oracles/gcc"
         ln -s "$(command -v g++-16)" "$RUNNER_TEMP/lccc-modern-oracles/g++"
         echo "$RUNNER_TEMP/lccc-modern-oracles" >> "$GITHUB_PATH"
         echo "GCC16=$(command -v gcc-16)" >> "$GITHUB_ENV"
-        echo "CLANG=$(command -v clang)" >> "$GITHUB_ENV"
+        ln -s "$CLANG" "$RUNNER_TEMP/lccc-modern-oracles/clang"
     - name: Provision authenticated vendor compiler snapshot
       run: |
         set -euo pipefail
