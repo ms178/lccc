@@ -116,7 +116,14 @@ for opt in -O0 -O2 -Os; do
   "$tmp/wide-check"
   echo "PASS Microsoft signed/unsigned integer128 returns $opt: direct/indirect, callbacks, SysV crossing and variadic definitions"
 done
-if "$CCC" -O2 -mno-sse -mno-sse2 -S "$tmp/wide-lccc.c" -o "$tmp/wide-forbidden.s" > "$tmp/wide-error" 2>&1; then
+# Isolate integer return transport: mixed-FP functions above must not mask a
+# missing XMM-return ISA check.
+cat > "$tmp/wide-nosse.c" <<'C'
+unsigned __int128 __attribute__((ms_abi)) wide_nosse(unsigned long a,unsigned long b) {
+    return ((unsigned __int128)b<<64)|a;
+}
+C
+if "$CCC" -O2 -mno-sse -mno-sse2 -S "$tmp/wide-nosse.c" -o "$tmp/wide-forbidden.s" > "$tmp/wide-error" 2>&1; then
   echo 'FAIL Microsoft integer128 XMM return accepted without SSE' >&2;exit 1
 fi
 grep -q 'SSE.*disabled' "$tmp/wide-error"
