@@ -747,6 +747,9 @@ pub struct CodegenState {
     pub num_params: usize,
     /// Whether the current function is variadic (for ParamRef ABI handling).
     pub func_is_variadic: bool,
+    /// Owning function ABI; unlike per-call state this cannot be overwritten
+    /// by emitting a call with a different convention.
+    pub func_calling_convention: crate::common::types::CallingConvention,
     /// Stack slots for parameter allocas, indexed by param_idx.
     /// Populated by `emit_store_params` so that `emit_param_ref` can load the
     /// parameter value from its alloca slot (where emit_store_params saved it)
@@ -1024,6 +1027,7 @@ impl CodegenState {
             param_classes: Vec::new(),
             num_params: 0,
             func_is_variadic: false,
+            func_calling_convention: Default::default(),
             param_alloca_slots: Vec::new(),
             param_homing_stores: FxHashSet::default(),
             frame_gep_direct: false,

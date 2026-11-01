@@ -2183,9 +2183,8 @@ impl X86Codegen {
     /// so the two can never disagree.
     pub(super) fn sibcall_abi_admits(&self, info: &CallInfo) -> Option<bool> {
         if info.calling_convention != crate::common::types::CallingConvention::Default
-            || self.current_func.is_some_and(|f| unsafe {
-                (*f).calling_convention != crate::common::types::CallingConvention::Default
-            })
+            || self.state.func_calling_convention
+                != crate::common::types::CallingConvention::Default
         {
             return None;
         }

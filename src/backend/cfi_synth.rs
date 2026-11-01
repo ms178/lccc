@@ -1478,7 +1478,7 @@ fn synthesize_function<'b>(
         let LineCtx { in_fn, app } = ctx[k];
         if in_fn
             && !app
-            && let Some(save) = t.strip_prefix("# LCCC_CFI_SAVE ")
+            && let Some(save) = t.strip_prefix("# CFI_NONVOL_SAVE ")
         {
             let mut parts = save.split_whitespace();
             if let (Some(reg), Some(off), None) = (parts.next(), parts.next(), parts.next()) {

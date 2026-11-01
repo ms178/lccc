@@ -4,7 +4,7 @@ This is a **partial implementation**, not completion of the kernel/QEMU task.
 The non-default ABI is represented on function types and call instructions,
 including typedefs, function pointers, composite types and indirect calls.
 
-## Implemented scalar path
+## Implemented ABI paths
 
 - Four shared argument positions: RCX/RDX/R8/R9 or XMM0–3 by position.
 - Caller-owned 32-byte home area, overflow arguments and stack alignment.
@@ -12,8 +12,12 @@ including typedefs, function pointers, composite types and indirect calls.
   hidden return pointers otherwise, and 16-byte-aligned caller-owned copies
   for indirect arguments. Callee copies read exactly the object bytes without
   clobbering uncaptured incoming argument registers.
-- Floating-point return and variadic *callers*, including GP duplicates of FP
-  register arguments. Microsoft variadic function definitions remain rejected.
+- Floating-point return and variadic callers, including GP duplicates of FP
+  register arguments. Microsoft variadic definitions use GP home slots and
+  eight-byte char-pointer cursors, separate from the 24-byte SysV va_list
+  record. Start/copy/end and indirect wide/record payload reads are supported.
+  Malformed Microsoft builtin arity, cursor types and start contexts are
+  rejected in both syntax-only and code-generation modes.
 - Preservation of RDI/RSI and, when SSE is enabled, XMM6–15, with synthesized
   DWARF save records. The current save policy is conservative; no performance
   superiority is claimed.
@@ -44,11 +48,21 @@ at `-O0`, `-O2`, `-Os`, and `-O2 -fstack-clash-protection`:
   and `readelf` save-record checks for all twelve extra nonvolatile registers.
 - Integer-only `-mno-sse -mno-sse2` emission without vector registers.
 
-The tested compiler executable SHA256 is
+The frozen kernel compiler SHA256 remains
 `883b8b34d4b13e7685de9426729bca9827c76bd8aa99c485e885895200e1a87c`.
-The subsequent source-only edits add comments, use equivalent Rust field
-shorthand and add a classifier unit test; they do not constitute a new tested
-compiler binary. Hosted CI must validate the submitted source revision.
+The subsequently rebuilt scalar/record/variadic test compiler is
+`645d6cc37e60476a4f6f4b0c2baa4f0f4aa546167c0e17336a83c650f024567a`.
+These are intentionally separate executables; kernel artifacts are not
+attributed to the newer compiler. Hosted CI must validate the submitted source.
+
+Run `check_ms_abi_records.sh` and `check_ms_abi_varargs.sh` separately too (both
+are wired into hosted and local CI). The latter passes GCC-to-LCCC Microsoft
+variadic definitions at O0/O2/Os: mixed register/overflow FP/GP slots, cursor
+copies and helper consumption, five fixed arguments, hidden return pointers,
+and simultaneous SysV variadic use. Payloads include integer128, long double,
+IEEE binary128, three-byte records, all three complex precisions and a 16-byte
+vector. This does **not** imply fixed wide signatures or LCCC wide variadic
+callers are implemented; those remain diagnosed rather than miscompiled.
 
 The actual patched CachyMod 6.18.58 default configuration was retained (SHA256
 `3d06a10a7773a3ca9fff4f425b8adff0cf373c656b849a7202744924034d1e5d`).
@@ -63,8 +77,10 @@ the translation unit previously stopped by fourteen `ms_abi` diagnostics.
   including FP-field integer carriers, hidden return pointers, register/stack
   indirect parameters and mutation isolation of caller-owned copies. The tested
   executable is `/home/user/compiler-next/lccc`, not the running kernel compiler.
-- Wide scalar, complex/vector ABI rules and Microsoft variadic definitions
-  still require implementation; unsupported signatures remain rejected.
+- Fixed wide scalar and complex/vector ABI signatures, and LCCC wide
+  variadic callers, still require implementation; these remain rejected.
+  Fetching those payloads in Microsoft variadic definitions is separately
+  tested and does not remove that guard.
 - Parser attribute placement and inherited conventions need further adversarial
   coverage, including post-asm attributes and typedef-derived declarations.
 - Further kernel compiler/linker defects and unsupported-option warnings must

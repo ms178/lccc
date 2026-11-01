@@ -778,6 +778,51 @@ struct CoreClassification {
 /// the ABI configuration. The `is_variadic` flag gates the `force_gp` behavior for
 /// float args in variadic functions (needed on the caller side; the callee side
 /// encodes this in `config.variadic_floats_in_gp` directly).
+fn classify_ms_x64_args(args: &[ArgInfo<'_>]) -> CoreClassification {
+    // Microsoft x64 allocates a POSITION, not independent GP/FP counters.
+    // Index into the existing x86 register-name table: rcx,rdx,r8,r9.
+    const GP: [usize; 4] = [3, 2, 4, 5];
+    let classes = args
+        .iter()
+        .enumerate()
+        .map(|(slot, info)| {
+            if let Some(size) = info.struct_size {
+                if !matches!(size, 1 | 2 | 4 | 8) {
+                    return if slot < 4 {
+                        CoreArgClass::LargeStructByRefReg {
+                            reg_idx: GP[slot],
+                            size,
+                        }
+                    } else {
+                        CoreArgClass::LargeStructByRefStack { size }
+                    };
+                }
+            }
+            if slot >= 4 {
+                return if let Some(size) = info.struct_size {
+                    CoreArgClass::StructByValStack { size }
+                } else {
+                    CoreArgClass::Stack
+                };
+            }
+            if info.is_float && !info.is_long_double {
+                CoreArgClass::FloatReg { reg_idx: slot }
+            } else if let Some(size) = info.struct_size {
+                CoreArgClass::StructByValReg {
+                    base_reg_idx: GP[slot],
+                    size,
+                }
+            } else {
+                CoreArgClass::IntReg { reg_idx: GP[slot] }
+            }
+        })
+        .collect();
+    CoreClassification {
+        classes,
+        int_reg_idx: args.len().min(4),
+    }
+}
+
 fn classify_args_core(
     args: &[ArgInfo<'_>],
     is_variadic: bool,
@@ -785,48 +830,7 @@ fn classify_args_core(
     config: &CallAbiConfig,
 ) -> CoreClassification {
     if config.microsoft_x64 {
-        // Microsoft x64 allocates a POSITION, not independent GP/FP counters.
-        // Index into the existing x86 register-name table: rcx,rdx,r8,r9.
-        const GP: [usize; 4] = [3, 2, 4, 5];
-        let classes = args
-            .iter()
-            .enumerate()
-            .map(|(slot, info)| {
-                if let Some(size) = info.struct_size {
-                    if !matches!(size, 1 | 2 | 4 | 8) {
-                        return if slot < 4 {
-                            CoreArgClass::LargeStructByRefReg {
-                                reg_idx: GP[slot],
-                                size,
-                            }
-                        } else {
-                            CoreArgClass::LargeStructByRefStack { size }
-                        };
-                    }
-                }
-                if slot >= 4 {
-                    return if let Some(size) = info.struct_size {
-                        CoreArgClass::StructByValStack { size }
-                    } else {
-                        CoreArgClass::Stack
-                    };
-                }
-                if info.is_float && !info.is_long_double {
-                    CoreArgClass::FloatReg { reg_idx: slot }
-                } else if let Some(size) = info.struct_size {
-                    CoreArgClass::StructByValReg {
-                        base_reg_idx: GP[slot],
-                        size,
-                    }
-                } else {
-                    CoreArgClass::IntReg { reg_idx: GP[slot] }
-                }
-            })
-            .collect();
-        return CoreClassification {
-            classes,
-            int_reg_idx: args.len().min(4),
-        };
+        return classify_ms_x64_args(args);
     }
     let mut result = Vec::with_capacity(args.len());
     let mut int_idx = 0usize;

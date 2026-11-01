@@ -590,8 +590,11 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
     - name: Attribute diagnostics match the GCC 16.2 classes
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_attribute_diagnostics.sh
-    - name: Microsoft x64 scalar ABI interoperability and unwind contracts
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ms_abi.sh
+    - name: Microsoft x64 scalar, record and variadic ABI interoperability and unwind contracts
+      run: |
+        env CCC=target/fastbuild/lccc bash tests/regression/check_ms_abi.sh
+        env CCC=target/fastbuild/lccc bash tests/regression/check_ms_abi_records.sh
+        env CCC=target/fastbuild/lccc bash tests/regression/check_ms_abi_varargs.sh
     - name: Verify GCC provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
     - name: Reproducer replay (pinned ISA, both legs)

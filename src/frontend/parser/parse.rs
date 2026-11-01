@@ -1284,6 +1284,7 @@ impl Parser {
             // <stdarg.h>
             "va_list",
             "__builtin_va_list",
+            "__builtin_ms_va_list",
             "__gnuc_va_list",
             // <locale.h>
             "locale_t",

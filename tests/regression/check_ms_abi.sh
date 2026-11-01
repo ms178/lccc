@@ -49,4 +49,3 @@ for declarations in \
   grep -q 'conflicting calling convention' "$tmp/error"
 done
 echo 'PASS Microsoft x64 ABI focused interoperability and fail-closed boundaries'
-bash "$HERE/check_ms_abi_records.sh"

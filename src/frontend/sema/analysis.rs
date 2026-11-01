@@ -674,7 +674,7 @@ impl SemanticAnalyzer {
         cc: crate::common::types::CallingConvention,
         ret: &CType,
         params: &[(CType, Option<String>)],
-        variadic_definition: bool,
+        _variadic_definition: bool,
         span: Span,
     ) {
         if cc != crate::common::types::CallingConvention::MicrosoftX64 {
@@ -691,11 +691,8 @@ impl SemanticAnalyzer {
         let supported_return = supported(ret) || (ret.is_struct_or_union() && record_size(ret) > 0);
         let supported_parameter =
             |ct: &CType| supported(ct) || (ct.is_struct_or_union() && record_size(ct) > 0);
-        if !supported_return
-            || params.iter().any(|(ct, _)| !supported_parameter(ct))
-            || variadic_definition
-        {
-            self.diagnostics.borrow_mut().error("Microsoft x64 aggregate/wide-scalar and variadic-definition lowering is not implemented yet; refusing an incorrect ABI".to_string(), span);
+        if !supported_return || params.iter().any(|(ct, _)| !supported_parameter(ct)) {
+            self.diagnostics.borrow_mut().error("Microsoft x64 wide-scalar lowering is not implemented yet; refusing an incorrect ABI".to_string(), span);
         }
     }
 
@@ -4005,6 +4002,7 @@ impl SemanticAnalyzer {
             }
             if builtins::is_builtin(name) {
                 self.check_builtin_vector_arguments(name, args);
+                self.check_ms_varargs_builtin(name, args, *callee_span);
                 // A builtin under its own name carries no prototype, so
                 // nothing below could check the call and lowering used
                 // to pass whatever the user wrote straight through to
@@ -4511,6 +4509,61 @@ impl SemanticAnalyzer {
     /// Keep native vector arguments out of scalar/address positions and require
     /// each vector source's own width (not the destination width for widening).
     /// This prevents malformed raw calls reaching pointer-backed SIMD emission.
+    /// Microsoft cursors are char pointers, not SysV array-of-record lists.
+    /// Check before lowering, including syntax-only compilations.
+    fn check_ms_varargs_builtin(&self, name: &str, args: &[Expr], span: Span) {
+        let ms_builtin = matches!(
+            name,
+            "__builtin_ms_va_start" | "__builtin_ms_va_end" | "__builtin_ms_va_copy"
+        );
+        if !ms_builtin && name != "__builtin_va_start" {
+            return;
+        }
+        let function_name = self.function_nesting_stack.join(".");
+        let current = self.result.functions.get(&function_name);
+        let microsoft = current.is_some_and(|f| {
+            f.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+        });
+        let message = if name == "__builtin_va_start" && microsoft {
+            Some("use __builtin_ms_va_start in a Microsoft variadic function")
+        } else if name == "__builtin_ms_va_start"
+            && (!microsoft || !current.is_some_and(|f| f.variadic))
+        {
+            Some("__builtin_ms_va_start requires a Microsoft variadic function")
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            self.diagnostics
+                .borrow_mut()
+                .error(message.to_string(), span);
+        }
+        if !ms_builtin {
+            return;
+        }
+        let valid_count = match name {
+            "__builtin_ms_va_start" => (1..=2).contains(&args.len()),
+            "__builtin_ms_va_copy" => args.len() == 2,
+            _ => args.len() == 1,
+        };
+        if !valid_count {
+            self.diagnostics
+                .borrow_mut()
+                .error(format!("invalid argument count for '{name}'"), span);
+            return;
+        }
+        let cursor_args = if name == "__builtin_ms_va_copy" { 2 } else { 1 };
+        for arg in args.iter().take(cursor_args) {
+            let ty = self.expr_type_checker().infer_expr_ctype(arg);
+            if !matches!(ty, Some(CType::Pointer(ref inner, _)) if **inner == CType::plain_char()) {
+                self.diagnostics.borrow_mut().error(
+                    format!("'{name}' requires a Microsoft char-pointer va_list"),
+                    arg.span(),
+                );
+            }
+        }
+    }
+
     fn check_builtin_vector_arguments(&self, name: &str, args: &[Expr]) {
         let Some(widths) = crate::common::x86_builtin_types::argument_vector_widths(name) else {
             return;

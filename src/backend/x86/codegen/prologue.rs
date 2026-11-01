@@ -551,6 +551,8 @@ impl X86Codegen {
         }
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
+        self.state.func_calling_convention = func.calling_convention;
+        self.state.num_params = func.params.len();
         // The IPA-RA keep set answers for one function (set below, after
         // the caller-saved pool is final).
         self.ipa_keep = 0;
@@ -3083,7 +3085,9 @@ impl X86Codegen {
             }
         }
 
-        if func.is_variadic {
+        if func.is_variadic
+            && func.calling_convention != crate::common::types::CallingConvention::MicrosoftX64
+        {
             if self.no_sse {
                 space += 48;
             } else {
@@ -3365,7 +3369,7 @@ impl X86Codegen {
                 self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
                 if matches!(reg.0, 14 | 15) {
                     self.state.emit_fmt(format_args!(
-                        "    # LCCC_CFI_SAVE {} {}",
+                        "    # CFI_NONVOL_SAVE {} {}",
                         reg_name,
                         -16 - (idx as i64 + 1) * 8
                     ));
@@ -3414,7 +3418,7 @@ impl X86Codegen {
                     -base - n * 16
                 ));
                 self.state.emit_fmt(format_args!(
-                    "    # LCCC_CFI_SAVE xmm{} {}",
+                    "    # CFI_NONVOL_SAVE xmm{} {}",
                     n + 6,
                     -base - n * 16 - 16
                 ));
@@ -3504,7 +3508,18 @@ impl X86Codegen {
 
         self.emit_gp_return_liveness_markers(func, vector_ret_in_xmm0);
 
-        if func.is_variadic {
+        if func.is_variadic
+            && func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+        {
+            // The caller supplies these four contiguous 8-byte home slots.
+            // Unnamed FP values are duplicated in the corresponding GP regs;
+            // no SysV register-save area or AL-based XMM census belongs here.
+            for (slot, reg) in ["rcx", "rdx", "r8", "r9"].iter().enumerate() {
+                self.state
+                    .out
+                    .emit_instr_reg_rbp("    movq", reg, 16 + slot as i64 * 8);
+            }
+        } else if func.is_variadic {
             let base = self.reg_save_area_offset;
 
             // Save only the GP registers that can hold VARIADIC arguments: the
@@ -3562,9 +3577,8 @@ impl X86Codegen {
         let used_regs = self.used_callee_saved.clone();
         let num_saved = used_regs.len() as i64;
         let omit_fp = self.state.omit_frame_pointer;
-        let ms_abi = self.current_func.is_some_and(|f| unsafe {
-            (*f).calling_convention == crate::common::types::CallingConvention::MicrosoftX64
-        });
+        let ms_abi = self.state.func_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64;
         if ms_abi && !self.no_sse {
             let base = ((num_saved * 8 + 15) & !15) + 16;
             for n in 0..10 {

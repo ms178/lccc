@@ -1676,7 +1676,10 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Void-returning builtins
-            "__builtin_va_start"
+            "__builtin_ms_va_start"
+            | "__builtin_ms_va_end"
+            | "__builtin_ms_va_copy"
+            | "__builtin_va_start"
             | "__builtin_va_end"
             | "__builtin_va_copy"
             | "__builtin_abort"
