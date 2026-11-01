@@ -26,6 +26,14 @@ static void report_fault(int sig, siginfo_t *info, void *context)
     for (unsigned i = 0; i < 8; ++i)
         message[14 + i] = digits[(ip >> (28 - 4 * i)) & 15];
     (void)write(STDERR_FILENO, message, sizeof(message));
+    const char bp_prefix[] = "EBP=0x00000000\n";
+    char bp_message[sizeof(bp_prefix) - 1];
+    for (unsigned i = 0; i < sizeof(bp_message); ++i)
+        bp_message[i] = bp_prefix[i];
+    unsigned long bp = (unsigned long)uc->uc_mcontext.gregs[REG_EBP];
+    for (unsigned i = 0; i < 8; ++i)
+        bp_message[6 + i] = digits[(bp >> (28 - 4 * i)) & 15];
+    (void)write(STDERR_FILENO, bp_message, sizeof(bp_message));
     _exit(128 + sig);
 }
 
