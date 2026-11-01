@@ -1062,14 +1062,19 @@ impl I686Codegen {
             }
             IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
             IrBinOp::UMulHigh | IrBinOp::SMulHigh => crate::ir::ops::mul_high_unsupported_here(),
-            IrBinOp::BitSet | IrBinOp::BitClear => {
-                // `bts`/`btr` write the base back into %eax and read the index
-                // modulo the operand width, exactly the operation's contract.
+            IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
+                // `bts`/`btr`/`btc` write the base back into %eax and read the
+                // index modulo the operand width, exactly the operation's
+                // contract.
                 // The 32-bit form is the one this target creates (a 64-bit
                 // operation never reaches a 32-bit target: the wide-int pair
                 // path has no bit-modify lowering, so the producing pass
                 // refuses it -- see `IrBinOp::BitSet`).
-                let mnem = if op == IrBinOp::BitSet { "bts" } else { "btr" };
+                let mnem = match op {
+                    IrBinOp::BitSet => "bts",
+                    IrBinOp::BitClear => "btr",
+                    _ => "btc",
+                };
                 match ty {
                     IrType::I32 | IrType::U32 | IrType::Ptr => match Self::const_as_imm32(rhs) {
                         Some(imm) => {

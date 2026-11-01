@@ -4669,14 +4669,22 @@ fn simplify_binop(
                 return Some(rewritten);
             }
         }
-        IrBinOp::BitSet | IrBinOp::BitClear => {
-            // Bit set/clear are produced by `bit_idioms` from the shift/OR and
-            // shift/NOT/AND shapes (see `bit_idioms::bit_select`), so there is
-            // no producer here.  Only one identity holds without knowing the
-            // index: clearing any bit of zero leaves zero.  Setting a bit of
-            // zero is `1 << (n mod W)`, never a constant, so there is no
-            // mirrored fold -- folding it to zero (or to one) was the same
-            // trap as the zero-index `BitTest` above.
+        IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
+            // Bit set/clear/toggle are produced by `bit_idioms` from the
+            // shift/OR, shift/NOT/AND and shift/XOR shapes (see
+            // `bit_idioms::bit_select`), so there is no producer here.  Only
+            // one identity holds without knowing the index: clearing any bit
+            // of zero leaves zero.  Setting or toggling a bit of zero is
+            // `1 << (n mod W)`, never a constant, so there is no mirrored fold
+            // -- folding it to zero (or to one) was the same trap as the
+            // zero-index `BitTest` above.
+            //
+            // The other two do have a defining identity that needs no index:
+            // toggling a bit twice -- or clearing a bit an already-clear mask
+            // has -- is idempotent/involutive.  Both need the *producer* to be
+            // the same operation on the same index, which this pass cannot see
+            // from one instruction, so they stay in the corpus's "not done"
+            // list rather than being guessed at here.
             if op == IrBinOp::BitClear && lhs_zero {
                 return Some(Instruction::Copy {
                     dest,

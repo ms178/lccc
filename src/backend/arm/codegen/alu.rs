@@ -485,7 +485,7 @@ impl ArmCodegen {
             let dest_name = callee_saved_name(dest_phys);
             let dest_name_32 = callee_saved_name_32(dest_phys);
 
-            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear) {
+            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle) {
                 if self.emit_bit_modify_into(op, dest_phys, lhs, rhs, use_32bit) {
                     self.state.reg_cache.invalidate_acc();
                     return;
@@ -832,7 +832,9 @@ impl ArmCodegen {
                     crate::ir::ops::mul_high_unsupported_here()
                 }
                 IrBinOp::BitTest => self.emit_bit_test(rhs, false),
-                IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify(op, rhs, true),
+                IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
+                    self.emit_bit_modify(op, rhs, true)
+                }
             }
         } else {
             match op {
@@ -884,7 +886,9 @@ impl ArmCodegen {
                 IrBinOp::UMulHigh => self.state.emit("    umulh x0, x1, x2"),
                 IrBinOp::SMulHigh => self.state.emit("    smulh x0, x1, x2"),
                 IrBinOp::BitTest => self.emit_bit_test(rhs, true),
-                IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify(op, rhs, false),
+                IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
+                    self.emit_bit_modify(op, rhs, false)
+                }
             }
         }
 
@@ -960,19 +964,32 @@ impl ArmCodegen {
                 }
             },
         }
-        let mnemonic = if op == IrBinOp::BitSet { "orr" } else { "bic" };
+        let mnemonic = Self::bit_modify_mnemonic(op);
         self.state
             .emit_fmt(format_args!("    {mnemonic} {dest}, {read}, {r}3"));
         true
     }
 
-    /// `BitSet`/`BitClear(x1, x2)` into x0/w0: one `mov` of the immediate 1,
-    /// one `lsl` by the index and one `orr` (set) or `bic` (clear, AArch64's
-    /// bit-clear).  There is no variable-immediate BFI, and `lsl`/`lslv` reduce
+    /// The AArch64 mnemonic for a bit-modify operation: `orr` sets, `bic`
+    /// clears, `eor` toggles the one-hot mask.  `orr`/`bic`/`eor` all write
+    /// their first operand, so the shape of the emission is identical for the
+    /// three and only this table changes.
+    fn bit_modify_mnemonic(op: IrBinOp) -> &'static str {
+        match op {
+            IrBinOp::BitSet => "orr",
+            IrBinOp::BitClear => "bic",
+            _ => "eor",
+        }
+    }
+
+    /// `BitSet`/`BitClear`/`BitToggle(x1, x2)` into x0/w0: one `mov` of the
+    /// immediate 1, one `lsl` by the index and one `orr` (set), `bic` (clear,
+    /// AArch64's bit-clear) or `eor` (toggle).  There is no variable-immediate BFI, and `lsl`/`lslv` reduce
     /// the count modulo the register size, which is exactly the operation's
     /// `index mod W` contract.  x3 is this path's scratch (the rotate arm above
     /// uses it the same way); t1 holds the base and t2 the index throughout.
     fn emit_bit_modify(&mut self, op: IrBinOp, rhs: &Operand, is_32: bool) {
+        let mnemonic = Self::bit_modify_mnemonic(op);
         let (r, width) = if is_32 { ('w', 32) } else { ('x', 64) };
         self.state.emit("    mov w3, #1");
         match Self::const_as_imm12(rhs) {
@@ -985,13 +1002,8 @@ impl ArmCodegen {
                 .state
                 .emit_fmt(format_args!("    lsl {r}3, {r}3, {r}2")),
         }
-        if op == IrBinOp::BitSet {
-            self.state
-                .emit_fmt(format_args!("    orr {r}0, {r}1, {r}3"));
-        } else {
-            self.state
-                .emit_fmt(format_args!("    bic {r}0, {r}1, {r}3"));
-        }
+        self.state
+            .emit_fmt(format_args!("    {mnemonic} {r}0, {r}1, {r}3"));
     }
 
     /// `BitTest(x1, rhs)` into x0/w0: bit `rhs mod W` of the base (the IR

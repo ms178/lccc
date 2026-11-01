@@ -1173,16 +1173,21 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
         // the operation width (an undefined C shift that may sit in dead code
         // must still fold to what codegen emits), and masking to the width
         // drops the sign extension a signed operand carries in the container.
-        IrBinOp::BitSet | IrBinOp::BitClear => {
+        IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
             let bits = (ty.size() * 8) as u32;
             if !(1..=64).contains(&bits) {
                 return None;
             }
+            let mode = match op {
+                IrBinOp::BitSet => crate::ir::ops::BitMode::Set,
+                IrBinOp::BitClear => crate::ir::ops::BitMode::Clear,
+                _ => crate::ir::ops::BitMode::Toggle,
+            };
             let result = crate::ir::ops::bit_op_within_bits(
                 lhs as u64 as u128,
                 rhs as u64 as u128,
                 bits,
-                op == IrBinOp::BitSet,
+                mode,
             );
             return Some(ty.truncate_i64(result as i64));
         }
@@ -1304,9 +1309,9 @@ mod tests {
         );
     }
 
-    /// `BitSet`/`BitClear` fold modulo the operation's width, at every width
-    /// the operations are created at, and the container-width evaluators the
-    /// other passes use agree once truncated to that width.
+    /// `BitSet`/`BitClear`/`BitToggle` fold modulo the operation's width, at
+    /// every width the operations are created at, and the container-width
+    /// evaluators the other passes use agree once truncated to that width.
     #[test]
     fn bit_set_and_clear_fold_modulo_the_width() {
         let sources = [
@@ -1334,6 +1339,7 @@ mod tests {
                     let bit = 1u64 << (index % u64::from(width));
                     let want_set = (x | bit) & mask;
                     let want_clear = (x & !bit) & mask;
+                    let want_toggle = (x ^ bit) & mask;
                     assert_eq!(
                         fold_binop(IrBinOp::BitSet, x as i64, index as i64, ty),
                         Some(want_set as i64),
@@ -1343,6 +1349,11 @@ mod tests {
                         fold_binop(IrBinOp::BitClear, x as i64, index as i64, ty),
                         Some(want_clear as i64),
                         "BitClear {x:#x} bit {index} at {width}"
+                    );
+                    assert_eq!(
+                        fold_binop(IrBinOp::BitToggle, x as i64, index as i64, ty),
+                        Some(want_toggle as i64),
+                        "BitToggle {x:#x} bit {index} at {width}"
                     );
                     // The container-width evaluators answer at 64 bits
                     // (`eval_i128` at 128), exactly like the rotates: a
@@ -1361,6 +1372,12 @@ mod tests {
                         Some((x & !(1u64 << (index % 64))) as i64),
                         "eval_i64 BitClear {x:#x} bit {index}"
                     );
+                    assert_eq!(
+                        IrBinOp::BitToggle.eval_i64(x as i64, index as i64),
+                        // `u64` is already the container: no mask above it.
+                        Some((x ^ (1u64 << (index % 64))) as i64),
+                        "eval_i64 BitToggle {x:#x} bit {index}"
+                    );
                     if index < u64::from(width) {
                         assert_eq!(
                             ty.truncate_i64(
@@ -1376,6 +1393,13 @@ mod tests {
                             want_clear as i64,
                             "eval_i64 BitClear {x:#x} bit {index} at {width}"
                         );
+                        assert_eq!(
+                            ty.truncate_i64(
+                                IrBinOp::BitToggle.eval_i64(x as i64, index as i64).unwrap()
+                            ),
+                            want_toggle as i64,
+                            "eval_i64 BitToggle {x:#x} bit {index} at {width}"
+                        );
                     }
                     assert_eq!(
                         IrBinOp::BitSet.eval_i128(x as i128, index as i128),
@@ -1383,6 +1407,11 @@ mod tests {
                         // there is no mask above it to apply.
                         Some((x as u128 | (1u128 << (index % 128))) as i128),
                         "eval_i128 BitSet {x:#x} bit {index}"
+                    );
+                    assert_eq!(
+                        IrBinOp::BitToggle.eval_i128(x as i128, index as i128),
+                        Some((x as u128 ^ (1u128 << (index % 128))) as i128),
+                        "eval_i128 BitToggle {x:#x} bit {index}"
                     );
                 }
             }
@@ -1396,9 +1425,30 @@ mod tests {
         // ring carries as -2 (0xFF would mean the clear did nothing).
         assert_eq!(fold_binop(IrBinOp::BitClear, -1, 0, IrType::I8), Some(-2));
         assert_eq!(fold_binop(IrBinOp::BitClear, -1, 0, IrType::U8), Some(0xFE));
+        // Toggling a bit of zero sets it, and toggling the same bit twice is
+        // the identity -- the involution is what makes a wrong index or a
+        // wrong width visible immediately.
+        assert_eq!(fold_binop(IrBinOp::BitToggle, 0, 3, IrType::U32), Some(8));
+        assert_eq!(
+            fold_binop(
+                IrBinOp::BitToggle,
+                fold_binop(IrBinOp::BitToggle, 0x1234, 5, IrType::U16).unwrap(),
+                5,
+                IrType::U16
+            ),
+            Some(0x1234)
+        );
+        // A signed operand's sign extension must not survive the mask here
+        // either: I8 `-1` toggled at bit 0 is 0xFE, carried as -2.
+        assert_eq!(fold_binop(IrBinOp::BitToggle, -1, 0, IrType::I8), Some(-2));
+        assert_eq!(
+            fold_binop(IrBinOp::BitToggle, -1, 0, IrType::U8),
+            Some(0xFE)
+        );
         // 128-bit values are not foldable through `fold_binop` (it works in a
         // 64-bit container); the pair path refuses rather than truncating.
         assert_eq!(fold_binop(IrBinOp::BitSet, 0, 0, IrType::U128), None);
+        assert_eq!(fold_binop(IrBinOp::BitToggle, 0, 0, IrType::U128), None);
     }
 
     /// Multiply-high folds at the operation's own width: at I64/U64 the

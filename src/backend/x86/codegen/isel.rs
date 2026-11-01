@@ -2168,11 +2168,14 @@ fn lower_instruction_typed_inner(
             // BitTest is lowered by the text path, which uses BT plus
             // register/stack-aware SETCC materialization and keeps the i32
             // result zero-extended. MachInst currently has no BT opcode.
-            // BitSet/BitClear take the same route for the same reason (no
-            // BTS/BTR opcode), and because their in-place base write has to
+            // BitSet/BitClear/BitToggle take the same route for the same
+            // reason (no BTS/BTR/BTC opcode), and because their in-place base
+            // write has to
             // respect the text path's home-clobber bookkeeping
             // (`note_inplace_compute`) rather than a MachInst destination.
-            if *op == IrBinOp::BitTest || matches!(op, IrBinOp::BitSet | IrBinOp::BitClear) {
+            if *op == IrBinOp::BitTest
+                || matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle)
+            {
                 return false;
             }
             // Bzhi likewise: MachInst has no BZHI opcode; the text path
