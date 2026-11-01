@@ -7,6 +7,39 @@ already evolved upstream. The final diff preserves the stronger existing
 implementations, carries forward the intended behavior, and applies to the base
 commit with `git apply --check --unidiff-zero --whitespace=error-all`.
 
+## Reconciliation of the 49-commit upstream series
+
+The latest `ms178-1.patch` fetched through the GitHub contents/blob API is a
+49-commit mbox (2,209,177 bytes, blob `1a3486c5…`, SHA-256 `7fba9ea7…`). It
+does not apply at zero fuzz to current `main` — and patch 0001 does not apply
+at zero fuzz even to its own declared base `0ff1d3f12` — so a forced `git am`
+was rejected. Instead the series was reconciled by path and content:
+
+- At the original audit snapshot, all **222 paths** touched by the 49 patches
+  were a subset of the **227 changed files** in open PR #1051 (`bd55a8e1`).
+  The refresh at `99c1eba6` (base `60a2e2c1`) finds 221 of those paths in its
+  **226-file diff**; the remaining path, `.github/ci-lane-plan.json`, is already
+  identical on that PR's base and therefore no longer appears in its diff.
+  All 222 paths exist in the PR tree. This is path-coverage evidence, not a
+  claim that every file is byte-identical.
+- Spot-checked final blobs from PR #1051 against the series' added content;
+  all four sampled blob IDs are unchanged at `99c1eba6`. These paths are
+  subsumed by PR #1051 and are not duplicated in this branch:
+
+  | PR #1051 path (subsumed upstream) | Comparison against series content |
+  |---|---|
+  | `scripts/diffrun.sh` | byte-identical |
+  | `src/backend/linker_common/binary_input.rs` | byte-identical |
+  | `tests/regression/ebp_data_register_stores_i686.c` | byte-identical |
+  | `src/backend/riscv/linker/relax.rs` | strict superset (extra overflow-hardening) |
+- The remaining i686/optimize/linker fixes (patches 36–48) are carried by
+  PR #1051; the sampled relaxation file has additional overflow hardening.
+  Duplicating that work here would create a competing copy.
+
+The orthogonal kernel-provenance / RWX / dot-assignment / sema delta was
+merged as #1052. This follow-up keeps only the measured RWX-reader and
+location-counter-parser improvements plus their audit, rebased onto `620e7e4b`.
+
 ## Toolchain and build policy
 
 All compiler/linker builds used the `fastbuild` profile, two Cargo jobs,
@@ -19,8 +52,10 @@ All compiler/linker builds used the `fastbuild` profile, two Cargo jobs,
 - mold 3.0.0
 - qemu-user 11.1.2
 
-ICX 2026.2 was requested but unavailable: the Intel PPA provisioning path failed
-with a TLS EOF in this sandbox. No other ICX version was substituted.
+ICX 2026.2 was requested but unavailable locally: the Intel PPA provisioning
+path failed with a TLS EOF in this sandbox. No other ICX version was
+substituted. The hosted `Authenticated Intel ICX 2026.2 integration` CI job
+provisions ICX itself and passes on this branch.
 
 ## 1. ELF `PT_LOAD` RWX diagnostics
 
@@ -29,13 +64,17 @@ with a TLS EOF in this sandbox. No other ICX version was substituted.
 The linker now inspects completed ELF outputs before any flat-binary conversion.
 The diagnostic is based on `PT_LOAD` `p_flags`, not section flags: section flags
 are not the kernel's final memory-permission contract. The reader is
-allocation-free and streaming:
+bounded-memory and chunked:
 
 - validates ELF ident, class, endianness, version, and header size;
 - handles ELF32 and ELF64 little-endian headers;
 - handles `PN_XNUM` by reading section 0 `sh_info` with bounds checks;
 - rejects inconsistent program-header tables;
 - uses checked 64-bit arithmetic and never trusts `phoff + phnum * phentsize`;
+- seeks once to the program-header table and reads it in bounded chunks of at
+  most 64 KiB (one oversized `phentsize` still fits in a single chunk), so a
+  table of N headers costs O(N / chunk) reads instead of N seek+read pairs;
+- stops at the first RWX `PT_LOAD` without reading the rest of the table;
 - performs no I/O when `--no-warn-rwx-segments` suppresses the warning;
 - preserves the completed output when `--fatal-warnings` promotes the warning.
 
@@ -63,6 +102,39 @@ does not route `-Wl,-T,<script>` into the script linker.
   runtime smokes pass when qemu is installed.
 - `tests/regression/ld_no_warn_rwx_fixture.sh`: passes.
 
+### Measured performance
+
+The first implementation issued one `seek` + one `read` per program header.
+That is correct but pays two syscalls per segment; a kernel image with hundreds
+of PHDRs turns the diagnostic into a syscall storm. The final implementation
+seeks once and reads the contiguous table in chunks capped at 64 KiB, stopping
+at the first RWX hit.
+
+Two independent measurements pin the contract:
+
+1. **Exact I/O-count unit tests** (`batching_bounds_io_and_crosses_chunks`,
+   `extended_phnum`, `oversized_phentsize_is_one_entry_per_chunk`): a
+   4096-header table takes exactly 4 reads for ELF32 and 6 for ELF64, with
+   3 seeks; an early hit takes 3 reads. `PN_XNUM` adds exactly one read/seek,
+   and an oversized `phentsize = u16::MAX` takes one read per entry. The tests
+   also pin last-chunk detection and fail-closed truncation.
+2. **End-to-end A/B timing** against the exact base `620e7e4b`, with both
+   variants rebuilt by the same `fastbuild` script/toolchain, CPU-pinned,
+   8 warmups and 80 randomized-interleaved samples per variant. Every timed
+   invocation succeeded without diagnostics and produced identical bytes.
+
+   | workload | base median | optimized median | median speedup | bootstrap 95% CI |
+   |---|---:|---:|---:|---:|
+   | link, 4096 `PT_LOAD` headers | 9.82 ms | 8.44 ms | **1.16×** | 1.147–1.177× |
+   | assemble, 20,000 symbolic `.org` targets | 213.61 ms | 205.63 ms | **1.04×** | 1.023–1.055× |
+
+   Output SHA-256 prefixes are `94598bf0…` (link) and `5f24b59f…` (assemble).
+   The interval is a 5,000-resample bootstrap of the median ratio. The
+   assembler workload is end-to-end and noisier (one long optimized-sample
+   outlier raised its mean), so the claim is the modest median improvement,
+   not a broad compiler-speed claim. Normal images use the single-chunk path;
+   suppression still performs zero I/O.
+
 ## 2. Assembler location-counter assignment
 
 ### Design
@@ -72,6 +144,12 @@ fill. A shared `parse_org_target` accepts absolute expressions, symbol-plus/minu
 constant targets, parenthesized forms, current-location expressions, and backward
 numeric-local targets. It rejects empty/malformed targets, backward movement,
 and unsupported symbolic arithmetic instead of silently guessing.
+
+Subtractive addends are negated with `checked_neg` on the parsed integer instead
+of allocating a `-(...)` string and re-parsing it. This removes one allocation
+and one parse per symbolic `.org`/`. =` target, and keeps the `i64::MIN`
+boundary fail-closed (`base - -9223372036854775808` is rejected, not wrapped).
+Unit tests pin double negatives, parenthesized products, and the overflow edge.
 
 Comparison spellings such as `. ==`, `. !=`, `. <=`, and `. >=` are rejected at
 the location-counter intercept rather than being misparsed as assignments.
@@ -166,10 +244,10 @@ the object name instead of the type). Builtins retain their existing path.
   GCC 16.2, and Clang 23.1.4 at `-O0` and `-O2` with `-Wall -Wextra -Werror`.
 - `tests/regression/check_fnptr_result_shadowing.sh`: positive runtime and
   negative must-reject cells pass across the available compilers.
-- Full C regression corpus with the GCC 16.2 oracle: **1305 passed, 0 failed,
-  3 skipped-compare, 0 skipped-run** out of 1308. The three skipped comparisons
-  are declared oracle gaps where GCC cannot compile the asserted semantics;
-  lccc compiled and ran all three successfully.
+- Full C regression corpus with the GCC 16.2 oracle on base `620e7e4b`:
+  **1307 passed, 0 failed, 3 skipped-compare, 0 skipped-run** out of 1310.
+  The three skipped comparisons are declared oracle gaps where GCC cannot
+  compile the asserted semantics; lccc compiled and ran all three successfully.
 
 ## CI wiring
 
@@ -188,13 +266,26 @@ honest:
 `check_ci_lane_plan.py` and `check_ci_shard_partition.py` pass after the
 rebalance.
 
+## Validation on base `620e7e4b`
+
+The rebased tree passed 7152 workspace tests (0 failed, 13 ignored), a
+warning-free `fastbuild` build with `-D warnings` and 4 GiB swap, Clippy with
+`-D warnings`, the 76-lint policy probe, rustfmt, and the doc-link gate.
+The assembler directive contract held all 517 cells (14 pinned divergences).
+CI structure checks passed: lane plan (2516 s), disjoint fast-contract shards
+(86/96 gates), workflow shell (12 files), and local/hosted parity (481 commands,
+27 invocation contracts). The targeted RWX, dot/org, kernel-provenance,
+kernel-full, call-result-shadowing, and suppression gates all passed.
+
 ## Validation commands
 
 ```sh
 scripts/build_lccc_fast.sh
-cargo test --profile fastbuild --locked -j2
-cargo clippy --all-targets --profile fastbuild --locked -j2 -- -D warnings
+cargo test --workspace --profile fastbuild --locked -j2
+cargo clippy --workspace --all-targets --profile fastbuild --locked -j2 -- -D warnings
 python3 scripts/check_clippy_policy.py
+cargo fmt --all -- --check
+python3 scripts/check_doc_links.py
 python3 tests/linker/check_rwx_segments.py
 bash tests/regression/ld_no_warn_rwx_fixture.sh
 python3 tests/regression/check_dot_assignment.py
@@ -202,5 +293,9 @@ python3 tests/regression/check_asm_directive_contract.py --lccc target/fastbuild
 python3 tests/regression/check_kernel_provenance.py
 python3 tests/regression/check_kernel_full_harness.py
 bash tests/regression/check_fnptr_result_shadowing.sh
+python3 tests/regression/check_ci_lane_plan.py
+python3 tests/regression/check_ci_shard_partition.py
+python3 scripts/check_ci_workflow_shell.py
+python3 scripts/check_ci_gate_parity.py
 python3 tests/regression/run_regression.py --lccc target/fastbuild/lccc --gcc gcc-16 -j2
 ```

@@ -1519,8 +1519,12 @@ fn parse_org_target(expr: &str, directive: &str) -> Result<(String, i64), String
         parse_integer_expr(rest.trim())
             .map_err(|_| format!("unsupported {directive} expression: {expr}"))?
     } else if let Some(rest) = tail.strip_prefix('-') {
-        parse_integer_expr(&format!("-({})", rest.trim()))
+        // Negate the parsed addend instead of allocating a `-(...)` string
+        // and re-parsing it.  `checked_neg` keeps `i64::MIN` fail-closed.
+        parse_integer_expr(rest.trim())
             .map_err(|_| format!("unsupported {directive} expression: {expr}"))?
+            .checked_neg()
+            .ok_or_else(|| format!("unsupported {directive} expression: {expr}"))?
     } else {
         return Err(format!("unsupported {directive} expression: {expr}"));
     };
@@ -5695,6 +5699,18 @@ main:
             parse_org_target("base - 4", ".org").unwrap(),
             ("base".into(), -4)
         );
+        // Negation is arithmetic on the parsed addend, not a re-parse of a
+        // freshly allocated `-(...)` string: double negatives and the
+        // i64::MIN boundary must behave exactly as the expression parser.
+        assert_eq!(
+            parse_org_target("base - -4", ".org").unwrap(),
+            ("base".into(), 4)
+        );
+        assert_eq!(
+            parse_org_target("base - (2 * 3)", ".org").unwrap(),
+            ("base".into(), -6)
+        );
+        assert!(parse_org_target("base - -9223372036854775808", ".org").is_err());
         assert_eq!(
             parse_org_target("2b + 8", ".org").unwrap(),
             ("2b".into(), 8)
