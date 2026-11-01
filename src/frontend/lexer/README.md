@@ -241,7 +241,7 @@ Each of these can be combined with an imaginary suffix. The `i`/`I` suffix can a
 `lex_string` processes the body character-by-character:
 
 - **Escape sequences** (`\n`, `\t`, `\x4F`, `\0`, `\u00E9`, `\U0001F600`, etc.) are handled by `lex_escape_char`.
-- **Unicode escapes in narrow strings**: `\u` and `\U` produce Unicode code points that are then UTF-8-encoded byte-by-byte into the string (matching GCC/Clang behavior for narrow string literals).
+- **Unicode escapes in narrow strings**: `\u`, `\U` and `\N{NAME}` produce Unicode code points that are then UTF-8-encoded byte-by-byte into the string (matching GCC/Clang behavior for narrow string literals). The escape *letter* decides this, never the value's magnitude: `"\u00e9"` is `C3 A9` while `"\xe9"` is the single byte `E9`.
 - **PUA-encoded bytes**: Non-UTF-8 source bytes (encoded as PUA code points by the encoding layer) are decoded back to their original byte values via `decode_pua_byte`.
 
 `u8"..."` strings are lexed identically to `"..."` and produce the same `StringLiteral` token.
@@ -279,8 +279,51 @@ Detected inside `lex_identifier` when a prefix (`L`, `U`, `u`) is immediately fo
 | `\xNN...` | Hex | Consumes all hex digits, truncated to byte |
 | `\uNNNN` | Unicode | Exactly 4 hex digits, returns code point |
 | `\UNNNNNNNN` | Unicode | Exactly 8 hex digits, returns code point |
+| `\N{NAME}` | Unicode | A Unicode character name, resolved by `ucn_name::lookup` |
+| `\u{...}` `\x{...}` `\o{...}` | C2y delimited forms | Arbitrary digits, delimited by `}` |
 
 Invalid Unicode code points (e.g., surrogates) fall back to U+FFFD (replacement character).
+
+### Named universal character escapes (`\N{NAME}`)
+
+`\N{LATIN SMALL LETTER E WITH ACUTE}` is C++23's *named* universal character
+name, which GCC 16.2, Clang 23.1.4 and LCCC also accept in C (GCC says so with
+`-pedantic`: "named universal character escapes are only valid in C++23"). It
+denotes a character, so it goes through the same UTF-8 / code-point paths as
+`\uXXXX`, and it is rejected inside an identifier exactly as `\uXXXX` is
+(`universal character \N{SNOWMAN} is not valid in an identifier`).
+
+The name data is `ucn_name_table.rs`, **generated** by
+`scripts/gen_ucn_name_table.py` from the Unicode 18.0.0 database -- 172,808
+named code points in 467,282 B:
+
+| Part | Why | Size |
+|---|---|---|
+| `HEX_FAMILIES` | names that are `<PREFIX><UPPERCASE HEX>` of their own code point (CJK, Tangut, Khitan, Nushu, Egyptian hieroglyphs, Jurchen, Small Seal) -- stored as prefix + assigned ranges and re-rendered on lookup, so digit count, leading zero and case cannot alias | 126,285 code points, no per-name bytes |
+| `HANGUL_L/V/T` | the 11,172 `HANGUL SYLLABLE <L><V><T>` names, composed from 67 jamo short names derived from the syllable names themselves | 11,172 code points |
+| `NAMES_BLOB` / `BLOCK_FIRST_NAME` / `CODEPOINTS` | the remaining 35,351 names, sorted and front-coded against the previous name, binary-searched through a 16-entry block index | 317,038 + 8,840 + 141,404 B |
+
+`ucn_name::lookup` is the decoder. Three checks keep it honest, because every
+failure mode of the encoding is silent (a wrong block, prefix or composition
+yields *a* character, just not the right one):
+
+* unit tests in `ucn_name.rs` round-trip **every** explicit name, **every**
+  family member and **every** Hangul syllable, and walk the blob to prove it is
+  sorted, unique and block-aligned;
+* `tests/regression/check_ucn_named_escapes.py` re-decodes the table, compares
+  1,103 sampled names byte for byte against `gcc-16`, and compares 11 malformed
+  cases by diagnostic text;
+* `tests/regression/c23_ucn_named_escapes.c` is the corpus fixture covering
+  every family, the wide/UTF-16/UTF-32 literal kinds and the adjacency of two
+  escapes.
+
+Measured: GCC 16.2 rejects 13,008 of the 172,713 testable names (7.5 %) and
+Clang 23.1.4 rejects 12,274 (7.1 %) -- both are missing the Unicode 16/17 blocks
+(`JURCHEN CHARACTER-`, `SMALL SEAL CHARACTER-`), GCC additionally misses 757
+explicit names (including `CUNEIFORM NUMERIC SIGN FOUR N18`) and Clang the last
+32 Tangut ideographs. LCCC implements Unicode 18.0.0 exactly, so it is the
+superset of both; that is the one deliberate deviation, and the gate asserts its
+direction. Where the oracles disagree in wording, LCCC follows GCC.
 
 ---
 

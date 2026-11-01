@@ -10,6 +10,31 @@ use crate::common::types::{AddressSpace, IrType};
 use crate::frontend::parser::ast::Expr;
 use crate::ir::reexports::{CallInfo, Instruction, IrBinOp, IrCmpOp, IrConst, Operand, Value};
 
+/// IEEE 754 binary128 field geometry as seen through the HIGH 64-bit word:
+/// bit 63 is the sign, bits 62..48 are the 15-bit exponent, bits 47..0 are the
+/// top 48 mantissa bits. The remaining 64 mantissa bits live in the low word,
+/// so every field test below is 64-bit arithmetic -- no 128-bit operation, no
+/// memory round trip, no endianness assumption (the two words are produced by an
+/// IR-level shift and truncation, not by reinterpreting stored bytes).
+/// A binary128 object is 16 bytes, which is also its natural alignment.
+const SIZE_OF_BINARY128: usize = 16;
+const BINARY128_EXP_FIELD: i64 = 0x7FFF_0000_0000_0000;
+const BINARY128_MANT_HI: i64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// The field tests every binary128 classification is built from, each either 0
+/// or 1 in an `I32`.
+struct Binary128Fields {
+    /// Exponent field is all ones: the value is a NaN or an infinity.
+    exp_is_max: Value,
+    /// Exponent field is zero: the value is a zero or a subnormal.
+    exp_is_zero: Value,
+    /// Mantissa field is zero: combined with an all-ones exponent this is an
+    /// infinity, combined with a zero exponent it is a zero.
+    mant_is_zero: Value,
+    /// The sign bit as 0 or 1 (not the C truth value 0 or -1).
+    sign: Value,
+}
+
 impl Lowerer {
     /// Helper: get the type, CType, and lowered value of the last argument for fp classification builtins.
     fn lower_fp_classify_arg(
@@ -74,6 +99,211 @@ impl Lowerer {
     /// bytes from the upper slot, causing incorrect results in I64 arithmetic.
     fn widen_to_i64(&mut self, val: Value) -> Value {
         self.emit_cast_val(Operand::Value(val), IrType::I32, IrType::I64)
+    }
+
+    /// Widen a comparison result (IR comparisons produce `I8`) to a 0/1 `I32`
+    /// flag, so that flag arithmetic runs in a type the backend materialises
+    /// with defined upper bits.
+    fn bool32(&mut self, flag: Value) -> Value {
+        self.emit_cast_val(Operand::Value(flag), IrType::I8, IrType::I32)
+    }
+
+    fn flag_not(&mut self, flag: Value) -> Value {
+        self.emit_binop_val(
+            IrBinOp::Xor,
+            Operand::Value(flag),
+            Operand::Const(IrConst::I32(1)),
+            IrType::I32,
+        )
+    }
+
+    fn flag_and(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.emit_binop_val(
+            IrBinOp::And,
+            Operand::Value(lhs),
+            Operand::Value(rhs),
+            IrType::I32,
+        )
+    }
+
+    fn flag_or(&mut self, lhs: Value, rhs: Value) -> Value {
+        self.emit_binop_val(
+            IrBinOp::Or,
+            Operand::Value(lhs),
+            Operand::Value(rhs),
+            IrType::I32,
+        )
+    }
+
+    /// Whether this argument is classified by the libc `long double`
+    /// classifiers (`__isnanl`, `__isinfl`, ...).
+    ///
+    /// `long double` and `_Float128` are both `IrType::F128` (16-byte storage),
+    /// but they are DIFFERENT formats: `CType::LongDouble` is the target's own
+    /// long double, which on x86-64 is the 80-bit x87 extended format stored in
+    /// a 16-byte slot, while `CType::Float128` is always IEEE binary128. The
+    /// libc classifiers match the target's long double and therefore only tell
+    /// the truth for the former. Feeding them binary128 bits made
+    /// `__builtin_isnan(nan)` return 0 and `__builtin_isfinite(inf)` return 1
+    /// (measured against GCC 16.2); binary128 is classified from its bits
+    /// instead, which is exact, libc-free and target-independent.
+    fn uses_libc_long_double_classifier(
+        arg_ty: IrType,
+        arg_ct: &crate::common::types::CType,
+    ) -> bool {
+        arg_ty == IrType::F128 && !matches!(arg_ct, crate::common::types::CType::Float128)
+    }
+
+    /// Whether this argument is IEEE binary128, classified from its bits.
+    ///
+    /// Decided on the C type alone: `_Float128` reaches the IR in an integer
+    /// carrier (`U128`, 16-byte bit-exact moves) in most positions, and only
+    /// sometimes as `IrType::F128`, so an `arg_ty` test misses it.
+    fn is_binary128(arg_ct: &crate::common::types::CType) -> bool {
+        matches!(arg_ct, crate::common::types::CType::Float128)
+    }
+
+    /// The bit pattern of a value that is not carried as an integer, as an
+    /// unsigned 128-bit carrier: the 16 bytes are stored and reloaded through a
+    /// temporary, so no FP conversion can silently round them.
+    fn bitcast_f128_to_u128(&mut self, val: Operand) -> Value {
+        let tmp_alloca = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: tmp_alloca,
+            size: SIZE_OF_BINARY128,
+            ty: IrType::F128,
+            align: SIZE_OF_BINARY128,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        let val_v = self.operand_to_value(val);
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(val_v),
+            ptr: tmp_alloca,
+            ty: IrType::F128,
+            seg_override: AddressSpace::Default,
+        });
+        let result = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: result,
+            ptr: tmp_alloca,
+            ty: IrType::U128,
+            seg_override: AddressSpace::Default,
+        });
+        result
+    }
+
+    /// Split a binary128 value into its high and low 64-bit words.
+    ///
+    /// The split is an IR-level shift and truncation of the 128-bit value, not a
+    /// reinterpretation of stored bytes, so it is independent of the target's byte
+    /// order and needs no aligned temporary when the value already lives in an
+    /// integer carrier (which is how `_Float128` normally reaches the IR).
+    fn binary128_halves(&mut self, arg_val: Operand, arg_ty: IrType) -> (Value, Value) {
+        let bits = match arg_ty {
+            // Already the raw bit pattern (or its signed twin): reuse it.
+            IrType::U128 | IrType::I128 => arg_val,
+            // A narrower float carrier: widen it to binary128 first, so the
+            // 16-byte store below stores a real binary128 value.
+            IrType::F32 | IrType::F64 => {
+                let widened = self.emit_cast_val(arg_val, arg_ty, IrType::F128);
+                Operand::Value(self.bitcast_f128_to_u128(Operand::Value(widened)))
+            }
+            _ => Operand::Value(self.bitcast_f128_to_u128(arg_val)),
+        };
+        let bits = self.operand_to_value(bits);
+        let hi_wide = self.emit_binop_val(
+            IrBinOp::LShr,
+            Operand::Value(bits),
+            Operand::Const(IrConst::I64(64)),
+            IrType::U128,
+        );
+        let hi = self.emit_cast_val(Operand::Value(hi_wide), IrType::U128, IrType::I64);
+        let lo = self.emit_cast_val(Operand::Value(bits), IrType::U128, IrType::I64);
+        (hi, lo)
+    }
+
+    /// Split a binary128 value into the field tests every classifier needs.
+    ///
+    /// Six 64-bit operations per value ("is the exponent all ones", "is it zero",
+    /// "is the mantissa zero", "is the sign set") answer all seven builtins, so a
+    /// classification never touches 128-bit arithmetic, memory, or libc.
+    fn binary128_fields(&mut self, arg_val: Operand, arg_ty: IrType) -> Binary128Fields {
+        let (hi, lo) = self.binary128_halves(arg_val, arg_ty);
+        // Sign and exponent share the top 16 bits of the high word: one mask
+        // answers both exponent questions and leaves the sign bit untouched.
+        let exponent = self.emit_binop_val(
+            IrBinOp::And,
+            Operand::Value(hi),
+            Operand::Const(IrConst::I64(BINARY128_EXP_FIELD)),
+            IrType::I64,
+        );
+        let exp_is_max = self.emit_cmp_val(
+            IrCmpOp::Eq,
+            Operand::Value(exponent),
+            Operand::Const(IrConst::I64(BINARY128_EXP_FIELD)),
+            IrType::I64,
+        );
+        let exp_is_zero = self.emit_cmp_val(
+            IrCmpOp::Eq,
+            Operand::Value(exponent),
+            Operand::Const(IrConst::I64(0)),
+            IrType::I64,
+        );
+        // The mantissa is zero iff both words are: fold the masked high word and
+        // the low word into one value and compare it once.
+        let mantissa_hi = self.emit_binop_val(
+            IrBinOp::And,
+            Operand::Value(hi),
+            Operand::Const(IrConst::I64(BINARY128_MANT_HI)),
+            IrType::I64,
+        );
+        let mantissa = self.emit_binop_val(
+            IrBinOp::Or,
+            Operand::Value(mantissa_hi),
+            Operand::Value(lo),
+            IrType::I64,
+        );
+        let mant_is_zero = self.emit_cmp_val(
+            IrCmpOp::Eq,
+            Operand::Value(mantissa),
+            Operand::Const(IrConst::I64(0)),
+            IrType::I64,
+        );
+        // A signed compare against zero reads the sign bit in one instruction.
+        let sign = self.emit_cmp_val(
+            IrCmpOp::Slt,
+            Operand::Value(hi),
+            Operand::Const(IrConst::I64(0)),
+            IrType::I64,
+        );
+        let exp_is_max = self.bool32(exp_is_max);
+        let exp_is_zero = self.bool32(exp_is_zero);
+        let mant_is_zero = self.bool32(mant_is_zero);
+        let sign = self.bool32(sign);
+        Binary128Fields {
+            exp_is_max,
+            exp_is_zero,
+            mant_is_zero,
+            sign,
+        }
+    }
+
+    /// `__builtin_fpclassify` class flags for binary128, in the order the
+    /// builtin's arguments arrive: nan, infinity, normal, subnormal, zero.
+    fn binary128_class_flags(&mut self, arg_val: Operand, arg_ty: IrType) -> [Value; 5] {
+        let f = self.binary128_fields(arg_val, arg_ty);
+        let mant_not_zero = self.flag_not(f.mant_is_zero);
+        let exp_not_max = self.flag_not(f.exp_is_max);
+        let exp_not_zero = self.flag_not(f.exp_is_zero);
+        let is_nan = self.flag_and(f.exp_is_max, mant_not_zero);
+        let is_inf = self.flag_and(f.exp_is_max, f.mant_is_zero);
+        let is_zero = self.flag_and(f.exp_is_zero, f.mant_is_zero);
+        let is_subnormal = self.flag_and(f.exp_is_zero, mant_not_zero);
+        let is_normal = self.flag_and(exp_not_zero, exp_not_max);
+        [is_nan, is_inf, is_normal, is_subnormal, is_zero]
     }
 
     /// Bitcast a float/double to its integer bit representation via memory.
@@ -184,7 +414,33 @@ impl Lowerer {
         let arg_ty = self.get_expr_type(&args[5]);
         let arg_val = self.lower_expr(&args[5]);
 
-        if arg_ty == IrType::F128 {
+        if Self::is_binary128(&arg_ct) {
+            // Same argument order as the integer paths below.
+            let flags = self.binary128_class_flags(arg_val, arg_ty);
+            let widened: Vec<Value> = flags.iter().map(|&flag| self.widen_to_i64(flag)).collect();
+            let mut result = self.emit_binop_val(
+                IrBinOp::Mul,
+                class_vals[0],
+                Operand::Value(widened[0]),
+                IrType::I64,
+            );
+            for idx in 1..5 {
+                let contrib = self.emit_binop_val(
+                    IrBinOp::Mul,
+                    class_vals[idx],
+                    Operand::Value(widened[idx]),
+                    IrType::I64,
+                );
+                result = self.emit_binop_val(
+                    IrBinOp::Add,
+                    Operand::Value(result),
+                    Operand::Value(contrib),
+                    IrType::I64,
+                );
+            }
+            return Some(Operand::Value(result));
+        }
+        if Self::uses_libc_long_double_classifier(arg_ty, &arg_ct) {
             // TODO: FP_* constants assume glibc/Linux; may differ on musl/BSD
             // __fpclassifyl returns: FP_NAN=0, FP_INFINITE=1, FP_ZERO=2, FP_SUBNORMAL=3, FP_NORMAL=4
             let cls = self.emit_f128_classify_libcall("__fpclassifyl", arg_val);
@@ -357,7 +613,12 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
-        if arg_ty == IrType::F128 {
+        if Self::is_binary128(&arg_ct) {
+            let f = self.binary128_fields(arg_val, arg_ty);
+            let mant_not_zero = self.flag_not(f.mant_is_zero);
+            return Some(Operand::Value(self.flag_and(f.exp_is_max, mant_not_zero)));
+        }
+        if Self::uses_libc_long_double_classifier(arg_ty, &arg_ct) {
             let result = self.emit_f128_classify_libcall("__isnanl", arg_val);
             let bool_result = self.classify_result_to_bool(result);
             return Some(Operand::Value(bool_result));
@@ -381,7 +642,11 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
-        if arg_ty == IrType::F128 {
+        if Self::is_binary128(&arg_ct) {
+            let f = self.binary128_fields(arg_val, arg_ty);
+            return Some(Operand::Value(self.flag_and(f.exp_is_max, f.mant_is_zero)));
+        }
+        if Self::uses_libc_long_double_classifier(arg_ty, &arg_ct) {
             let result = self.emit_f128_classify_libcall("__isinfl", arg_val);
             let bool_result = self.classify_result_to_bool(result);
             return Some(Operand::Value(bool_result));
@@ -405,7 +670,13 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
-        if arg_ty == IrType::F128 {
+        if Self::is_binary128(&arg_ct) {
+            let f = self.binary128_fields(arg_val, arg_ty);
+            // Finite iff the exponent is not all ones: an all-ones exponent
+            // is an infinity or a NaN whatever the mantissa says.
+            return Some(Operand::Value(self.flag_not(f.exp_is_max)));
+        }
+        if Self::uses_libc_long_double_classifier(arg_ty, &arg_ct) {
             let result = self.emit_f128_classify_libcall("__finitel", arg_val);
             let bool_result = self.classify_result_to_bool(result);
             return Some(Operand::Value(bool_result));
@@ -434,7 +705,13 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
-        if arg_ty == IrType::F128 {
+        if Self::is_binary128(&arg_ct) {
+            let f = self.binary128_fields(arg_val, arg_ty);
+            let exp_not_zero = self.flag_not(f.exp_is_zero);
+            let exp_not_max = self.flag_not(f.exp_is_max);
+            return Some(Operand::Value(self.flag_and(exp_not_zero, exp_not_max)));
+        }
+        if Self::uses_libc_long_double_classifier(arg_ty, &arg_ct) {
             // TODO: FP_NORMAL = 4 assumes glibc/Linux FP_* constants; may differ on musl/BSD
             let cls = self.emit_f128_classify_libcall("__fpclassifyl", arg_val);
             let result = self.emit_cmp_val(
@@ -487,7 +764,11 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
-        if arg_ty == IrType::F128 {
+        if Self::is_binary128(&arg_ct) {
+            let f = self.binary128_fields(arg_val, arg_ty);
+            return Some(Operand::Value(f.sign));
+        }
+        if Self::uses_libc_long_double_classifier(arg_ty, &arg_ct) {
             let result = self.emit_f128_classify_libcall("__signbitl", arg_val);
             let bool_result = self.classify_result_to_bool(result);
             return Some(Operand::Value(bool_result));
@@ -516,7 +797,31 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let (arg_ty, arg_ct, arg_val) = self.lower_fp_classify_arg(args);
-        if arg_ty == IrType::F128 {
+        if Self::is_binary128(&arg_ct) {
+            let f = self.binary128_fields(arg_val, arg_ty);
+            let is_inf = self.flag_and(f.exp_is_max, f.mant_is_zero);
+            // 1 - 2 * sign
+            let two_sign = self.emit_binop_val(
+                IrBinOp::Mul,
+                Operand::Value(f.sign),
+                Operand::Const(IrConst::I32(2)),
+                IrType::I32,
+            );
+            let direction = self.emit_binop_val(
+                IrBinOp::Sub,
+                Operand::Const(IrConst::I32(1)),
+                Operand::Value(two_sign),
+                IrType::I32,
+            );
+            let result = self.emit_binop_val(
+                IrBinOp::Mul,
+                Operand::Value(is_inf),
+                Operand::Value(direction),
+                IrType::I32,
+            );
+            return Some(Operand::Value(result));
+        }
+        if Self::uses_libc_long_double_classifier(arg_ty, &arg_ct) {
             // __isinfl returns nonzero if inf
             let isinf_result = self.emit_f128_classify_libcall("__isinfl", arg_val);
             let is_inf_narrow = self.classify_result_to_bool(isinf_result);
