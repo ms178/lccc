@@ -1023,7 +1023,8 @@ impl I686Codegen {
         // and this probe.
         if let Operand::Value(v) = op {
             let is_alloca = self.state.is_alloca(v.0);
-            if self.state.acc_has_verified(v.0, is_alloca) {
+            let has_register_home = self.reg_assignments.contains_key(&v.0);
+            if self.state.acc_has_verified(v.0, is_alloca) && !(is_alloca && has_register_home) {
                 return;
             }
         }
@@ -1042,7 +1043,20 @@ impl I686Codegen {
             }
             Operand::Value(v) => {
                 let is_alloca = self.state.is_alloca(v.0);
-                // Check if value is in a callee-saved register (allocas are never register-allocated)
+                // An alloca's value is its frame address, not a register-held
+                // scalar. Coalescing can nevertheless give an alloca alias a
+                // register home; that home may be undefined on a branch where
+                // the address has not yet been materialized (notably an sret
+                // argument in a conditional expression). Recompute from the
+                // authoritative stack slot instead of consuming that register.
+                if is_alloca {
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        self.emit_alloca_addr_to("eax", v.0, slot);
+                        self.state.park_acc(v.0, true);
+                        return;
+                    }
+                }
+                // Check if value is in a callee-saved register.
                 if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
                     if phys.0 == 6 {
                         // Value is homed in %eax itself (Phase 2e): it is
@@ -5604,6 +5618,20 @@ mod tests {
     fn frame_object(cg: &mut I686Codegen, v: u32, slot: i64) {
         cg.state.value_locations.insert(v, StackSlot(slot));
         cg.state.alloca_values.insert(v);
+    }
+
+    #[test]
+    fn alloca_operand_uses_frame_address_instead_of_register_home() {
+        let mut cg = I686Codegen::new();
+        frame_object(&mut cg, 7, -64);
+        cg.reg_assignments.insert(7, PhysReg(5));
+
+        cg.operand_to_eax(&Operand::Value(Value(7)));
+
+        assert_eq!(
+            emitted(&cg),
+            [format!("leal {}, %eax", cg.slot_ref(StackSlot(-64)))]
+        );
     }
 
     /// Frame object to frame object: addressed as frame operands, no address
