@@ -2332,13 +2332,24 @@ impl Parser {
                         false,
                     );
                 } else {
+                    // One sentence of *verdict* in the error, the reasoning in a
+                    // note. Editors and `-fdiagnostics-format` consumers show the
+                    // error line alone, so a four-clause error reads as noise
+                    // exactly where it has to be scannable; the note keeps the
+                    // explanation attached to the same location.
                     self.emit_error(
                         format!(
                             "'{spelling}' attribute selects {convention}, which this compiler \
-                             does not implement for {target}; refusing rather than emitting \
-                             {target}'s default convention under a foreign-ABI declaration \
-                             (define CCC_ALLOW_UNSUPPORTED_ABI only if every object in the \
-                             program is built by this compiler)"
+                             does not implement for {target}"
+                        ),
+                        span,
+                    );
+                    self.diagnostics.note(
+                        format!(
+                            "emitting {target}'s default convention under a foreign-ABI \
+                             declaration would link and then disagree about the arguments; \
+                             define CCC_ALLOW_UNSUPPORTED_ABI only if every object in the \
+                             program is built by this compiler"
                         ),
                         span,
                     );
