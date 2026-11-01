@@ -420,6 +420,127 @@ Backend lowerings, all of them measured in this section's probe corpus:
 | AArch64 | `mov w3, #1` + `lsl` + `orr` | … + `bic` | … + `eor` | three instructions, the same count the shift/OR spelling costs, which is why the toggle's AArch64 counts do not move: the win there is the eliminated shift, not the mnemonic |
 | RISC-V | `andi` (index mod W) + `li` + `sll` + `or` | … + `xori` + `and` | … + `xor` | no `bts`/`btr`/`btc` (Zbs), so the portable sequence with the index reduced explicitly |
 
+### 13. Predicate materialization — `predicate`
+
+```c
+int f1(int a, int b) { return a != b ? 1 : 0; }   /* 5 -> 4 */
+int f2(int a, int b) { return a != b ? 0 : 1; }   /* 5 -> 4 */
+unsigned f3(int c)   { return c ? 1u : 0u; }      /* 5 -> 4 */
+int f4(int a, int b) { return (a != 0) | (b != 0); }  /* 9 -> 4 */
+int f5(int a, int b) { return (a == 0) & (b == 0); }  /* 9 -> 4 */
+```
+
+C spells a boolean result two ways, and they are the same program: `return a != b;`
+lowers to the comparison itself, which every backend emits as one `setcc` off the
+flags the compare already set, while `return a != b ? 1 : 0;` lowers to a `Select`
+over the two constants. A `Select` needs its arms in registers, so x86 emitted
+`mov $1,%ecx; mov $0,%eax; cmovne` where the comparison alone is
+`xor %eax,%eax; setne %al`. Both oracles canonicalize the two spellings to the
+same IR (gcc and clang both spend 4 instructions on every row above, before and
+after), and LCCC spent 5 -- one instruction per boolean, forever, purely from the
+spelling.
+
+`fold_predicate_select` rewrites the select to the comparison it is hiding, and it
+never needs a new value:
+
+* `select(c, 1, 0)` where `c` *is* a comparison of the select's type becomes a
+  **copy** of it -- the select only copied the boolean through two constants.
+  Through a wider carrier (`(int)t` for a `_Bool`-shaped `t`, the shape
+  `int_ptr_provenance_alias` stores) it becomes the **cast** that restates the
+  carrier: the value is already a boolean, so only its type was ever in question.
+* `select(c, 0, 1)` is `!c`. When the comparison behind `c` has this select as its
+  only reader the fold answers with that comparison **inverted**, so the negated
+  case costs the same as the plain one (no second compare); when it does not, and
+  `c` is already a boolean, the select is left alone -- a zero test on top of a
+  `setcc` pays for the materialization twice (`setne %dil; movzbl %dil,%edi;
+  xorl %eax,%eax; testl %edi,%edi; setne %al`, measured, 5 where the select was 4).
+* Any other integer condition gets the zero test it was hiding: `select(c, 1, 0)`
+  is `(c != 0)` and `select(c, 0, 1)` is `(c == 0)`, so `c` needs only to be as
+  wide as the result. That is the `c ? 1u : 0u` row, where the condition is a
+  plain `int` and no comparison exists.
+
+The arms are read **in the select's ring**, because the frontend emits the two
+constants at a wider `IrConst` type than the select (`Const(I64(1))` on a `U32`
+select, measured) -- refusing that mismatch would refuse every `? 1u : 0u`.
+Everything else is refused: arms that are equal (`select(c,1,1)` is `simplify`'s
+constant fold, not a comparison), arms outside `{0,1}` (`c ? 3 : 2` has no
+comparison form), float and vector results (no `setcc`), and a condition narrower
+than the result (it would have to be widened first, which is not free and needs a
+value of its own).
+
+`fold_predicate_merge` covers the mask algebra of the same family: a disjunction is
+zero exactly when both halves are, so `(a != 0) | (b != 0)` is `(a | b) != 0` and
+its De Morgan dual `(a == 0) & (b == 0)` is `(a | b) == 0`. Both replace two
+`setcc` selectors and a logic op with one disjunction and one compare (9 -> 4), and
+the chain form folds again (`(a != 0) | (b != 0) | (c != 0)` is 13 -> 5). The two
+**mixed** forms are refused, and one of them is the reason this rewrite needs a
+proof rather than a pattern: `(a != 0) & (b != 0)` is **not** `(a & b) != 0` --
+`a = 1, b = 2` shares no set bit but is nonzero twice -- and `(a == 0) | (b == 0)`
+is about two separate zeros, which no conjunction expresses. The matcher accepts
+only the two laws above, requires both comparisons to have exactly one reader (so
+the splice removes two instructions instead of adding one), and requires the
+comparisons' carrier to match the join's.
+
+The merge needs one value of its own for the disjunction, and the `bit_idioms` scan
+forbids inserting values under coordinates it still has to visit, so the pair is
+queued as an `Expansion` and spliced in after the scan (`queue_predicate_merge`),
+with `defs`/`use_counts` updated immediately so later matchers see the post-rewrite
+truth.
+
+Two pipeline facts were learned by measuring, and both are pinned by the gate:
+
+* **The fold runs only in the post-if-conversion invocation.** The select
+  `c ? 1 : 0` is a shape the earlier passes consume: `int t = (x == 4); if (x == 4)
+  r += 1; if (x == 4) r += 2;` folds the two `+=` into ONE select with the arm
+  constants `3`/`0` (5 instructions), and converting `t` to a comparison before
+  that pass has had its turn leaves `t + 2` arithmetic on the side (6 instructions,
+  +3 for the function, measured on `signext_move_cross_block.c`).
+* **A stored comparison is 0/1; a stored lane mask is 0/-1.** With the select gone,
+  `d[i] = lo <= c && c <= hi ? 1 : 0` becomes a comparison feeding the map
+  vectorizer, which stores the packed compare -- the raw mask. The loop
+  `k_s_classify` in `vec_signed_range_fusion.c` then wrote `0xFFFFFFFF` where the C
+  program writes `1`, and it *passed* the corpus sweep (which compares counts, not
+  answers) at `-O2`: the sweep only noticed the file got longer. The vectorizer now
+  materializes `& 1` for any mask-shaped root value tree, and
+  `tests/regression/predicate_materialize_mask_store.c` reproduces the miscompile
+  at `-O2` (verified: it fails without the normalization and passes with it). This
+  is a pre-existing vectorizer bug that no earlier test reached, because the shape
+  needed the select to be gone to parse; the fix is the reason the fold's
+  `vec_signed_range_fusion` rows cost +70 static instructions (a 4-lane SIMD body
+  and its prologue) and run ~3.3x fewer dynamic instructions.
+
+## The sweep behind it
+
+This round began as a measurement, not a fold: a 76-function differential probe
+against gcc 16.2.0 and clang 23.1.4 at `-O2` over the scalar-predicate idioms the
+project has not covered yet, to find where LCCC still loses. Counted inside the
+function body, worst first (LCCC before this round / gcc / clang):
+
+| function | LCCC | gcc | clang | status |
+| --- | --- | --- | --- | --- |
+| `pop32` (`__builtin_popcount`) | 17 | 5 | 16 | deferred: linking policy (see *What is not done*) |
+| `par32` | 18 | 7 | 7 | deferred: same |
+| `next_pow2` | 19 | 18 | 18 | no gap |
+| `div_const` (unsigned magic division) | 9 | 8 | 5 | open: magic-number selection |
+| `avg_u` (`(a & b) + ((a ^ b) >> 1)`) | 9 | 9 | 5 | open: instruction selection |
+| `or_or` (`(a != 0) \| (b != 0)`) | 9 | 4 | 4 | **fixed here** |
+| `and_and` (`(a != 0) & (b != 0)`) | 9 | 7 | 7 | refused: not a rewrite |
+| `add_ovf` (`__builtin_add_overflow`) | 8 | 4 | 4 | open: same-width `seto` path |
+| `sign_of` (`(x > 0) - (x < 0)`) | 8 | 6 | 6 | open: `sbb` form |
+| `seclect`/`cond_neg`/`neg_sel` | 6-7 | 5 | 5 | open: `abs` selection |
+| `align_up` | 7 | 4 | 5 | open: `neg`+`and` spelling |
+| `and03`/`low_byte` (`x & 0xff` stores) | 4/3 | 3/2 | 3/2 | open: byte-extract selection |
+| `sat_add` | 5 | 4 | 4 | open: `cmovae` form |
+| `bool_ne`/`bool_le`/`zero_or_one`/`one_or_zero`/`max_mask`/`bool_from_cmp` | 5 | 4 | 4 | **fixed here** |
+| `add_bytes` (`(u8)(a + b)`) | 5 | 2 | 2 | open: narrow ALU lattice |
+| `absdiff`/`iabs`/`clamp` | 6-9 | 4-7 | 4-7 | open: `mov`+`neg`+`cmovs` |
+
+The two rows this round closes are the boolean-materialization family, because it
+is the one with a law behind it rather than an instruction-selection target: every
+row above is a *different* gap, and the rest are listed here so the next round
+starts from data. The wins that were already LCCC's stay wins (`sext_mul` 3 vs 4,
+`rd32` 3 vs gcc 11 / clang 2, `clz32`/`ctz32` ahead of gcc).
+
 ## Measurements
 
 x86-64, `-O2`, instructions counted inside each function body including `ret`.
