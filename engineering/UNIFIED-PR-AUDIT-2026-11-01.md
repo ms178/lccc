@@ -154,7 +154,7 @@ units; differently named twins permitted incidental register choices to look
 like ABI differences. An explicit EBX/ESI/EDI clobber probe exposes register
 preservation independently of arithmetic register pressure. It also proves
 that `force_align_arg_pointer` can affect a real x86-64 prologue; it cannot be
-classified as universally inert. All 28 table cells match modern GCC after
+classified as universally inert. All 30 table cells match modern GCC after
 these changes. Malformed ABI argument lists are tested in both GNU syntaxes
 and word sizes; an initially missed C23 `regparm(1,2)` case was detected and
 corrected before acceptance.
@@ -182,3 +182,9 @@ reason to install random headers or weaken the trapv test. The fix admits the
 shared tree only when its explicit `gnu/stubs-32.h` support marker exists
 inside the selected sysroot, retains i386 precedence, and adds a real UAPI
 width regression.
+
+Local `ci_local.sh --fast --skip-msrv` selects the cached modern toolchain
+suite without invoking the older compatibility-floor compiler. This selection
+never emits a full/fast acceptance stamp. The default local runner and hosted
+MSRV job are unchanged; hosted CI must still pass before delivery. Gate
+selection tests prove that the compiler-contract gates remain selected.

@@ -35,6 +35,10 @@
 #                                      # it to mode=full: fast + slow on one tree
 #                                      # is every gate GitHub runs.
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
+#   ./scripts/ci_local.sh --fast --skip-msrv
+#       Modern-toolchain-only local validation. Omits the compatibility-floor
+#       compiler, NOT any compiler correctness gate; never writes a pass stamp.
+#       Default local and hosted compatibility coverage is unchanged.
 #
 # A --fast pass is NOT CI-equivalent: GitHub runs all seven slow gates on every
 # PR.  PR #638 went red on check_peephole_whitespace.sh after a green
@@ -74,11 +78,13 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}"
 
 FAST=0
 SLOW_ONLY=0
+SKIP_MSRV=0
 ONLY=""
 for arg in "$@"; do
     case "$arg" in
         --fast) FAST=1 ;;
         --slow) SLOW_ONLY=1 ;;
+        --skip-msrv) SKIP_MSRV=1 ;;
         --only) ONLY="__NEXT__" ;;
         *) if [ "$ONLY" = "__NEXT__" ]; then ONLY="$arg"; else
                echo "unknown argument: $arg" >&2; exit 2
@@ -129,6 +135,11 @@ gate() {
     fi
     if [ "$FAST" = "1" ] && [ "$slow" = "slow" ]; then
         echo "SKIP  $name (--fast)"
+        SKIPPED=$((SKIPPED + 1))
+        return 0
+    fi
+    if [ "$SKIP_MSRV" = 1 ] && [ "$name" = msrv-check ]; then
+        echo "SKIP  $name (--skip-msrv: modern toolchains only; no pass stamp)"
         SKIPPED=$((SKIPPED + 1))
         return 0
     fi
@@ -3361,8 +3372,8 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 echo "ALL GATES GREEN"
-if [ -n "$ONLY" ]; then
-    echo "(--only $ONLY: partial run, no pass stamp)"
+if [ -n "$ONLY" ] || [ "$SKIP_MSRV" = 1 ]; then
+    echo "(explicit gate selection: partial run, no pass stamp)"
 else
     TREE_END=$(bash scripts/worktree_tree.sh 2>/dev/null || true)
     if [ -n "$TREE_START" ] && [ "$TREE_START" = "$TREE_END" ]; then
