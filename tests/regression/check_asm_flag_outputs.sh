@@ -108,7 +108,11 @@ fi
 if ! "$CCC" -O2 -S "$TMP/x86-eq.c" -o "$TMP/x86-eq.s"; then
     echo "FAIL x86-64 -S: flag output function did not assemble" >&2
     fail=1
-elif ! grep -Eq '^[[:space:]]+sete[[:space:]]+%[a-z0-9]+' "$TMP/x86-eq.s"; then
+elif ! grep -Eq '^[[:space:]]+sete[[:space:]]+' "$TMP/x86-eq.s"; then
+    # Either materialisation is legal and this back end picks the better one:
+    # `setcc` straight into the output's stack home when the output is a byte
+    # with a direct slot, and `setcc %r8` + widen + store otherwise. The gate
+    # asserts the flag is materialised by SETcc, not the operand form.
     echo "FAIL x86-64: no 'sete' materialised the flag output:" >&2
     cat "$TMP/x86-eq.s" >&2
     fail=1
@@ -172,7 +176,7 @@ EOF
     if ! "$CCC_I686" -O2 -S "$TMP/i686-eq.c" -o "$TMP/i686-eq.s"; then
         echo "FAIL i686 -S: flag output function did not assemble" >&2
         fail=1
-    elif ! grep -Eq '^[[:space:]]+sete[[:space:]]+%[a-z]{2,3}' "$TMP/i686-eq.s"; then
+    elif ! grep -Eq '^[[:space:]]+sete[[:space:]]+' "$TMP/i686-eq.s"; then
         echo "FAIL i686: no 'sete' materialised the flag output:" >&2
         cat "$TMP/i686-eq.s" >&2
         fail=1
@@ -219,8 +223,12 @@ fi
 # ── RISC-V: no condition register, so the operand is refused ─────────────────
 if [[ -n ${CCC_RISCV:-} && -x ${CCC_RISCV} ]]; then
     for spelling in '=@ccz' '=@cceq' '=@cc'; do
-        printf 'int f(int a,int b){ _Bool r; __asm__("sub %1, %2" : "%s"(r) : "r"(a),"r"(b)); return r; }\n' \
-            "$spelling" >"$TMP/rv-bad.c"
+        # A heredoc, not `printf`: the template itself contains `%1`/`%2`, and
+        # printf reads those as conversions -- the C file came out truncated
+        # and the gate compared a parse error against the diagnostic it wanted.
+        cat >"$TMP/rv-bad.c" <<EOF
+int f(int a, int b){ _Bool r; __asm__("sub %1, %2" : "$spelling"(r) : "r"(a), "r"(b)); return r; }
+EOF
         want="'$spelling' flag output constraint is not supported on this target"
         expect_error "riscv rejects $spelling" "$CCC_RISCV" "$TMP/rv-bad.c" "$want"
     done
@@ -269,14 +277,17 @@ EOF
     if ! "$CCC_I686" -O2 -S "$TMP/i686-byte.c" -o "$TMP/i686-byte.s"; then
         echo "FAIL i686 -S: %b operand function did not assemble" >&2
         fail=1
-    elif grep -Eq '^[[:space:]]+movb.*%(esi|edi|ebp)\b' "$TMP/i686-byte.s"; then
-        echo "FAIL i686: a %b operand was given a register with no byte view:" >&2
-        cat "$TMP/i686-byte.s" >&2
-        fail=1
-    elif ! grep -Eq 'movb \$3, %(al|bl|cl|dl)\b' "$TMP/i686-byte.s"; then
-        echo "FAIL i686: the third %b operand did not use a byte register:" >&2
-        cat "$TMP/i686-byte.s" >&2
-        fail=1
+    else
+        # All three `%b` operands, not just the third: IA-32 cannot name a byte
+        # of `esi`/`edi`/`ebp`, so every one of them must come out as
+        # `al`/`bl`/`cl`/`dl`. The count is exact because the template is the
+        # only `movb $<imm>` in the function body.
+        n=$(grep -Ec '^[[:space:]]+movb \$[123], %(al|bl|cl|dl)\b' "$TMP/i686-byte.s" || true)
+        if [[ ${n:-0} -ne 3 ]]; then
+            echo "FAIL i686: expected three %b operands on byte registers, found ${n:-0}:" >&2
+            cat "$TMP/i686-byte.s" >&2
+            fail=1
+        fi
     fi
 fi
 
