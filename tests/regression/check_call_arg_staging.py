@@ -87,7 +87,9 @@ def const_of(t, rng):
     if t == "MX":
         return f"(struct MX){{{k}, {k}.75}}"
     if t == "i128":
-        return f"((__int128){k} << 70 | {abs(k)})"
+        # k is in [-9, 99], so this signed product is representable;
+        # left-shifting a negative signed k would instead be undefined.
+        return f"(((__int128){k} * ((__int128)1 << 70)) | {abs(k)})"
     raise ValueError(t)
 
 
@@ -177,10 +179,10 @@ class Gen:
                 f"if ({cond(-3)}) return {self.call_expr(params)}; return {self.call_expr(params)};"
             )
         elif shape == "nontail":
-            tail = f" ^ (long){live_after}" if live_after else ""
-            body = f"long r = {self.call_expr(params)}; return r * 3{tail};"
+            tail = f" ^ (u64){live_after}" if live_after else ""
+            body = f"long r = {self.call_expr(params)}; return (long)((u64)r * 3u{tail});"
         else:
-            body = f"long r = {self.call_expr(params)}; return r + {self.call_expr(params)};"
+            body = f"long r = {self.call_expr(params)}; return (long)((u64)r + (u64){self.call_expr(params)});"
         attr = "__attribute__((noinline)) "
         return f"{attr}long f{idx}({decl}) {{ {body} }}", params, not cond_src
 
@@ -222,6 +224,7 @@ class Gen:
 # (`movabsq` into %rax, the one scratch left), small constants
 # (`pushq $imm`), and the original seed-11 reduction.
 PINNED_CALLER = r"""
+typedef unsigned long u64;
 typedef __int128 i128;
 typedef unsigned __int128 u128;
 extern long base_arr[];
@@ -229,7 +232,7 @@ long c13(int, int, const long *, float, int, int, int, i128);
 long c7(long, long, long, long, long, long, i128, i128);
 long c8(long, long, long, long, long, i128, long, u128);
 __attribute__((noinline)) long k_seed11(int p0, i128 p1)
-{ long r = c13(30, p0, base_arr + 0, 5.5f, 9, p0 ^ 3, 46, p1); return r * 3 ^ (long)p0; }
+{ long r = c13(30, p0, base_arr + 0, 5.5f, 9, p0 ^ 3, 46, p1); return (long)((u64)r * 3u ^ (u64)p0); }
 __attribute__((noinline)) long k_value(long a, long b)
 { return c7(b, a, b, a, b, a, (i128)a * b, (i128)b); }
 __attribute__((noinline)) long k_wide_const(long a)
@@ -237,7 +240,7 @@ __attribute__((noinline)) long k_wide_const(long a)
 __attribute__((noinline)) long k_small_const(long a, long b)
 { return c7(b, a, b, a, b, a, -1, -5); }
 __attribute__((noinline)) long k_mixed(long a, long b, u128 u)
-{ return c8(a, b, a ^ b, b - a, a + 7, (i128)a << 70, b, u + 1); }
+{ return c8(a, b, a ^ b, b - a, a + 7, (i128)((u128)(i128)a << 70), b, u + 1); }
 """
 
 PINNED_MAIN = r"""
@@ -262,7 +265,7 @@ long c8(long a, long b, long c, long d, long e, i128 g, long f, u128 u)
 long k_seed11(int, i128); long k_value(long, long); long k_wide_const(long);
 long k_small_const(long, long); long k_mixed(long, long, u128);
 int main(void) {
-    printf("k_seed11 %ld\n", k_seed11(13, ((i128)-3 << 64) | 11));
+    printf("k_seed11 %ld\n", k_seed11(13, (-((i128)3 << 64)) | 11));
     printf("k_value %ld\n", k_value(-9, 1234567));
     printf("k_wide_const %ld\n", k_wide_const(17));
     printf("k_small_const %ld\n", k_small_const(4, -6));
@@ -276,10 +279,20 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def build_and_run(cc, opt, caller, main_obj, work, tag):
+# Fail closed on undefined reference behavior, without depending on the
+# cached compiler shipping an optional libubsan runtime. Both translation
+# units of the reference are instrumented; LCCC callers remain unsanitized.
+REFERENCE_SANITIZER_FLAGS = [
+    "-fsanitize=undefined,float-cast-overflow",
+    "-fsanitize-trap=undefined,float-cast-overflow",
+    "-fno-sanitize-recover=all",
+]
+
+
+def build_and_run(cc, opt, caller, main_obj, work, tag, extra_flags=()):
     obj = os.path.join(work, f"caller.{tag}.o")
     exe = os.path.join(work, f"t.{tag}")
-    r = run([cc, opt, "-c", caller, "-o", obj])
+    r = run([cc, opt, *extra_flags, "-c", caller, "-o", obj])
     if r.returncode:
         return None, f"compile failed ({cc} {opt}): {r.stderr[-2000:]}"
     r = run(["gcc-16" if shutil.which("gcc-16") else "gcc", obj, main_obj, "-o", exe])
@@ -333,12 +346,12 @@ def main():
         with open(mainc, "w") as f:
             f.write(main_tu)
         main_obj = os.path.join(work, f"main{seed}.o")
-        r = run([a.gcc, "-O1", "-c", mainc, "-o", main_obj])
+        r = run([a.gcc, "-O1", *REFERENCE_SANITIZER_FLAGS, "-c", mainc, "-o", main_obj])
         if r.returncode:
             print(f"FAIL: seed {seed}: driver compile: {r.stderr[-1500:]}")
             failures += 1
             continue
-        ref, err = build_and_run(a.gcc, "-O0", caller, main_obj, work, f"ref{seed}")
+        ref, err = build_and_run(a.gcc, "-O0", caller, main_obj, work, f"ref{seed}", REFERENCE_SANITIZER_FLAGS)
         if err:
             print(f"FAIL: seed {seed}: reference: {err}")
             failures += 1
