@@ -1947,7 +1947,15 @@ jobs:
       # scripts/check_ci_gate_parity.py checks.
       run: |
         set -Eeuo pipefail
-        bash tests/regression/check_layout_tie_rule.sh
+        log="$RUNNER_TEMP/layout-tie-rule.log"
+        if bash tests/regression/check_layout_tie_rule.sh >"$log" 2>&1; then
+          cat "$log"
+        else
+          rc=$?
+          cat "$log"
+          python3 scripts/ci_annotate_log.py --title "Layout tie rule" --tail 80 "$log"
+          exit "$rc"
+        fi
 
     - name: Verify peephole phi-hoist safety contracts
       env:
