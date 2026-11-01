@@ -1202,7 +1202,12 @@ fn remove_inert_inline_asm(f: &mut crate::ir::reexports::IrFunction) -> usize {
     let mut removed = 0;
     for block in &mut f.blocks {
         let before = block.instructions.len();
-        block.instructions.retain(|inst| {
+        // `retain_insts` keeps `source_spans` parallel to `instructions`.
+        // A bare `instructions.retain` left one stale span per removed asm,
+        // which the next structural verifier (phi_relay_fold) reported as a
+        // span/instruction count mismatch and which `.loc` emission would
+        // otherwise index past the shorter instruction list.
+        block.retain_insts(|inst| {
             !matches!(
                 inst,
                 Instruction::InlineAsm {
@@ -1220,6 +1225,62 @@ fn remove_inert_inline_asm(f: &mut crate::ir::reexports::IrFunction) -> usize {
         removed += before - block.instructions.len();
     }
     removed
+}
+
+#[cfg(test)]
+mod inert_asm_tests {
+    use super::remove_inert_inline_asm;
+    use crate::common::source::Span;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
+    };
+
+    fn inert_asm() -> Instruction {
+        Instruction::InlineAsm {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: vec!["memory".to_string()],
+            operand_types: Vec::new(),
+            goto_labels: Vec::new(),
+            input_symbols: Vec::new(),
+            seg_overrides: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn removing_inert_asm_keeps_source_spans_parallel() {
+        // The late inert-asm cleanup runs after `.loc` tracking is live. A
+        // bare `instructions.retain` deleted the asm but kept its span, so
+        // the next structural verifier saw N+1 spans for N instructions and
+        // debug emission could index past the instruction list.
+        let mut func = IrFunction::new("inert_asm_spans".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(crate::ir::reexports::IrConst::I32(1)),
+                },
+                inert_asm(),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![Span::new(1, 2, 0), Span::new(3, 4, 0), Span::new(5, 6, 0)],
+        });
+        assert_eq!(remove_inert_inline_asm(&mut func), 1);
+        let block = &func.blocks[0];
+        assert_eq!(block.instructions.len(), 2);
+        assert_eq!(
+            block.source_spans,
+            vec![Span::new(1, 2, 0), Span::new(5, 6, 0)],
+            "the removed asm's span must go with it"
+        );
+    }
 }
 
 /// Apply the driver-level `-fno-tree-vectorize` policy to every automatic
