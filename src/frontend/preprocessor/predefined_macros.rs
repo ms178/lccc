@@ -84,6 +84,15 @@ const PREDEFINED_OBJECT_MACROS: &[(&str, &str)] = &[
     ("__REGISTER_PREFIX__", ""),
     ("__SIG_ATOMIC_TYPE__", "int"),
     ("__GCC_HAVE_DWARF2_CFI_ASM", "1"),
+    // GCC defines this on every target that implements `=@cc<cond>` flag
+    // output operands, which is how headers decide whether they may use them:
+    // the Linux kernel's `CC_SET`/`CC_OUT` expand to a flag output only when
+    // it is defined, and a compiler that omits the macro silently gets the
+    // flags-clobbering fallback instead. lccc implements flag outputs on
+    // x86-64, i686 and AArch64, so it claims them on exactly those targets;
+    // `set_target` undefines the macro again for RISC-V, whose back end has no
+    // condition register (GCC does not define it there either).
+    ("__GCC_ASM_FLAG_OUTPUTS__", "1"),
     ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", "1"),
     ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", "1"),
     ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", "1"),
@@ -1203,6 +1212,11 @@ impl Preprocessor {
                     "/usr/include/aarch64-linux-gnu",
                 ];
                 self.insert_arch_paths_after_bundled(&aarch64_paths);
+                // `__GCC_ASM_FLAG_OUTPUTS__` and the rest of the common set
+                // stay defined here: GCC defines the flag-output macro on
+                // AArch64 as well, and this back end implements `=@cc<cond>`
+                // with `CSET`.
+                //
                 // AArch64 uses IEEE 754 binary128 for long double (not x87 80-bit)
                 self.override_ldbl_binary128();
             }
@@ -1218,6 +1232,10 @@ impl Preprocessor {
                 self.macros.undefine("__MMX__");
                 self.macros.undefine("__SSE_MATH__");
                 self.macros.undefine("__SSE2_MATH__");
+                // No condition register on RISC-V, hence no flag outputs: GCC
+                // does not define `__GCC_ASM_FLAG_OUTPUTS__` here either, and a
+                // header that saw it would emit an `asm` this parser rejects.
+                self.macros.undefine("__GCC_ASM_FLAG_OUTPUTS__");
                 // Define riscv64 macros
                 self.define_simple_macro("__riscv", "1");
                 self.define_simple_macro("__riscv_xlen", "64");

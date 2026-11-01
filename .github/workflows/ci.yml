@@ -665,6 +665,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_trapv_boundary_matrix.sh --bits -m32
     - name: Inline-asm operand and template diagnostics match GCC 16.2
       run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
+    - name: Flag-output operands (=@cc) are per-target and materialised, not stored stale
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv GCC=gcc-16 bash tests/regression/check_asm_flag_outputs.sh
     - name: One-lane ext_vector FP/int carrier correctness
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_lane1_abi.sh
     - name: RISC-V shared-binding relocation algebra
