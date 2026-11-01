@@ -414,6 +414,55 @@ direct `eliminate_redundant_jumps` test that also pins the "different target is
 live" case. None of these can run in the agent sandbox (no Rust toolchain), so
 they are compiled and executed by the `Unit tests` and `Clippy` CI jobs.
 
+### 5.4 Ported: trampoline threading to both RISC targets
+
+**Donor.** i686's `thread_trivial_blocks` finds local labels whose whole body is
+an unconditional jump, resolves the chains once with a cycle check, retargets
+every reference, and then deletes the block once a module-wide reference census
+proves nothing else points at it. Neither RISC target had any of it, so every
+trampoline left behind by block shuffling, select lowering or identical-block
+merging cost an extra fetch and an extra taken branch on every execution.
+
+**What was ported.** `thread_trampolines` on AArch64 and RISC-V builds
+`label -> forward target` for every local label whose body is a single
+unconditional branch, resolves chains with `resolve_trampoline` (bounded at 16
+hops, cycles refused rather than broken), and rewrites the branch targets in one
+pass. The analysis borrows the text and produces a list of rewrites; only the
+rewrites mutate it, so no `&str` key outlives the analysis and the pass allocates
+nothing per label.
+
+**What was deliberately *not* ported: block deletion.** The i686 pass removes the
+trampoline label and jump once its census proves the block unreachable from
+elsewhere. That requires two proofs this back end does not have in a text
+peephole: the block cannot be entered by *fall-through*, and no label address is
+observable to code (`adrp`/`adr` on AArch64, `lla` on RISC-V, plus the
+`.L`-symbol tricks the assembler tests use). Retargeting alone is
+control-flow-equivalent with no such proof: only branch *targets* change, every
+rewritten branch keeps its mnemonic, and the trampoline text stays exactly where
+it was. The now-unreferenced copies are removed by the ordinary dead-code passes
+of later rounds instead.
+
+**Range discipline.** AArch64 retargets `b` to `b`, which keeps the ±128 MB
+reach. RISC-V retargets the far `jump` pseudo freely (it reaches the whole text
+via `auipc` + `addi` + `jalr`), but the near `j` form (`jal x0`, ±1 MiB) is only
+retargeted when `interval_is_near` proves the new target reachable inside the
+same conservative ±3 KB, 32-bytes-per-line census that gates
+`fuse_branch_over_jump` — that helper was factored out of the fusion pass so both
+users share one definition of "near" instead of two drifting copies. The census
+still fails closed across directives, global labels and the opaque
+volatile-cut region.
+
+**Interaction with the pass added in §5.3.** A trampoline whose body jumps to the
+immediately following label is already flattened by the dead-branch pass (the
+branch was dead), so it never reaches the threading analysis; the threading pass
+therefore handles exactly the non-adjacent case that remains, and the two passes
+converge in one round rather than fighting.
+
+**Evidence.** `trampolines_are_threaded_to_the_end_of_the_chain` and
+`trampoline_cycles_are_left_alone` on AArch64 (full pipeline), and one RISC-V
+test that drives `thread_trampolines` directly for both the two-hop chain and the
+cyclic chain, asserting the text is left byte-identical in the cyclic case.
+
 ## 6. Ranked cross-pollination backlog
 
 Ordered by (correctness impact × reach) / risk. Every item names donor, recipient
@@ -423,7 +472,7 @@ and the mechanism.
 |---|---|---|---|---|---|
 | 1 | ~~byte-register-safe asm operand allocation~~ (§5.2) | x86-64 semantics → i686 | **done** — hard error on `%b`/`%h`, wrong-byte `%h` on x86-64 | medium | landed as `operand_reg_views` + two `InlineAsmEmitter` hooks |
 | 2 | `else_hoist_diamonds` | i686 → AArch64, RISC-V | shrinks every if/else region | medium | pure CFG rewrite; needs a scheduler that can undo fall-through |
-| 3 | `thread_trivial_blocks` / `merge_duplicate_epilogues_terminal` | i686 → AArch64, RISC-V | removes `b`→`b` trampolines and duplicate returns | low | RISC-V already has `fuse_branch_over_jump`; reuse its range checks |
+| 3 | `thread_trivial_blocks` ~~(§5.4: retargeting half)~~ / `merge_duplicate_epilogues_terminal` | i686 → AArch64, RISC-V | **partly done** — `b`→`b` trampoline hops removed; block deletion and duplicate epilogues remain | low | retargeting needs no fall-through or label-identity proof; deletion does |
 | 4 | `eliminate_unused_callee_saves` / `eliminate_dead_frame_allocation` | i686 → AArch64 | shrinks prologue/epilogue of every leaf-ish function | low | AArch64 prologue is simpler than i686's; slot model already shared |
 | 5 | `propagate_address_aliases` + `eliminate_repeated_slot_loads` | AArch64 → RISC-V | repeated slot loads in loops | low | RISC-V has the slot dataflow this pass needs |
 | 6 | `global_store_forwarding` + `global_dead_store_elimination` | RISC-V → AArch64 | address-taken slot traffic | medium | needs the cross-block value numbering RISC-V already built |

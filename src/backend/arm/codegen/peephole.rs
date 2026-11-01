@@ -668,6 +668,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fold_zero_stores(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
+        changed |= thread_trampolines(&mut lines, &mut kinds, n);
         // After the folds: dead staging movs (their patterns must win first).
         changed |= eliminate_overwritten_moves(&lines, &mut kinds, n);
         changed |= eliminate_overwritten_stores(&lines, &mut kinds, n);
@@ -4568,6 +4569,112 @@ fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usiz
             changed = true;
         }
         i += 1;
+    }
+    changed
+}
+
+// ── Pass 5c: Trampoline threading ────────────────────────────────────────────
+//
+// A local label whose body is nothing but `b .Lreal` is a trampoline: every
+// `b .Ltramp` pays an extra fetch and an extra taken branch to reach `.Lreal`.
+// Block shuffling, select lowering and identical-block merging all leave these
+// behind.
+//
+// Only unconditional branches are retargeted, and they stay unconditional, so no
+// rewritten branch reaches less far than the one it replaced. The trampoline
+// instruction itself is left in place: deleting a block is a control-flow change
+// (fall-through entry, `adrp`/`adr` label identity) that the i686 donor pass
+// proves with a module-wide census of label references. Keeping the conservative
+// half of that pass cannot be wrong, and the unreachable copies are removed by
+// the dead-code passes of later rounds anyway.
+
+/// Maximum number of trampoline hops followed before a chain is given up on.
+const TRAMPOLINE_CHAIN_LIMIT: usize = 16;
+
+/// Follow trampolines forwards from `start` to the first label whose body is not
+/// a trampoline. Returns `None` for a chain that revisits itself.
+fn resolve_trampoline<'a>(start: &str, direct: &'a FxHashMap<&'a str, &'a str>) -> Option<&'a str> {
+    let mut current: &'a str = direct.get(start).copied()?;
+    for _ in 0..TRAMPOLINE_CHAIN_LIMIT {
+        if current == start {
+            // The chain came back to the label it started from.
+            return None;
+        }
+        match direct.get(current).copied() {
+            Some(further) => current = further,
+            None => return Some(current),
+        }
+    }
+    None
+}
+
+fn thread_trampolines(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_TRAMPOLINE_THREAD").is_ok() {
+        return false;
+    }
+    // The analysis only borrows the text; the rewrites are the only mutation.
+    let rewrites: Vec<(usize, String)> = {
+        // A name that is defined twice cannot be resolved locally.
+        let mut definitions: FxHashMap<&str, usize> = FxHashMap::default();
+        for i in 0..n {
+            if kinds[i] != LineKind::Label {
+                continue;
+            }
+            if let Some(name) = label_name(&lines[i]) {
+                *definitions.entry(name).or_insert(0) += 1;
+            }
+        }
+        // Local label -> the target of the single unconditional branch it guards.
+        let mut direct: FxHashMap<&str, &str> = FxHashMap::default();
+        for i in 0..n {
+            if kinds[i] != LineKind::Label {
+                continue;
+            }
+            let Some(name) = label_name(&lines[i]) else {
+                continue;
+            };
+            if !name.starts_with('.') || definitions.get(name) != Some(&1) {
+                continue;
+            }
+            let Some(j) = next_insn(kinds, i + 1, n) else {
+                continue;
+            };
+            if kinds[j] != LineKind::Branch {
+                continue;
+            }
+            let Some(target) = branch_target(&lines[j]) else {
+                continue;
+            };
+            if target != name {
+                direct.insert(name, target);
+            }
+        }
+        if direct.is_empty() {
+            return false;
+        }
+        let mut resolved: FxHashMap<&str, &str> = FxHashMap::default();
+        for &name in direct.keys() {
+            if let Some(final_target) = resolve_trampoline(name, &direct) {
+                resolved.insert(name, final_target);
+            }
+        }
+        let mut rewrites = Vec::new();
+        for i in 0..n {
+            if kinds[i] != LineKind::Branch {
+                continue;
+            }
+            let Some(target) = branch_target(&lines[i]) else {
+                continue;
+            };
+            if let Some(final_target) = resolved.get(target) {
+                rewrites.push((i, format!("    b {}", final_target)));
+            }
+        }
+        rewrites
+    };
+    let changed = !rewrites.is_empty();
+    for (i, text) in rewrites {
+        lines[i] = text;
     }
     changed
 }
@@ -8846,6 +8953,87 @@ f:
         assert!(
             result.contains("    b.eq .Lother\n"),
             "a live conditional branch was removed:\n{result}"
+        );
+    }
+
+    #[test]
+    fn trampolines_are_threaded_to_the_end_of_the_chain() {
+        let asm = concat!(
+            "f:\n",
+            "    b .Ltramp\n",
+            "    ret\n",
+            ".Ltramp:\n",
+            "    b .Lhop\n",
+            ".Lother:\n",
+            "    mov x0, #9\n",
+            "    ret\n",
+            ".Lhop:\n",
+            "    b .Lreal\n",
+            ".Lrest:\n",
+            "    mov x0, #7\n",
+            "    ret\n",
+            ".Lreal:\n",
+            "    mov x0, #3\n",
+            "    ret\n",
+        );
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(thread_trampolines(&mut lines, &mut kinds, n));
+        assert_eq!(lines[1], "    b .Lreal", "entry hop not resolved");
+        assert_eq!(lines[3], ".Ltramp:", "the label itself is never removed");
+        assert_eq!(lines[4], "    b .Lreal", "second hop of the chain not folded");
+        assert_eq!(lines[11], "    mov x0, #7", "unrelated code is untouched");
+    }
+
+    #[test]
+    fn trampoline_cycles_are_left_alone() {
+        let asm = concat!(
+            "f:\n",
+            "    b .La\n",
+            "    ret\n",
+            ".La:\n",
+            "    b .Lb\n",
+            ".Lmid:\n",
+            "    mov x0, #1\n",
+            "    ret\n",
+            ".Lb:\n",
+            "    b .La\n",
+            ".Lrest:\n",
+            "    mov x0, #2\n",
+            "    ret\n",
+        );
+        let original: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut lines = original.clone();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!thread_trampolines(&mut lines, &mut kinds, n));
+        assert_eq!(lines, original);
+    }
+
+    #[test]
+    fn trampolines_are_threaded_through_the_whole_pipeline() {
+        // End-to-end guard: whatever the surrounding passes do, no branch may
+        // still hop through the trampoline label.
+        let asm = concat!(
+            "f:\n",
+            "    cmp x0, #0\n",
+            "    b.eq .Ltramp\n",
+            "    b .Ltramp\n",
+            "    ret\n",
+            ".Ltramp:\n",
+            "    b .Lreal\n",
+            ".Lother:\n",
+            "    mov x0, #9\n",
+            "    ret\n",
+            ".Lreal:\n",
+            "    mov x0, #3\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            !result.contains("    b .Ltramp"),
+            "the pipeline kept a trampoline hop: {result:?}"
         );
     }
 }

@@ -773,6 +773,16 @@ is inside the ±1 MB window of `cbz`, `cbnz`, `tbz`, `tbnz` and `b.cond`
 emits the one-instruction `cbnz x0, label` directly, so the fusion normally has
 nothing left to do for boolean branches.
 
+**5b. Trampoline Threading**
+
+A local label whose body is a single unconditional branch (`b .Lreal`) is a
+trampoline. Every `b .Ltramp` is retargeted to the end of the chain
+(`b .Lreal`), with chains resolved once and cycles refused. Only branch targets
+change and the mnemonic stays `b`, so no rewritten branch has a shorter reach
+than the one it replaced; the trampoline instructions themselves are left in
+place, because deleting a block would need fall-through and label-identity
+proofs this text peephole does not have. Gate: `CCC_NO_TRAMPOLINE_THREAD`.
+
 **6. Move-Immediate Chain**
 
 The sequence `mov xN, #imm; mov xM, xN` where `xN` is a scratch register is collapsed
