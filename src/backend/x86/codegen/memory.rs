@@ -5080,22 +5080,16 @@ mod indexed_fold_contract_tests {
     #[test]
     fn leaq_sym_index_extends_a_narrow_index_before_the_sib() {
         let mut cg = X86Codegen::new();
-        cg.reg_assignments.insert(3, PhysReg(4)); // %r14 as the index home
-        cg.reg_assignments.insert(4, PhysReg(1)); // %rbx as the dest home
+        cg.reg_assignments.insert(3, PhysReg(4)); // %r14 holds the index
+        cg.reg_assignments.insert(4, PhysReg(1)); // %rbx holds the dest
         cg.value_types.insert(3, IrType::I32);
-        assert!(
-            cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 2, 0),
-            "a narrow index must be extended, not refused"
-        );
+        let folded = cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 2, 0);
+        assert!(folded, "a narrow index is extended");
         let buf = &cg.state.out.buf;
-        assert!(
-            buf.contains("movslq %r14d, %r14"),
-            "I32 index must be sign-extended into its 64-bit form, got: {buf:?}"
-        );
-        assert!(
-            buf.contains("leaq scratch(, %r14, 4), %rbx"),
-            "the SIB must consume the extended index, got: {buf:?}"
-        );
+        let extended = buf.contains("movslq %r14d, %r14");
+        assert!(extended, "I32 sign-extended: {buf:?}");
+        let sib = buf.contains("leaq scratch(, %r14, 4), %rbx");
+        assert!(sib, "the SIB uses the extended index: {buf:?}");
     }
 
     /// A 64-bit index needs no extension, so the fold costs exactly one LEA —
@@ -5106,13 +5100,13 @@ mod indexed_fold_contract_tests {
         cg.reg_assignments.insert(3, PhysReg(4));
         cg.reg_assignments.insert(4, PhysReg(1));
         cg.value_types.insert(3, IrType::I64);
-        assert!(cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 0, 8));
+        let folded = cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 0, 8);
+        assert!(folded, "a 64-bit index needs no extension");
         let buf = &cg.state.out.buf;
-        assert!(!buf.contains("movslq"), "no extension for a 64-bit index: {buf:?}");
-        assert!(
-            buf.contains("leaq scratch+8(, %r14), %rbx"),
-            "one LEA with the displacement, got: {buf:?}"
-        );
+        let extended = buf.contains("movslq");
+        assert!(!extended, "no extension for I64: {buf:?}");
+        let sib = buf.contains("leaq scratch+8(, %r14), %rbx");
+        assert!(sib, "one LEA with the displacement: {buf:?}");
     }
 
     /// The raw `reg_assignments` lookup this arm used bypassed the freshness
@@ -5126,21 +5120,17 @@ mod indexed_fold_contract_tests {
         cg.reg_assignments.insert(4, PhysReg(1));
         cg.value_types.insert(3, IrType::I64);
         cg.home_clobbered.insert(3);
-        assert!(
-            !cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 0, 0),
-            "a clobbered index home must not feed a SIB"
-        );
-        assert!(
-            cg.state.out.buf.is_empty(),
-            "a refusal must emit nothing, got: {:?}",
-            cg.state.out.buf
-        );
+        let folded = cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 0, 0);
+        assert!(!folded, "a clobbered index home is refused");
+        let quiet = cg.state.out.buf.is_empty();
+        assert!(quiet, "nothing emitted: {:?}", cg.state.out.buf);
     }
 
     // ── the emitter half: D32/D64 reach the SSE arms width-exactly ─────────
 
     #[test]
-    fn d32_indexed_load_and_store_move_like_f32() {        // Load: dest homed in an XMM register, value lands there width-exactly.
+    fn d32_indexed_load_and_store_move_like_f32() {
+        // Load: dest homed in an XMM register, value lands there width-exactly.
         let mut cg = X86Codegen::new();
         xmm_home(&mut cg, 100);
         assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 2, IrType::D32, mem4()));
