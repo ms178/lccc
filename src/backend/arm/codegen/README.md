@@ -723,7 +723,11 @@ load after 32-bit store).
 **2. Redundant Branch Elimination**
 
 An unconditional `b .label` where `.label:` is the immediately next non-empty line
-is a no-op (natural fall-through) and is eliminated.
+is a no-op (natural fall-through) and is eliminated. The same holds for a
+*conditional* branch to its own fall-through: `b.cc .Lnext` / `cbz xM, .Lnext` /
+`tbz xM, #n, .Lnext` immediately followed by `.Lnext:` reaches the same
+instruction whether it is taken or not, and the compare-and-branch forms only
+read their operands, so the whole line is dropped.
 
 **3. Self-Move Elimination**
 
@@ -751,6 +755,23 @@ is fused into a single inverted conditional branch:
 ```asm
     b.!cc .target
 ```
+
+The compare-and-branch heads invert the same way — `cbz` <-> `cbnz`,
+`tbz` <-> `tbnz`:
+
+```asm
+    cbnz x0, .Lskip
+    b .target              --->      cbz x0, .target
+.Lskip:                          .Lskip:
+```
+
+The `.Lskip:` label itself is kept: other predecessors may still branch to it.
+
+Each head is retargeted only when the instruction census proves the new target
+is inside the ±1 MB window of `cbz`, `cbnz`, `tbz`, `tbnz` and `b.cond`
+(`COND_BRANCH_SAFE_DISTANCE = 200,000` instructions). `emit_branch_nonzero`
+emits the one-instruction `cbnz x0, label` directly, so the fusion normally has
+nothing left to do for boolean branches.
 
 **6. Move-Immediate Chain**
 

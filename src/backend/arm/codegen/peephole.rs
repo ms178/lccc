@@ -26,7 +26,10 @@
 //!    enabling the first mov to become dead if A is unused.
 //!
 //! 5. **Branch-over-branch fusion**: `b.cc .Lskip; b .target; .Lskip:`
-//!    → `b.!cc .target` (invert condition, eliminate skip label).
+//!    → `b.!cc .target` (invert condition, eliminate skip label).  The same
+//!    fold applies to the compare-and-branch heads `cbz`/`cbnz` and the
+//!    bit-test heads `tbz`/`tbnz`, which invert into each other
+//!    (`cbnz x0, .Lskip; b .target; .Lskip:` → `cbz x0, .target`).
 //!
 //! 6. **Move-immediate chain**: `mov xN, #imm; mov xM, xN` where xN is a
 //!    scratch register (x0-x15) → `mov xM, #imm` when safe.
@@ -554,6 +557,38 @@ fn cond_branch_parts(line: &str) -> Option<(&str, &str)> {
         }
     }
     None
+}
+
+/// Extract the mnemonic, the operands that precede the branch target, and the
+/// target from a compare-and-branch.
+///
+/// `cbz x0, .Lskip` → `Some(("cbz", "x0", ".Lskip"))`
+/// `tbz w1, #3, .Lskip` → `Some(("tbz", "w1, #3", ".Lskip"))`
+fn cmp_branch_parts(line: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = line.trim();
+    let (mnemonic, args) = trimmed.split_once(' ')?;
+    match mnemonic {
+        "cbz" | "cbnz" | "tbz" | "tbnz" => {}
+        _ => return None,
+    }
+    let comma = args.rfind(',')?;
+    let operands = args[..comma].trim_end();
+    let target = args[comma + 1..].trim();
+    if operands.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some((mnemonic, operands, target))
+}
+
+/// Invert a compare-and-branch mnemonic (`cbz` ↔ `cbnz`, `tbz` ↔ `tbnz`).
+fn invert_cmp_branch(mnemonic: &str) -> Option<&'static str> {
+    match mnemonic {
+        "cbz" => Some("cbnz"),
+        "cbnz" => Some("cbz"),
+        "tbz" => Some("tbnz"),
+        "tbnz" => Some("tbz"),
+        _ => None,
+    }
 }
 
 /// Invert a condition code.
@@ -3303,22 +3338,24 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
 fn eliminate_redundant_branches(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     for i in 0..n {
-        if kinds[i] == LineKind::Branch {
-            if let Some(target) = branch_target(&lines[i]) {
-                // Find next non-Nop line
-                let mut j = i + 1;
-                while j < n && kinds[j] == LineKind::Nop {
-                    j += 1;
-                }
-                if j < n && kinds[j] == LineKind::Label {
-                    if let Some(lbl) = label_name(&lines[j]) {
-                        if target == lbl {
-                            kinds[i] = LineKind::Nop;
-                            changed = true;
-                        }
-                    }
-                }
+        // `b .Lnext`, `b.cc .Lnext`, `cbz .Lnext` and `tbz .Lnext` are all dead
+        // when `.Lnext` is the label that immediately follows: taken or not,
+        // control reaches the same instruction. The compare-and-branch forms
+        // only read their operands, so dropping the line cannot lose a write.
+        let target = match kinds[i] {
+            LineKind::Branch => branch_target(&lines[i]),
+            LineKind::CondBranch | LineKind::CmpBranch => {
+                range_limited_branch_target(&lines[i], kinds[i])
             }
+            _ => continue,
+        };
+        let Some(target) = target else { continue };
+        let Some(j) = next_insn(kinds, i + 1, n) else {
+            continue;
+        };
+        if kinds[j] == LineKind::Label && label_name(&lines[j]) == Some(target) {
+            kinds[i] = LineKind::Nop;
+            changed = true;
         }
     }
     changed
@@ -4396,15 +4433,22 @@ fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
 // ── Pass 5: Branch-over-branch fusion ────────────────────────────────────────
 //
 // Pattern:
-//   b.cc .Lskip_N
+//   b.cc .Lskip_N        (or cbz/cbnz/tbz/tbnz .Lskip_N)
 //   b .target
 //   .Lskip_N:
 //
 // Transform to:
-//   b.!cc .target
+//   b.!cc .target        (or the inverted compare-and-branch)
 //
 // This is a very common pattern from the codegen: it emits a conditional branch
-// to skip over an unconditional branch.
+// to skip over an unconditional branch.  Both heads are folded: the classic
+// condition-code form (`b.cc`) and the compare-and-branch forms (`cbz`/`cbnz`
+// and the bit-test forms `tbz`/`tbnz`).  The compare-and-branch heads are the
+// AArch64 counterpart of the x86 `test`+`jcc` fusion and cover every emitter
+// that materialises "branch if non-zero" as `cbz .Lskip; b .Ltarget; .Lskip:`.
+//
+// All four heads reach ±1 MB, the same window as `b.cond`, so the same
+// instruction-census range guard applies to each of them.
 
 /// Estimate the distance (in instructions) from position `from` to the label
 /// `target` in the assembly. Returns `None` if the label is not found.
@@ -4429,61 +4473,99 @@ fn estimate_branch_distance(
     None
 }
 
-/// Maximum number of instructions a b.cond can reach (±1MB = ±262144 instructions).
-/// Use a conservative threshold of 200,000 to leave margin.
+/// Maximum number of instructions a `b.cond` (or `cbz`/`cbnz`/`tbz`/`tbnz`)
+/// can reach (±1 MB = ±262144 instructions).  Use a conservative threshold of
+/// 200,000 to leave margin.
 const COND_BRANCH_SAFE_DISTANCE: usize = 200_000;
+
+/// Does this kind carry a branch target that `fuse_branch_over_branch` can
+/// retarget, and reach the same ±1 MB window as `b.cond`?
+fn is_range_limited_branch(kind: LineKind) -> bool {
+    matches!(kind, LineKind::CondBranch | LineKind::CmpBranch)
+}
+
+/// Index of the next non-`Nop` line at or after `from`, bounded by `n`.
+fn next_insn(kinds: &[LineKind], from: usize, n: usize) -> Option<usize> {
+    (from..n).find(|&pos| kinds[pos] != LineKind::Nop)
+}
+
+/// Target label of a range-limited branch head.
+fn range_limited_branch_target(head: &str, kind: LineKind) -> Option<&str> {
+    if kind == LineKind::CondBranch {
+        return cond_branch_parts(head).map(|(_, target)| target);
+    }
+    cmp_branch_parts(head).map(|(_, _, target)| target)
+}
+
+/// Rewrite `head` so that it branches to `real_target` instead of skipping over
+/// the unconditional branch that guards `real_target`.
+///
+/// Returns `None` when the head mnemonic has no invertible counterpart, in
+/// which case the caller must leave the sequence untouched.
+fn retarget_branch_over_branch(head: &str, kind: LineKind, real_target: &str) -> Option<String> {
+    if kind == LineKind::CondBranch {
+        let (cc, _) = cond_branch_parts(head)?;
+        let inv_cc = invert_condition(cc)?;
+        return Some(format!("    b.{} {}", inv_cc, real_target));
+    }
+    let (mnemonic, operands, _) = cmp_branch_parts(head)?;
+    let inv_mnemonic = invert_cmp_branch(mnemonic)?;
+    Some(format!(
+        "    {} {}, {}",
+        inv_mnemonic, operands, real_target
+    ))
+}
+
+/// Recognise `head; b .target; .Lskip:` starting at `i` and return the index of
+/// the redundant unconditional branch together with the rewritten head.
+fn fused_branch_head(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    i: usize,
+) -> Option<(usize, String)> {
+    let head_kind = kinds[i];
+    if !is_range_limited_branch(head_kind) {
+        return None;
+    }
+    let j = next_insn(kinds, i + 1, n)?;
+    let k = next_insn(kinds, j + 1, n)?;
+    if kinds[j] != LineKind::Branch || kinds[k] != LineKind::Label {
+        return None;
+    }
+    // The head must branch exactly over the unconditional branch.
+    let skip_target = range_limited_branch_target(&lines[i], head_kind)?;
+    if skip_target != label_name(&lines[k])? {
+        return None;
+    }
+    let real_target = branch_target(&lines[j])?;
+    let in_range = match estimate_branch_distance(lines, kinds, i, real_target) {
+        Some(distance) => distance < COND_BRANCH_SAFE_DISTANCE,
+        // `b.cc` head: keep the historical assumption that an unmeasurable
+        // target is reachable, since the unconditional branch already reached
+        // it and `b.cond` reaches ±1 MB.
+        None if head_kind == LineKind::CondBranch => true,
+        // `cbz`/`cbnz`/`tbz`/`tbnz` reach ±1 MB, 128x narrower than `b`.
+        // Fail closed unless the instruction census proves the distance.
+        None => false,
+    };
+    if !in_range {
+        return None;
+    }
+    let rewritten = retarget_branch_over_branch(&lines[i], head_kind, real_target)?;
+    Some((j, rewritten))
+}
 
 fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i + 2 < n {
-        if kinds[i] == LineKind::CondBranch {
-            // Find the next two non-Nop instructions
-            let mut j = i + 1;
-            while j < n && kinds[j] == LineKind::Nop {
-                j += 1;
-            }
-            if j >= n {
-                i += 1;
-                continue;
-            }
-            let mut k = j + 1;
-            while k < n && kinds[k] == LineKind::Nop {
-                k += 1;
-            }
-            if k >= n {
-                i += 1;
-                continue;
-            }
-
-            // Check pattern: b.cc .skip ; b .target ; .skip:
-            if kinds[j] == LineKind::Branch && kinds[k] == LineKind::Label {
-                if let (Some((cc, skip_target)), Some(real_target), Some(lbl)) = (
-                    cond_branch_parts(&lines[i]),
-                    branch_target(&lines[j]),
-                    label_name(&lines[k]),
-                ) {
-                    if skip_target == lbl {
-                        // Check if the real target is within safe b.cond range.
-                        // If the label isn't found in this snippet (external target),
-                        // assume it's in range since the unconditional branch already
-                        // reached it, and b.cond has ±1MB range which is generous.
-                        let in_range = estimate_branch_distance(lines, kinds, i, real_target)
-                            .is_none_or(|d| d < COND_BRANCH_SAFE_DISTANCE);
-                        if in_range {
-                            if let Some(inv_cc) = invert_condition(cc) {
-                                // Replace conditional branch with inverted condition to real target
-                                lines[i] = format!("    b.{} {}", inv_cc, real_target);
-                                // kinds[i] stays as CondBranch
-                                // Remove the unconditional branch
-                                kinds[j] = LineKind::Nop;
-                                // Keep the label (might be targeted by other branches)
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some((removed, rewritten)) = fused_branch_head(lines, kinds, n, i) {
+            // Retarget the head, then drop the unconditional branch. The skip
+            // label stays: other predecessors may still branch to it.
+            lines[i] = rewritten;
+            kinds[removed] = LineKind::Nop;
+            changed = true;
         }
         i += 1;
     }
@@ -8622,6 +8704,148 @@ f:
         assert!(
             result.contains(".LCFP_2:\n    .quad 1073741824\n    .quad 0\n"),
             "trailing .rodata truncated after loop-hoist insertion:\n{result}"
+        );
+    }
+
+    #[test]
+    fn branch_over_branch_folds_compare_and_branch_heads() {
+        // `cbnz x0, .Lskip; b .Lfalse; .Lskip:` is how every "branch if
+        // non-zero" emitter used to be written. It must collapse to a single
+        // inverted compare-and-branch on the real target.
+        let asm = concat!(
+            "f:\n",
+            "    cbnz x0, .Lskip\n",
+            "    b .Lfalse\n",
+            ".Lskip:\n",
+            "    mov x0, #1\n",
+            "    ret\n",
+            ".Lfalse:\n",
+            "    mov x0, #2\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("    cbz x0, .Lfalse\n"),
+            "cbnz head was not fused into cbz on the real target:\n{result}"
+        );
+        assert!(
+            !result.contains("    b .Lfalse\n"),
+            "the unconditional branch over which cbnz guarded survived:\n{result}"
+        );
+        assert!(
+            result.contains(".Lskip:\n    mov x0, #1\n"),
+            "the skip label must stay for other predecessors:\n{result}"
+        );
+    }
+
+    #[test]
+    fn branch_over_branch_folds_bit_test_heads() {
+        // tbz/tbnz carry two operands before the target; the fusion must keep
+        // them verbatim and only invert the mnemonic.
+        let asm = concat!(
+            "f:\n",
+            "    tbz x2, #63, .Lstack\n",
+            "    b .Lreg\n",
+            ".Lstack:\n",
+            "    mov x0, #1\n",
+            "    ret\n",
+            ".Lreg:\n",
+            "    mov x0, #2\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("    tbnz x2, #63, .Lreg\n"),
+            "tbz head was not fused into tbnz on the real target:\n{result}"
+        );
+        assert!(
+            !result.contains("    b .Lreg\n"),
+            "the guarded unconditional branch survived:\n{result}"
+        );
+    }
+
+    #[test]
+    fn branch_over_branch_leaves_compare_and_branch_alone_when_unmeasurable() {
+        // `external_fn` is not defined in this unit, so the census cannot prove
+        // the ±1 MB compare-and-branch range. The pass must fail closed and keep
+        // the unconditional branch (which reaches ±128 MB) in place.
+        let asm = concat!(
+            "f:\n",
+            "    cbnz x0, .Lskip\n",
+            "    b external_fn\n",
+            ".Lskip:\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("    b external_fn\n"),
+            "an unmeasurable compare-and-branch target must not be retargeted:\n{result}"
+        );
+        assert!(
+            result.contains("    cbnz x0, .Lskip\n"),
+            "the head must be left untouched:\n{result}"
+        );
+    }
+
+    #[test]
+    fn branch_over_branch_still_folds_condition_code_heads() {
+        // Regression guard for the pre-existing b.cc path after the head kinds
+        // were unified.
+        let asm = concat!(
+            "f:\n",
+            "    b.eq .Lskip\n",
+            "    b .Lne\n",
+            ".Lskip:\n",
+            "    mov x0, #1\n",
+            "    ret\n",
+            ".Lne:\n",
+            "    mov x0, #2\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("    b.ne .Lne\n"),
+            "b.cc head was not fused into its inverse on the real target:\n{result}"
+        );
+        assert!(
+            !result.contains("    b .Lne\n"),
+            "the guarded unconditional branch survived:\n{result}"
+        );
+    }
+
+    #[test]
+    fn redundant_conditional_branch_to_its_own_fallthrough_is_removed() {
+        // Taken or not, control lands on `.Lnext`; the branch is dead. Sibling
+        // of the pre-existing unconditional `b .Lnext` elimination.
+        let asm = concat!(
+            "f:\n",
+            "    cbz x0, .Lnext\n",
+            ".Lnext:\n",
+            "    mov x0, #1\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            !result.contains("cbz x0, .Lnext"),
+            "a compare-and-branch to its own fall-through label is dead:\n{result}"
+        );
+
+        // A conditional branch to a different label is the only instruction
+        // that distinguishes the two paths and must be kept.
+        let asm = concat!(
+            "f:\n",
+            "    b.eq .Lother\n",
+            ".Lnext:\n",
+            "    mov x0, #1\n",
+            "    ret\n",
+            ".Lother:\n",
+            "    mov x0, #2\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("    b.eq .Lother\n"),
+            "a live conditional branch was removed:\n{result}"
         );
     }
 }

@@ -1365,23 +1365,21 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
 fn eliminate_redundant_jumps(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     for i in 0..n {
-        if kinds[i] == LineKind::Jump {
-            // Get jump target
-            if let Some(target) = jump_target(&lines[i]) {
-                // Find next non-Nop line
-                let mut j = i + 1;
-                while j < n && kinds[j] == LineKind::Nop {
-                    j += 1;
-                }
-                if j < n && kinds[j] == LineKind::Label {
-                    if let Some(lbl) = label_name(&lines[j]) {
-                        if target == lbl {
-                            kinds[i] = LineKind::Nop;
-                            changed = true;
-                        }
-                    }
-                }
-            }
+        // A conditional branch to the label that immediately follows it reaches
+        // the same instruction whether it is taken or not, so the branch itself
+        // is dead (the same argument the unconditional `j` case uses).
+        let target = match kinds[i] {
+            LineKind::Jump => jump_target(&lines[i]),
+            LineKind::Branch => branch_parts(&lines[i]).map(|(_, _, target)| target),
+            _ => continue,
+        };
+        let Some(target) = target else { continue };
+        let Some(j) = (i + 1..n).find(|&pos| kinds[pos] != LineKind::Nop) else {
+            continue;
+        };
+        if kinds[j] == LineKind::Label && label_name(&lines[j]) == Some(target) {
+            kinds[i] = LineKind::Nop;
+            changed = true;
         }
     }
     changed
@@ -3327,5 +3325,27 @@ mod jump_near_tests {
         assert!(!implicitly_writes_rv("jal ra, .Ltail", REG_RA));
         assert!(!implicitly_writes_rv("ret", REG_RA));
         assert_eq!(classify_implicit_operands_rv("ret").0, ra);
+    }
+
+    #[test]
+    fn redundant_conditional_jump_to_its_own_fallthrough_is_removed() {
+        // `bnez t0, .Lnext` immediately followed by `.Lnext:` reaches the same
+        // instruction whether or not it is taken.
+        let asm = "f:\n    bnez t0, .Lnext\n.Lnext:\n    ret\n";
+        let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(eliminate_redundant_jumps(&lines, &mut kinds, n));
+        assert_eq!(kinds[0], LineKind::Label, "labels are never touched");
+        assert_eq!(kinds[1], LineKind::Nop);
+
+        // The same shape with a different target must survive: the branch is
+        // the only thing selecting between the two labels.
+        let asm = "f:\n    bnez t0, .Lother\n.Lnext:\n    ret\n";
+        let lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!eliminate_redundant_jumps(&lines, &mut kinds, n));
+        assert_eq!(kinds[1], LineKind::Branch);
     }
 }

@@ -354,6 +354,66 @@ function. The GCC oracle used to derive the expected behaviour was
 `movb %dl,%dl`, `movb %cl,%cl`, `movb %al,%al`, `movb %bl,%bl` -- the four
 legacy registers in that order, never `esi`/`edi`.
 
+### 5.3 Ported: compare-and-branch fusion to AArch64, dead fall-through branch removal everywhere
+
+**Donor.** x86-64's `emit_branch_nonzero` is `testq %rax, %rax` + `jne label`: the
+conditional move and the branch are one decision, and the branch goes straight
+to its target. RISC-V's peephole already fused the three-instruction spelling
+(`beqz t0, .Lskip; jump .Ltarget, t6; .Lskip:` → `bnez t0, .Ltarget`) with a
+range check. AArch64 had neither: its `emit_branch_nonzero` emitted
+`cbz x0, .Lskip; b label; .Lskip:` and its `fuse_branch_over_branch` only
+recognised `b.cc` heads, so every boolean branch kept an extra instruction and a
+second taken branch.
+
+**Codegen.** `ArmCodegen::emit_branch_nonzero` now emits a single
+`cbnz x0, label`. `cbz`/`cbnz` reach ±1 MB, the same window as `b.cond`, so the
+direct form is what the assembler's relaxation would have produced anyway. Four
+sites used to pay the three-instruction price on every boolean branch:
+`emit_select`, `emit_cond_branch_blocks`, `emit_fused_cmp_branch` and the
+conditional-increment paths. RISC-V keeps its
+three-instruction spelling on purpose: `jump` is a far pseudo-op (`auipc` +
+`jr`), a raw `bnez` only reaches ±4 KiB, and the range-gated peephole is the
+only place in that back end that can *prove* the target is near.
+
+**Peephole.** `fuse_branch_over_branch` was restructured around three small
+predicates — `is_range_limited_branch`, `range_limited_branch_target`,
+`retarget_branch_over_branch` — plus a `fused_branch_head` recogniser, so the
+head kinds are data rather than nested `if let` towers. It now folds:
+
+| head | fold |
+|---|---|
+| `b.cc .Lskip` | `b.!cc .Ltarget` |
+| `cbz xM, .Lskip` | `cbnz xM, .Ltarget` |
+| `cbnz xM, .Lskip` | `cbz xM, .Ltarget` |
+| `tbz xM, #n, .Lskip` | `tbnz xM, #n, .Ltarget` |
+| `tbnz xM, #n, .Lskip` | `tbz xM, #n, .Ltarget` |
+
+The range guard is the pre-existing instruction census against
+`COND_BRANCH_SAFE_DISTANCE` (200,000 instructions), which is conservative for the
+±1 MB window all four heads share. One asymmetry is deliberate and documented in
+the code: the `b.cc` head keeps the historical behaviour of trusting an
+*unmeasurable* target (the unconditional branch already reached it), while the
+compare-and-branch heads fail closed unless the census proves the distance — a
+`cbz` reaches 128x less far than the `b` it replaces, so "the `b` reached it" is
+not evidence.
+
+**Both RISC targets: dead fall-through branches.** `eliminate_redundant_branches`
+(AArch64) and `eliminate_redundant_jumps` (RISC-V) removed a branch only when it
+was unconditional *and* its target was the immediately following label. A
+conditional branch in the same position is equally dead: taken or not, control
+reaches the same instruction, and `cbz`/`tbz`/`bnez` only read their operands, so
+dropping the line cannot lose a write. Both passes now share the same
+`next_insn`-style search and cover `Branch`, `CondBranch` and `CmpBranch` (ARM)
+resp. `Jump` and `Branch` (RISC-V). This is the shape `emit_cond_branch_blocks`
+produces whenever the true block is laid out first.
+
+**Evidence.** `src/backend/arm/codegen/peephole.rs` gains four fusion tests
+(compare-and-branch head, bit-test head, unmeasurable target fails closed,
+`b.cc` regression guard) and one fall-through test; the RISC-V peephole gains a
+direct `eliminate_redundant_jumps` test that also pins the "different target is
+live" case. None of these can run in the agent sandbox (no Rust toolchain), so
+they are compiled and executed by the `Unit tests` and `Clippy` CI jobs.
+
 ## 6. Ranked cross-pollination backlog
 
 Ordered by (correctness impact × reach) / risk. Every item names donor, recipient
@@ -367,7 +427,7 @@ and the mechanism.
 | 4 | `eliminate_unused_callee_saves` / `eliminate_dead_frame_allocation` | i686 → AArch64 | shrinks prologue/epilogue of every leaf-ish function | low | AArch64 prologue is simpler than i686's; slot model already shared |
 | 5 | `propagate_address_aliases` + `eliminate_repeated_slot_loads` | AArch64 → RISC-V | repeated slot loads in loops | low | RISC-V has the slot dataflow this pass needs |
 | 6 | `global_store_forwarding` + `global_dead_store_elimination` | RISC-V → AArch64 | address-taken slot traffic | medium | needs the cross-block value numbering RISC-V already built |
-| 7 | `cbz`/`cbnz` fusion with range checking | i686 `fuse_setcc_branch` + RISC-V `rewrite_far_jumps_to_near` → AArch64 | one instruction per compare-and-branch | medium | must keep the `cbz` offset in ±32 KiB |
+| 7 | ~~`cbz`/`cbnz` fusion with range checking~~ (§5.3) | i686 `fuse_setcc_branch` + RISC-V `rewrite_far_jumps_to_near` → AArch64 | **done** — one instruction and one taken branch fewer per boolean branch | medium | `cbz`/`b.cond` reach ±1 MB, not ±32 KiB; the census guard was already there |
 | 8 | `instruction_modifies_reg_id` precision (`mul`/`div` clobbers, `Other{dest_reg}`) | new | fewer spills around `push`/`pop` sequences | medium | x86-only; the TODO is in `x86/codegen/peephole/passes/push_pop.rs` |
 | 9 | pass manifest for the x86-64 tree | x86-64 → tree-wide | reviewability, generator-friendly | low | precondition for #10 |
 | 10 | split the i686/ARM/RISC-V monoliths along the x86-64 pass-file pattern | x86-64 → i686, ARM, RISC-V | bisectability, per-pass tests | high (mechanical churn) | do pass-by-pass, never as one commit |
