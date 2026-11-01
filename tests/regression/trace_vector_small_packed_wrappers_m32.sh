@@ -32,8 +32,9 @@ if objdump -d -M intel --disassemble=ret "$work/probe" \
 fi
 if objdump -d -M intel --disassemble=vector_small_packed_wrappers_test_main \
     "$work/probe" >"$work/caller-disassembly" 2>/dev/null; then
-    caller_disassembly=$(head -n 56 "$work/caller-disassembly" | tr '\n' ';')
-    printf '::notice title=i686 vector caller disassembly::%s\n' "$caller_disassembly"
+    call_site=$(grep -m1 -B18 -A8 -E 'call.*<ret>' "$work/caller-disassembly" || true)
+    call_site=${call_site//$'\n'/;}
+    printf '::notice title=i686 ret caller call-site::%s\n' "$call_site"
 fi
 eip=$(sed -n 's/^SIGSEGV EIP=0x\([[:xdigit:]]\{8\}\)$/0x\1/p' "$work/run.err" | head -n 1)
 if [[ -n $eip ]]; then
