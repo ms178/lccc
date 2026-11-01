@@ -1136,7 +1136,12 @@ impl X86Codegen {
                 self.emit_bzhi_reg_direct(lhs, rhs, dest_phys, use_32bit, dest.0);
                 return;
             }
-            if op == IrBinOp::BitTest {
+            if op == IrBinOp::BitTest
+                && matches!(
+                    ty,
+                    IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr
+                )
+            {
                 if self.emit_bit_test_reg_direct(lhs, rhs, dest_phys, use_32bit) {
                     // Definition-writes-home accounting: BT staged the base
                     // into dest_phys and SETC materialised the boolean there.
@@ -1158,58 +1163,7 @@ impl X86Codegen {
         }
 
         if op == IrBinOp::BitTest {
-            // Use the native BT instruction: base stays in %rax, the index is
-            // consumed from its own register when it has one (BT's index is an
-            // ordinary r/m operand — only variable shifts are pinned to %cl),
-            // SETC materializes CF, and the boolean is stored to the
-            // destination.  This is the cross-cutting canonical lower instead
-            // of patching text peepholes.
-            self.emit_load_operand(lhs);
-            if let Some(imm) = Self::const_as_imm32(rhs) {
-                let width = if use_32bit { 32 } else { 64 };
-                let bit = (imm as u32) % width;
-                let bt_line = if use_32bit {
-                    format!("    btl ${bit}, %eax")
-                } else {
-                    format!("    btq ${bit}, %rax")
-                };
-                self.state.emit(&bt_line);
-            } else {
-                // %rax is not allocatable on x86-64, so a register-resident
-                // index can never be clobbered by the base load above.  A
-                // value without a home still stages through %rcx.
-                let own_reg = match rhs {
-                    Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
-                    _ => None,
-                };
-                match own_reg {
-                    Some(reg) if !super::emit::is_xmm_reg(reg) => {
-                        let idx = if use_32bit {
-                            super::emit::phys_reg_name_32(reg)
-                        } else {
-                            super::emit::phys_reg_name(reg)
-                        };
-                        let dst = if use_32bit { "eax" } else { "rax" };
-                        let bt = if use_32bit { "btl" } else { "btq" };
-                        self.state.emit_fmt(format_args!("    {bt} %{idx}, %{dst}"));
-                    }
-                    _ => {
-                        self.operand_to_rcx(rhs);
-                        self.state.emit(if use_32bit {
-                            "    btl %ecx, %eax"
-                        } else {
-                            "    btq %rcx, %rax"
-                        });
-                    }
-                }
-            }
-            self.state.emit("    setc %al");
-            self.state.emit(if use_32bit {
-                "    movzbl %al, %eax"
-            } else {
-                "    movzbq %al, %rax"
-            });
-            self.store_rax_to(dest);
+            self.emit_bit_test_acc(dest, lhs, rhs, ty, use_32bit);
             return;
         }
 
@@ -2000,6 +1954,80 @@ impl X86Codegen {
         }
     }
 
+    /// Accumulator-path BitTest. Subword widths have no native BT form, so
+    /// the index is reduced modulo the IR width and the 32-bit BT form reads
+    /// the base's low 8/16 bits; 32/64-bit widths use their native BT form.
+    fn emit_bit_test_acc(
+        &mut self,
+        dest: &Value,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+        use_32bit: bool,
+    ) {
+        // Use the native BT instruction: base stays in %rax, the index is
+        // consumed from its own register when it has one (BT's index is an
+        // ordinary r/m operand — only variable shifts are pinned to %cl),
+        // SETC materializes CF, and the boolean is stored to the
+        // destination.  This is the cross-cutting canonical lower instead
+        // of patching text peepholes.
+        self.emit_load_operand(lhs);
+        let bits = (ty.size() * 8) as u32;
+        debug_assert!(matches!(bits, 8 | 16 | 32 | 64));
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            let bit = (imm as u32) % bits;
+            let bt_line = if bits <= 32 {
+                format!("    btl ${bit}, %eax")
+            } else {
+                format!("    btq ${bit}, %rax")
+            };
+            self.state.emit(&bt_line);
+        } else if bits < 32 {
+            // Subword BT has no native form. Stage the index through
+            // %rcx, reduce it modulo the IR width, and use the 32-bit BT
+            // form; the base's low 8/16 bits are the whole IR value.
+            self.operand_to_rcx(rhs);
+            self.state.emit(&format!("    andl ${}, %ecx", bits - 1));
+            self.state.emit("    btl %ecx, %eax");
+        } else {
+            // %rax is not allocatable on x86-64, so a register-resident
+            // index can never be clobbered by the base load above.  A
+            // value without a home still stages through %rcx.
+            let own_reg = match rhs {
+                Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
+                _ => None,
+            };
+            match own_reg {
+                Some(reg) if !super::emit::is_xmm_reg(reg) => {
+                    let idx = if use_32bit {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    };
+                    let dst = if use_32bit { "eax" } else { "rax" };
+                    let bt = if use_32bit { "btl" } else { "btq" };
+                    self.state.emit_fmt(format_args!("    {bt} %{idx}, %{dst}"));
+                }
+                _ => {
+                    self.operand_to_rcx(rhs);
+                    self.state.emit(if use_32bit {
+                        "    btl %ecx, %eax"
+                    } else {
+                        "    btq %rcx, %rax"
+                    });
+                }
+            }
+        }
+        self.state.emit("    setc %al");
+        self.state.emit(if use_32bit {
+            "    movzbl %al, %eax"
+        } else {
+            "    movzbq %al, %rax"
+        });
+        self.store_rax_to(dest);
+        return;
+    }
+
     /// The x86 mnemonic for one of the three bit-modify operations.  `bts`,
     /// `btr` and `btc` all write the base operand back and all read the index
     /// modulo the operand width, so the only difference between the three
@@ -2537,4 +2565,57 @@ impl X86Codegen {
 /// The IR types `Bzhi` is defined on (see `IrBinOp::Bzhi`).
 fn is_bzhi_type(ty: IrType) -> bool {
     matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+}
+
+#[cfg(test)]
+mod bit_test_width_tests {
+    use super::*;
+
+    fn emit_var(ty: IrType) -> String {
+        let mut cg = X86Codegen::new();
+        // Give the base/index ordinary GPR homes so the emitter can stage
+        // them; subword BitTest still takes the accumulator path because the
+        // register-direct path refuses narrow widths.
+        cg.reg_assignments.insert(1, super::super::machinst::R12);
+        cg.reg_assignments.insert(2, super::super::machinst::R13);
+        cg.emit_int_binop_impl(
+            &Value(3),
+            IrBinOp::BitTest,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            ty,
+        );
+        cg.state.out.buf
+    }
+
+    #[test]
+    fn narrow_bit_test_reduces_the_index_modulo_the_operation_width() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            let width = (ty.size() * 8) as u32;
+            let asm = emit_var(ty);
+            assert!(
+                asm.contains(&format!("andl ${}, %ecx", width - 1)),
+                "BitTest {ty:?} must reduce the index modulo {width}:\n{asm}"
+            );
+            assert!(
+                asm.contains("btl %ecx, %eax"),
+                "BitTest {ty:?} must use the 32-bit BT form after reduction:\n{asm}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_narrow_bit_test_reduces_the_immediate() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(1, super::super::machinst::R12);
+        cg.emit_int_binop_impl(
+            &Value(3),
+            IrBinOp::BitTest,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I32(9)),
+            IrType::U8,
+        );
+        let asm = cg.state.out.buf;
+        assert!(asm.contains("btl $1, %eax"), "9 mod 8 is 1:\n{asm}");
+    }
 }

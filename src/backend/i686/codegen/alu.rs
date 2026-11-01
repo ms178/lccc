@@ -1102,14 +1102,21 @@ impl I686Codegen {
                 }
             }
             IrBinOp::BitTest => {
-                // i686 BT stores the selected bit directly in CF and masks the
-                // index modulo 32, exactly matching `(base >> index) & 1` on
-                // an i32 classifier value.
+                // i686 BT stores the selected bit directly in CF. The 32-bit
+                // form masks the index modulo 32; subword operations must
+                // reduce modulo their own width first or an index of 8/16
+                // would select a live bit outside the IR value.
+                let bits = (ty.size() * 8) as u32;
+                debug_assert!(matches!(bits, 8 | 16 | 32));
                 if let Some(imm) = Self::const_as_imm32(rhs) {
-                    let bit = (imm as u32) % 32;
+                    let bit = (imm as u32) % bits;
                     self.state
                         .out
                         .emit_instr_imm_reg("    btl", bit as i64, "eax");
+                } else if bits < 32 {
+                    self.operand_to_ecx(rhs);
+                    self.state.emit(&format!("    andl ${}, %ecx", bits - 1));
+                    self.state.emit("    btl %ecx, %eax");
                 } else {
                     // The index is wherever the shared staging above put it:
                     // a direct register home or %ecx. The old hardcoded
@@ -1615,5 +1622,53 @@ mod synth_mul_tests {
             Some(vec![MulStep::LeaSrcSrc(2)])
         );
         assert_eq!(synth_mul(6, true, 1, false), None);
+    }
+}
+
+#[cfg(test)]
+mod bit_test_width_tests {
+    use super::*;
+    use crate::ir::reexports::IrConst;
+
+    fn emit_var(ty: IrType) -> String {
+        let mut cg = I686Codegen::new();
+        cg.emit_int_binop_impl(
+            &Value(3),
+            IrBinOp::BitTest,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            ty,
+        );
+        cg.state.out.buf
+    }
+
+    #[test]
+    fn narrow_bit_test_reduces_the_index_modulo_the_operation_width() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            let width = (ty.size() * 8) as u32;
+            let asm = emit_var(ty);
+            assert!(
+                asm.contains(&format!("andl ${}, %ecx", width - 1)),
+                "BitTest {ty:?} must reduce the index modulo {width}:\n{asm}"
+            );
+            assert!(
+                asm.contains("btl %ecx, %eax"),
+                "BitTest {ty:?} must use the 32-bit BT form after reduction:\n{asm}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_narrow_bit_test_reduces_the_immediate() {
+        let mut cg = I686Codegen::new();
+        cg.emit_int_binop_impl(
+            &Value(3),
+            IrBinOp::BitTest,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I32(17)),
+            IrType::U16,
+        );
+        let asm = cg.state.out.buf;
+        assert!(asm.contains("btl $1, %eax"), "17 mod 16 is 1:\n{asm}");
     }
 }

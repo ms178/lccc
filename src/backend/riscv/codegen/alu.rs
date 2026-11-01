@@ -99,10 +99,16 @@ impl RiscvCodegen {
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
 
         if op == IrBinOp::BitTest {
-            // RISC-V has no BT. The canonical operation is i32, but keep 64-bit
-            // behavior for the shared integer default: logical-shift the base
-            // right by the index, then isolate bit zero. This is exactly what
-            // every backend would otherwise reconstruct from `(x >> i) & 1`.
+            // RISC-V has no BT. Reduce the index modulo the *operation* width,
+            // then logical-shift the base right and isolate bit zero. `srlw`
+            // is the 32-bit form; subword operations use XLEN shifts after the
+            // explicit modulo, and the 0/1 result is already canonical.
+            let bits = (ty.size() * 8) as u32;
+            debug_assert!(matches!(bits, 8 | 16 | 32 | 64));
+            if bits < 64 {
+                self.state
+                    .emit_fmt(format_args!("    andi t2, t2, {}", bits - 1));
+            }
             let shift = if use_32bit { "srlw" } else { "srl" };
             self.state.emit_fmt(format_args!("    {shift} t0, t1, t2"));
             self.state.emit("    andi t0, t0, 1");
@@ -298,6 +304,22 @@ mod bit_modify_width_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn narrow_bit_test_reduces_the_index_modulo_the_operation_width() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            let width = (ty.size() * 8) as u32;
+            let asm = emit(IrBinOp::BitTest, ty);
+            assert!(
+                asm.contains(&format!("andi t2, t2, {}", width - 1)),
+                "BitTest {ty:?} must mask the index to {width} bits:\n{asm}"
+            );
+            assert!(
+                asm.contains("srl t0, t1, t2") && asm.contains("andi t0, t0, 1"),
+                "BitTest {ty:?} must extract a canonical 0/1 result:\n{asm}"
+            );
         }
     }
 
