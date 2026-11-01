@@ -1144,6 +1144,17 @@ impl X86Codegen {
                     return;
                 }
             }
+            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear) {
+                // BTS/BTR write the base back, so the register-direct form
+                // only claims the cases where staging the base into
+                // dest_phys cannot destroy the index (see the emitter); every
+                // other shape takes the accumulator path below, which stages
+                // through %rax/%rcx and is correct for all widths.
+                if self.emit_bit_modify_reg_direct(op, lhs, rhs, dest_phys, ty) {
+                    self.note_inplace_compute(dest_phys, dest.0);
+                    return;
+                }
+            }
         }
 
         if op == IrBinOp::BitTest {
@@ -1967,6 +1978,7 @@ impl X86Codegen {
                 }
             }
             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
+            IrBinOp::BitSet | IrBinOp::BitClear => self.emit_bit_modify_acc(op, ty),
             IrBinOp::Bzhi => self.emit_bzhi_acc(use_32bit),
             IrBinOp::UMulHigh | IrBinOp::SMulHigh => self.emit_mul_high_acc(op, use_32bit),
             // Rotates of every integer width are emitted above
@@ -1984,6 +1996,140 @@ impl X86Codegen {
         } else {
             self.store_rax_to(dest);
         }
+    }
+
+    /// `BitSet`/`BitClear` register-direct: stage the base into `dest_phys`
+    /// and let `bts`/`btr` write the modified base there.  Unlike BT — which
+    /// only reads its base and writes CF — the bit-modify forms write the
+    /// base operand, so the staging move must not destroy the index:
+    ///
+    /// * an index homed in `dest_phys` itself is refused (the base move would
+    ///   overwrite it before the instruction reads it), as is one with no home
+    ///   when `dest_phys` is `%rcx` (the homeless index stages through `%rcx`);
+    /// * an XMM-homed base is refused, like the ALU register-direct form:
+    ///   `phys_reg_name_32` has no name for it.
+    ///
+    /// Returning `false` lets the caller fall through to the accumulator path,
+    /// which stages through `%rax`/`%rcx` and is correct for every width.
+    fn emit_bit_modify_reg_direct(
+        &mut self,
+        op: IrBinOp,
+        base: &Operand,
+        index: &Operand,
+        dest_phys: PhysReg,
+        ty: IrType,
+    ) -> bool {
+        // 8/16-bit operations have no register-direct bit-modify form here:
+        // `btsw` masks modulo 16 but the shared `use_32bit`/sext plumbing is
+        // written for 32/64, and no pass creates those widths (see
+        // `IrBinOp::BitSet`).  The accumulator path owns them.
+        let use_32bit = match ty {
+            IrType::I32 | IrType::U32 => true,
+            IrType::I64 | IrType::U64 | IrType::Ptr => false,
+            _ => return false,
+        };
+        let base_homed_in_xmm = match base {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .is_some_and(|r| super::emit::is_xmm_reg(*r)),
+            _ => false,
+        };
+        if base_homed_in_xmm {
+            return false;
+        }
+        let own_idx_reg = match index {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| !super::emit::is_xmm_reg(*r)),
+            _ => None,
+        };
+        if own_idx_reg == Some(dest_phys) {
+            return false;
+        }
+        let dest64 = super::emit::phys_reg_name(dest_phys);
+        if own_idx_reg.is_none() && dest64 == "rcx" {
+            return false;
+        }
+        self.operand_to_callee_reg(base, dest_phys);
+        let mnemonic = if op == IrBinOp::BitSet { "bts" } else { "btr" };
+        if let Some(imm) = Self::const_as_imm32(index) {
+            // Reduce explicitly: an index of W or more is defined by the
+            // operation's contract, and the emitted immediate then documents
+            // the bit instead of leaning on the hardware's count mask.
+            let width = if use_32bit { 32i64 } else { 64 };
+            let bit = i64::from(imm as u32 as i32).rem_euclid(width);
+            let (mnem, dst) = if use_32bit {
+                (
+                    format!("{mnemonic}l"),
+                    super::emit::phys_reg_name_32(dest_phys),
+                )
+            } else {
+                (format!("{mnemonic}q"), dest64)
+            };
+            self.state
+                .emit_fmt(format_args!("    {mnem} ${bit}, %{dst}"));
+        } else {
+            let idx_name = match own_idx_reg {
+                Some(reg) => {
+                    if use_32bit {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    }
+                }
+                None => {
+                    self.operand_to_rcx(index);
+                    if use_32bit { "ecx" } else { "rcx" }
+                }
+            };
+            let (mnem, dst) = if use_32bit {
+                (
+                    format!("{mnemonic}l"),
+                    super::emit::phys_reg_name_32(dest_phys),
+                )
+            } else {
+                (format!("{mnemonic}q"), dest64)
+            };
+            self.state
+                .emit_fmt(format_args!("    {mnem} %{idx_name}, %{dst}"));
+        }
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    /// `BitSet`/`BitClear` on the accumulator path: the base is in `%rax`
+    /// (`%eax` for I32/U32) and the index in `%rcx`, both staged by the
+    /// shared sequence above, and the shared postlude stores `%rax`.
+    ///
+    /// `bts`/`btr` exist at 16, 32 and 64 bits and read the index modulo the
+    /// operand width, which is exactly the operation's contract.  The 8-bit
+    /// width has no `btsb`, so it reduces the index to three bits and uses the
+    /// 64-bit form: the extra index reduction is the same modulo-8 the
+    /// operation specifies, and the untouched bits above bit 7 are the same
+    /// container garbage the pre-existing shift/OR sequence left there (every
+    /// consumer of an I8 value reads it through its truncating name).
+    fn emit_bit_modify_acc(&mut self, op: IrBinOp, ty: IrType) {
+        let mnemonic = if op == IrBinOp::BitSet { "bts" } else { "btr" };
+        match ty.size() {
+            8 => self
+                .state
+                .emit_fmt(format_args!("    {mnemonic}q %rcx, %rax")),
+            4 => self
+                .state
+                .emit_fmt(format_args!("    {mnemonic}l %ecx, %eax")),
+            2 => self
+                .state
+                .emit_fmt(format_args!("    {mnemonic}w %cx, %ax")),
+            _ => {
+                self.state.emit("    andl $7, %ecx");
+                self.state
+                    .emit_fmt(format_args!("    {mnemonic}q %rcx, %rax"));
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
     }
 
     /// Invalidate acc/sec cache entries that claim to hold one of `ids`. Used

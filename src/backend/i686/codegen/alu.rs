@@ -1062,6 +1062,40 @@ impl I686Codegen {
             }
             IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
             IrBinOp::UMulHigh | IrBinOp::SMulHigh => crate::ir::ops::mul_high_unsupported_here(),
+            IrBinOp::BitSet | IrBinOp::BitClear => {
+                // `bts`/`btr` write the base back into %eax and read the index
+                // modulo the operand width, exactly the operation's contract.
+                // The 32-bit form is the one this target creates (a 64-bit
+                // operation never reaches a 32-bit target: the wide-int pair
+                // path has no bit-modify lowering, so the producing pass
+                // refuses it -- see `IrBinOp::BitSet`).
+                let mnem = if op == IrBinOp::BitSet { "bts" } else { "btr" };
+                match ty {
+                    IrType::I32 | IrType::U32 | IrType::Ptr => match Self::const_as_imm32(rhs) {
+                        Some(imm) => {
+                            let bit = (imm as u32) % 32;
+                            self.state.out.emit_instr_imm_reg(
+                                &format!("    {mnem}l"),
+                                bit as i64,
+                                "eax",
+                            );
+                        }
+                        None => emit!(self.state, "    {mnem}l {}, %eax", rhs_ref),
+                    },
+                    // Sub-word widths have no i386 bit-modify form (and
+                    // `btsw` would need the index's 16-bit name); reduce the
+                    // index explicitly, which is the same modulo the
+                    // operation defines, and let consumers truncate.  The
+                    // index is re-staged through %ecx so the reduction cannot
+                    // clobber a register home.
+                    _ => {
+                        self.operand_to_ecx(rhs);
+                        let bits = (ty.size() * 8) as u32;
+                        self.state.emit(&format!("    andl ${}, %ecx", bits - 1));
+                        self.state.emit(&format!("    {mnem}l %ecx, %eax"));
+                    }
+                }
+            }
             IrBinOp::BitTest => {
                 // i686 BT stores the selected bit directly in CF and masks the
                 // index modulo 32, exactly matching `(base >> index) & 1` on

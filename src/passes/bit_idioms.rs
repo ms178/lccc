@@ -2846,16 +2846,38 @@ fn note_use(use_counts: &mut [u32], operand: Operand, add: bool) {
 /// shape, not merely for the `BinOp`/`Or` -> `UnaryOp` rewrites that call it
 /// today, so a future rewrite cannot silently inherit a narrower assumption.
 fn retarget_use_counts(old: &Instruction, new: &Instruction, use_counts: &mut [u32]) {
-    fn visit(inst: &Instruction, use_counts: &mut [u32], add: bool) {
-        crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
-            note_use(use_counts, *op, add);
-        });
-        crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
-            note_use(use_counts, Operand::Value(*v), add);
-        });
+    note_instruction_uses(old, use_counts, false);
+    note_instruction_uses(new, use_counts, true);
+}
+
+/// Add every read `inst` performs to the use counts (`add`), or remove them
+/// (`!add`).  The 1 -> N expansions have to account for each written
+/// instruction individually, so the visit is exposed separately.
+fn note_instruction_uses(inst: &Instruction, use_counts: &mut [u32], add: bool) {
+    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+        note_use(use_counts, *op, add);
+    });
+    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+        note_use(use_counts, Operand::Value(*v), add);
+    });
+}
+
+/// The source of the zero-defined `Ctz` that defines `count`, when that Ctz
+/// runs at exactly the consuming shift's width.
+///
+/// The width agreement is what makes the lowest-set-bit rewrite exact: a
+/// narrower count would make `1 << W` land on a live bit of the wider shift
+/// instead of wrapping back to 1.
+fn ctz_source(count: Value, ty: IrType, defs: &[Option<Instruction>]) -> Option<Value> {
+    match defs.get(count.0 as usize).and_then(Option::as_ref)? {
+        Instruction::UnaryOp {
+            op: IrUnaryOp::Ctz,
+            src: Operand::Value(v),
+            ty: t,
+            ..
+        } if *t == ty => Some(*v),
+        _ => None,
     }
-    visit(old, use_counts, false);
-    visit(new, use_counts, true);
 }
 
 pub(crate) fn recognize_function(
@@ -2905,6 +2927,11 @@ pub(crate) fn recognize_function(
     // Boolean mux/majority algebra kill switch (same authority contract as
     // the vectorizer's CCC_NO_* gates; A/B for the differential batteries).
     let bool_algebra_disabled = facts::bool_algebra_disabled();
+    // Lowest-set-bit kill switch (`1 << Ctz(y)` -> `y & -y` plus the zero arm).
+    let lowest_set_bit_disabled = facts::lowest_set_bit_disabled();
+    // Comparison-dominance kill switch (`(x != 0) & (x > 4)` -> `x > 4`).
+    let compare_dominance_disabled = facts::compare_dominance_disabled();
+    let bit_select_disabled = facts::bit_select_disabled();
     // Deferred cross-block rewrites (mask distribution): the producer and
     // consumer may live in different blocks; both mutations are applied
     // after the scan ends so no &mut borrow of `func.blocks` overlaps the
@@ -2992,6 +3019,109 @@ pub(crate) fn recognize_function(
                         note_use(&mut use_counts, forwarded, true);
                         changes += 1;
                     }
+                }
+            }
+
+            // Lowest-set-bit idiom: `1 << Ctz(~x)`.
+            //
+            // The shift count is masked modulo the operand width -- every
+            // backend emits a bare `shl %cl` and `fold_binop` evaluates the
+            // same way -- so the expression is exactly
+            //
+            //     1 << (ctz(~x) mod W) == ~x & -~x == (x + 1) & ~x   for ~x != 0
+            //                         == 1                              for ~x == 0
+            //
+            // The negate disappears through `-~x IS x + 1`, which leaves one
+            // add and one and for the isolation; the zero case cannot be
+            // dropped (`1 << W` wraps back to 1, while the isolated bit is 0)
+            // and costs one `cmov` on the flags the `and` already set.
+            //
+            // The non-complemented `1 << Ctz(y)` deliberately stays alone, and
+            // the numbers are why: the count path is `bsf` plus the count
+            // staging plus the shift (5 instructions at 32 bits, 6 at 64,
+            // because the 32-bit zero fixup is the `mov $32,%ecx` that `bsf`
+            // leaves untouched), while `y & -y` plus the zero arm measures 8
+            // at both widths. Recognising it would be a pessimisation, so the
+            // matcher requires the complement. (With BMI1 available the
+            // isolated bit is a single `blsi`; that selection happens in the
+            // backend and would make the general form worth revisiting.)
+            //
+            // Measured with the two folds on and off, x86-64 at -O2,
+            // instructions including `ret`:
+            //     `1u   << __builtin_ctz(~x)`     9  ->  8   (GCC 6, Clang 4)
+            //     `1ull << __builtin_ctzll(~x)`  12  ->  8   (GCC 6, Clang 4)
+            //     `1u   << __builtin_ctz(y)`      5  ->  5   (refused, above)
+            //     `1ull << __builtin_ctzll(y)`    6  ->  6   (refused, above)
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Shl,
+                lhs,
+                rhs,
+                ty,
+            } = &block.instructions[index]
+            {
+                let (dest, ty, count) = (*dest, *ty, *rhs);
+                if !lowest_set_bit_disabled
+                    && matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+                    && const_in_ring(*lhs, ty.size() * 8) == Some(1)
+                    && let Operand::Value(count_v) = count
+                    && let Some(src_v) = ctz_source(count_v, ty, &defs)
+                    && let Some(Instruction::UnaryOp {
+                        op: IrUnaryOp::Not,
+                        src: inner,
+                        ty: not_ty,
+                        ..
+                    }) = defs.get(src_v.0 as usize).and_then(Option::as_ref)
+                    && *not_ty == ty
+                {
+                    let x = *inner;
+                    let incremented = Value(next_value_id);
+                    let isolated = Value(next_value_id + 1);
+                    let zero = Value(next_value_id + 2);
+                    next_value_id = next_value_id.saturating_add(3);
+                    // `x + 1` is `-~x`: the negate is folded into the add.
+                    let mut replacement = Vec::with_capacity(4);
+                    replacement.push(Instruction::BinOp {
+                        dest: incremented,
+                        op: IrBinOp::Add,
+                        lhs: x,
+                        rhs: int_const(1, ty),
+                        ty,
+                    });
+                    replacement.push(Instruction::BinOp {
+                        dest: isolated,
+                        op: IrBinOp::And,
+                        lhs: Operand::Value(incremented),
+                        rhs: Operand::Value(src_v),
+                        ty,
+                    });
+                    // Exactly the adjacent Cmp+Select the backend fuses into a
+                    // `cmov` off the `and`'s own flags.
+                    replacement.push(Instruction::Cmp {
+                        dest: zero,
+                        op: IrCmpOp::Eq,
+                        lhs: Operand::Value(isolated),
+                        rhs: int_const(0, ty),
+                        ty,
+                    });
+                    replacement.push(Instruction::Select {
+                        dest,
+                        cond: Operand::Value(zero),
+                        true_val: int_const(1, ty),
+                        false_val: Operand::Value(isolated),
+                        ty,
+                    });
+                    note_instruction_uses(&block.instructions[index], &mut use_counts, false);
+                    for inst in &replacement {
+                        note_instruction_uses(inst, &mut use_counts, true);
+                    }
+                    expansions.push(Expansion {
+                        block: block_bi,
+                        index,
+                        dest,
+                        replacement,
+                    });
+                    changes += 1;
                 }
             }
 
@@ -3136,6 +3266,27 @@ pub(crate) fn recognize_function(
             if let Some(new) = fold_same_condition_select(&block.instructions[index], &defs)
                 .or_else(|| fold_sign_choice_zero(&block.instructions[index], &defs))
                 .or_else(|| fold_shift_pair_into_mask(&block.instructions[index], &defs))
+                .or_else(|| {
+                    (!compare_dominance_disabled)
+                        .then(|| {
+                            compare_dominance::fold_compare_dominance(
+                                &block.instructions[index],
+                                &defs,
+                            )
+                        })
+                        .flatten()
+                })
+                .or_else(|| {
+                    (!bit_select_disabled)
+                        .then(|| {
+                            bit_select::fold_bit_select(
+                                &block.instructions[index],
+                                &defs,
+                                &use_counts,
+                            )
+                        })
+                        .flatten()
+                })
                 .or_else(|| fold_unit_interval_test(&block.instructions[index], &defs))
             {
                 // New direct arm uses must be counted BEFORE a later boolean
@@ -6328,6 +6479,24 @@ mod zero_choice_tests;
 #[cfg(test)]
 #[path = "bit_idioms_mask_interval_tests.rs"]
 mod mask_interval_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_compare_dominance_tests.rs"]
+mod compare_dominance_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_bit_select_tests.rs"]
+mod bit_select_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_lowest_bit_tests.rs"]
+mod lowest_bit_tests;
+
+#[path = "bit_idioms_compare_dominance.rs"]
+mod compare_dominance;
+
+#[path = "bit_idioms_bit_select.rs"]
+mod bit_select;
 
 #[path = "bit_idioms_observe.rs"]
 mod observe;

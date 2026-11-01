@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# Single-bit selection: `x | 1 << n`, `x & ~(1 << n)`, `(x & 1 << n) != 0`.
+#
+#   x | (1u << n)          is   bts      set bit n
+#   x & ~(1u << n)         is   btr      clear bit n
+#   (x & (1u << n)) != 0   is   bt       test bit n
+#
+# Portable C spells these three everywhere (bitmaps, atomics masks, allocator
+# free lists, `1u << (n & 31)` in hash tables).  Spelled out they cost a
+# materialized constant, a variable shift pinned to `%cl` and the logic op;
+# both oracles emit one instruction for the set/clear and two for the test, and
+# LCCC emitted 6, 8 and 7 where they emit 3, 3 and 4.
+#
+# The IR gained `BitSet` and `BitClear` (the existing `BitTest` covers the
+# third) and `bit_idioms` creates them from those shapes.  This gate pins six
+# things, because an instruction-count win that changes answers is worthless:
+#
+#   1. every folded shape selects the bit instruction at 32 and 64 bits, with
+#      the constant folded away (the shift and the complement are gone),
+#   2. the controls keep their exact counts in both builds: a two-bit mask
+#      (`3u << n`), the toggle (`x ^ 1 << n`), a mask compared against a
+#      non-zero constant, and a shift whose result is used twice,
+#   3. the equality direction, `(x & 1 << n) == 0`, keeps its count: `BitTest`
+#      is a 0/1 value, so the negated form needs a second instruction and the
+#      fold would not save the compare,
+#   4. `CCC_NO_BIT_SELECT=1` brings every folded shape back to its pinned
+#      count and removes every bit mnemonic, which is what proves the
+#      assertions above belong to this fold and not to some other rule,
+#   5. the other backends never get *longer*: for i686, AArch64 and RISC-V the
+#      whole probe corpus is compiled twice (knob off/on) and every function
+#      must stay the same length or shrink -- and the native mnemonics appear
+#      where the ISA has them (`btsl`/`btrl` on i686, `bic` on AArch64),
+#   6. -O0, -O1, -O2, -O3, -Os, the kill switch and GCC agree bit for bit on a
+#      checksum over every width, both edges and 64-bit operands.
+set -euo pipefail
+CCC=${LCCC_BIN:-${CCC:-target/fastbuild/lccc}}
+bindir=$(CDPATH= cd -- "$(dirname -- "$CCC")" && pwd)
+tmp=${TMPDIR:-/tmp}/lccc-bit-select.$$
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp"
+
+cat > "$tmp/shapes.c" <<'C'
+typedef unsigned u32;
+typedef unsigned long u64;
+
+u32 bset32(u32 x, u32 n)     { return x | (1u << n); }
+u64 bset64(u64 x, u64 n)     { return x | (1ul << n); }
+u32 bset_masked(u32 x, u32 n) { return x | (1u << (n & 31)); }
+u32 bclr32(u32 x, u32 n)     { return x & ~(1u << n); }
+u64 bclr64(u64 x, u64 n)     { return x & ~(1ul << n); }
+int btest32(u32 x, u32 n)    { return (x & (1u << n)) != 0; }
+int btest64(u64 x, u64 n)    { return (x & (1ul << n)) != 0; }
+
+/* Controls: none of these is a single-bit operation on the base. */
+u32 keep_two(u32 x, u32 n)   { return x & (3u << n); }
+u32 keep_xor(u32 x, u32 n)   { return x ^ (1u << n); }
+u32 keep_shl(u32 x, u32 n)   { return (x << n) | x; }
+int keep_eq4(u32 x, u32 n)   { return (x & (1u << n)) == 4; }
+int btest32z(u32 x, u32 n)   { return (x & (1u << n)) == 0; }
+/* Control: a bit set whose base comes from memory, not a parameter. */
+u32 set_from_mem(u32 *p, u32 n) { u32 v = *p; v |= 1u << n; return v; }
+C
+
+"$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/on.s"
+CCC_NO_BIT_SELECT=1 "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/off.s"
+
+fn_body() { # $1 = asm file, $2 = label; body between the label and the return
+    sed -n "/^$2:/,/^[[:space:]]*\(ret\|retq\|ldp x29, x30\)/p" "$1"
+}
+count() { # $1 = asm file, $2 = label
+    fn_body "$1" "$2" | grep -c -e '^[[:space:]]\+[a-z]' || true
+}
+body() { fn_body "$1" "$2"; }
+expect() { # $1 = label, $2 = expected count, $3 = build
+    local n
+    n=$(count "$tmp/$3" "$1")
+    if [ "$n" -ne "$2" ]; then
+        echo "$1 costs $n instructions in $3, expected $2:" >&2
+        body "$tmp/$3" "$1" >&2
+        exit 1
+    fi
+}
+want() { # $1 = build, $2 = label, $3 = pattern
+    if ! grep -Eq -- "$3" <<<"$(body "$tmp/$1" "$2")"; then
+        echo "$2 in $1 has no '$3':" >&2
+        body "$tmp/$1" "$2" >&2
+        exit 1
+    fi
+}
+refuse() { # $1 = build, $2 = label, $3 = pattern, $4 = message
+    if grep -Eq -- "$3" <<<"$(body "$tmp/$1" "$2")"; then
+        echo "$4: $2 in $1 still contains '$3':" >&2
+        body "$tmp/$1" "$2" >&2
+        exit 1
+    fi
+}
+
+# ── 1. The folded shapes select the bit instruction, nothing else ──────────
+expect bset32 3 on.s
+expect bset64 3 on.s
+expect bset_masked 4 on.s
+expect bclr32 3 on.s
+expect bclr64 3 on.s
+expect btest32 4 on.s
+expect btest64 4 on.s
+want on.s bset32 'bts[lq][[:space:]]'
+want on.s bset64 'bts[lq][[:space:]]'
+want on.s bclr32 'btr[lq][[:space:]]'
+want on.s bclr64 'btr[lq][[:space:]]'
+want on.s btest32 'bt[lq][[:space:]]'
+want on.s btest64 'bt[lq][[:space:]]'
+# The producers are gone, not merely shadowed by the bit instruction.
+refuse on.s bset32 'sh[lq][[:space:]]' "the constant shift must be dead"
+refuse on.s bclr32 'sh[lq][[:space:]]' "the constant shift must be dead"
+refuse on.s bclr32 'not[lq][[:space:]]' "the complement must be dead"
+refuse on.s btest32 'sh[lq][[:space:]]' "the constant shift must be dead"
+refuse on.s btest32 'and[lq][[:space:]]' "the mask must be dead"
+
+# ── 2. Controls keep their shape in BOTH builds ────────────────────────────
+for build in on.s off.s; do
+    expect keep_two 6 "$build"
+    expect keep_xor 6 "$build"
+    expect keep_shl 5 "$build"
+    expect keep_eq4 8 "$build"
+done
+
+# ── 3. The equality direction is not folded ────────────────────────────────
+expect btest32z 7 on.s
+expect btest32z 7 off.s
+
+# ── 4. The kill switch restores the shift spelling, shape for shape ────────
+expect bset32 6 off.s
+expect bset64 6 off.s
+expect bset_masked 6 off.s
+expect bclr32 8 off.s
+expect bclr64 8 off.s
+expect btest32 7 off.s
+expect btest64 7 off.s
+for label in bset32 bset64 bclr32 bclr64 btest32 btest64; do
+    refuse off.s "$label" '(^|[[:space:]])bt[s]?[lq]?[[:space:]]' \
+        "CCC_NO_BIT_SELECT must remove the bit instruction"
+done
+
+# ── 5. The other backends never get longer ────────────────────────────────
+# Every function of the corpus, compiled by both builds of each cross target:
+# the selected sequence must be the same length or shorter.  That property, not
+# a pinned count, is what keeps a backend change from turning this fold into a
+# pessimisation.
+cross_length_check() { # $1 = binary, $2 = target name
+    local bin=$1 name=$2 after before labels label a b
+    before="$tmp/$name-off.s"
+    after="$tmp/$name-on.s"
+    CCC_NO_BIT_SELECT=1 "$bin" -O2 -S "$tmp/shapes.c" -o "$before"
+    "$bin" -O2 -S "$tmp/shapes.c" -o "$after"
+    labels=$(grep -oE '^[a-z_][a-zA-Z0-9_]*:$' "$before" | tr -d ':')
+    for label in $labels; do
+        a=$(count "$after" "$label")
+        b=$(count "$before" "$label")
+        if [ "$a" -gt "$b" ]; then
+            echo "$name: $label got longer ($b -> $a):" >&2
+            body "$after" "$label" >&2
+            exit 1
+        fi
+    done
+}
+if [ -x "$bindir/lccc-i686" ]; then
+    cross_length_check "$bindir/lccc-i686" i686
+    want i686-on.s bset32 'btsl[[:space:]]'
+    want i686-on.s bclr32 'btrl[[:space:]]'
+fi
+if [ -x "$bindir/lccc-arm" ]; then
+    cross_length_check "$bindir/lccc-arm" arm
+    want arm-on.s bclr32 'bic[[:space:]]'
+fi
+if [ -x "$bindir/lccc-riscv" ]; then
+    cross_length_check "$bindir/lccc-riscv" riscv
+fi
+
+# ── 6. Answers: every level, both builds, and GCC agree ───────────────────
+cat > "$tmp/exec.c" <<'C'
+#include <stdio.h>
+#include <stdint.h>
+typedef unsigned u32;
+typedef unsigned long u64;
+
+static u32 bset(u32 x, u32 n)     { return x | (1u << n); }
+static u32 bclr(u32 x, u32 n)     { return x & ~(1u << n); }
+static int btest(u32 x, u32 n)    { return (x & (1u << n)) != 0; }
+static int btestz(u32 x, u32 n)   { return (x & (1u << n)) == 0; }
+static u64 bset64(u64 x, u64 n)   { return x | (1ul << n); }
+static u64 bclr64(u64 x, u64 n)   { return x & ~(1ul << n); }
+static int btest64(u64 x, u64 n)  { return (x & (1ul << n)) != 0; }
+static u32 keep_two(u32 x, u32 n) { return x & (3u << n); }
+static u32 keep_xor(u32 x, u32 n) { return x ^ (1u << n); }
+static int keep_eq4(u32 x, u32 n) { return (x & (1u << n)) == 4; }
+
+static unsigned h = 2166136261u;
+static void mix(uint64_t v) {
+    for (int i = 0; i < 8; i++) h = (h ^ (unsigned)((v >> (8 * i)) & 0xFFu)) * 16777619u;
+}
+
+int main(void) {
+    static const u32 pat[] = {0u, ~0u, 0xAAAA5555u, 0x80000001u, 0xdeadbeefu};
+    for (unsigned p = 0; p < 5; p++) {
+        u32 x = pat[p];
+        for (u32 n = 0; n < 32; n++) {
+            mix(bset(x, n)); mix(bclr(x, n)); mix((unsigned)btest(x, n));
+            mix((unsigned)btestz(x, n)); mix(keep_two(x, n)); mix(keep_xor(x, n));
+            mix((unsigned)keep_eq4(x, n));
+        }
+    }
+    for (unsigned p = 0; p < 5; p++) {
+        u64 x = ((u64)pat[p] << 32) | (u64)pat[p];
+        for (u64 n = 0; n < 64; n++) {
+            mix(bset64(x, n)); mix(bclr64(x, n)); mix((unsigned)btest64(x, n));
+        }
+    }
+    printf("%08x\n", h);
+    return 0;
+}
+C
+sum=""
+for level in -O0 -O1 -O2 -O3 -Os; do
+    "$CCC" "$level" "$tmp/exec.c" -o "$tmp/ex$level"
+    got=$("$tmp/ex$level")
+    [ -z "$sum" ] || [ "$got" = "$sum" ] || {
+        echo "$level checksum $got differs from $sum" >&2
+        exit 1
+    }
+    sum=$got
+done
+CCC_NO_BIT_SELECT=1 "$CCC" -O2 "$tmp/exec.c" -o "$tmp/exoff"
+got=$("$tmp/exoff")
+[ "$got" = "$sum" ] || { echo "CCC_NO_BIT_SELECT=1 checksum $got differs from $sum" >&2; exit 1; }
+if command -v gcc >/dev/null 2>&1; then
+    gcc -O2 "$tmp/exec.c" -o "$tmp/exgcc"
+    got=$("$tmp/exgcc")
+    [ "$got" = "$sum" ] || { echo "gcc checksum $got differs from $sum" >&2; exit 1; }
+fi
+
+echo "OK bit_select_fold ($sum)"

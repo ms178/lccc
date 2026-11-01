@@ -883,6 +883,46 @@ pub(super) fn bool_algebra_disabled() -> bool {
     *FLAG
 }
 
+/// The single authority for the `CCC_NO_LOWEST_SET_BIT` kill switch.
+///
+/// Same contract as [`bool_algebra_disabled`]: presence of the variable is the
+/// answer, not its text, and the answer is cached for the process lifetime.
+/// The gate exists so the differential batteries can A/B the `1 << Ctz(y)`
+/// rewrite (A/B: `A = set`, `B = unset`) without a second binary, and so a
+/// miscompile can be bisected to this one rule in a single run.
+pub(super) fn lowest_set_bit_disabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_LOWEST_SET_BIT").is_some());
+    *FLAG
+}
+
+/// The single authority for the `CCC_NO_COMPARE_DOMINANCE` kill switch.
+///
+/// Same contract as [`lowest_set_bit_disabled`]: presence of the variable is
+/// the answer, not its text, and the answer is cached for the process lifetime.
+/// The gate exists so the differential batteries can A/B the two-comparison
+/// dominance rewrite (`(x != 0) & (x > 4)` -> `x > 4`) without a second binary,
+/// and so a miscompile can be bisected to this one rule in a single run.
+pub(super) fn compare_dominance_disabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_COMPARE_DOMINANCE").is_some());
+    *FLAG
+}
+
+/// The single authority for the `CCC_NO_BIT_SELECT` kill switch.
+///
+/// Same contract as [`compare_dominance_disabled`]: presence of the variable is
+/// the answer, not its text, and the answer is cached for the process lifetime.
+/// The gate exists so the differential batteries can A/B the single-bit
+/// selection rewrite (`x | 1 << n` -> `BitSet`, `x & ~(1 << n)` -> `BitClear`,
+/// `(x & 1 << n) != 0` -> `BitTest`) without a second binary, and so a
+/// miscompile can be bisected to those three rules in a single run.
+pub(super) fn bit_select_disabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_BIT_SELECT").is_some());
+    *FLAG
+}
+
 pub(super) fn run(func: &mut IrFunction) -> usize {
     use crate::ir::reexports::Terminator;
     if func

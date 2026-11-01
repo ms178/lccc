@@ -11,10 +11,15 @@ What this pins, and how:
   interval test contains exactly one compare, and a sign-magnitude select
   carries the arithmetic-shift mask instead of a conditional move.  Counting
   alone is not enough for any of them.
-* **controls** -- `diff_control` (constant 5, not 0), `range_union` (a union,
-  not an interval), `member_gap` ({0, 2}, not consecutive), `two_values` (two
-  different values) and `abs_control` (arms disagreeing on the value) are one
+* **controls** -- `diff_control` (constant 5, not 0), `member_gap` ({0, 2},
+  not consecutive), `two_values` (two different values), `range_crossing_control`
+  (an outside test) and `abs_control` (arms disagreeing on the value) are one
   token away from a folded shape and must keep their original shape.
+  `range_union` (`(x > 3) | (x > 10)`) is pinned in two pieces instead, because
+  two rules meet on it: it is NOT one interval, so `interval` must not merge it
+  into a window, but it IS a disjunction whose weaker disjunct decides it, so
+  the comparison-dominance fold reduces it to the bare `x > 3`.  With
+  `CCC_NO_COMPARE_DOMINANCE=1` the second comparison must come back.
 * **attribution** -- with ``CCC_DISABLE_PASSES=diffcmp,interval,signmag`` the
   same functions must get longer, so each win belongs to its pass.
 * **oracle** -- with GCC 16.2 present, every folded function must be no longer
@@ -43,6 +48,8 @@ RANGE_FOLDED = (
     "outside_short",
     "member_short",
     "member_bitand",
+    "range_crossing",
+    "range_crossing_bitand",
 )
 MAGNITUDE_FOLDED = ("abs_select", "abs_select64", "absdiff_select")
 CONTROLS = ("diff_control", "range_union", "member_gap", "two_values", "abs_control")
@@ -136,12 +143,31 @@ def main():
         # ---- controls: one token away, must not fold ----------------------
         if not has_subtraction(body(text, "diff_control")):
             problems.append("diff_control folded although its constant is 5, not 0")
-        for name in ("range_union", "member_gap", "two_values"):
+        for name in ("member_gap", "two_values", "range_crossing_control"):
             if len(compares(body(text, name))) < 2:
                 problems.append(
                     f"{name} lost a comparison although it is not one interval: "
                     f"{body(text, name)}"
                 )
+        # `range_union`: not one interval for `interval`, but a disjunction the
+        # dominance fold owns.  Both halves are pinned so neither rule can take
+        # the shape by accident and neither can regress behind the other.
+        union = body(text, "range_union")
+        if len(compares(union)) != 1:
+            problems.append(
+                f"range_union: {len(compares(union))} compares, want the "
+                f"dominance fold's single `x > 3`: {union}"
+            )
+        union_off = body(
+            asm(lccc, SOURCE, env={**os.environ, "CCC_NO_COMPARE_DOMINANCE": "1"}),
+            "range_union",
+        )
+        if len(compares(union_off)) < 2:
+            problems.append(
+                f"range_union: CCC_NO_COMPARE_DOMINANCE=1 does not restore the "
+                f"second comparison: {union_off}"
+            )
+
         control = body(text, "abs_control")
         if not any("cmov" in line for line in control) and not has_subtraction(control):
             problems.append(f"abs_control: expected the original select: {control}")
@@ -159,6 +185,8 @@ def main():
         # range_check and set_membership, so the claim there is only "not
         # worse" -- an honest attribution rather than a borrowed win.
         improved = (
+            "range_crossing",
+            "range_crossing_bitand",
             "diff_gt",
             "diff_ge",
             "range_bitand",

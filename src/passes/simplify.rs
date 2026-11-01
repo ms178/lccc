@@ -123,6 +123,9 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max_id + 1];
     let mut neg_defs: Vec<Option<NegDef>> = vec![None; max_id + 1];
     let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max_id + 1];
+    // `Not` producers, kept apart from `unary_defs` (which the clz/ctz folds
+    // own) so the complement fold cannot perturb their matching.
+    let mut not_defs: Vec<Option<Operand>> = vec![None; max_id + 1];
     let mut value_types: Vec<Option<IrType>> = vec![None; max_id + 1];
     // Track values known to be boolean (0 or 1). This includes Cmp results
     // and bitwise And/Or/Xor of boolean values.
@@ -291,6 +294,9 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     );
                 }
                 Instruction::UnaryOp { dest, op, src, ty } => match op {
+                    IrUnaryOp::Not => {
+                        set_def(&mut not_defs, dest.0, *src);
+                    }
                     IrUnaryOp::Neg => {
                         set_def(&mut neg_defs, dest.0, NegDef { src: *src });
                         if def_counts.get(dest.0 as usize).copied() == Some(1) {
@@ -497,6 +503,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 &binop_defs,
                 &neg_defs,
                 &unary_defs,
+                &not_defs,
                 &is_boolean,
                 &value_types,
                 &use_counts,
@@ -2406,7 +2413,13 @@ struct BinOpDef {
 /// Bisection helper for the preboot-ZSTD miscompile. `CCC_SIMPLIFY_SKIP` is a
 /// comma-separated list of fold families to disable:
 /// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`,
-/// `negneg`, `addneg`.
+/// `negneg`, `addneg`, `cast_narrow`, `cast_widen`, `cast_same`, `cast_mix`,
+/// `pack_extract`, `rotate_chain`, `widened_cond`, `zeroneg`, `negcast`,
+/// `notcast`.
+/// `zeroneg` (`0 - x` => `Neg`), `negcast` (a truncation distributes over a
+/// negate) and `notcast` (a truncation distributes over a complement) are the
+/// pieces of a narrow unary op; each is measured on its own by
+/// `check_narrow_negate_fold.sh`.
 fn simplify_skip(family: &str) -> bool {
     static SKIP: std::sync::LazyLock<String> =
         std::sync::LazyLock::new(|| std::env::var("CCC_SIMPLIFY_SKIP").unwrap_or_default());
@@ -2424,6 +2437,7 @@ fn try_simplify_with_types(
     binop_defs: &[Option<BinOpDef>],
     neg_defs: &[Option<NegDef>],
     unary_defs: &[Option<UnaryDef>],
+    not_defs: &[Option<Operand>],
     is_boolean: &[bool],
     value_types: &[Option<IrType>],
     use_counts: &[u32],
@@ -2452,6 +2466,8 @@ fn try_simplify_with_types(
             *to_ty,
             cast_defs,
             binop_defs,
+            neg_defs,
+            not_defs,
             value_types,
         ),
         Instruction::GetElementPtr {
@@ -2630,6 +2646,7 @@ fn try_simplify(
         binop_defs,
         neg_defs,
         &[],
+        &[],
         is_boolean,
         &[],
         &[],
@@ -2671,6 +2688,8 @@ fn simplify_cast(
     to_ty: IrType,
     def_map: &[Option<CastDef>],
     binop_defs: &[Option<BinOpDef>],
+    neg_defs: &[Option<NegDef>],
+    not_defs: &[Option<Operand>],
     value_types: &[Option<IrType>],
 ) -> Option<Instruction> {
     // Identity cast: same type
@@ -2706,6 +2725,108 @@ fn simplify_cast(
             if value_types.get(v.0 as usize).copied().flatten() == Some(to_ty) {
                 return Some(Instruction::Copy { dest, src: *src });
             }
+        }
+    }
+
+    // A negation sandwiched between an extension and a truncation:
+    // `(T)(- (W)(T)v)` is `-(T)v`.  The extension's high bits die in the
+    // truncation and negation is a ring operation, so it commutes with both;
+    // what is left is the negate at the width the result is observed at.
+    //
+    // This is not cosmetic.  A 64-bit negate is never cheaper than a 32-bit
+    // one, so `trunc32(neg64(ext64(v)))` is pure overhead: `-(x != 0)` used to
+    // be `setne; movzbl; movslq; negq; movl` where `testl; setne; negl` is the
+    // whole answer (GCC: 3, LCCC 6 either way around the intermediate).
+    //
+    // The fold is deliberately restricted to a 64-bit source and a 32-bit
+    // destination, which is the ONE width pair where it measured as a pure
+    // win.  The two shapes it does not touch were measured too, and both were
+    // net pessimisations on the 2,791-file sweep:
+    //
+    //   * a 32-bit source (`trunc16(neg32(ext32(v)))`, the packed-mask idiom
+    //     `(u16)(0 - (u16)(a < b))`) removes two instructions per site but
+    //     flipped the vectorizer's decision in `packed_mask_shifts.c` to a
+    //     worse 128-bit form: +60 instructions over four functions, versus
+    //     -1 or -2 at each of the scalar sites;
+    //   * a 16-bit destination costs a partial-register negate whose result the
+    //     consumers must re-extend, and register allocation paid for it
+    //     (`bb_slp_unary_demote.c` +3, `sib_index_narrow_sext.c` +1, both
+    //     spills rather than folds).
+    //
+    // Narrow destinations are therefore left alone; a narrow negation reaches
+    // them as the wide negate plus the truncation the backend already had.
+    if !simplify_skip("negcast")
+        && from_ty.is_integer()
+        && to_ty.is_integer()
+        && from_ty.size() == 8
+        && to_ty.size() == 4
+        && let Some(neg_src) = get_neg_def(src, neg_defs)
+    {
+        // Either the negate already reads a `to_ty`-wide value (the extension
+        // above it is then the one the truncation undoes), or it reads a cast
+        // that extends `to_ty` to the negate's width.  Both leave `-(T)v`.
+        let narrowed = match neg_src {
+            Operand::Value(v)
+                if value_types.get(v.0 as usize).copied().flatten() == Some(to_ty) =>
+            {
+                Some(neg_src)
+            }
+            Operand::Value(v) => def_map
+                .get(v.0 as usize)
+                .and_then(|d| d.as_ref())
+                .filter(|d| d.from_ty == to_ty && d.to_ty == from_ty)
+                .map(|d| d.src),
+            Operand::Const(_) => None,
+        };
+        if let Some(inner) = narrowed {
+            return Some(Instruction::UnaryOp {
+                dest,
+                op: IrUnaryOp::Neg,
+                src: inner,
+                ty: to_ty,
+            });
+        }
+    }
+
+    // The complement's twin: `(T)(~(W)(T)v)` is `~(T)v`.
+    //
+    // `Not` is bitwise, so it commutes with truncation outright -- the low
+    // bits of `~(W)(ext v)` ARE `~v`, whatever the extension put in the high
+    // ones -- which is why, unlike the negate above, this fold needs no width
+    // pair restriction and no signedness argument.  What it does need is a
+    // NARROWING outer cast: `ext(~v)` and `~ext(v)` differ in the high bits,
+    // so a widening step cannot be dropped.
+    //
+    // Measured: `x & ~(1 << n)` used to widen the `~` to 64 bits for no
+    // reason (`shll; cltq; notq; andl`, 4 instructions for the complement)
+    // because the extension was materialized around the `Not`; the truncated
+    // complement is `notl` (one instruction).
+    if !simplify_skip("notcast")
+        && from_ty.is_integer()
+        && to_ty.is_integer()
+        && to_ty.size() < from_ty.size()
+        && let Some(not_src) = get_not_def(src, not_defs)
+    {
+        let narrowed = match not_src {
+            Operand::Value(v)
+                if value_types.get(v.0 as usize).copied().flatten() == Some(to_ty) =>
+            {
+                Some(not_src)
+            }
+            Operand::Value(v) => def_map
+                .get(v.0 as usize)
+                .and_then(|d| d.as_ref())
+                .filter(|d| d.from_ty == to_ty && d.to_ty == from_ty)
+                .map(|d| d.src),
+            Operand::Const(_) => None,
+        };
+        if let Some(inner) = narrowed {
+            return Some(Instruction::UnaryOp {
+                dest,
+                op: IrUnaryOp::Not,
+                src: inner,
+                ty: to_ty,
+            });
         }
     }
 
@@ -4339,6 +4460,24 @@ fn simplify_binop(
                     src: Operand::Const(IrConst::zero(ty)),
                 });
             }
+            if !is_float && lhs_zero && !simplify_skip("zeroneg") {
+                // `0 - x => -x` (integers only: -0.0 - x is not -x for x = 0.0).
+                // The ring identity makes this a pure canonicalisation, but it
+                // is worth stating because the two forms do NOT lower alike:
+                // the subtraction has to materialise the zero first (`xor;sub`
+                // on x86) and every consumer that understands a negate -- the
+                // `x & -x` lowest-set-bit recognition, `try_cancel_add_sub`, the
+                // backends' negate/flag folds -- only speaks `Neg`. Source
+                // negation reaches the IR as `Neg` anyway; this is the signed-
+                // zero and macro-expanded spelling of the same value (e.g. the
+                // `x & -x` idiom, whose `0u - x` reaches the IR as this Sub).
+                return Some(Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::Neg,
+                    src: *rhs,
+                    ty,
+                });
+            }
             if !is_float {
                 // Modular ring cancellation: `(x + y) - x => y`, `(y + x) - x => y`,
                 // `x - (x - y) => y`.
@@ -4801,6 +4940,21 @@ fn simplify_binop(
                 return Some(rewritten);
             }
         }
+        IrBinOp::BitSet | IrBinOp::BitClear => {
+            // Bit set/clear are produced by `bit_idioms` from the shift/OR and
+            // shift/NOT/AND shapes (see `bit_idioms::bit_select`), so there is
+            // no producer here.  Only one identity holds without knowing the
+            // index: clearing any bit of zero leaves zero.  Setting a bit of
+            // zero is `1 << (n mod W)`, never a constant, so there is no
+            // mirrored fold -- folding it to zero (or to one) was the same
+            // trap as the zero-index `BitTest` above.
+            if op == IrBinOp::BitClear && lhs_zero {
+                return Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::zero(ty)),
+                });
+            }
+        }
     }
 
     // Commutative operand canonicalization: for commutative operations
@@ -4909,6 +5063,14 @@ fn is_neg_one(op: &Operand, ty: IrType) -> bool {
         }
         _ => false,
     }
+}
+
+/// The source of a `Not` defining `op`, if any.
+fn get_not_def(op: &Operand, not_defs: &[Option<Operand>]) -> Option<Operand> {
+    let Operand::Value(v) = op else {
+        return None;
+    };
+    not_defs.get(v.0 as usize).copied().flatten()
 }
 
 /// Look up a NegDef for a Value operand.
@@ -8953,6 +9115,430 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // === Constant-zero negation tests ===
+
+    #[test]
+    fn test_zero_minus_x_folds_to_neg() {
+        // `0 - x` is the modular negate; canonicalising it to `Neg` is a ring
+        // identity, and it is the difference between `xor;sub` (which has to
+        // materialise the zero) and one `negl` on x86 -- and between the
+        // `x & -x` lowest-set-bit idiom being recognisable or not.
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ] {
+            let inst = Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Sub,
+                lhs: Operand::Const(IrConst::from_i64(0, ty)),
+                rhs: Operand::Value(Value(1)),
+                ty,
+            };
+            match simplify_default(&inst) {
+                Some(Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::Neg,
+                    src: Operand::Value(v),
+                    ty: t,
+                }) => {
+                    assert_eq!(dest.0, 3);
+                    assert_eq!(v.0, 1);
+                    assert_eq!(t, ty);
+                }
+                other => panic!("expected Neg for {ty:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_zero_minus_x_float_is_not_negated() {
+        // IEEE 754: `0.0 - x` is not `-x` for `x = +0.0` (it is `+0.0`, while
+        // `-x` is `-0.0`), and it is not `-x` for NaN payloads either.
+        for ty in [IrType::F64, IrType::F32] {
+            let (zero, one) = if ty == IrType::F64 {
+                (IrConst::F64(0.0), IrConst::F64(1.0))
+            } else {
+                (IrConst::F32(0.0), IrConst::F32(1.0))
+            };
+            let inst = Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Sub,
+                lhs: Operand::Const(zero),
+                rhs: Operand::Const(one),
+                ty,
+            };
+            assert!(
+                !matches!(
+                    simplify_default(&inst),
+                    Some(Instruction::UnaryOp {
+                        op: IrUnaryOp::Neg,
+                        ..
+                    })
+                ),
+                "{ty:?}: float zero minus x must not become a negate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_minus_x_keeps_rhs_zero_case() {
+        // Order matters: `0 - 0` is the zero test, not a negation.
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Sub,
+            lhs: Operand::Const(IrConst::I32(0)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        };
+        let result = simplify_default(&inst).expect("0 - 0 must fold");
+        assert!(
+            matches!(
+                result,
+                Instruction::Copy {
+                    src: Operand::Const(_),
+                    ..
+                }
+            ),
+            "expected a constant, got {result:?}"
+        );
+    }
+
+    // === Truncated negate of an extension ===
+
+    /// `v2 = sext v1 (i32 -> i64); v3 = neg v2; v4 = trunc v3 (i64 -> i32)`,
+    /// with `v4` the instruction under test -- the shape the C integer
+    /// promotions put around `-(x != 0)` and every other 32-bit negation whose
+    /// value is carried at 64 bits in between.
+    fn truncated_negate_i64(
+        cast_defs: &mut [Option<CastDef>],
+        neg_defs: &mut [Option<NegDef>],
+    ) -> Instruction {
+        cast_defs[2] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        neg_defs[3] = Some(NegDef {
+            src: Operand::Value(Value(2)),
+        });
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I64,
+            to_ty: IrType::I32,
+        }
+    }
+
+    #[test]
+    fn test_truncated_negate_of_an_extension_folds_to_the_narrow_negate() {
+        // `(int)(-(long)(int)x)` is `-(int)x`: the extension's high bits die in
+        // the truncation and negation is a ring operation.  A 64-bit negate is
+        // never cheaper than a 32-bit one, so the round trip is pure overhead.
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 5];
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 5];
+        let inst = truncated_negate_i64(&mut cast_defs, &mut neg_defs);
+        let result = try_simplify_with_types(
+            &inst,
+            &cast_defs,
+            &[],
+            &[],
+            &[],
+            &neg_defs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("the truncated negate of an extension must fold");
+        assert!(
+            matches!(
+                result,
+                Instruction::UnaryOp {
+                    dest: Value(4),
+                    op: IrUnaryOp::Neg,
+                    src: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                }
+            ),
+            "expected `neg v1 @ i32`, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_truncated_negate_control_keeps_the_wide_negate() {
+        // Same negation, no truncation: a widening cast must NOT relocate the
+        // negate into the narrow width (the high bits are observed there).
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 5];
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 5];
+        truncated_negate_i64(&mut cast_defs, &mut neg_defs);
+        let widen = Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        };
+        assert!(
+            try_simplify_with_types(
+                &widen,
+                &cast_defs,
+                &[],
+                &[],
+                &[],
+                &neg_defs,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[]
+            )
+            .is_none(),
+            "widening the negate must not fold to a narrow negate"
+        );
+
+        // A 32-bit source and a 16-bit destination is the shape the fold
+        // deliberately leaves alone (measured: it flips a vectorization
+        // decision and costs a spill -- see the comment on the fold).
+        let mut narrow: Vec<Option<CastDef>> = vec![None; 5];
+        narrow[2] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::U16,
+            to_ty: IrType::I32,
+        });
+        let inst = Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I32,
+            to_ty: IrType::U16,
+        };
+        assert!(
+            try_simplify_with_types(
+                &inst,
+                &narrow,
+                &[],
+                &[],
+                &[],
+                &neg_defs,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[]
+            )
+            .is_none(),
+            "the 32 -> 16 shape must stay put"
+        );
+
+        // A negate whose operand is neither `to_ty`-wide nor an extension of a
+        // `to_ty`-wide value has no `to_ty`-wide form at all.
+        let mut unrelated: Vec<Option<CastDef>> = vec![None; 5];
+        unrelated[2] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::I8,
+            to_ty: IrType::I64,
+        });
+        let inst = Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I64,
+            to_ty: IrType::I32,
+        };
+        assert!(
+            try_simplify_with_types(
+                &inst,
+                &unrelated,
+                &[],
+                &[],
+                &[],
+                &neg_defs,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[]
+            )
+            .is_none(),
+            "an extension from a different width must stay put"
+        );
+    }
+
+    // === Truncated complement of an extension ===
+
+    /// `v2 = ext v1 (i32 -> i64); v3 = not v2; v4 = trunc v3 (i64 -> i32)`,
+    /// the shape the C promotions put around `~(1 << n)`.
+    fn truncated_not_i64(
+        cast_defs: &mut [Option<CastDef>],
+        not_defs: &mut [Option<Operand>],
+    ) -> Instruction {
+        cast_defs[2] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        not_defs[3] = Some(Operand::Value(Value(2)));
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I64,
+            to_ty: IrType::I32,
+        }
+    }
+
+    #[test]
+    fn test_truncated_complement_of_an_extension_folds_to_the_narrow_complement() {
+        // `(int)(~(long)(int)x)` is `~(int)x`: `Not` is bitwise, so the low
+        // bits of the complement are `~x` whatever the extension did above
+        // them.
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 5];
+        let mut not_defs: Vec<Option<Operand>> = vec![None; 5];
+        let inst = truncated_not_i64(&mut cast_defs, &mut not_defs);
+        let result = try_simplify_with_types(
+            &inst,
+            &cast_defs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &not_defs,
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("the truncated complement of an extension must fold");
+        assert!(
+            matches!(
+                result,
+                Instruction::UnaryOp {
+                    dest: Value(4),
+                    op: IrUnaryOp::Not,
+                    src: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                }
+            ),
+            "expected `not v1 @ i32`, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_truncated_complement_controls() {
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 5];
+        let mut not_defs: Vec<Option<Operand>> = vec![None; 5];
+        let _ = truncated_not_i64(&mut cast_defs, &mut not_defs);
+
+        // A WIDENING cast: `ext(~x)` is not `~ext(x)` -- the high bits differ,
+        // so the complement cannot be relocated into the narrow width.
+        let widen = Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        };
+        assert!(
+            try_simplify_with_types(
+                &widen,
+                &cast_defs,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &not_defs,
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .is_none(),
+            "a widening cast must keep the wide complement"
+        );
+
+        // An extension from a DIFFERENT width: `trunc32(not64(ext64(i8)))` is
+        // `trunc32(not64(v))`, not `~(i32)v`, whose high 24 bits would be v's
+        // rather than the complement's.
+        let mut unrelated: Vec<Option<CastDef>> = vec![None; 5];
+        unrelated[2] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::I8,
+            to_ty: IrType::I64,
+        });
+        let inst = Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I64,
+            to_ty: IrType::I32,
+        };
+        assert!(
+            try_simplify_with_types(
+                &inst,
+                &unrelated,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &not_defs,
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .is_none(),
+            "an extension from a different width must stay put"
+        );
+
+        // A `Not` whose operand is already `to_ty`-wide needs no extension to
+        // peel: the complement is simply taken at the observed width.
+        let mut wide: Vec<Option<IrType>> = vec![None; 5];
+        wide[2] = Some(IrType::I32);
+        let direct = Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I64,
+            to_ty: IrType::I32,
+        };
+        let mut direct_not: Vec<Option<Operand>> = vec![None; 5];
+        direct_not[3] = Some(Operand::Value(Value(2)));
+        let result = try_simplify_with_types(
+            &direct,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &direct_not,
+            &[],
+            &wide,
+            &[],
+            &[],
+        )
+        .expect("a `to_ty`-wide complement folds");
+        assert!(
+            matches!(
+                result,
+                Instruction::UnaryOp {
+                    dest: Value(4),
+                    op: IrUnaryOp::Not,
+                    src: Operand::Value(Value(2)),
+                    ty: IrType::I32,
+                }
+            ),
+            "expected `not v2 @ i32`, got {result:?}"
+        );
     }
 
     // === Unsigned comparison simplification tests ===

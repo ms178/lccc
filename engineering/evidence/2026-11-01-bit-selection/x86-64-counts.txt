@@ -1,0 +1,24 @@
+             lccc-before.slccc-after.sgcc.s     clang.s   
+bset32       6         3         3         3         
+bset64       6         3         3         3         
+bset_imm     3         3         3         3         
+bset_masked  6         4         3         3         
+bclr32       8         3         3         3         
+bclr64       8         3         3         3         
+bclr_imm     3         3         3         3         
+btest32      7         4         4         4         
+btest32z     7         7         4         4         
+btest64      7         4         5         4         
+btest_imm    4         4         4         4         
+bset_mem     6         4         5         5         
+bclr_mem     7         4         5         5         
+pop32        17        17        5         16        
+pop64        21        21        4         20        
+parity32     18        18        7         7         
+parity64     22        22        10        10        
+pop_and1     18        18        7         7         
+keep_shl     5         5         5         5         
+keep_two     6         6         5         5         
+keep_xor     6         6         3         3         
+keep_eq4     8         8         8         8         
+keep_and     6         6         5         5         

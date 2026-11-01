@@ -34,12 +34,19 @@ __attribute__((noinline)) static int outside_or(unsigned x) { return (x < 4u) | 
 __attribute__((noinline)) static int outside_short(unsigned x) { return x < 4u || x > 9u; }
 __attribute__((noinline)) static int member_short(unsigned x) { return x == 0u || x == 1u; }
 __attribute__((noinline)) static int member_bitand(unsigned x) { return (x != 0u) & (x != 1u); }
+/* A window that crosses zero: [-7, 7].  In the operand ring its lower bound
+ * sits ABOVE its upper one, which is why this shape used to keep two compares
+ * and a select while every positive window folded. */
+__attribute__((noinline)) static int range_crossing(int x) { return x > -8 && x < 8; }
+__attribute__((noinline)) static int range_crossing_bitand(int x) { return (x > -8) & (x < 8); }
 
 /* Controls: a union that is not an interval, a membership with a gap, and two
  * predicates on different values.  None of them is one unsigned compare. */
 __attribute__((noinline)) static int range_union(int x) { return (x > 3) | (x > 10); }
 __attribute__((noinline)) static int member_gap(unsigned x) { return (x == 0u) | (x == 2u); }
 __attribute__((noinline)) static int two_values(int a, int b) { return (a > 3) & (b < 10); }
+/* Not a window: the two halves exclude each other instead of intersecting. */
+__attribute__((noinline)) static int range_crossing_control(int x) { return (x > -8) | (x < 8); }
 
 /* ---- sign magnitude ----------------------------------------------------- */
 __attribute__((noinline)) static int abs_select(int x) { return x < 0 ? -x : x; }
@@ -97,6 +104,9 @@ int main(void) {
         if (abs_select(vi) != (x < 0 ? -x : x)) bad++;
         if (abs_select64((long long)x) != (x < 0 ? -(long long)x : (long long)x)) bad++;
         if (member_gap((unsigned)x) != (((unsigned)x == 0u) | ((unsigned)x == 2u))) bad++;
+        if (range_crossing(vi) != (x > -8 && x < 8)) bad++;
+        if (range_crossing_bitand(vi) != ((x > -8) & (x < 8))) bad++;
+        if (range_crossing_control(vi) != ((x > -8) | (x < 8))) bad++;
     }
     for (unsigned i = 0; i < sizeof uprobes / sizeof *uprobes; i++) {
         unsigned x = uprobes[i];
@@ -134,6 +144,9 @@ int main(void) {
         if (abs_select(vi) != (a < 0 ? -a : a)) bad++;
         if (absdiff_select(vi, vj) != (a > b ? a - b : b - a)) bad++;
         if (range_union(vi) != ((a > 3) | (a > 10))) bad++;
+        if (range_crossing(vi) != (a > -8 && a < 8)) bad++;
+        if (range_crossing_bitand(vi) != ((a > -8) & (a < 8))) bad++;
+        if (range_crossing_control(vi) != ((a > -8) | (a < 8))) bad++;
         if (member_gap(vu) != ((ua == 0u) | (ua == 2u))) bad++;
     }
 

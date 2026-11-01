@@ -2324,10 +2324,10 @@ jobs:
     # steps are a partition: tests/regression/check_ci_shard_partition.py
     # fails if a gate appears in both, disappears from both, or reappears in a
     # third step.
-    # lane-split: 87 of 191 independent gate invocations from the
+    # lane-split: 89 of 193 independent gate invocations from the
     # lane-split: single step that used to run them all in sequence, assigned by
-    # lane-split: longest-processing-time over measured per-gate cost (438 s of
-    # lane-split: 875 s). The shards are a partition:
+    # lane-split: longest-processing-time over measured per-gate cost (440 s of
+    # lane-split: 878 s). The shards are a partition:
     # lane-split: tests/regression/check_ci_shard_partition.py fails if a gate appears in
     # lane-split: both, disappears from both, or reappears in a third step, and
     # lane-split: tests/regression/check_ci_lane_plan.py fails if a shard drifts from
@@ -2543,6 +2543,34 @@ jobs:
         # and the -fwrapv INT_MIN contract.  Mirrored in
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_iabs_cmp_fold.sh
+        # Lowest-set-bit recognition (1 << Ctz(y) -> y & -y with the exact
+        # y == 0 arm) and the `0 - x` -> Neg canonicalisation: emitted shapes,
+        # kill-switch ownership (CCC_NO_LOWEST_SET_BIT / zeroneg) and -O0/-O2/
+        # -O3 agreement over every boundary value.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_lowest_set_bit_fold.sh
+        # The narrow negate: `(T)(-(W)(T)v)` is `-(T)v` (the extension dies in
+        # the truncation) and `0 - x` is a `Neg`.  Pins the emitted shapes, the
+        # CCC_SIMPLIFY_SKIP=negcast/zeroneg ownership, the widening and float
+        # controls, and bit-exact -O0..-O3 agreement over every 8/16-bit input.
+        # Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_narrow_negate_fold.sh
+        # Comparison dominance: a `&`/`|` of two comparisons of ONE value is
+        # its stronger (conjunction) or weaker (disjunction) operand, so
+        # `(x != 0) & (x > 4)` is `x > 4` (9 -> 4 instructions).  Pins the
+        # emitted shapes at every width, the CCC_NO_COMPARE_DOMINANCE
+        # ownership, the two non-dominant controls, and bit-exact -O0..-O3
+        # agreement against GCC.  Mirrored in scripts/ci_local.sh
+        # (parity-checked).
+        bash tests/regression/check_compare_dominance_fold.sh
+        # Single-bit selection: `x | 1 << n`, `x & ~(1 << n)` and
+        # `(x & 1 << n) != 0` become BitSet/BitClear/BitTest, which x86 lowers
+        # to bts/btr/bt (6/8/7 -> 3/3/4).  Pins the shapes and the dead
+        # producers, the CCC_NO_BIT_SELECT ownership, the non-single-bit
+        # controls, the i686/AArch64/RISC-V lengths (never longer than the
+        # knob-off build) and -O0..-O3 agreement against GCC.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_bit_select_fold.sh
         # Predicate differences and ranges: difference compares, interval and
         # membership tests, sign-magnitude selects, five near-miss controls.
         python3 tests/regression/check_predicate_differences_and_ranges.py
@@ -2825,11 +2853,11 @@ jobs:
         # a dead home was dropped, the first N allocas were the callee's
         # locals, and gzip's `memcpy(&v, p, sizeof v)` stored the POINTER into
         # `unsigned int v` with `ty: U32` (`mov %r15d,%r15d` before the
-        # dereference).  ET_EXEC hid it below 4 GiB; `-pie` read 0xaac8a202
-        # and died.  Rows: the kernel self-checks under `-pie` and matches
-        # gcc and the `-fpie` build, a struct-by-value program keeps working,
-        # and `CCC_VERIFY_IR=1` stays silent.  Mirrored in
-        # scripts/ci_local.sh (parity-checked).
+        # dereference).  ET_EXEC hid it below 4 GiB; `-pie` read 0xaac8a202 and
+        # died.  Rows: the kernel self-checks under `-pie` and matches gcc and
+        # the `-fpie` build, a struct-by-value program keeps working, and
+        # `CCC_VERIFY_IR=1` stays silent.  Mirrored in scripts/ci_local.sh
+        # (parity-checked).
         bash tests/regression/check_pie_link_execution.sh
         # A parameter's home is written where the callee READS it.  A
         # memory-passed parameter (__int128, __float128, a vector, a struct) is
@@ -2839,8 +2867,10 @@ jobs:
         # unwritten slot.  The store now follows the alloca that defines its own
         # home, a site that cannot satisfy "after the definition, before the
         # first read" declines the inline, and a synthesized home owns the whole
-        # value (16 bytes, not a word).  Rows: i128 / float128 / vector-ABI
-        # programs at -O1..-Os must equal gcc AND equal lccc with
+        # value -- and the parameter's own type: on i386 a `Ptr` home is four
+        # bytes, so a 24-byte vector lowered to three `U64` parameters must not
+        # be bridged through the vector object.  Rows: i128 / float128 /
+        # vector-ABI programs at -O1..-Os must equal gcc AND equal lccc with
         # CCC_DISABLE_PASSES=inline, plus a coverage row proving the inliner
         # really fires.  Mirrored in scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_inline_param_home.sh

@@ -96,7 +96,21 @@ MARKER='FIX''ME'
 #        set_strided_reduce_enabled, so no pass site reads them at all -- the
 #        three inline.rs reads and the strided-reduce read leave the count.
 #        Tightened to the new measurement, per the rule above.
-ENV_READ_BUDGET=143
+#   144  2026-11-01: the lowest-set-bit kill switch (CCC_NO_LOWEST_SET_BIT,
+#        resolved once in src/passes/bit_idioms_facts.rs next to the boolean
+#        algebra's, so the matcher pays one read per process, not per site).
+#        Raised to the measurement, exactly -- a fold that needs no switch gets
+#        no budget.
+#   145  2026-11-01: the comparison-dominance kill switch
+#        (CCC_NO_COMPARE_DOMINANCE), resolved once next to the two above in
+#        src/passes/bit_idioms_facts.rs.  The truncated-complement rule reuses
+#        the existing CCC_SIMPLIFY_SKIP parse and adds no read.  Raised to the
+#        measurement, exactly.
+#   146  2026-11-01: the single-bit selection kill switch (CCC_NO_BIT_SELECT),
+#        resolved once next to the three above in src/passes/bit_idioms_facts.rs
+#        so the matcher pays one read per process, not one per block.  Raised to
+#        the measurement, exactly.
+ENV_READ_BUDGET=146
 
 fail=0
 report() { # report <label> <offending lines>

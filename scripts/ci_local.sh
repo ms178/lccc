@@ -475,9 +475,9 @@ gate "pie-link-execution" fast \
 # "after the allocas" wrote the argument after that read and a switch on an
 # `__int128` argument read an unwritten slot. The store now follows the alloca
 # defining its own home, an unsatisfiable site declines the inline, and a
-# synthesized home owns the whole value. Rows compare against gcc AND against
-# lccc with CCC_DISABLE_PASSES=inline, with a coverage row proving the inliner
-# fires.
+# synthesized home owns the whole value at the parameter's own type. Rows
+# compare against gcc AND against lccc with CCC_DISABLE_PASSES=inline, with a
+# coverage row proving the inliner fires.
 gate "inline-param-home" fast \
     env CCC="$LCCC" bash tests/regression/check_inline_param_home.sh
 
@@ -1863,6 +1863,38 @@ gate "unsigned-reduction-codegen" fast \
 # INT_MIN/LONG_MIN contract (folds suppressed; wrapping answers kept).
 gate "iabs-cmp-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_iabs_cmp_fold.sh
+
+# Lowest-set-bit recognition: `1 << Ctz(y)` becomes `y & -y` with a `cmov` for
+# the exact `y == 0` arm, and `0 - x` canonicalises to `Neg` (one `negl` where
+# the subtraction had to materialise the zero first).  Pins the emitted shapes,
+# the ownership of both kill switches and bit-exact -O0/-O2/-O3 agreement.
+gate "lowest-set-bit-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_lowest_set_bit_fold.sh
+
+# The narrow negate: the C integer promotions wrap every narrow negation in a
+# widen/negate/narrow round trip; `negcast` relocates the negate to the width
+# the result is observed at and `zeroneg` spells `0 - x` as the `Neg` every
+# consumer understands.  Pins the shapes, both kill switches, the widening and
+# float controls, and -O0..-O3 agreement on every 8/16-bit input.
+gate "narrow-negate-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_narrow_negate_fold.sh
+
+# Comparison dominance: two comparisons of the same value joined by `&` or `|`
+# collapse to the operand that implies the other, so `(x != 0) & (x > 4)` is
+# `x > 4` and `(x != 0) | (x > 4)` is `x != 0` (9 -> 4 instructions at every
+# width).  Pins the shapes, both join directions, the CCC_NO_COMPARE_DOMINANCE
+# ownership, the two non-dominant controls and -O0..-O3 agreement against GCC.
+gate "compare-dominance-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_compare_dominance_fold.sh
+
+# Single-bit selection: `x | 1 << n` is `bts`, `x & ~(1 << n)` is `btr` and
+# `(x & 1 << n) != 0` is `bt` (6/8/7 -> 3/3/4 instructions), selected by the
+# new `BitSet`/`BitClear` IR operations.  Pins the shapes and the dead
+# producers, the CCC_NO_BIT_SELECT ownership, the non-single-bit controls, the
+# i686/AArch64/RISC-V lengths (never longer than the knob-off build) and
+# -O0..-O3 agreement against GCC.
+gate "bit-select-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_bit_select_fold.sh
 
 # Observable-access gates.  Three instruments, because each catches a
 # different way the `volatile` contract gets broken and each was proved to do
