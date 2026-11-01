@@ -240,8 +240,8 @@ decides what fits from the literal's width, not from the escape: `u'\x100'` is
 
 Evidence. `tests/regression/check_char_literal_encoding.py` is differential: it
 compiles and **runs** every case under both compilers and compares the value,
-`sizeof`, and the ordered `warning:`/`error:` stream — 466 checks over 121
-literals in {`c23`, `gnu23`, `gnu17`} (C23-only where the spelling is) plus five
+`sizeof`, and the ordered `warning:`/`error:` stream — 466 checks: 146 distinct
+literals over {`c23`, `gnu23`, `gnu17`} (C23-only where the spelling is) and five
 flag sets (`-Wno-multichar`, `-Werror=multichar`, `-w`, `-Werror` and a clean
 run), `0` differences, plus two pinned deviations (GP-29, GP-31). `--sweep N`
 crosses the same atoms mechanically (N deterministic, seeded literals) and runs

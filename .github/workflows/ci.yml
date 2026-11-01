@@ -690,9 +690,9 @@ jobs:
     # is the UTF-16 low surrogate, not the low 16 bits of the code point), so
     # this compiles and runs every case under both compilers and compares the
     # value, sizeof and the ordered diagnostic stream. The curated table holds
-    # 121 literals x 3 dialects; `--sweep 400` adds 400 generated literals, so
-    # the combinations nobody wrote down are covered too (1,208 checks, with
-    # the pinned deviations reported separately).
+    # 146 distinct literals over three dialects; `--sweep 400` adds 400
+    # generated literals, so the combinations nobody wrote down are covered too
+    # (1,208 checks, with the pinned deviations reported separately).
     - name: Character-constant encoding and diagnostics match GCC 16.2
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_char_literal_encoding.py --sweep 400
     - name: Ext-vector rvalue subscript cross-ABI
