@@ -35,6 +35,12 @@
 #      answer "foldable" for a live base, skip the chain, and leave the
 #      emitter's fallback reading a never-written offset home.
 #
+# Row 5 is also the end-to-end check that codegen may NOT assume a fixed image:
+# `-fpie` links ET_EXEC, `-fpie -pie` links ET_DYN, and the same kernel must
+# self-check under both.  (The inliner once bridged a pointer argument through
+# a 32-bit slot, so the ET_DYN build read `0xaac8a202` and died; see
+# check_pie_link_execution.sh.)
+#
 # Usage: bash tests/regression/check_reg_off_sym_fold.sh
 #        CCC=/path/to/lccc bash tests/regression/check_reg_off_sym_fold.sh
 set -eu
@@ -235,19 +241,32 @@ GZIP=tests/benchmark/programs/gzip_longest_match.c
 GZIP_FLAGS="-O1 -march=x86-64-v3 -fno-pie -DPASSES=1"
 "$CCC" $GZIP_FLAGS -no-pie "$GZIP" -o "$TMP/gzip.bin"
 env CCC_NO_REG_OFF_SYM=1 "$CCC" $GZIP_FLAGS -no-pie "$GZIP" -o "$TMP/gzip_nofold.bin"
-# `-fpie` alone already links a PIE (the driver couples the two); passing a
-# bare `-pie` is a separate, unrelated knob and is deliberately not used here.
+# `-fpie` compiles position independent and still links ET_EXEC; only
+# `-fpie -pie` asks for the ET_DYN image the loader may place above 4 GiB
+# (checked, not assumed: the two ELF types are asserted below).  Both are rows:
+# a 32-bit narrowing of an address is invisible in the first and fatal in the
+# second.
 "$CCC" -O1 -march=x86-64-v3 -fpie -DPASSES=1 "$GZIP" -o "$TMP/gzip_pie.bin"
+"$CCC" -O1 -march=x86-64-v3 -fpie -pie -DPASSES=1 "$GZIP" -o "$TMP/gzip_dyn.bin"
 gcc $GZIP_FLAGS -no-pie "$GZIP" -o "$TMP/gzip_gcc.bin"
 rc_fold=0; out_fold=$("$TMP/gzip.bin") || rc_fold=$?
 rc_nofold=0; out_nofold=$("$TMP/gzip_nofold.bin") || rc_nofold=$?
 rc_pie=0; out_pie=$("$TMP/gzip_pie.bin") || rc_pie=$?
+rc_dyn=0; out_dyn=$("$TMP/gzip_dyn.bin") || rc_dyn=$?
 rc_gcc=0; out_gcc=$("$TMP/gzip_gcc.bin") || rc_gcc=$?
-if [ "$rc_fold" -eq 0 ] && [ "$out_fold" = "$out_nofold" ] && [ "$out_fold" = "$out_gcc" ] \
-    && [ "$out_fold" = "$out_pie" ]; then
-    note PASS "live-\`Add\` kernel self-check agrees: fold = kill switch = gcc = -fpie (${out_fold#* })"
+exec_type=$(readelf -h "$TMP/gzip_pie.bin" | awk '$1 == "Type:" { print $2 }')
+dyn_type=$(readelf -h "$TMP/gzip_dyn.bin" | awk '$1 == "Type:" { print $2 }')
+if [ "$exec_type" = "EXEC" ] && [ "$dyn_type" = "DYN" ]; then
+    note PASS "link modes under test: -fpie ${exec_type}, -fpie -pie ${dyn_type}"
 else
-    note FAIL "live-\`Add\` kernel self-check disagrees: rc=$rc_fold/$rc_nofold/$rc_pie/$rc_gcc fold='$out_fold' nofold='$out_nofold' pie='$out_pie' gcc='$out_gcc'"
+    note FAIL "unexpected ELF types: -fpie='$exec_type' -fpie -pie='$dyn_type'"
+    fail=1
+fi
+if [ "$rc_fold" -eq 0 ] && [ "$out_fold" = "$out_nofold" ] && [ "$out_fold" = "$out_gcc" ] \
+    && [ "$out_fold" = "$out_pie" ] && [ "$out_fold" = "$out_dyn" ]; then
+    note PASS "live-\`Add\` kernel self-check agrees: fold = kill switch = gcc = -fpie = -fpie -pie (${out_fold#* })"
+else
+    note FAIL "live-\`Add\` kernel self-check disagrees: rc=$rc_fold/$rc_nofold/$rc_pie/$rc_dyn/$rc_gcc fold='$out_fold' nofold='$out_nofold' pie='$out_pie' dyn='$out_dyn' gcc='$out_gcc'"
     fail=1
 fi
 
