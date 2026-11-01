@@ -33,7 +33,7 @@ if grep -Eq '%[xyz]mm[0-9]' "$tmp/kernel.s"; then
 fi
 # Unsupported classes must still fail closed, never fall through to SysV.
 cat > "$tmp/unsupported.c" <<'C'
-__int128 __attribute__((ms_abi)) f(__int128 x) { return x; }
+_Float128 __attribute__((ms_abi)) f(_Float128 x) { return x; }
 C
 if "$CCC" -c "$tmp/unsupported.c" -o "$tmp/bad.o" > "$tmp/error" 2>&1; then
   echo 'FAIL: accepted unimplemented Microsoft wide-scalar lowering' >&2; exit 1
@@ -127,3 +127,116 @@ if "$CCC" -O2 -mno-sse -mno-sse2 -S "$tmp/wide-nosse.c" -o "$tmp/wide-forbidden.
   echo 'FAIL Microsoft integer128 XMM return accepted without SSE' >&2;exit 1
 fi
 grep -q 'SSE.*disabled' "$tmp/wide-error"
+
+# Fixed integer128 arguments retain semantic IR types until backend transport.
+cat > "$tmp/wide-args.h" <<'C'
+#define MS __attribute__((ms_abi))
+typedef unsigned __int128 U;
+typedef unsigned long W;
+typedef U MS (*wide_cb)(U,W,U,W,U,U);
+extern MS U cc_gather(U,W,U,W,U,U), gcc_gather(U,W,U,W,U,U);
+extern MS W cc_fold(U), gcc_smash(U), cc_mixwide(U,double,U,float,U);
+extern MS __int128 cc_signed_arg(__int128);
+extern U cc_inline_wide(U);
+extern MS W gcc_check_alignment(U,W,U,W,U,U);
+extern W cc_alignment(U,U,U,U);
+extern MS U cc_wide_vadef(U,int,...), gcc_wide_vadef(int,...);
+extern U cc_wide_vacall(U,U,U,U), clang_wide_self(U,U,U,U);
+struct wide_record { U bits; W tag; };
+extern MS struct wide_record cc_wide_sret(U,int,...);
+extern U cc_cross(U,U,U,U), cc_isolate(U), cc_indirect(wide_cb,U,U,U,U);
+C
+cat > "$tmp/wide-args-lccc.c" <<'C'
+#include "wide-args.h"
+MS U cc_gather(U a,W m,U b,W n,U c,U d) { a+=b; return a+c+d+m+n; }
+MS W cc_fold(U a) { return (W)a^(W)(a>>64); }
+MS __int128 cc_signed_arg(__int128 a) { return a^1; }
+MS W cc_mixwide(U a,double x,U b,float y,U c) {
+    return (W)a^(W)(b>>64)^(W)c^(W)(x+y);
+}
+static MS __attribute__((always_inline)) inline U inline_wide(U a) { return a^1; }
+U cc_inline_wide(U a) { return inline_wide(a); }
+U cc_cross(U a,U b,U c,U d) { return gcc_gather(a,3,b,5,c,d)^a; }
+W cc_alignment(U a,U b,U c,U d) { return gcc_check_alignment(a,3,b,5,c,d); }
+U cc_isolate(U a) { gcc_smash(a); return a; }
+MS U cc_wide_vadef(U fixed,int n,...) {
+    __builtin_ms_va_list ap; __builtin_ms_va_start(ap,n);
+    U sum=fixed;
+    while(n--)sum+=__builtin_va_arg(ap,U);
+    __builtin_ms_va_end(ap); return sum;
+}
+U cc_wide_vacall(U a,U b,U c,U d) { return gcc_wide_vadef(4,a,b,c,d); }
+MS struct wide_record cc_wide_sret(U fixed,int n,...) {
+    __builtin_ms_va_list ap; __builtin_ms_va_start(ap,n);
+    U sum=fixed;
+    for(int i=0;i<n;++i)sum+=__builtin_va_arg(ap,U);
+    __builtin_ms_va_end(ap);
+    struct wide_record out={sum,(W)n}; return out;
+}
+U cc_indirect(wide_cb cb,U a,U b,U c,U d) { return cb(a,3,b,5,c,d)^a; }
+C
+cat > "$tmp/wide-args-oracle.c" <<'C'
+#include "wide-args.h"
+MS U gcc_gather(U a,W m,U b,W n,U c,U d) { a+=b; return a+c+d+m+n; }
+
+/* A callee may overwrite its caller-owned by-value image, never the source. */
+__asm__(".text\n.globl gcc_smash\ngcc_smash:\nmovq $0,(%rcx)\nmovq $0,8(%rcx)\nxorl %eax,%eax\nret\n");
+__asm__(".text\n.globl gcc_check_alignment\ngcc_check_alignment:\nmovq %rcx,%rax\norq %r8,%rax\norq 40(%rsp),%rax\norq 48(%rsp),%rax\nandq $15,%rax\nret\n");
+int main(void) {
+    W words[]={0,1,0xffffffffffffffffUL,0x8000000000000000UL,0x123456789abcdef0UL};
+    wide_cb volatile callback=cc_gather;
+    for(int i=0;i<5;++i)for(int j=0;j<5;++j){
+        U a=((U)words[i]<<64)|words[j],b=~a,c=a^((U)1<<100),d=a+37;
+        U expected=a+b+c+d+8;
+        if(cc_gather(a,3,b,5,c,d)!=expected||callback(a,3,b,5,c,d)!=expected)return 1;
+        if(cc_cross(a,b,c,d)!=(expected^a))return 2;
+        if(cc_indirect(gcc_gather,a,b,c,d)!=(expected^a))return 3;
+        if(cc_isolate(a)!=a)return 4;
+        if(cc_alignment(a,b,c,d))return 9;
+        if(clang_wide_self(a,b,c,d)!=a+b+c+d)return 12;
+        if(cc_wide_vadef(a,3,b,c,d)!=a+b+c+d)return 10;
+        if(cc_wide_vacall(a,b,c,d)!=a+b+c+d)return 11;
+        struct wide_record record=cc_wide_sret(a,3,b,c,d);
+        if(record.bits!=a+b+c+d||record.tag!=3)return 13;
+        if(cc_fold(a)!=(words[i]^words[j]))return 5;
+        if((U)cc_signed_arg((__int128)a)!=(a^1))return 6;
+        if(cc_inline_wide(a)!=(a^1))return 7;
+        if(cc_mixwide(a,3.0,b,5.0f,c)!=((W)a^(W)(b>>64)^(W)c^8UL))return 8;
+    }
+    return 0;
+}
+C
+# GCC 16.2 fails its own __builtin_ms_va_list / integer128 self-check:
+# its caller passes an indirect image, but va_arg reads inline aligned bytes.
+# Use the pinned, self-checked Clang receiver for this direction, not a broken
+# reference. GCC still produces all callers and the fixed-signature oracle.
+. "$HERE/lib/clang_oracle.sh"
+require_clang_oracle check_ms_abi_wide_variadic
+cat > "$tmp/wide-args-clang.c" <<'C'
+#include "wide-args.h"
+MS U gcc_wide_vadef(int n,...) {
+    __builtin_ms_va_list ap; __builtin_ms_va_start(ap,n);
+    U sum=0;
+    while(n--)sum+=__builtin_va_arg(ap,U);
+    __builtin_ms_va_end(ap); return sum;
+}
+U clang_wide_self(U a,U b,U c,U d) { return gcc_wide_vadef(4,a,b,c,d); }
+C
+"$CLANG_ORACLE_BIN" -O2 -c "$tmp/wide-args-clang.c" -o "$tmp/wide-args-clang.o"
+"$GCC" -O2 -c "$tmp/wide-args-oracle.c" -o "$tmp/wide-args-oracle.o"
+for opt in -O0 -O2 -Os '-O2 -mpreferred-stack-boundary=3'; do
+  read -r -a flags <<< "$opt"
+  "$CCC" "${flags[@]}" -c "$tmp/wide-args-lccc.c" -o "$tmp/wide-args-lccc.o"
+  "$GCC" "$tmp/wide-args-lccc.o" "$tmp/wide-args-oracle.o" "$tmp/wide-args-clang.o" -o "$tmp/wide-args-check"
+  "$tmp/wide-args-check"
+  echo "PASS Microsoft integer128 arguments $opt: four copies, overflow, indirect, mutation isolation and full-width results"
+done
+cat > "$tmp/wide-args-nosse.c" <<'C'
+unsigned long __attribute__((ms_abi)) cc_fold(unsigned __int128 a) {
+    return (unsigned long)a^(unsigned long)(a>>64);
+}
+C
+"$CCC" -O2 -mno-sse -mno-sse2 -S "$tmp/wide-args-nosse.c" -o "$tmp/wide-args-nosse.s"
+if grep -Eq '%[xyz]mm[0-9]' "$tmp/wide-args-nosse.s"; then
+  echo 'FAIL wide integer arguments introduced forbidden vector registers' >&2; exit 1
+fi

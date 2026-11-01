@@ -13,8 +13,10 @@ including typedefs, function pointers, composite types and indirect calls.
   for indirect arguments. Callee copies read exactly the object bytes without
   clobbering uncaptured incoming argument registers.
 - Signed/unsigned integer128 returns use the GNU Microsoft ABI single-XMM0
-  carrier while retaining integer128 semantic IR types. Fixed integer128
-  arguments remain rejected.
+  carrier. Fixed and variadic integer128 arguments use 16-byte-aligned private
+  images and one pointer position each. Semantic IR retains integer128 values
+  through optimization and inlining; backend-only legalization rewrites both
+  parameter capture and call transport together.
 - Floating-point return and variadic callers, including GP duplicates of FP
   register arguments. Microsoft variadic definitions use GP home slots and
   eight-byte char-pointer cursors, separate from the 24-byte SysV va_list
@@ -51,9 +53,9 @@ at `-O0`, `-O2`, `-Os`, and `-O2 -fstack-clash-protection`:
   and `readelf` save-record checks for all twelve extra nonvolatile registers.
 - Integer-only `-mno-sse -mno-sse2` emission without vector registers.
 
-The frozen kernel compiler SHA256 remains
+The earlier kernel5 compiler SHA256 was
 `883b8b34d4b13e7685de9426729bca9827c76bd8aa99c485e885895200e1a87c`.
-The subsequently rebuilt scalar/record/variadic test compiler is
+The frozen kernel6 scalar/record/variadic compiler is
 `6cce8a32fa17c14fd17608ede004a617d802c8ceb30d6922fd57d404f9218b39`.
 These are intentionally separate executables; kernel artifacts are not
 attributed to the newer compiler. Hosted CI must validate the submitted source.
@@ -64,8 +66,9 @@ variadic definitions at O0/O2/Os: mixed register/overflow FP/GP slots, cursor
 copies and helper consumption, five fixed arguments, hidden return pointers,
 and simultaneous SysV variadic use. Payloads include integer128, long double,
 IEEE binary128, three-byte records, all three complex precisions and a 16-byte
-vector. This does **not** imply fixed wide signatures or LCCC wide variadic
-callers are implemented; those remain diagnosed rather than miscompiled.
+vector. Integer128 fixed signatures and variadic callers are now separately tested.
+Other fixed wide signatures and other wide variadic callers remain diagnosed
+rather than silently assigned SysV transport.
 
 The actual patched CachyMod 6.18.58 default configuration was retained (SHA256
 `3d06a10a7773a3ca9fff4f425b8adff0cf373c656b849a7202744924034d1e5d`).
@@ -90,8 +93,8 @@ review obligations, and measured non-kernel variadic-home-save improvements.
   including FP-field integer carriers, hidden return pointers, register/stack
   indirect parameters and mutation isolation of caller-owned copies. The tested
   executable is `/home/user/compiler-next/lccc`, not the running kernel compiler.
-- Fixed wide scalar arguments, wide returns other than integer128,
-  complex/vector ABI signatures and LCCC wide variadic callers still require
+- Fixed wide scalar arguments/returns other than integer128, complex/vector
+  ABI signatures and wide variadic callers other than integer128 still require
   implementation; these remain rejected.
   Fetching those payloads in Microsoft variadic definitions is separately
   tested and does not remove that guard.
@@ -145,3 +148,41 @@ passed its 64-bit trapv matrix (910 expected traps, zero mismatches), but its
 It is not counted as a full-driver pass. This does not relax hosted coverage.
 The full6 kernel compiler predates these diagnostics, so its tolerated-option
 warnings remain explicitly outstanding.
+
+## Integer128 argument extension and oracle red-team result
+
+`check_ms_abi.sh` now covers fixed integer128 arguments and variadic callers,
+including four simultaneous private copies, register/overflow positions,
+signed and unsigned bit patterns, mixed GP/FP arguments, callbacks,
+always-inline helpers, hidden record returns combined with a named wide
+parameter and variadic payloads, and no-SSE integer-return functions. Assembly
+witnesses check all four argument-image addresses for 16-byte alignment and
+mutate a callee-owned image to prove isolation of the caller's live SSA value.
+The runtime gate passes at O0/O2/Os and O2 with an 8-byte preferred stack
+boundary, against both GCC 16.2 and Clang 23.1.4 callers/fixed-signature callees.
+
+The oracle self-check exposed a GCC 16.2 receiver limitation: its Microsoft
+integer128 variadic caller passes indirect images, but its own `va_arg` reads
+aligned inline bytes. The minimal non-kernel
+`tests/regression/fixtures/ms_abi/wide_variadic_self_control.c` exits **1** with
+GCC 16.2 and **0** with Clang 23.1.4. Therefore the gate requires the pinned
+Clang receiver for that direction and verifies Clang-to-Clang agreement before
+comparing LCCC's caller. GCC still supplies the callers and fixed-signature
+oracles. This is not a claim that the broken GCC receiver passed, and missing
+Clang is a failure, not a skip.
+
+Three backend unit tests pass: unchanged functions retain a borrowed view;
+physical views preserve the semantic input, source-span pairing, unique IDs
+with stale cached bounds, alloca definition order and idempotence; and SysV
+calls retain their integer128 operands. Record and Microsoft variadic gates
+also pass unchanged, as do the 109 warning-precedence cases. The new pass is
+x86-64-only; other backends retain the default borrowed view.
+
+Design alternatives: mutating only call operands would break inlining's typed
+parameter contract. Normalizing the entire optimizer IR would couple every
+semantic pass to physical Microsoft transport. A backend-only physical view
+avoids both problems and adds no copy of unrelated function IR. Caller images
+must be private because callees may overwrite them. The current callee capture
+is deliberately conservative; copy elision and nonvolatile-save pruning still
+need alias/provenance, debug/unwind and performance evidence. No optimality or
+kernel runtime/code-size benefit is claimed from this ABI extension alone.

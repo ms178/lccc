@@ -5600,6 +5600,8 @@ fn generate_function(
     source_mgr: Option<&SourceManager>,
     file_table: &FxHashMap<String, u32>,
 ) {
+    let physical = cg.legalize_function_abi(func);
+    let func = physical.as_ref();
     cg.set_function_target_features(&func.target_features);
     let mark = cg.state_ref().out.buf.len();
     generate_function_body(cg, attr_align, func, source_mgr, file_table);

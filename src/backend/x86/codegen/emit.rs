@@ -8323,6 +8323,10 @@ impl X86Codegen {
 }
 
 impl ArchCodegen for X86Codegen {
+    fn legalize_function_abi<'a>(&self, func: &'a IrFunction) -> std::borrow::Cow<'a, IrFunction> {
+        crate::backend::x86::ms_wide_abi::legalize(func)
+    }
+
     fn set_function_target_features(&mut self, features: &[String]) {
         use super::super::isa::{X86Isa, features_permit};
         use crate::common::x86_features::{X86Feature as F, effective};

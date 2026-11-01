@@ -1428,6 +1428,11 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     /// Return the ABI configuration for this architecture's function calls.
     fn call_abi_config(&self) -> super::call_abi::CallAbiConfig;
 
+    /// A backend-only physical ABI view, after all semantic optimizers.
+    fn legalize_function_abi<'a>(&self, func: &'a IrFunction) -> std::borrow::Cow<'a, IrFunction> {
+        std::borrow::Cow::Borrowed(func)
+    }
+
     /// Store a `bytes`-byte aggregate that came back in ONE vector register
     /// (`%ymm0` / `%zmm0`, x86-64 AVX ABI level) through the caller's result
     /// buffer at `buffer` (the hidden argument 0 of the sret-shaped call),

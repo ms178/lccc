@@ -696,8 +696,11 @@ impl SemanticAnalyzer {
         let supported_return = supported(ret)
             || matches!(ret, CType::Int128 | CType::UInt128)
             || (ret.is_struct_or_union() && record_size(ret) > 0);
-        let supported_parameter =
-            |ct: &CType| supported(ct) || (ct.is_struct_or_union() && record_size(ct) > 0);
+        let supported_parameter = |ct: &CType| {
+            supported(ct)
+                || matches!(ct, CType::Int128 | CType::UInt128)
+                || (ct.is_struct_or_union() && record_size(ct) > 0)
+        };
         if !supported_return || params.iter().any(|(ct, _)| !supported_parameter(ct)) {
             self.diagnostics.borrow_mut().error("Microsoft x64 wide-scalar lowering is not implemented yet; refusing an incorrect ABI".to_string(), span);
         }
