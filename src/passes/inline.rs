@@ -6186,32 +6186,42 @@ fn inline_call_site(
     let mut paramref_subst: FxInlineMap<u32, Operand> = FxInlineMap::default();
     let paramref_debug = PARAMREF_DEBUG_ENABLED.with(std::cell::Cell::get);
     {
-        use crate::common::fx_hash::FxHashMap as ParamMap;
-        let entry_block = &mut inlined_blocks[0];
-
-        // A bridge store must follow the alloca it writes and precede the first
-        // READ of that home, and those two constraints do not share a position:
-        // a memory-passed parameter (`__int128`, `__float128`, a vector, a
-        // struct) is read straight out of its home in the entry block, in the
-        // middle of the prologue.  A single "after the allocas" position (first
-        // run or last alloca) puts the store after that read -- a switch on an
-        // `__int128` argument then read the uninitialized slot.  Each store
-        // therefore goes immediately after ITS home's definition.
-        let mut home_def_index: ParamMap<u32, usize> = ParamMap::default();
-        for (index, inst) in entry_block.instructions.iter().enumerate() {
-            if let Instruction::Alloca { dest, .. } = inst {
-                home_def_index.insert(dest.0, index);
+        let entry = &mut inlined_blocks[0];
+        for &(home, _, _) in param_alloca_info.iter().flatten() {
+            let lead = entry
+                .instructions
+                .iter()
+                .take_while(|inst| matches!(inst, Instruction::Alloca { .. }))
+                .count();
+            let at = entry
+                .instructions
+                .iter()
+                .position(|inst| matches!(inst, Instruction::Alloca { dest, .. } if *dest == home));
+            if let Some(at) = at.filter(|&at| at >= lead) {
+                let span = entry.span_at(at);
+                let alloca = entry.remove_inst(at);
+                entry.insert_inst(0, alloca, span);
             }
         }
-        let prologue_end = entry_block
-            .instructions
-            .iter()
-            .rposition(|inst| matches!(inst, Instruction::Alloca { .. }))
-            .map_or(0, |i| i + 1);
-        // Every parameter with a live ParamRef retains this bridge even for a
-        // constant argument: constants may replace the ParamRef directly, while
-        // the home remains a valid ABI object for address-taken or later memory
-        // uses.
+    }
+    let mut paramref_subst: FxInlineMap<u32, Operand> = FxInlineMap::default();
+    let paramref_debug = PARAMREF_DEBUG_ENABLED.with(std::cell::Cell::get);
+    {
+        let entry_block = &mut inlined_blocks[0];
+        let mut insert_pos = 0;
+        // Find position after all allocas in the entry block.
+        for (i, inst) in entry_block.instructions.iter().enumerate() {
+            if matches!(inst, Instruction::Alloca { .. }) {
+                insert_pos = i + 1;
+            } else {
+                break;
+            }
+        }
+
+        // Insert stores in reverse order so indices stay valid. Every parameter
+        // with a live ParamRef retains this bridge even for a constant argument:
+        // constants may replace the ParamRef directly, while the home remains a
+        // valid ABI object for address-taken or later memory uses.
         let has_spans = !entry_block.source_spans.is_empty();
         let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
         let mut bridge: Vec<(usize, Instruction)> = Vec::new();
@@ -6222,25 +6232,29 @@ fn inline_call_site(
             if home_subst.contains_key(&home.0) {
                 continue; // value flows via the older pure-home substitution
             }
-            let pos = home_def_index
-                .get(&home.0)
-                .map_or(prologue_end, |index| index + 1);
             let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();
             if let Some(struct_size) = param_struct_size {
                 // Struct-by-value parameter: the caller passes a pointer to the struct data.
                 // We must copy the struct data from that pointer into the callee's param alloca.
-                let Operand::Value(src_ptr) = site.args[i] else {
+                if let Operand::Value(src_ptr) = site.args[i] {
+                    entry_block.instructions.insert(
+                        insert_pos,
+                        Instruction::Memcpy {
+                            dest: home,
+                            src: src_ptr,
+                            size: struct_size,
+                        },
+                    );
+                    if has_spans {
+                        entry_block
+                            .source_spans
+                            .insert(insert_pos, crate::common::source::Span::dummy());
+                    }
+                    inserted_arg_count += 1;
+                } else {
                     // Struct arg should always be a Value (pointer), not a Const.
                     return false;
-                };
-                bridge.push((
-                    pos,
-                    Instruction::Memcpy {
-                        dest: home,
-                        src: src_ptr,
-                        size: struct_size,
-                    },
-                ));
+                }
             } else {
                 let store_ty = home_ty;
                 bridge.push((
@@ -6249,73 +6263,25 @@ fn inline_call_site(
                         volatile: false,
                         val: site.args[i],
                         ptr: home,
-                        ty: store_ty,
+                        ty: home_ty,
                         seg_override: AddressSpace::Default,
                     },
-                ));
-            }
-        }
-        let insert_high = bridge
-            .iter()
-            .map(|(pos, _)| *pos)
-            .max()
-            .unwrap_or(prologue_end);
-        let inserted_arg_count = bridge.len();
-        let mut placed: Vec<(u32, usize)> = Vec::with_capacity(bridge.len()); // (home, index)
-        bridge.sort_by_key(|(pos, _)| *pos);
-        for (offset, (pos, inst)) in bridge.into_iter().enumerate() {
-            let at = pos + offset;
-            if let Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } = &inst {
-                placed.push((ptr.0, at));
-            }
-            entry_block.instructions.insert(at, inst);
-            if has_spans {
-                entry_block
-                    .source_spans
-                    .insert(at, crate::common::source::Span::dummy());
-            }
-        }
-
-        // Ordering is a property of the FINAL instruction list, so it is checked
-        // there: each bridge store must precede every read of its home, and the
-        // materialization loads must precede the first use of the ParamRef they
-        // replace.  A site that cannot have both declines the inline (returning
-        // false discards the cloned body).
-        for &(home, store_index) in &placed {
-            for (index, inst) in entry_block.instructions.iter().enumerate() {
-                if index >= store_index {
-                    break;
-                }
-                if inst.used_values().contains(&home) {
-                    return false;
-                }
-            }
-        }
-
-        let mut materialize_pos = insert_high + inserted_arg_count;
-        for (paramref_dest, param_idx, _) in &paramref_records {
-            if *param_idx >= num_args_to_store {
-                continue;
-            }
-            let first_use = entry_block
-                .instructions
-                .iter()
-                .position(|inst| inst.used_values().contains(&paramref_dest.0))
-                .or_else(|| {
+                );
+                if has_spans {
                     entry_block
-                        .terminator
-                        .used_values()
-                        .contains(&paramref_dest.0)
-                        .then_some(entry_block.instructions.len())
-                });
-            if first_use.is_some_and(|index| index < materialize_pos) {
-                return false;
+                        .source_spans
+                        .insert(insert_pos, crate::common::source::Span::dummy());
+                }
+                inserted_arg_count += 1;
             }
         }
+
+        let mut materialize_pos = insert_pos + inserted_arg_count;
         // Deduplicate loads: one Load per distinct param_idx, and one Cast per
         // distinct (param_idx, param_ty) when types differ.  This reduces IR
         // bloat when a callee has multiple ParamRef for same parameter (common
         // after TCE / loop lowering) and keeps compile-time low.
+        use crate::common::fx_hash::FxHashMap as ParamMap;
         let mut loaded_per_param: ParamMap<usize, Value> = ParamMap::default();
         let mut cast_per_param_ty: ParamMap<(usize, IrType), Value> = ParamMap::default();
 
