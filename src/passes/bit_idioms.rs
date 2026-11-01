@@ -2889,6 +2889,11 @@ pub(crate) fn recognize_function(
     native_bswap: bool,
 ) -> usize {
     let pre_changes = canonicalize_narrow_crc_casts(func);
+    let shared_bit_changes = if !facts::bit_select_disabled() {
+        bit_select::fold_shared_bit_select(func)
+    } else {
+        0
+    };
     let mut defs = vec![None; func.max_value_id() as usize + 1];
     let mut def_counts = vec![0u32; defs.len()];
     // (block index, instruction index) of each value's defining instruction,
@@ -2922,7 +2927,7 @@ pub(crate) fn recognize_function(
 
     // Union-punned copysign first: it mints fresh IDs (written back to
     // `func.next_value_id`) before the main scan seeds its own counter.
-    let mut changes = pre_changes + recognize_copysign_mem(func);
+    let mut changes = pre_changes + shared_bit_changes + recognize_copysign_mem(func);
     let mut next_value_id = func.max_value_id().saturating_add(1);
     // Boolean mux/majority algebra kill switch (same authority contract as
     // the vectorizer's CCC_NO_* gates; A/B for the differential batteries).
