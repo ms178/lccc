@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -133,6 +134,7 @@ g:
                 scorer.check_correctness("gcc", bad, "2", sanitizer_flags)
             except RuntimeError as error:
                 assert "program failed" in str(error), str(error)
+                assert f"exit={-signal.SIGILL}" in str(error), str(error)
             else:
                 raise AssertionError(f"UBSan failed to trap intentional {name}")
 

@@ -96,7 +96,7 @@ operand-count assertions.
 Deduplication removes seven production panic/expect sites. Relative to the
 fetched main census, production panic sites fall **881 → 877**, hot panic
 sites stay 101, unsafe sites stay 25, long functions (>300 lines) fall
-233 → 232, unique knobs stay 549 and undocumented knobs fall 264 → 262.
+233 → 232, unique knobs are 550 after the new ABI escape hatch and undocumented knobs fall 264 → 262.
 The integrated baseline is regenerated against that upstream baseline;
 there is no ratchet increase relative to main. The internal tail-call marker
 is no longer mislabeled a user configuration knob.
@@ -188,3 +188,54 @@ suite without invoking the older compatibility-floor compiler. This selection
 never emits a full/fast acceptance stamp. The default local runner and hosted
 MSRV job are unchanged; hosted CI must still pass before delivery. Gate
 selection tests prove that the compiler-contract gates remain selected.
+
+
+## Follow-through: corrected tests and refreshed PR heads
+
+The audit refreshed #1060 through `07992c547`; #1050 `a62b7d708` and
+#1051 `130f9e0cb` are also ancestors of the unified branch. Main remains
+`013983d6a` at the latest fetch. The following are measured integration fixes,
+not assertions of universal completion:
+
+- All-target Rust: **7,429 library tests + 1 linker-binary test PASS**, 10
+  intentionally ignored. The materialized-Alloca-copy positive control had
+  replaced instruction 2 (removing Copy7) rather than instruction 1 (BinOp6).
+  The fixture now asserts the replaced destination and retains both the
+  positive coalescing expectation and the Alloca refusal control.
+  Warning-denied all-target Clippy also passes.
+- The independent shell attribute gate now requires preservation-convention
+  refusals, rather than its obsolete ignored-attribute expectations. Escape
+  hatch assertions remain. `regparm(3)` on x86-64 is explicitly ignored.
+- The cached modern GCC does not ship libubsan. The RA harness uses GCC's
+  native trap instrumentation, **not an older runtime or a sanitizer skip**.
+  All 20 generated kernels pass GCC O0/O1/O2/O3 and sanitized O2. Intentional
+  signed-overflow and float-cast-overflow controls must terminate with SIGILL.
+- Sanitizing the call-staging reference exposed real fixture UB: negative
+  signed left shifts and overflowing signed hash postprocessing. Negative
+  constants are now constructed with representable multiplication/negation;
+  variable wide-bit assembly uses an unsigned carrier; hash postprocessing
+  uses modular unsigned arithmetic. Both reference translation units are now
+  instrumented. **35/35 target builds and 10,825 ABI call comparisons PASS**
+  (pinned cases + six 120-function seeds, O0/O1/O2/O3/Os).
+- The hosted fast-contract shard caught negative frontend tests masquerading
+  as accepted IR fixtures. The latest #1060 supplies the purpose-built
+  bit-field IR fixture. The unsupported preserve-none fixture is replaced
+  with accepted native direct/forwarded/indirect calls; foreign-ABI refusal
+  remains independently pinned. **78-file abort-mode IR sweep PASS**; the
+  new native fixture also passes GCC/LCCC, m32/m64, O0/O2 with
+  `-Wall -Wextra -Werror` (**eight compile/execute pairs**).
+- Historical simple `x+x` vector probes emit one packed add plus return;
+  the offset-memset probe matches GCC 16.2 at four instructions. These limited
+  non-reproductions do not justify speculative backend changes or close all
+  context-sensitive profitability questions.
+- The ICX hosted lane now provisions multilib before the exact GCC installer,
+  installs GCC 16.2 and Clang 23.1.4, retains the Clang installer's exported
+  executable, and verifies the pair before selecting unversioned aliases.
+
+The first full modern-selected local run started before these test fixes; it
+records failures for the obsolete shell expectations and missing libubsan.
+Those gates pass independently after correction. An unchanged-tree clean
+rerun, fresh unified timing, current-head hosted CI, and the remaining browser
+and follow-up work are **not yet certified** by the receipts above. Focused
+validated `ms178-1.patch` snapshots 04 through 08 record their exact commits
+and these limitations rather than manufacturing a canonical local pass stamp.
