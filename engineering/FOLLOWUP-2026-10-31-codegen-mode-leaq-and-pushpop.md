@@ -93,14 +93,13 @@ So every default build was linked **position-fixed** while its codegen still
 paid the full PIC price from §2. The two halves of the driver disagreed, and
 the losing half was the one that costs instructions, `leaq`s and registers.
 
-A candidate fix was implemented and measured as
-`pic_codegen_effective(pic, pie, fixed_exec_link) = pic || (pie &&
-!fixed_exec_link)` (a PIE request is honoured only when the image is really
-relocatable), plus `-pie`/`-no-pie` setting the codegen half so the two can no
-longer drift apart. It delivers the §2 numbers on default builds and leaves
-`-S`/`-c` output byte-identical (absolute forms stay gated on
-`fixed_exec_link`, exactly like absolute switch tables). It is **not landed**
-because of the blocker below.
+The fix is `pic_codegen_effective(pic, pie, fixed_exec_link, pie_explicit)`
+(a PIE request is honoured only when the image is really relocatable, or when
+the user spelled `-fPIE`), plus a `-pie` link forcing the codegen half so the
+two can no longer drift apart. It delivers the §2 numbers on default builds and
+leaves `-S`/`-c` output byte-identical (absolute forms stay gated on
+`fixed_exec_link`, exactly like absolute switch tables). **Landed** — see §6 for
+the final shape; the blocker below is what had to be fixed first.
 
 ## 4. Blocker: a latent miscompile in non-PIC codegen at `-O1`
 
@@ -149,14 +148,168 @@ Impact today: `-fno-pie` (already supported) inherits it; `-no-pie` does not
 
 ## 5. Next steps
 
-1. Fix the `-O1` non-PIC miscompile (§4): make the non-PIC symbol-SIB arms go
-   through the same index-form normalisation as the PIC arm, and add the
-   `gzip_longest_match`-at-`-O1` case to `scripts/check_benchmark_outputs.sh`
-   as a `-O1 -fno-pie` variant so the path is covered by CI from then on.
-2. Re-land `pic_codegen_effective` (the candidate patch is described in §3).
-   Expected: -306 instructions, -179 `leaq`, -54 `push`/`pop` on the linked
-   benchmark binaries; `-S`/`-c` output unchanged.
+1. ~~Fix the `-O1` non-PIC miscompile (§4)~~ — done:
+   `tests/regression/check_reg_off_sym_fold.sh` contract 5 runs the gzip
+   longest-match kernel at `-O1 -fno-pie` against gcc and the kill switch, so
+   the level and mode that used to answer "foldable" for a live base are
+   covered by CI from then on.
+2. ~~Re-land `pic_codegen_effective` (§3)~~ — done, see §6. Expected: -306
+   instructions, -179 `leaq`, -54 `push`/`pop` on the linked benchmark
+   binaries; `-S`/`-c` output unchanged.
 3. Register-pressure work beyond that is small: pool size (+%rax/%rcx) buys
    -4 %, save-set compaction is already worth -30 pushes, and 88 % of the
    remaining pushes live in call-free functions where they are the ABI cost of
    keeping more than six values live — not a defect.
+
+## 6. Landed: the codegen mode follows the link mode
+
+`Driver` carries two facts, not one:
+
+* `pie` — what the `-f` flags say. It still drives `__PIE__`/`__PIC__`,
+  because those macros describe the option, not the image.
+* `pie_explicit` — whether `-fPIE`/`-fpie` was *spelled*. It exists for exactly
+  one case: an explicit request for position-independent CODE must not be
+  overridden by a position-fixed LINK.
+
+`compile_translation_unit` then computes, once, from the same argument list the
+linker receives:
+
+```rust
+let link_pie         = linker_pie_effective(&self.build_linker_args());
+let fixed_exec_link  = matches!(self.mode, CompileMode::Full)
+                       && !self.shared_lib && !self.relocatable && !link_pie;
+let pic_codegen      = self.pic || self.shared_lib;
+let pie_codegen      = (self.pie && (!fixed_exec_link || self.pie_explicit)) || link_pie;
+```
+
+`fixed_exec_link` already existed for the absolute switch-table form; symbol
+addressing now rides the same predicate, so there is one answer to "can this
+image be relocated" rather than two that could disagree — which is what the
+original defect was.
+
+What each invocation gets:
+
+| invocation | image | codegen | why |
+|---|---|---|---|
+| `lccc -O2 a.c -o a` (default) | ET_EXEC | position-fixed | the image cannot move; PIC buys nothing |
+| `lccc -O2 -c a.c` / `-S` | object | position-independent | a later link may be `-pie` |
+| `lccc -O2 -pie a.c -o a` | ET_DYN | position-independent | `R_X86_64_32S` is unresolvable in ET_DYN |
+| `lccc -O2 -fpie a.c -o a` | ET_EXEC | position-independent | the user asked for PIC code |
+| `lccc -O2 -fPIC` / `-shared` | — | full PIC | interposition-safe |
+
+`tests/regression/check_default_codegen_mode.sh` pins all six arms, in the
+linked images (the only place a FULL invocation's codegen mode is observable,
+since `-S`/`-c` are deliberately mode-independent): the absolute symbol+index
+SIB form `0x404040(,%rax,4)` exists by default and never in a `-pie`/`-fpie`/
+`-c` image, `-fPIC` still reaches a preemptible global through
+`@GOTPCREL`, every arm prints gcc's own output, and `-S` is byte-identical with
+and without `-no-pie`.
+
+The security posture is unchanged and worth stating: lccc's default link was
+already non-PIE (`linker_pie_effective` defaults to false), so this change does
+not disable ASLR for code — it stops paying for position independence the
+resulting binary never had. A hardened build is one flag away and now honoured
+end to end: `-pie` (or `-fPIE`) produces position-independent codegen *and* an
+ET_DYN image.
+
+## 7. What this unlocks, and what it does not
+
+The mode change is the whole of the measured address-generation gap, so the
+next levers are elsewhere. Ranked by measured size, with the reason each is a
+project rather than a commit:
+
+1. **ChaCha20 quarter-round SIMD** (`engineering/STATE.md` backlog 1). LCCC 592
+   instructions against ICX 74, Clang 176, GCC 232 on the same kernel: a 3-8x
+   code-size gap driven by scalar quarter-rounds under spill pressure. This is
+   vectorisation work in the loop/SLP passes, not a codegen tweak.
+2. **The remaining `push`/`pop`.** After the mode change the corpus still
+   emits 741 against GCC's 271, and the first explanation to reach for — "the
+   allocator hands leaves a callee-saved home they never needed" — is **not**
+   what is happening. `RegAllocConfig::leaf_caller_saved_homes` (x86-64, on by
+   default, `CCC_NO_LEAF_CALLER_HOME` to A/B it) already lets a call-free
+   leaf's hot loop values compete for the volatile pool first, with only the
+   Phase-2c overflow reaching the callee-saved bank; `tests/regression/
+   check_leaf_caller_homes.sh` pins that shape. What produces the count is:
+
+   * leaves whose live set exceeds the six-register volatile pool (the
+     overflow is a real register, so the save is real);
+   * non-leaf functions, where callee-saved homes are the point;
+   * functions containing an inline-expanded `memcpy`/`memset`. Those are
+     call points in the allocator *by design* (`instruction_is_call_point`
+     answers true for the IR `Call`, and the completeness argument in
+     `collect_x64_rdx_clobber_points` says why: the expansion writes the
+     volatile pool without staging the values that live across it, so a
+     volatile home spanning it would be corrupted). They are *not* call
+     points for the frame (`has_calls` in the prologue excludes them) or for
+     parameter homes, and those three predicates agreeing is itself
+     deliberate. Recovering the volatile homes those functions lose means
+     modelling the expansion's clobber set per register instead of declaring
+     a whole call point — the same machinery that already admits `%rdx`
+     per-value at clobber-free live ranges — and it has to be done for every
+     expansion shape (GPR, SSE, `rep movs`, per-CPU tuning row). That is the
+     next real win, and it is a register-class project, not a pool tweak.
+3. **Loop rotation default-enable (PF-17).** The pass exists and removes the
+   extra entry jump in hot loops; it stays off until the remaining 15 edge-case
+   loop shapes are hardened.
+
+**Narrow integer ALU width — analysed, and why it is not in this change.**
+`tests/regression/check_narrow_alu_arithmetic.sh` states the value contract the
+change would have to preserve (wrapped results, sign extension, comparisons,
+over the whole u8 grid and a sampled i16 grid), so the next attempt has its
+safety net already in place; what it does not have is a proof about FLAGS,
+which is where the difficulty actually lives.
+After the divide work, narrow integer arithmetic still runs at 64-bit width.
+It looks like a mechanical `addq` -> `addl` sweep and it is not: `addl` and
+`addq` are only equivalent on canonical operands when the *result* also stays
+canonical. `0xFFFFFFFF + 1` is `0` in 32 bits (CF=1, ZF=1) and `0x100000000` in
+64 (CF=0, ZF=0), so the width decides both the value's upper half and every
+flag a consumer reads; and the consumers — `setcc`, `cmov`, `jcc`, the
+`check_narrow_cmp_flag_law.sh` contracts — are chosen at the same width today.
+Making the ALU 32-bit is therefore a whole-lattice change: the ALU, the flag
+law and every flag consumer have to move together, or nothing moves. It is
+provably free of *lost* information (the canonical form is 32 bits) but it is
+not free of *work*, and a change of that size has to be measured against the
+corpus with a compiler in the loop, not reasoned about.
+
+## 8. Why the narrow-ALU width stays 64-bit here (the lattice, stated exactly)
+
+The tempting reading of "narrow values live in the low half" is "so emit the
+32-bit ALU form". The reason that is wrong is not the *low* half; it is that
+lccc's 64-bit form and its flag consumers are a matched pair, and only the pair
+can move.
+
+Two canonical i32 values `a = 0xFFFF_FFFF` and `b = 1` demonstrate it. `addl`
+produces `0` in the destination with `ZF=1, CF=1`; `addq` produces
+`0x1_0000_0000` with `ZF=0, CF=0`. Both are "correct" for the type — the IR
+result is a 32-bit value — but they disagree about the *value* in bits 32-63
+and about every flag bit a consumer reads. Today lccc emits `addq` and compares
+at 64 bits (`cmpq`), which is internally consistent: the compare sees the same
+`0x1_0000_0000` the add produced, and a `jcc` on it answers the question the IR
+asked. Switching the add alone would leave the compare reading a different
+number than the one produced; switching the add *and* the compare changes the
+answer for the wrap case unless the truncation is materialised somewhere.
+
+That is what `tests/regression/check_narrow_cmp_flag_law.sh` pins: which
+`cmp` width a narrow compare emits, and that the `jcc`/`setcc` consumer reads
+at that same width. The work is therefore a lattice move — every narrow ALU
+op, its narrow compare, and its `setcc`/`cmov`/`jcc` consumer, at once — and
+the value contract that came with it (`check_narrow_alu_arithmetic.sh`) is the
+half of the proof that already exists. The other half, a flag-consumer audit,
+does not exist yet, and a change of that shape cannot be validated by reading
+it: it needs a compiler in the loop on the whole corpus.
+
+## 9. How the next tuning round is measured
+
+The corpus ratios used to be unreachable from outside a run: the job log
+redirects to a blob host and a reusable-workflow job's step summary does not
+surface in `output.summary`, so "the lane passed" was all anyone could see.
+`.github/scripts/ci_bench_ratios.py` now publishes the shard's paired medians as
+one checks annotation — the geomean with best/worst, then the worst kernels
+first — gated on `LCCC_BENCH_RATIOS` like the codegen gate's `LCCC_CODEGEN_ASM`,
+and printing the same table to the log either way. The first run through it
+(86-program corpus, `-O2`, reps=9) reports shard a geomean **0.600** and shard b
+**0.956** against GCC 16.2, with the widest losses at `double_reduction` 1.184,
+`expat_xml_scan` 1.174, `binary_trees` 1.136, `matmul` 1.084, `zlib_ng_compare256`
+1.078 and `nbody` 1.064. Those six are the next round's work list, in that
+order, and every future change now has a number attached to it before it is
+argued about.

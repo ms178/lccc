@@ -1,170 +1,184 @@
 #!/usr/bin/env bash
 # ============================================================================
-# build_kernel_full.sh — drive a full linux-cachymod kernel build with LCCC.
+# build_kernel_full.sh — full Linux/CachyMod build with LCCC for ALL target
+# code and lccc-ld for ALL target links. Host tools (including the real
+# objtool) use HOSTCC. No validation or security feature is disabled by this
+# harness, and a no-op objtool shim is rejected outright.
 #
-# This is the incremental "real workload" harness for the kernel-compilation
-# quest.  It prepares the patched linux-cachymod tree (see prepare_kernel_tree.sh;
-# the version is whatever the package PKGBUILD pins),
-# compiles it with the package's OWN x86_64 configuration (`cp ../config
-# .config`, exactly what the PKGBUILD's prepare() does: CachyOS scheduler set,
-# FUNCTION_TRACER/DYNAMIC_FTRACE, STACKPROTECTOR, OBJTOOL, UNWINDER_ORC, ...),
-# and drives the whole Kbuild with `CC=lccc LDLD=lccc-ld AS=lccc`.
+# Configuration contract:
+#   * An existing .config is preserved by default. LCCC_RECONFIG=1 explicitly
+#     selects the package configuration (or a documented defconfig recipe when
+#     no package config is available). A missing BORE symbol is NOT a license
+#     to overwrite a caller-selected configuration.
+#   * When the package config is selected, olddefconfig may absorb new symbols
+#     but must not silently drop a package-enabled feature; drift is refused
+#     unless LCCC_ALLOW_CONFIG_DRIFT=1 is set explicitly.
+#   * The exact configuration, compiler, linker and recipe identities are
+#     recorded before the build and re-verified afterwards.
 #
-# The harness is *honest about what it builds*. It no longer disables package
-# features to get past a gap (tracer, stack protector and objtool/ORC all work
-# now), it stops if `olddefconfig` drops a symbol the package enabled, and the
-# objtool no-op shim is opt-in (LCCC_NOOBJTOOL=1) and only legitimate for
-# compile-only sweeps — a boot test must run the real objtool.
-#
-# Usage:
-#   build_kernel_full.sh [kbuild-targets...]
-#     e.g. build_kernel_full.sh                          # arch/x86 defconfig build
-#          build_kernel_full.sh kernel/exit.o            # one object
-#          build_kernel_full.sh net/core/ fs/ ...        # selected subdirs
-#
+# Usage: build_kernel_full.sh [kbuild-targets...]   (default: bzImage)
 # Environment:
-#   KERNEL_DIR  patched tree  (default: kernel_version.sh's answer, i.e.
-#               $KERNEL_WORK/linux-$KVER under ~/.cache/lccc/kernel-work)
-#   PKGDIR      archpkgbuilds pkg dir (default .../packages/linux-cachymod-6.18)
-#   LCCC        compiler (default <repo>/target/fastbuild/lccc, where <repo> is
-#               the checkout this script lives in)
-#   LCCC_LD     linker   (default <repo>/target/fastbuild/lccc-ld)
-#   LCCC_JOBS   build parallelism (default 2)
-#   LCCC_NOOBJTOOL  if 1, swap tools/objtool/objtool for a no-op shim. That
-#                  makes the output NOT the package's kernel (no ORC data, no
-#                  stack validation), so it is for compile-only sweeps, never
-#                  for a boot test. Default 0: real objtool.
-#   LCCC_RECONFIG  if 1, force rewrite of .config; default reuses existing.
+#   KERNEL_DIR, KERNEL_WORK, PKGDIR, LCCC, LCCC_LD, HOSTCC, LCCC_JOBS=2,
+#   LCCC_RECONFIG=0, LCCC_KERNEL_SCX=0 (opt-in BTF/sched-ext milestone),
+#   LCCC_ALLOW_CONFIG_DRIFT=0.
 # ============================================================================
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-# Which kernel tree?  scripts/kernel_version.sh is the single source of truth
-# (explicit KERNEL_DIR/KVER > the prepared tree on disk > the package PKGBUILD
-# > a pinned fallback); the literal that used to live here went stale the
-# moment archpkgbuilds bumped 6.18.55 -> 6.18.58.
 # shellcheck source=kernel_version.sh
-. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/kernel_version.sh"
+. "$here/kernel_version.sh"
 # shellcheck source=kconfig_query.sh
 . "$here/kconfig_query.sh"
+
 K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
 PKGDIR=${PKGDIR:-$(lccc_kernel_pkgdir)}
-REPO_ROOT=$(CDPATH= cd -- "$here/.." && pwd)
-LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
-LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
+REPO=$(CDPATH= cd -- "$here/.." && pwd)
+LCCC=${LCCC:-$REPO/target/fastbuild/lccc}
+LCCC_LD=${LCCC_LD:-$REPO/target/fastbuild/lccc-ld}
 HOSTCC=${HOSTCC:-gcc}
 JOBS=${LCCC_JOBS:-2}
-NOOBJTOOL=${LCCC_NOOBJTOOL:-0}
-RECONFIG=${LCCC_RECONFIG:-0}
 
-# ---- 1. ensure the patched tree exists -------------------------------------
-if [[ -n $PKGDIR ]]; then
-  PKGDIR="$PKGDIR" "$here/prepare_kernel_tree.sh" "$K"
-else
-  "$here/prepare_kernel_tree.sh" "$K"
+[[ $JOBS =~ ^[1-9][0-9]*$ ]] || {
+  echo 'LCCC_JOBS must be a positive integer' >&2; exit 2;
+}
+[[ ${LCCC_NOOBJTOOL:-0} == 0 ]] || {
+  echo 'LCCC_NOOBJTOOL=1 is no longer supported: a no-op validator is not a kernel build' >&2
+  exit 2
+}
+[[ -x $LCCC && -x $LCCC_LD ]] || {
+  echo 'build LCCC first with scripts/build_lccc_fast.sh' >&2; exit 1;
+}
+LCCC=$(realpath -- "$LCCC")
+LCCC_LD=$(realpath -- "$LCCC_LD")
+
+# Prepare only a missing/incomplete tree. Re-running preparation is not a
+# license to overwrite an existing caller-selected configuration; the prepare
+# script's recipe/ownership guards decide whether a damaged tree may be replaced.
+if [[ ! -f $K/.lccc-prepared || ! -f $K/include/generated/autoconf.h ]]; then
+  if [[ -n $PKGDIR ]]; then
+    PKGDIR=$PKGDIR "$here/prepare_kernel_tree.sh" "$K"
+  else
+    "$here/prepare_kernel_tree.sh" "$K"
+  fi
 fi
-
-# ---- 2. configuration: the package's own config, verbatim -------------------
-#   * PKGBUILD's prepare() does `cp ../config .config` for the package's full
-#     x86_64 configuration (CachyOS scheduler set, FUNCTION_TRACER/DYNAMIC_
-#     FTRACE, STACKPROTECTOR, OBJTOOL + UNWINDER_ORC, ...).  This script now
-#     does exactly that: the package config is the source of truth and it is
-#     copied unmodified (olddefconfig only absorbs symbols a newer tree adds).
-#     Earlier revisions of this script rebuilt a defconfig with the tracer,
-#     stack protector and ORC/objtool disabled as "documented prerequisites";
-#     those features are implemented now (LCCC emits `call __fentry__` under
-#     -pg -mfentry, byte-identical canary access under the kernel's exact
-#     -mstack-protector-guard-* spelling, and real objtool accepts and ORC-
-#     annotates LCCC objects), and disabling package features to make a build
-#     pass is not an acceptable trade.
-#   * olddefconfig absorbs NEW Kconfig symbols non-interactively (avoids the
-#     "Restart config..." prompt that otherwise stalls a headless build).
+[[ -f $K/Makefile && -f $K/.lccc-prepared ]] || {
+  echo "not a prepared kernel tree: $K" >&2; exit 1;
+}
 cd "$K"
 
-# Package features a silent drop would make this build a *different* kernel.
-# Checked only where the package config itself enables them, so a package that
-# legitimately disables one is never second-guessed.
-PACKAGE_FEATURES=(
-  FUNCTION_TRACER DYNAMIC_FTRACE
-  STACKPROTECTOR STACKPROTECTOR_STRONG
-  UNWINDER_ORC OBJTOOL STACK_VALIDATION DEBUG_ENTRY
-  SCHED_BORE SCHED_CACHE SCHED_CLASS_EXT
-)
+# Kbuild does not fingerprint compiler/linker executable contents. Invalidate
+# stale products before any target code is rebuilt, and keep the boot ISA
+# portability fix idempotent and explicit.
+"$here/kernel_tool_identity.sh" "$K" "$LCCC" "$LCCC_LD"
+"$here/kernel_boot_isa.sh" patch "$K"
 
-if [[ $RECONFIG == 1 ]] || ! grep -q "^CONFIG_SCHED_BORE=y" .config; then
+make_args=(ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" HOSTCC="$HOSTCC")
+package_config=""
+config_recipe=existing-config
+if [[ ${LCCC_RECONFIG:-0} == 1 ]] || [[ ! -f .config ]]; then
   if [[ -n $PKGDIR && -r $PKGDIR/config ]]; then
     cp -f "$PKGDIR/config" .config
     package_config=$PKGDIR/config
-    echo "config: package configuration $package_config"
-    echo "config: package sha256 $(sha256sum "$package_config" | cut -d' ' -f1)"
+    config_recipe=package-config
   else
-    package_config=""
-    echo "WARNING: no package configuration (\$PKGDIR=${PKGDIR:-unset});" >&2
-    echo "WARNING: falling back to defconfig + the CachyOS scheduler enables." >&2
-    echo "WARNING: this is NOT the configuration the package ships, and nothing" >&2
-    echo "WARNING: below verifies the package's feature set." >&2
-    make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" defconfig >/dev/null
+    make "${make_args[@]}" defconfig >/dev/null
     ./scripts/config \
-      --enable CACHY \
-      --enable SCHED_BORE \
-      --enable SCHED_CACHE \
-      --enable SCHED_CLASS_EXT
-  fi
-  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" olddefconfig </dev/null >/dev/null
-  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" syncconfig </dev/null >/dev/null
-  echo "config: resulting .config sha256 $(sha256sum .config | cut -d' ' -f1)"
-
-  # olddefconfig absorbs new symbols, but it also *drops* symbols whose
-  # dependencies the tree no longer meets. For a package feature that is not a
-  # detail: the build would quietly stop being the package's kernel. Report the
-  # whole drift at once, then refuse — a boot test of a different kernel proves
-  # nothing about the package's.
-  if [[ -n $package_config ]]; then
-    symbols=()
-    for feature in "${PACKAGE_FEATURES[@]}"; do symbols+=("CONFIG_$feature"); done
-    if ! drift=$(lccc_config_drift "$package_config" .config "${symbols[@]}"); then
-      echo "config: the package enables these features but the prepared .config does not:" >&2
-      printf '%s\n' "$drift" | sed 's/^/config:   /' >&2
-      if [[ ${LCCC_ALLOW_CONFIG_DRIFT:-0} == 1 ]]; then
-        echo "config: LCCC_ALLOW_CONFIG_DRIFT=1 — continuing with a kernel that is not the package's" >&2
-      else
-        echo "config: refusing to build a kernel the package does not ship." >&2
-        echo "config: fix the gap, or re-enable with ./scripts/config --enable <SYMBOL>," >&2
-        echo "config: or set LCCC_ALLOW_CONFIG_DRIFT=1 to build anyway." >&2
-        exit 1
-      fi
+      --enable CACHY --enable SCHED_BORE --enable SCHED_CACHE \
+      --enable HZ_800 --disable HZ_1000 --enable PREEMPT --disable PREEMPT_VOLUNTARY \
+      --enable TCP_CONG_BBR --enable DEBUG_FS --enable IKCONFIG --enable IKCONFIG_PROC \
+      --enable BLK_DEV_INITRD --enable RD_GZIP --enable DEVTMPFS --enable DEVTMPFS_MOUNT \
+      --enable SERIAL_8250 --enable SERIAL_8250_CONSOLE --enable KERNEL_ZSTD
+    config_recipe=fresh-defconfig-cachymod
+    if [[ ${LCCC_KERNEL_SCX:-0} == 1 ]]; then
+      ./scripts/config --enable BPF_SYSCALL --enable DEBUG_INFO --enable DEBUG_INFO_DWARF5 \
+        --enable DEBUG_INFO_BTF --enable SCHED_CLASS_EXT
+      config_recipe+=+scx-btf
     fi
   fi
-  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" prepare -j"$JOBS" >/dev/null
 fi
 
-# ---- 3. objtool (real by default; a no-op shim is a deliberate opt-in) -----
-# x86_64 6.18 *requires* objtool (HAVE_OBJTOOL is selected for X86_64), and
-# real objtool accepts and ORC-annotates LCCC objects, so it runs by default:
-# shimming it silently drops UNWINDER_ORC data and stack validation, which is
-# a different kernel from the one the package ships. LCCC_NOOBJTOOL=1 remains
-# for compile-only sweeps, where a boot artifact is not claimed.
-if [[ $NOOBJTOOL == 1 ]] && [[ -x tools/objtool/objtool ]]; then
-  if ! grep -q "no-op objtool for lccc compile sweep" tools/objtool/objtool 2>/dev/null; then
-    cp -f tools/objtool/objtool /tmp/objtool.real.$$
-    cat > tools/objtool/objtool <<'EOF'
-#!/usr/bin/env bash
-# no-op objtool for LCCC compile sweep (objtool interop is a tracked blocker)
-exit 0
-EOF
-    chmod +x tools/objtool/objtool
-    printf 'note: tools/objtool/objtool shimmed to no-op (LCCC_NOOBJTOOL=1)\n' >&2
+make "${make_args[@]}" olddefconfig </dev/null >/dev/null
+make "${make_args[@]}" syncconfig </dev/null >/dev/null
+
+# A package config is the source of truth for the package's feature set.
+# olddefconfig may absorb NEW symbols, but dropping a package-enabled feature
+# means the build is no longer the package's kernel.
+if [[ -n $package_config ]]; then
+  symbols=(
+    CONFIG_FUNCTION_TRACER CONFIG_DYNAMIC_FTRACE
+    CONFIG_STACKPROTECTOR CONFIG_STACKPROTECTOR_STRONG
+    CONFIG_UNWINDER_ORC CONFIG_OBJTOOL CONFIG_STACK_VALIDATION CONFIG_DEBUG_ENTRY
+    CONFIG_SCHED_BORE CONFIG_SCHED_CACHE CONFIG_SCHED_CLASS_EXT
+    CONFIG_CACHY CONFIG_TCP_CONG_BBR CONFIG_PREEMPT CONFIG_IKCONFIG_PROC
+  )
+  if ! drift=$(lccc_config_drift "$package_config" .config "${symbols[@]}"); then
+    echo 'config: the package enables these features but the prepared .config does not:' >&2
+    printf '%s\n' "$drift" | sed 's/^/config:   /' >&2
+    if [[ ${LCCC_ALLOW_CONFIG_DRIFT:-0} == 1 ]]; then
+      echo 'config: LCCC_ALLOW_CONFIG_DRIFT=1 — continuing with a different kernel' >&2
+    else
+      echo 'config: refusing to build a kernel the package does not ship.' >&2
+      echo 'config: fix the gap, or set LCCC_ALLOW_CONFIG_DRIFT=1 to build anyway.' >&2
+      exit 1
+    fi
   fi
 fi
-
-# ---- 4. build -----------------------------------------------------------------
-printf 'Building kernel with LCCC (CC=%s LD=%s AS=%s, -j%s)\n' "$LCCC" "$LCCC_LD" "$LCCC" "$JOBS"
-targets=("$@")
-if (( ${#targets[@]} == 0 )); then
-  targets=(vmlinux)
+if [[ ${LCCC_KERNEL_SCX:-0} == 1 ]] && ! grep -q '^CONFIG_SCHED_CLASS_EXT=y' .config; then
+  echo 'config: LCCC_KERNEL_SCX=1 requested sched-ext but Kconfig did not enable it' >&2
+  exit 1
 fi
-# `AS` (uppercase) is the Kbuild assembler variable; the previous lowercase
-# `as=` was a plain (ignored) make variable, so .S files silently used the host
-# binutils `as` instead of LCCC.  Kbuild drives .S files through $(CC) anyway,
-# but AS is consumed by a handful of arch rules and must be consistent.
-exec make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" -j"$JOBS" "${targets[@]}"
+
+make "${make_args[@]}" prepare -j"$JOBS"
+
+# Kconfig may force OBJTOOL on x86-64. Build and use the real host executable;
+# never replace it with a script. The build itself remakes it when inputs change.
+if grep -q '^CONFIG_OBJTOOL=y' .config; then
+  make "${make_args[@]}" tools/objtool -j"$JOBS"
+  # Verify the ELF magic directly instead of depending on file(1): a no-op
+  # shell shim must never be accepted as the real host validator.
+  [[ -x tools/objtool/objtool && $(head -c4 tools/objtool/objtool) == $'\177ELF' ]] || {
+    echo 'real ELF objtool is missing' >&2; exit 1;
+  }
+fi
+
+for feature in STACKPROTECTOR UNWINDER_ORC OBJTOOL FUNCTION_TRACER DYNAMIC_FTRACE \
+               MITIGATION_RETPOLINE SCHED_CLASS_EXT DEBUG_INFO_BTF; do
+  if grep -q "^CONFIG_${feature}=y" .config; then echo "CONFIG_${feature}=y"; fi
+done
+
+config_hash=$(sha256sum .config | cut -d' ' -f1)
+compiler_hash=$(sha256sum "$LCCC" | cut -d' ' -f1)
+linker_hash=$(sha256sum "$LCCC_LD" | cut -d' ' -f1)
+stamp_tmp=$(mktemp .lccc-full-build-config.tmp.XXXXXX)
+trap 'rm -f -- "$stamp_tmp"' EXIT
+{
+  printf 'recipe=%s\nconfig-sha256=%s\ncompiler-sha256=%s\nlinker-sha256=%s\n' \
+    "$config_recipe" "$config_hash" "$compiler_hash" "$linker_hash"
+  printf 'boot-isa-sha256=%s\n' "$(sha256sum "$here/kernel_boot_isa.sh" | cut -d' ' -f1)"
+  if [[ -n $package_config ]]; then
+    printf 'package-config-sha256=%s\n' "$(sha256sum "$package_config" | cut -d' ' -f1)"
+  fi
+  if [[ -d .git ]] || git rev-parse --git-dir >/dev/null 2>&1; then
+    printf 'kernel-commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  fi
+} > "$stamp_tmp"
+mv -f "$stamp_tmp" .lccc-full-build-config
+cp .config .lccc-full-build.config
+
+printf 'Building with LCCC (CC=%s LD=%s AS=%s, -j%s, config=%s)\n' \
+  "$LCCC" "$LCCC_LD" "$LCCC" "$JOBS" "$config_hash"
+targets=("$@")
+if ((${#targets[@]} == 0)); then targets=(bzImage); fi
+make "${make_args[@]}" -j"$JOBS" "${targets[@]}"
+
+# syncconfig during the build must not silently change the recorded contract,
+# and a compiler/linker rebuilt underneath the build invalidates the artifacts.
+[[ $(sha256sum .config | cut -d' ' -f1) == "$config_hash" ]] || {
+  echo 'configuration changed during Kbuild; inspect and rerun' >&2; exit 1;
+}
+[[ $(sha256sum "$LCCC" | cut -d' ' -f1) == "$compiler_hash" ]] || {
+  echo 'compiler changed during Kbuild; inspect and rerun' >&2; exit 1;
+}
+[[ $(sha256sum "$LCCC_LD" | cut -d' ' -f1) == "$linker_hash" ]] || {
+  echo 'linker changed during Kbuild; inspect and rerun' >&2; exit 1;
+}

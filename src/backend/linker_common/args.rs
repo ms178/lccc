@@ -192,6 +192,10 @@ pub struct LinkerArgs {
     /// `--warn-common`: GNU ld's COMMON-symbol diagnostics (see
     /// `warn_common`), honoring `--fatal-warnings`.
     pub warn_common: bool,
+    /// `--warn-rwx-segments` / `--no-warn-rwx-segments`: diagnose a PT_LOAD
+    /// that is both writable and executable. GNU ld enables this by default;
+    /// the last toggle wins. The check never changes layout or output bytes.
+    pub warn_rwx_segments: bool,
     /// `--fatal-warnings` / `--no-fatal-warnings`.
     pub fatal_warnings: bool,
     /// `--print-memory-usage`: print MEMORY / segment usage summary.
@@ -547,6 +551,8 @@ fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
         "--warn-common" => {
             result.warn_common = true;
         }
+        "--warn-rwx-segments" => result.warn_rwx_segments = true,
+        "--no-warn-rwx-segments" => result.warn_rwx_segments = false,
         "--no-threads" => {
             result.threads = None;
         }
@@ -1058,6 +1064,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     // `-Wl,-rpath,$ORIGIN` links behaving identically under every linker.
     // `--disable-new-dtags` still opts back into DT_RPATH below.
     result.use_runpath = true;
+    result.warn_rwx_segments = true; // GNU ld's default RWX LOAD diagnostic
     result.z_relro = true; // RELRO is on by default, like GNU ld/mold
 
     // GNU ld accepts `--opt VALUE` alongside `--opt=VALUE`.  A driver that
@@ -2178,6 +2185,24 @@ mod z_isa_level_tests {
                 .oformat
                 .is_none()
         );
+    }
+
+    #[test]
+    fn warn_rwx_segments_defaults_on_and_last_toggle_wins() {
+        assert!(parse_linker_args(&args(&[])).warn_rwx_segments);
+        assert!(parse_linker_args(&args(&["--warn-rwx-segments"])).warn_rwx_segments);
+        assert!(!parse_linker_args(&args(&["--no-warn-rwx-segments"])).warn_rwx_segments);
+        assert!(
+            parse_linker_args(&args(&["--no-warn-rwx-segments", "--warn-rwx-segments",]))
+                .warn_rwx_segments
+        );
+        assert!(
+            !parse_linker_args(&args(&["--warn-rwx-segments", "--no-warn-rwx-segments",]))
+                .warn_rwx_segments
+        );
+        let via_wl = parse_linker_args(&args(&["-Wl,--no-warn-rwx-segments,--fatal-warnings"]));
+        assert!(!via_wl.warn_rwx_segments);
+        assert!(via_wl.fatal_warnings);
     }
 
     #[test]

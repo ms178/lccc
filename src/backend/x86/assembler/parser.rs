@@ -638,14 +638,22 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
         return Ok(items);
     }
 
-    // GAS location-counter assignment is an `.org` with zero fill, not a
-    // symbol definition. In particular Linux kexec's exception vectors use
-    // `. = base + (index * stride)` to enforce fixed entry positions.
+    // GAS location-counter assignment is positioning, NOT a symbol named ".".
+    // Linux kexec spells each fixed-width exception vector as
+    // `. = base + (index * stride)`. Lower it to the same .org machinery
+    // (including relaxation markers) with zero fill. Comparison operators
+    // (`==`, `!=`, `<=`, `>=`) are not assignments and fail closed.
     if let Some(eq_pos) = rest.find('=') {
         let before = rest[..eq_pos].trim();
         let expr = rest[eq_pos + 1..].trim();
         if before == "." {
-            items.push(parse_directive(&format!(".org {expr}"))?);
+            if expr.starts_with('=')
+                || (eq_pos > 0 && matches!(rest.as_bytes()[eq_pos - 1], b'!' | b'<' | b'>' | b'='))
+            {
+                return Err("unsupported location-counter assignment".into());
+            }
+            let (sym, addend) = parse_org_target(expr, "location-counter assignment")?;
+            items.push(AsmItem::Org(sym, addend, 0));
             return Ok(items);
         }
         // Ordinary GAS symbol assignment is equivalent to `.set`.
@@ -899,21 +907,8 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             if args.is_empty() {
                 return Err("missing .org expression".to_string());
             }
-            if let Ok(val) = parse_integer_expr(args) {
-                Ok(AsmItem::Org(String::new(), val, fill))
-            } else {
-                let mut sym = args.to_string();
-                let mut offset = 0i64;
-                if let Some(plus_pos) = args.find('+') {
-                    if plus_pos > 0 {
-                        sym = args[..plus_pos].trim().to_string();
-                        let offset_str = args[plus_pos + 1..].trim();
-                        offset = parse_integer_expr(offset_str)
-                            .map_err(|_| format!("bad .org offset: {}", offset_str))?;
-                    }
-                }
-                Ok(AsmItem::Org(sym, offset, fill))
-            }
+            let (sym, offset) = parse_org_target(args, ".org")?;
+            Ok(AsmItem::Org(sym, offset, fill))
         }
         ".byte" => {
             let vals = parse_data_values(args)?;
@@ -1415,6 +1410,121 @@ fn parse_symbol_list(args: &str, directive: &str) -> Result<Vec<String>, String>
         ));
     }
     Ok(names)
+}
+
+/// Parse the representable, same-section target of `.org` / `. =`.
+///
+/// The ELF writer already knows how to resolve an absolute offset, a named
+/// label, a numeric local label (`2b`/`2f`) or `.` plus a constant addend, and
+/// how to re-check that target after jump relaxation. This parser is the single
+/// front door for both spellings so they cannot drift apart. Unsupported
+/// symbolic arithmetic (products, differences of two labels, cross-section
+/// expressions) fails closed instead of silently becoming a symbol named after
+/// the whole expression.
+fn parse_org_target(expr: &str, directive: &str) -> Result<(String, i64), String> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return Err(format!("missing {directive} expression"));
+    }
+
+    // Balance check with checked arithmetic: a pathological input must produce
+    // a diagnostic, never an overflow or a native stack issue.
+    let mut depth: i32 = 0;
+    for b in expr.bytes() {
+        match b {
+            b'(' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| format!("{directive}: expression nesting too deep"))?;
+            }
+            b')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("{directive}: unbalanced expression"))?;
+                if depth < 0 {
+                    return Err(format!("{directive}: unbalanced expression"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(format!("{directive}: unbalanced expression"));
+    }
+
+    // Strip only parentheses that wrap the *entire* expression. `(a)+(b)` is
+    // not the same as `((a)+(b))`; the first '(' must match the last ')'.
+    let mut expr = expr;
+    while expr.starts_with('(') && expr.ends_with(')') {
+        let bytes = expr.as_bytes();
+        let mut level: i32 = 0;
+        let mut wraps = false;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'(' => {
+                    level = level
+                        .checked_add(1)
+                        .ok_or_else(|| format!("{directive}: expression nesting too deep"))?;
+                }
+                b')' => {
+                    level = level
+                        .checked_sub(1)
+                        .ok_or_else(|| format!("{directive}: unbalanced expression"))?;
+                    if level == 0 {
+                        wraps = i == bytes.len() - 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !wraps {
+            break;
+        }
+        expr = expr[1..expr.len() - 1].trim();
+    }
+
+    if let Ok(value) = parse_integer_expr(expr) {
+        if value < 0 {
+            return Err(format!("{directive}: cannot move backwards"));
+        }
+        return Ok((String::new(), value));
+    }
+
+    // Leading symbol token: GAS identifier, '.' or a numeric local label.
+    let bytes = expr.as_bytes();
+    let mut end = 0usize;
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$') {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    let sym = &expr[..end];
+    let numeric_local = sym.len() >= 2
+        && sym.as_bytes()[..sym.len() - 1]
+            .iter()
+            .all(u8::is_ascii_digit)
+        && matches!(sym.as_bytes().last(), Some(b'b' | b'f'));
+    if !is_valid_gas_identifier(sym) && sym != "." && !numeric_local {
+        return Err(format!("unsupported {directive} expression: {expr}"));
+    }
+
+    let tail = expr[end..].trim_start();
+    let addend = if tail.is_empty() {
+        0
+    } else if let Some(rest) = tail.strip_prefix('+') {
+        parse_integer_expr(rest.trim())
+            .map_err(|_| format!("unsupported {directive} expression: {expr}"))?
+    } else if let Some(rest) = tail.strip_prefix('-') {
+        parse_integer_expr(&format!("-({})", rest.trim()))
+            .map_err(|_| format!("unsupported {directive} expression: {expr}"))?
+    } else {
+        return Err(format!("unsupported {directive} expression: {expr}"));
+    };
+    Ok((sym.to_string(), addend))
 }
 
 /// Parse `.set alias, target`.
@@ -5551,6 +5661,104 @@ main:
         // for label-valued repeats), so the >u64::MAX rejection for
         // `18446744073709551616` is asserted at assemble level in
         // `gas247_fill_ceiling_refuses_before_alloc`.
+    }
+
+    #[test]
+    fn org_target_absolute_and_symbolic_forms() {
+        use super::parse_org_target;
+        assert_eq!(parse_org_target("8", ".org").unwrap(), (String::new(), 8));
+        assert_eq!(
+            parse_org_target("(2 * 4)", ".org").unwrap(),
+            (String::new(), 8)
+        );
+        assert_eq!(
+            parse_org_target("base", ".org").unwrap(),
+            ("base".into(), 0)
+        );
+        assert_eq!(
+            parse_org_target("base + 8", ".org").unwrap(),
+            ("base".into(), 8)
+        );
+        assert_eq!(
+            parse_org_target("base + (2 * 6)", ".org").unwrap(),
+            ("base".into(), 12)
+        );
+        assert_eq!(
+            parse_org_target("(base + 8)", ".org").unwrap(),
+            ("base".into(), 8)
+        );
+        assert_eq!(
+            parse_org_target("base + 4 + 4", ".org").unwrap(),
+            ("base".into(), 8)
+        );
+        assert_eq!(
+            parse_org_target("base - 4", ".org").unwrap(),
+            ("base".into(), -4)
+        );
+        assert_eq!(
+            parse_org_target("2b + 8", ".org").unwrap(),
+            ("2b".into(), 8)
+        );
+        assert_eq!(parse_org_target(". + 4", ".org").unwrap(), (".".into(), 4));
+        assert!(parse_org_target("-1", ".org").is_err());
+        assert!(parse_org_target("", ".org").is_err());
+        assert!(parse_org_target("(1 + 2", ".org").is_err());
+        assert!(parse_org_target("base * 2", ".org").is_err());
+        assert!(parse_org_target("base + other", ".org").is_err());
+    }
+
+    #[test]
+    fn dot_assignment_lowers_to_org_with_zero_fill() {
+        let items = parse_line_items(". = base + (2 * 6)").unwrap();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            AsmItem::Org(sym, off, fill) => {
+                assert_eq!(sym, "base");
+                assert_eq!(*off, 12);
+                assert_eq!(*fill, 0);
+            }
+            other => panic!("expected Org, got {other:?}"),
+        }
+        let items = parse_line_items("label: . = 8").unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], AsmItem::Label(_)));
+        assert!(matches!(items[1], AsmItem::Org(_, 8, 0)));
+    }
+
+    #[test]
+    fn dot_assignment_rejects_comparisons_and_malformed_input() {
+        for src in [
+            ". == 8",
+            ". = =8",
+            ". != 8",
+            ". <= 8",
+            ". >= 8",
+            ". = (1 + 2",
+        ] {
+            assert!(parse_line_items(src).is_err(), "accepted {src:?}");
+        }
+    }
+
+    #[test]
+    fn org_directive_shares_the_target_parser() {
+        match parse_directive(".org base + 8, 0x77").unwrap() {
+            AsmItem::Org(sym, off, fill) => {
+                assert_eq!(sym, "base");
+                assert_eq!(off, 8);
+                assert_eq!(fill, 0x77);
+            }
+            other => panic!("expected Org, got {other:?}"),
+        }
+        match parse_directive(".org . + 4").unwrap() {
+            AsmItem::Org(sym, off, fill) => {
+                assert_eq!(sym, ".");
+                assert_eq!(off, 4);
+                assert_eq!(fill, 0);
+            }
+            other => panic!("expected Org, got {other:?}"),
+        }
+        assert!(parse_directive(".org").is_err());
+        assert!(parse_directive(".org base * 2").is_err());
     }
 }
 

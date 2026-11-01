@@ -363,6 +363,28 @@ gate "builtin-float-aliases" fast \
 gate "ci-link-oracle-provisioning" fast \
     python3 tests/regression/check_ci_link_oracle_provisioning.py
 
+# GNU ld's default RWX LOAD diagnostic must be real on ELF32/ELF64, obey
+# --fatal-warnings and last-toggle-wins, and run before flat-binary conversion.
+gate "linker-rwx-segments" fast \
+    python3 tests/linker/check_rwx_segments.py
+
+# GAS `. =` / `.org` parity: macro vector layout, relaxation fixup, fill bytes,
+# numeric locals and fail-closed malformed expressions on ELF32/ELF64.
+gate "assembler-dot-assignment" fast \
+    python3 tests/regression/check_dot_assignment.py
+
+# Kernel preparation/build provenance: recipe identity, compiler-content
+# invalidation, config preservation, real objtool and post-build re-verification.
+gate "kernel-provenance" fast \
+    python3 tests/regression/check_kernel_provenance.py
+gate "kernel-full-harness" fast \
+    python3 tests/regression/check_kernel_full_harness.py
+
+# C11 6.2.1p4: the visible object binding types the call result; a non-callable
+# shadow must not fall back to a hidden file-scope function.
+gate "fnptr-result-shadowing" fast \
+    bash tests/regression/check_fnptr_result_shadowing.sh
+
 # Three compiles and two runs: pins that a loop-carried accumulator keeps its
 # callee-saved home when a call inside the loop forces the value to be
 # call-spanning, instead of being displaced by a loop-invariant constant that
@@ -1708,6 +1730,29 @@ gate "cfi-unwind" fast \
 # a large CFA offset when it PRINTS it, so the gate decodes the section).
 gate "narrow-int-codegen" fast \
     env CCC=target/fastbuild/lccc python3 tests/regression/check_narrow_int_codegen.py --lccc target/fastbuild/lccc --gcc gcc-16 --clang clang-23
+
+# The codegen mode and the link mode are one decision: a position-fixed
+# ET_EXEC pays no position-independent price, while -pie, -fpie, -c, -S and
+# -fPIC stay position independent.
+gate "default-codegen-mode" fast \
+    bash tests/regression/check_default_codegen_mode.sh
+
+# A call-free leaf pays no callee-saved register: the volatile pool carries its
+# loop state, the kill switch restores the old shape, and a call the compiler
+# cannot summarize still preserves its state.
+gate "leaf-caller-homes" fast \
+    bash tests/regression/check_leaf_caller_homes.sh
+
+# Narrow arithmetic: wrapped values, sign extension and comparisons over the
+# whole u8 grid and a sampled i16 grid, at -O0..-Os.
+gate "narrow-alu-arithmetic" fast \
+    bash tests/regression/check_narrow_alu_arithmetic.sh
+
+# A symbol+index SIB consumes the index's full register, so a narrow index must
+# be sign- or zero-extended before the SIB uses it. Four folds obey the law;
+# the LEA arm did not, so the same `base + i` lowered two different ways.
+gate "symbol-index-widths" fast \
+    bash tests/regression/check_symbol_index_widths.sh
 
 # The builtin linkers against gcc's link semantics: -shared startup files and
 # default libraries, user -l before the defaults, -rpath, as-needed libm.

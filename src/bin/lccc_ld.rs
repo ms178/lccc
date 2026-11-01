@@ -284,11 +284,6 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "--no-copy-dt-needed-entries"
         | "--no-warn-mismatch"
         | "--no-warn-search-mismatch"
-        // No backend currently emits RWX LOAD-segment warnings. Explicitly
-        // disabling that diagnostic is therefore already honored; do not
-        // promote a spurious "not implemented" warning under --fatal-warnings.
-        // This does NOT implement --warn-rwx-segments, which remains diagnosed.
-        | "--no-warn-rwx-segments"
         | "--no-warn-execstack"
         | "--warn-execstack"
         // GNU's `--warn-textrel` turns the text-relocation check to "warn",
@@ -377,6 +372,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut emulation = Emulation::X86_64;
     let mut trace = false;
     let mut fatal_warnings = false;
+    let mut warn_rwx_segments = true;
     let mut print_memory_usage = false;
     let mut oformat_binary = false;
     let mut top_warnings: Vec<String> = Vec::new();
@@ -435,6 +431,10 @@ fn run(args: &[String]) -> Result<(), String> {
             // GNU ld's COMMON-symbol diagnostics, implemented by every
             // backend (`linker_common::warn_common`).
             "--warn-common" => passthrough.push("--warn-common".to_string()),
+            "--warn-rwx-segments" | "--no-warn-rwx-segments" => {
+                warn_rwx_segments = a == "--warn-rwx-segments";
+                passthrough.push(a.to_string());
+            }
             "--fatal-warnings" => {
                 fatal_warnings = true;
                 passthrough.push("--fatal-warnings".to_string());
@@ -960,7 +960,8 @@ fn run(args: &[String]) -> Result<(), String> {
         if strip_debug || !emit_symtab {
             lccc::linker_entry::strip_debug_sections(&mut objects);
         }
-        return lccc::linker_entry::link_relocatable_x86(&objects, &output);
+        lccc::linker_entry::link_relocatable_x86(&objects, &output)?;
+        return lccc::linker_entry::check_rwx_segments(&output, warn_rwx_segments, fatal_warnings);
     }
 
     if saw_lto_plugin
@@ -1116,6 +1117,11 @@ fn run(args: &[String]) -> Result<(), String> {
             )
         };
         res?;
+        lccc::linker_entry::check_rwx_segments(
+            &output,
+            script_args.warn_rwx_segments,
+            script_args.fatal_warnings,
+        )?;
         if oformat_binary {
             lccc::linker_entry::convert_elf_file_to_flat_binary(&output)?;
         }
@@ -1148,6 +1154,7 @@ fn run(args: &[String]) -> Result<(), String> {
             lccc::linker_entry::link_builtin_i386(&output, &i386_args, default_dirs)
         };
         res?;
+        lccc::linker_entry::check_rwx_segments(&output, warn_rwx_segments, fatal_warnings)?;
         if oformat_binary {
             lccc::linker_entry::convert_elf_file_to_flat_binary(&output)?;
         }
@@ -1219,6 +1226,7 @@ fn run(args: &[String]) -> Result<(), String> {
         ),
     };
     res?;
+    lccc::linker_entry::check_rwx_segments(&output, warn_rwx_segments, fatal_warnings)?;
     if oformat_binary {
         lccc::linker_entry::convert_elf_file_to_flat_binary(&output)?;
     }

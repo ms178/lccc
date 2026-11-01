@@ -294,6 +294,29 @@ jobs_count() {
   getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 2
 }
 
+# Content identity of every input that determines patching/preparation. The
+# selected configuration is an INPUT here; later caller changes to .config are
+# managed by olddefconfig/syncconfig in the build harness, not by silently
+# restoring the package config. Source-acquisition transport (auto/tarball/git)
+# is deliberately NOT part of the recipe: the tarball sha256 pins content, and
+# the resolved git commit is recorded separately in the stamp.
+recipe_id() {
+  {
+    printf 'format=2\nversion=%s\npkgrel=%s\nsuffix=%s\ncpusched=%s\nprevent-avx2=%s\ntarball-sha256=%s\n' \
+      "$KVER" "$PKGREL" "${LCCC_PKGBASE_SUFFIX:--cachymod}" "$CPUSCHED" "$PREVENT_AVX2" "$PKG_TARBALL_SHA256"
+    printf 'PKGBUILD '; sha256_of "$PKGBUILD"
+    printf 'config '; sha256_of "$PKGDIR/config"
+    while IFS= read -r patch_name; do
+      [[ -n $patch_name ]] || continue
+      case $patch_name in
+        *-prevent-avx2*) [[ $PREVENT_AVX2 =~ ^(yes|y|1)$ ]] || continue ;;
+        *-prjc.patch|*-prjc-s.patch) [[ $CPUSCHED =~ ^(bmq|pds)$ ]] || continue ;;
+      esac
+      printf '%s ' "$patch_name"; sha256_of "$PKGDIR/$patch_name"
+    done < <(pkgbuild_patch_sources)
+  } | sha256_of /dev/stdin
+}
+
 # `make olddefconfig`/`make prepare` need host tools that are not part of the
 # LCCC build and therefore easy to have absent on a fresh machine; failing
 # there wastes the whole download+patch phase that precedes it.  Check first.
@@ -340,12 +363,14 @@ preflight_host_tools() {
   echo "prepare_kernel_tree: host tools OK"
 }
 preflight_host_tools || exit 1
+PREPARE_RECIPE=$(recipe_id)
 
 # Already prepared?  Verify the stamp AND a canary file the snapshot truncation
 # removed last time (setup.ld); a damaged tree must regenerate, not half-work.
 # A tree stamped by another compiler gets only the LCCC `make prepare` rerun.
 compiler_id() { # identity of the kernel compiler, recorded in the stamp
-  printf 'compiler=%s version=%s\n' "$LCCC" "$("$LCCC" --version 2>/dev/null | head -n 1)"
+  printf 'compiler=%s version=%s sha256=%s\n' \
+    "$LCCC" "$("$LCCC" --version 2>/dev/null | head -n 1)" "$(sha256_of "$LCCC")"
 }
 require_lccc() {
   [[ -x $LCCC ]] || {
@@ -371,17 +396,46 @@ canaries_ok() {
 }
 if [[ -f "$KDIR/.lccc-prepared" ]] && [[ -f "$KDIR/${LCCC_PREPARED_CANARIES[0]}" ]] && canaries_ok; then
   require_lccc
-  # Only the compiler line identifies the stamp; later lines record the source
-  # provenance (git tag vs tarball sha256) and must not force a re-prepare.
-  if [[ $(head -n1 "$KDIR/.lccc-prepared") == "$(compiler_id)" ]]; then
-    echo "prepare_kernel_tree: $KDIR already prepared (stamp + canaries OK)"
+  stamp_recipe=$(sed -n 's/^recipe-sha256=//p' "$KDIR/.lccc-prepared" | head -n1)
+  if [[ $stamp_recipe != "$PREPARE_RECIPE" ]]; then
+    if [[ ${LCCC_REPREPARE:-0} != 1 ]]; then
+      echo "prepare_kernel_tree: recipe mismatch/legacy stamp in $KDIR; refusing to overwrite it" >&2
+      echo "  expected recipe=$PREPARE_RECIPE; found=${stamp_recipe:-legacy}" >&2
+      echo "  use a fresh KERNEL_DIR, or explicitly set LCCC_REPREPARE=1 to replace this owned tree" >&2
+      exit 3
+    fi
+    echo "prepare_kernel_tree: recipe changed; LCCC_REPREPARE=1 replaces owned tree" >&2
+  else
+    if [[ $(head -n1 "$KDIR/.lccc-prepared") == "$(compiler_id)" ]]; then
+      echo "prepare_kernel_tree: $KDIR already prepared (compiler + recipe + canaries OK)"
+      exit 0
+    fi
+    echo "prepare_kernel_tree: compiler content changed; cleaning and re-running LCCC make prepare"
+    # Kbuild does not fingerprint the compiler executable. A content change must
+    # invalidate generated headers/asm-offsets, not just relink them.
+    (cd "$KDIR" && make ARCH=x86_64 CC="$LCCC" HOSTCC="$HOSTCC" clean >/dev/null)
+    (cd "$KDIR" && lccc_make_prepare)
+    # Preserve source/config/patch provenance while updating only compiler identity.
+    stamp_tmp=$(mktemp "$KDIR/.lccc-prepared.tmp.XXXXXX")
+    trap 'rm -f -- "$stamp_tmp"' EXIT
+    { compiler_id; grep -v '^compiler=' "$KDIR/.lccc-prepared"; } > "$stamp_tmp"
+    mv -f "$stamp_tmp" "$KDIR/.lccc-prepared"
+    echo "prepare_kernel_tree: $KDIR re-prepared with LCCC"
     exit 0
   fi
-  echo "prepare_kernel_tree: $KDIR was prepared by a different compiler; re-running LCCC make prepare"
-  (cd "$KDIR" && lccc_make_prepare)
-  (cd "$KDIR" && compiler_id > .lccc-prepared)
-  echo "prepare_kernel_tree: $KDIR re-prepared with LCCC"
-  exit 0
+fi
+
+# A valid stamp is a strict no-op above. Reaching here with a stamp means
+# missing canaries or an explicit reprepare: check mounts BEFORE the ownership
+# decision so a mount guard, not a generic recipe error, protects an unsafe path.
+if [[ -e $KDIR && -f $KDIR/.lccc-prepared ]]; then
+  if mounts_under "$KDIR"; then
+    echo "prepare_kernel_tree: refusing KDIR=$KDIR (a mount point lies below it)" >&2; exit 1
+  fi
+  if [[ ${LCCC_REPREPARE:-0} != 1 ]]; then
+    echo "prepare_kernel_tree: refusing to replace prepared $KDIR without LCCC_REPREPARE=1" >&2
+    exit 3
+  fi
 fi
 
 mkdir -p "$WORK"
@@ -650,8 +704,15 @@ EOF
 for c in "${LCCC_PREPARED_CANARIES[@]}"; do
   [[ -f "$c" ]] || { echo "prepare_kernel_tree: post-check failed, missing: $c" >&2; exit 1; }
 done
+stamp_tmp=$(mktemp .lccc-prepared.tmp.XXXXXX)
+trap 'rm -f -- "$stamp_tmp"' EXIT
 {
   compiler_id
+  printf 'format=2\nrecipe-sha256=%s\nconfig-input-sha256=%s\npkgrel=%s\ncpusched=%s\nprevent-avx2=%s\n' \
+    "$PREPARE_RECIPE" "$(sha256_of "$PKGDIR/config")" "$PKGREL" "$CPUSCHED" "$PREVENT_AVX2"
+  if [[ -d $PKGDIR/.git ]] || git -C "$PKGDIR" rev-parse --git-dir >/dev/null 2>&1; then
+    printf 'package-commit=%s\n' "$(git -C "$PKGDIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  fi
   printf 'source=%s\n' "$SOURCE_MODE"
   if [[ $SOURCE_MODE == git ]]; then
     printf 'commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -660,5 +721,6 @@ done
   else
     printf 'tarball-sha256=%s\n' "$PKG_TARBALL_SHA256"
   fi
-} > .lccc-prepared
+} > "$stamp_tmp"
+mv -f "$stamp_tmp" .lccc-prepared
 echo "prepare_kernel_tree: $KDIR ready (stamp written: $(cat .lccc-prepared))"

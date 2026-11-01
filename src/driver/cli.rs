@@ -2993,14 +2993,20 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 "-fPIC" | "-fpic" => {
                     self.pic = true;
                     self.pie = false;
+                    self.pie_explicit = false;
                 }
                 "-fPIE" | "-fpie" => {
                     self.pic = false;
                     self.pie = true;
+                    // An explicit request for position-independent CODE, as
+                    // opposed to the mode default: honoured even when this
+                    // invocation final-links a position-fixed image.
+                    self.pie_explicit = true;
                 }
                 "-fno-PIC" | "-fno-pic" | "-fno-PIE" | "-fno-pie" => {
                     self.pic = false;
                     self.pie = false;
+                    self.pie_explicit = false;
                 }
                 // GCC's `flag_tls_default`: a FLOOR every TLS symbol's model is
                 // raised to (common::tls::select_model); per-declaration
