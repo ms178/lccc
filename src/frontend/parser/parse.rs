@@ -2306,11 +2306,10 @@ impl Parser {
             // explicit so a future table edit cannot silently swallow one.
             AbiEffect::Implemented => return false,
             AbiEffect::GccIgnored => {
-                let message = format!("'{spelling}' attribute ignored");
                 // `explicit_only = false`: gcc emits this without being asked,
                 // and it is the only signal that the declaration is not what it
                 // looks like.
-                self.attribute_warning(message, span, false);
+                self.attribute_warning(format!("'{spelling}' attribute ignored"), span, false);
             }
             AbiEffect::OnlyAvailable32Bit => {
                 self.attribute_warning(

@@ -114,36 +114,6 @@ impl RiscvCodegen {
             return;
         }
 
-        if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle) {
-            // Portable bit modify: `1 << (index mod W)` then OR it in,
-            // complement the mask and AND it out, or XOR it in.  RISC-V has no
-            // `bts`/`btr`/`btc` (those are Zbs), and `sll`/`sllw` reduce the
-            // count modulo XLEN
-            // rather than modulo the operation width, so the index is reduced
-            // explicitly -- that reduction IS `IrBinOp::BitSet`'s contract, and
-            // it keeps an index of W or more (an undefined C shift in dead
-            // code) defined and equal to what the constant folder computes.
-            // The mask is built in t0 from the immediate 1, so the 32-bit form
-            // needs no sign-extension normalization: bit 31 is the highest bit
-            // a 32-bit mask can carry, and `or`/`and` preserve the operand's
-            // own normalization.
-            let mask_bits = ty.size() * 8 - 1;
-            self.state
-                .emit_fmt(format_args!("    andi t2, t2, {mask_bits}"));
-            self.state.emit("    li t0, 1");
-            self.state.emit("    sll t0, t0, t2");
-            match op {
-                IrBinOp::BitSet => self.state.emit("    or t0, t1, t0"),
-                IrBinOp::BitClear => {
-                    self.state.emit("    xori t0, t0, -1");
-                    self.state.emit("    and t0, t1, t0");
-                }
-                _ => self.state.emit("    xor t0, t1, t0"),
-            }
-            self.store_t0_to(dest);
-            return;
-        }
-
         if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
             // RV64I has no rotate: `rol`/`ror` are Zbb, and this backend does
             // not yet model Z-extension availability, so emit the portable
@@ -201,7 +171,8 @@ impl RiscvCodegen {
             (IrBinOp::LShr, true) => "srlw",
             (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
             (IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle, _) => {
-                unreachable!("BitSet/BitClear/BitToggle handled above")
+                self.emit_bit_modify_impl(dest, op, ty);
+                return;
             }
             (IrBinOp::Bzhi, _) => crate::ir::ops::bzhi_outside_x86_64(),
             (IrBinOp::UMulHigh, false) => "mulhu",
@@ -219,6 +190,61 @@ impl RiscvCodegen {
         self.store_t0_to(dest);
     }
 
+    /// `BitSet`/`BitClear`/`BitToggle` with the base already staged in `t1`
+    /// and the index in `t2`.  RV64I has no Zbs `bset`/`bclr`/`bext`-modify,
+    /// so build a one-hot mask and OR/AND-NOT/XOR it.  The shift count is reduced modulo the *operation* width,
+    /// not XLEN: an 8/16/32-bit operation must wrap at 8/16/32 even though
+    /// `sll` itself masks at 64.  The result is then put back into the rv64
+    /// canonical form for its type (signed narrow values sign-filled,
+    /// unsigned narrow values zero-extended) because downstream comparisons
+    /// and widening reads trust that invariant rather than re-truncating.
+    fn emit_bit_modify_impl(&mut self, dest: &Value, op: IrBinOp, ty: IrType) {
+        let bits = (ty.size() * 8) as u32;
+        debug_assert!(matches!(bits, 8 | 16 | 32 | 64));
+        if bits < 64 {
+            self.state
+                .emit_fmt(format_args!("    andi t2, t2, {}", bits - 1));
+        }
+        self.state.emit("    li t0, 1");
+        // I32 needs a sign-extended word mask so OR/AND with a canonical
+        // sign-extended base stays sign-extended.  U32 and the narrow widths
+        // use an XLEN mask; narrow results are canonicalized explicitly below.
+        if ty == IrType::I32 {
+            self.state.emit("    sllw t0, t0, t2");
+        } else {
+            self.state.emit("    sll t0, t0, t2");
+        }
+        if op == IrBinOp::BitSet {
+            self.state.emit("    or t0, t1, t0");
+        } else if op == IrBinOp::BitClear {
+            self.state.emit("    xori t0, t0, -1");
+            self.state.emit("    and t0, t1, t0");
+        } else {
+            // The only remaining caller-gated operation is BitToggle.
+            self.state.emit("    xor t0, t1, t0");
+        }
+        match ty {
+            IrType::I8 => {
+                self.state.emit("    slli t0, t0, 56");
+                self.state.emit("    srai t0, t0, 56");
+            }
+            IrType::I16 => {
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srai t0, t0, 48");
+            }
+            IrType::U8 => self.state.emit("    andi t0, t0, 255"),
+            IrType::U16 => {
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srli t0, t0, 48");
+            }
+            // I32 preserved sign-extension through the sllw mask; U32 used a
+            // zero-extended XLEN mask and a zero-extended base, so the result
+            // is already canonical.  64-bit results need no normalization.
+            _ => {}
+        }
+        self.store_t0_to(dest);
+    }
+
     // ---- Copy i128 ----
 
     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
@@ -228,12 +254,30 @@ impl RiscvCodegen {
 }
 
 #[cfg(test)]
-mod narrow_bit_modify_backend_tests {
+mod bit_modify_width_tests {
     use super::*;
-    use crate::ir::reexports::IrConst;
+    use crate::backend::regalloc::PhysReg;
+
+    fn emit(op: IrBinOp, ty: IrType) -> String {
+        let mut cg = RiscvCodegen::new();
+        // a0/a1 hold the base/index; a2 receives the result. The index is a
+        // runtime Value, so the emitter must perform the modulo-W reduction
+        // itself rather than relying on a constant folder.
+        cg.reg_assignments.insert(1, PhysReg(12));
+        cg.reg_assignments.insert(2, PhysReg(13));
+        cg.reg_assignments.insert(3, PhysReg(14));
+        cg.emit_int_binop_impl(
+            &Value(3),
+            op,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            ty,
+        );
+        cg.state.out.buf
+    }
 
     #[test]
-    fn narrow_bit_modify_backend_emission() {
+    fn index_is_reduced_modulo_the_operation_width_not_xlen() {
         for ty in [
             IrType::I8,
             IrType::U8,
@@ -244,33 +288,42 @@ mod narrow_bit_modify_backend_tests {
             IrType::I64,
             IrType::U64,
         ] {
-            let bits = ty.size() * 8;
+            let width = (ty.size() * 8) as u32;
             for op in [IrBinOp::BitSet, IrBinOp::BitClear, IrBinOp::BitToggle] {
-                for index in [0, bits - 1, bits, bits + 1, u64::MAX as usize] {
-                    let mut cg = RiscvCodegen::new();
-                    let base = if op == IrBinOp::BitSet { 0 } else { -1 };
-                    cg.emit_int_binop_impl(
-                        &Value(100),
-                        op,
-                        &Operand::Const(IrConst::I64(base)),
-                        &Operand::Const(IrConst::I64(index as i64)),
-                        ty,
-                    );
-                    let body = &cg.state.out.buf;
+                let asm = emit(op, ty);
+                if width < 64 {
                     assert!(
-                        body.contains(&format!("andi t2, t2, {}", bits - 1)),
-                        "{ty:?}: {body}"
-                    );
-                    println!(
-                        "BIT_MODIFY_RV|{bits}|{}|{index}\n{body}END_BIT_MODIFY",
-                        match op {
-                            IrBinOp::BitSet => "set",
-                            IrBinOp::BitClear => "clear",
-                            _ => "toggle",
-                        }
+                        asm.contains(&format!("andi t2, t2, {}", width - 1)),
+                        "{op:?} {ty:?} must mask the index to {width} bits:\n{asm}"
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn result_keeps_the_rv64_canonical_integer_form() {
+        for op in [IrBinOp::BitSet, IrBinOp::BitClear, IrBinOp::BitToggle] {
+            let asm8 = emit(op, IrType::I8);
+            assert!(
+                asm8.contains("slli t0, t0, 56") && asm8.contains("srai t0, t0, 56"),
+                "I8 {op:?} must sign-extend the result:\n{asm8}"
+            );
+            let asm16 = emit(op, IrType::I16);
+            assert!(
+                asm16.contains("slli t0, t0, 48") && asm16.contains("srai t0, t0, 48"),
+                "I16 {op:?} must sign-extend the result:\n{asm16}"
+            );
+            let asm32 = emit(op, IrType::I32);
+            assert!(
+                asm32.contains("sllw t0, t0, t2"),
+                "I32 {op:?} must build a sign-extended word mask:\n{asm32}"
+            );
+            let asm_u32 = emit(op, IrType::U32);
+            assert!(
+                asm_u32.contains("sll t0, t0, t2") && !asm_u32.contains("sllw"),
+                "U32 {op:?} must build a zero-extended mask:\n{asm_u32}"
+            );
         }
     }
 }

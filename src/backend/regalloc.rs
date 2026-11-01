@@ -4709,10 +4709,40 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     let all_phi_pairs = detect_phi_coalesce_groups_with_config(func, &liveness, &config.ra_config);
+    // Frame addresses are excluded from phi coalescing. An `Alloca` (and
+    // every `Cast`/`Copy`/`GetElementPtr` derived from one) has no home of its
+    // own: the text emitter materialises it as a `lea` at each *use*, and only
+    // for as long as the value stayed home-less. Giving it the phi's register
+    // instead turns those uses into reads of that register, and a use that
+    // executes *before* the merge point -- i.e. one on a predecessor path --
+    // then reads whatever the register happened to hold.
+    //
+    // Measured (i686, `-O2`): `(long long)(c ? v0 : ret(v1, v2))` where `ret`
+    // returns an 8-byte vector. The vector returns through a hidden pointer, so
+    // the alloca holding the call's result is *also* the false-path operand of
+    // the pointer phi; coalescing gave the phi and the alloca `%ebp`, the
+    // call's `sret` slot was emitted as `mov %ebp,(%esp)` (the `lea` that
+    // defines it is emitted after the call, on the phi side), and the callee
+    // wrote the vector through `0x20000005` -- a SIGSEGV inside the callee.
+    // `CCC_NO_PHI_COALESCE=1` hides it; so does this filter, at the cost of one
+    // `lea` per use on a control-flow-derived frame address.
+    let frame_addresses = frame_address_values(func);
+    let is_frame_address_pair = |cand: &PhiCoalesceCandidate| {
+        frame_addresses.contains(&cand.backedge_src) || frame_addresses.contains(&cand.phi_dest)
+    };
     let mut phi_coalesce: Vec<PhiCoalesceCandidate> = Vec::new();
     if !config.ra_config.no_phi_coalesce {
         let mut seen_dest: FxHashSet<u32> = FxHashSet::default();
         for cand in &all_phi_pairs {
+            if is_frame_address_pair(cand) {
+                if config.ra_config.debug_phi_coalesce {
+                    eprintln!(
+                        "[PHI_COALESCE] fn={} FRAME_ADDRESS phi_dest=v{} src=v{} (block={} copy_idx={})",
+                        func.name, cand.phi_dest, cand.backedge_src, cand.block_idx, cand.copy_idx
+                    );
+                }
+                continue;
+            }
             if seen_dest.insert(cand.phi_dest) {
                 phi_coalesce.push(*cand);
             }
@@ -6746,10 +6776,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         // `Vec::contains` filter was quadratic on large functions).
         let primary: FxHashSet<PhiCoalesceCandidate> = phi_coalesce.iter().copied().collect();
         let mut list = phi_coalesce.clone();
+        // The secondary list must obey the same frame-address exclusion as the
+        // primary one: every excluded pair reappears here (`all_phi_pairs`
+        // minus `primary`), and a secondary pair is applied exactly like a
+        // primary one, so filtering only the primary list left the i686 `sret`
+        // miscompile above reachable through the if/else latch shape.
         list.extend(
             all_phi_pairs
                 .iter()
                 .filter(|c| !primary.contains(c))
+                .filter(|c| !is_frame_address_pair(c))
                 .copied(),
         );
         list
@@ -12169,6 +12205,58 @@ pub(crate) struct PhiCoalesceCandidate {
     pub(crate) copy_idx: usize,
 }
 
+/// Every value that denotes the address of a frame object: an `Alloca`
+/// destination and anything derived from one by `Cast`, `Copy` or
+/// `GetElementPtr`.
+///
+/// Such values are deliberately home-less in the register allocator: the text
+/// emitter computes the address at the point of use and folds the `lea` into
+/// the access. Coalescing one into a register breaks that contract, because the
+/// `lea` then has to be emitted at the value's single definition -- and a
+/// definition that the emitter schedules after a use (a `call`'s `sret`
+/// operand, whose buffer is only "created" by the call in source order) leaves
+/// the use reading a stale register.
+fn frame_address_values(func: &IrFunction) -> FxHashSet<u32> {
+    // Worklist closure over the derivation edges. A repeated full scan is
+    // quadratic on a long Copy/Cast/GEP chain whose blocks are stored in
+    // reverse order; this visits each instruction once and each derivation
+    // edge once, independent of block order, while still closing through
+    // merge-block copies that name a source emitted later in `func.blocks`.
+    let mut out: FxHashSet<u32> = FxHashSet::default();
+    let mut work: Vec<u32> = Vec::new();
+    let mut derived: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { dest, .. } => {
+                    if out.insert(dest.0) {
+                        work.push(dest.0);
+                    }
+                }
+                Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } => {
+                    if let Operand::Value(v) = src {
+                        derived.entry(v.0).or_default().push(dest.0);
+                    }
+                }
+                Instruction::GetElementPtr { dest, base, .. } => {
+                    derived.entry(base.0).or_default().push(dest.0);
+                }
+                _ => {}
+            }
+        }
+    }
+    while let Some(value) = work.pop() {
+        if let Some(dests) = derived.get(&value) {
+            for &dest in dests {
+                if out.insert(dest) {
+                    work.push(dest);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// True iff `inst` clobbers the caller-saved GPR set. Mirrors the
 /// conservative core of `liveness::instruction_is_call_point` without
 /// pulling in the i686-libcall / F128 special cases: a phi-destructive
@@ -17053,6 +17141,110 @@ mod map_collector_tests {
             source_spans: Vec::new(),
         }];
         f
+    }
+
+    #[test]
+    fn frame_address_values_follow_every_derivation_step() {
+        // The phi-coalescing filter is only sound if this set is *closed* under
+        // the derivation instructions the frontend emits for frame objects:
+        // `Alloca` itself, `GetElementPtr` into it, and the `Cast`/`Copy`
+        // spellings that survive into the backend. A hole in the closure is
+        // exactly the i686 `sret` miscompile: the alloca's address reached the
+        // phi through a `Copy`, so the phi and the alloca shared one register
+        // and the call read it before the `lea` had run.
+        let f = func(
+            vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::U8,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I32(4)),
+                    ty: IrType::U8,
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(2)),
+                    from_ty: IrType::Ptr,
+                    to_ty: IrType::Ptr,
+                },
+                Instruction::Copy {
+                    dest: Value(4),
+                    src: Operand::Value(Value(3)),
+                },
+                Instruction::Copy {
+                    dest: Value(6),
+                    src: Operand::Value(Value(7)),
+                },
+            ],
+            Terminator::Return(None),
+        );
+        let addresses = frame_address_values(&f);
+        for value in [1u32, 2, 3, 4] {
+            assert!(
+                addresses.contains(&value),
+                "v{value} is (derived from) a frame address"
+            );
+        }
+        assert!(
+            !addresses.contains(&6),
+            "a copy of a non-address value is not a frame address"
+        );
+    }
+
+    #[test]
+    fn frame_address_values_closes_across_reverse_block_order() {
+        // The derivation closure must not depend on `func.blocks` being in
+        // definition order. A merge-block copy can be stored before the block
+        // that defines its source; a single forward scan would miss it, and a
+        // fixpoint rescan would pay O(n^2) on a long reverse-ordered chain.
+        let mut f = func(
+            vec![Instruction::Copy {
+                dest: Value(4),
+                src: Operand::Value(Value(3)),
+            }],
+            Terminator::Return(None),
+        );
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::U8,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::U8,
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(2)),
+                    from_ty: IrType::Ptr,
+                    to_ty: IrType::Ptr,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let addresses = frame_address_values(&f);
+        for value in [1u32, 2, 3, 4] {
+            assert!(
+                addresses.contains(&value),
+                "reverse block order must still close v{value} into the frame-address set"
+            );
+        }
     }
 
     #[test]
