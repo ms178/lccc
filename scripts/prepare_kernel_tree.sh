@@ -449,6 +449,16 @@ EOF
   fi
 }
 
+# Preparation has already performed the authoritative Kbuild clean and rebuilt
+# compiler-dependent headers. Publish that fact so the full-build identity gate
+# does not clean them a second time (and remove boot-only canaries again).
+record_prepared_compiler_hash() {
+  local tmp
+  tmp=$(mktemp "$KDIR/.lccc-compiler-stamp.tmp.XXXXXX")
+  sha256_of "$LCCC" > "$tmp"
+  mv -f "$tmp" "$KDIR/.lccc-compiler-stamp"
+}
+
 canaries_ok() {
   local c
   for c in "${LCCC_PREPARED_CANARIES[@]}"; do
@@ -477,6 +487,7 @@ if [[ -f "$KDIR/.lccc-prepared" ]] && [[ -f "$KDIR/${LCCC_PREPARED_CANARIES[0]}"
     (cd "$KDIR" && make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" HOSTCC="$HOSTCC" clean >/dev/null)
     (cd "$KDIR"; lccc_make_prepare; prepare_boot_headers)
     canaries_ok
+    record_prepared_compiler_hash
     # Preserve source/config/patch provenance while updating only compiler identity.
     stamp_tmp=$(mktemp "$KDIR/.lccc-prepared.tmp.XXXXXX")
     trap 'rm -f -- "$stamp_tmp"' EXIT
@@ -719,6 +730,7 @@ prepare_boot_headers
 for c in "${LCCC_PREPARED_CANARIES[@]}"; do
   [[ -f "$c" ]] || { echo "prepare_kernel_tree: post-check failed, missing: $c" >&2; exit 1; }
 done
+record_prepared_compiler_hash
 stamp_tmp=$(mktemp .lccc-prepared.tmp.XXXXXX)
 trap 'rm -f -- "$stamp_tmp"' EXIT
 {

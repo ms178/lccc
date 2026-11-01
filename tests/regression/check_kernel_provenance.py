@@ -162,6 +162,8 @@ def main() -> int:
         assert f"LD={cc} AS={cc}" in log, log
         assert all((kdir / name).is_file() for name in CANARIES)
         assert "generated-cpustr" in (kdir / "arch/x86/boot/cpustr.h").read_text()
+        compiler_hash = (kdir / ".lccc-compiler-stamp").read_text()
+        assert compiler_hash.strip() == sha256(cc)
         new = (kdir / ".lccc-prepared").read_text()
         assert f"recipe-sha256={recipe}" in new
         assert "config-input-sha256=original" in new
@@ -180,11 +182,13 @@ def main() -> int:
         cc.write_text(cc.read_text() + "# another compiler change\n")
         run(dict(env, TEST_FAIL_PREPARE="1"), kdir, expect=7)
         assert (kdir / ".lccc-prepared").read_text() == new
+        assert (kdir / ".lccc-compiler-stamp").read_text() == compiler_hash
         for name in CANARIES:
             (kdir / name).write_text("canary\n")
         hostcc.write_text('#!/bin/sh\nexit 1\n')
         run(env, kdir, expect=1)
         assert (kdir / ".lccc-prepared").read_text() == new
+        assert (kdir / ".lccc-compiler-stamp").read_text() == compiler_hash
         for name in CANARIES:
             (kdir / name).write_text("canary\n")
 
