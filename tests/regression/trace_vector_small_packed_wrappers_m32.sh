@@ -10,7 +10,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/lccc-vsmall-trace.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
 if ! "$CCC" -O2 -m32 -msse2 -g -no-pie \
-    "$root/tests/regression/vector_small_packed_wrappers_m32_trace.c" \
+    "$root/tests/regression/diagnostics/vector_small_packed_wrappers_m32_trace.c" \
     -o "$work/probe" >"$work/build.out" 2>&1; then
     echo "::warning title=i686 vector trace unavailable::diagnostic build failed"
     tail -n 20 "$work/build.out"
@@ -32,7 +32,12 @@ if [[ -n $eip ]]; then
     addr=$((eip))
     lo=$((addr > 24 ? addr - 24 : 0))
     hi=$((addr + 24))
-    objdump -d -M intel --start-address="$lo" --stop-address="$hi" "$work/probe" 2>/dev/null || true
+    if objdump -d -M intel --start-address="$lo" --stop-address="$hi" \
+        "$work/probe" >"$work/disassembly" 2>/dev/null; then
+        while IFS= read -r line; do
+            printf '::notice title=i686 vector disassembly::%s\n' "$line"
+        done < "$work/disassembly"
+    fi
 else
     echo "::notice title=i686 vector trace probe failed::rc=$rc; no EIP marker (signal handler or executable environment unavailable)"
 fi

@@ -10,7 +10,7 @@
 #include <unistd.h>
 
 #define main vector_small_packed_wrappers_test_main
-#include "vector_small_packed_wrappers_m32.c"
+#include "../vector_small_packed_wrappers_m32.c"
 #undef main
 
 static void report_fault(int sig, siginfo_t *info, void *context)
