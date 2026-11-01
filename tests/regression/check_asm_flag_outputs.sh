@@ -56,7 +56,11 @@ expect_error() {
 # defines <driver> <macro> -> prints "yes"/"no"
 defines() {
     local driver=$1 macro=$2
-    if "$driver" -dM -E - </dev/null 2>/dev/null | grep -qx "#define $macro 1"; then
+    # `grep -c ... >/dev/null`, not `grep -q`: a consumer that exits at the
+    # first match closes the pipe under `set -o pipefail` and a producer that
+    # is still writing (`lccc -dM -E`) then dies of SIGPIPE/141, which turns a
+    # clean "no" into a spurious failure. Count every line, print none.
+    if "$driver" -dM -E - </dev/null 2>/dev/null | grep -c "^#define $macro 1\$" >/dev/null; then
         echo yes
     else
         echo no
@@ -265,7 +269,7 @@ EOF
     if ! "$CCC_I686" -O2 -S "$TMP/i686-byte.c" -o "$TMP/i686-byte.s"; then
         echo "FAIL i686 -S: %b operand function did not assemble" >&2
         fail=1
-    elif grep -E 'movb' "$TMP/i686-byte.s" | grep -Eq '%(esi|edi|ebp)\b'; then
+    elif grep -Eq '^[[:space:]]+movb.*%(esi|edi|ebp)\b' "$TMP/i686-byte.s"; then
         echo "FAIL i686: a %b operand was given a register with no byte view:" >&2
         cat "$TMP/i686-byte.s" >&2
         fail=1
