@@ -35,8 +35,8 @@ on:
     branches: [main]
     # Every input whose change can alter this lane's verdict. `tests/**` matters
     # because the corpus runner and its contract tests live there; the
-    # provisioning scripts matter because a broken gcc-16 install surfaces here
-    # first. Without them a breakage lands on main unobserved until the next cron.
+    # provisioning scripts matter because a broken gcc-16 install, or a tag-cache
+    # 16.2 prefix that stops shadowing it, surfaces here first. Without them a breakage lands on main unobserved until the next cron.
     paths:
       - 'src/**'
       - 'include/**'
@@ -47,6 +47,8 @@ on:
       - 'scripts/x86_gcc_torture_i686.py'
       - 'scripts/build_lccc_fast.sh'
       - 'scripts/ci_install_gcc16.sh'
+      - 'scripts/ci_install_gcc_oracle.sh'
+      - 'scripts/ci_toolchain_bundle.sh'
       - 'scripts/ci_provision_toolchain.sh'
       - 'scripts/ci_verify_oracles.sh'
       - 'scripts/ci_enable_swap.sh'
@@ -100,9 +102,13 @@ jobs:
             target/fastbuild/lccc-arm target/fastbuild/lccc-riscv \
             target/fastbuild/lccc-i686 target/fastbuild/lccc-ld \
             > target/fastbuild/ci-build.sha256
+      # NOT `lccc-fast-${{ github.sha }}`: ci.yml publishes that name as a single
+      # `lccc-fast.tar.gz`, whose member modes survive extraction. Two payload
+      # shapes behind one artifact name make every consumer's extraction step a
+      # guess, so the shape is in the name here and the legs download this one.
       - uses: actions/upload-artifact@v7
         with:
-          name: lccc-fast-${{ github.sha }}
+          name: lccc-fast-binaries-${{ github.sha }}
           path: |
             target/fastbuild/lccc
             target/fastbuild/lccc-x86

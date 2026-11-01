@@ -2917,6 +2917,14 @@ fi
 gate "ensure-gcc-torture-contract" fast \
     bash tests/regression/check_ensure_gcc_torture.sh
 
+# Artifact and lane-mode contracts: a lane that downloads BARE compiler
+# binaries must restore their executable bit (artifact uploads store content
+# only), two payload shapes must not share an artifact name, and the GCC 17
+# torture lane must install and verify its GCC 16.2 pin and pin its corpus
+# revision. Static YAML/text analysis, no compiler.
+gate "ci-artifact-modes" fast \
+    python3 tests/regression/check_ci_artifact_modes.py
+
 # The AArch64 differential oracle is the tool that found the four encoder
 # defects above, and it is also the tool most likely to rot silently: a
 # harness that has drifted out of agreement with GAS reports "OK" for

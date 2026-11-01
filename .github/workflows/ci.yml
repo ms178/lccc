@@ -2295,8 +2295,8 @@ jobs:
     # third step.
     # lane-split: 89 of 193 independent gate invocations from the
     # lane-split: single step that used to run them all in sequence, assigned by
-    # lane-split: longest-processing-time over measured per-gate cost (438 s of
-    # lane-split: 877 s). The shards are a partition:
+    # lane-split: longest-processing-time over measured per-gate cost (440 s of
+    # lane-split: 878 s). The shards are a partition:
     # lane-split: tests/regression/check_ci_shard_partition.py fails if a gate appears in
     # lane-split: both, disappears from both, or reappears in a third step, and
     # lane-split: tests/regression/check_ci_lane_plan.py fails if a shard drifts from
@@ -2351,6 +2351,13 @@ jobs:
         # Torture-corpus provisioning: stamp trust, integrity manifest,
         # auto-repair and invalidate-before-replace (synthetic tarball).
         bash tests/regression/check_ensure_gcc_torture.sh
+        # Artifact and lane-mode contracts, static: a job that downloads BARE
+        # compiler binaries must restore their executable bit (upload-artifact
+        # stores content only -- the GCC 17 torture lane died in 0 s without
+        # it), two payload shapes must not share one artifact name, and that
+        # lane must deliver/verify its GCC 16.2 pin and pin its corpus
+        # revision. Parses YAML; needs no compiler.
+        python3 tests/regression/check_ci_artifact_modes.py
         # The helper scripts are tools, not gates, so nothing in the
         # suite ever imports them. Check their imports via the AST so a
         # tool that cannot run cannot ship unnoticed.
