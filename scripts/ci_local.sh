@@ -229,6 +229,12 @@ gate "driver-option-contract-core" fast \
 # Hosted CI runs the same scripts.
 gate "attribute-class-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_attribute_diagnostics.sh
+gate "microsoft-scalar-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ms_abi.sh
+gate "microsoft-record-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ms_abi_records.sh
+gate "microsoft-variadic-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ms_abi_varargs.sh
 gate "lexer-extensions" fast \
     env CCC="$LCCC" bash tests/regression/check_lexer_extensions.sh
 gate "ucn-identifier-table" fast \

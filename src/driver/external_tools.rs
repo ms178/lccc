@@ -245,7 +245,7 @@ impl Driver {
             // .S files (or -x assembler-with-cpp) need C preprocessing before assembly
             let source = Self::read_source(input_file)?;
             let mut preprocessor = crate::frontend::preprocessor::Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             // GCC defines __ASSEMBLER__ when preprocessing assembly source files (.S).
             // This is needed for headers like <cet.h> which gate assembly-specific
             // macro definitions (e.g. _CET_ENDBR) behind #ifdef __ASSEMBLER__.

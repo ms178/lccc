@@ -27,13 +27,14 @@ case ${FAKE_QEMU_CASE:-pass} in
   missing) echo 'LCCC_DEFCFG_BOOT_BEGIN' > "$log" ;;
   *) cat > "$log" <<'LOG'
 LCCC_DEFCFG_BOOT_BEGIN
-Linux version test
+Linux version test (lccc synthetic compiler identity)
 LCCC_DEFCFG_CPUS=2
 LCCC_DEFCFG_SERIAL=the quick brown fox 0123456789 !?
 LCCC_DEFCFG_BOOT_PASS
 reboot: Power down
 LOG
 esac
+[[ ${FAKE_QEMU_CASE:-pass} != wrong-compiler ]] || sed -i 's/lccc synthetic/gcc synthetic/' "$log"
 [[ ${FAKE_QEMU_CASE:-pass} != panic ]] || echo 'Kernel panic - synthetic' >> "$log"
 [[ ${FAKE_QEMU_CASE:-pass} != exit ]] || exit 1
 FAKE
@@ -47,7 +48,7 @@ FAKE_QEMU_CASE=pass "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/
 [[ ! -L "$BOOT_LOG" && $(cat "$work/victim") == 'do not overwrite' ]] || {
   echo 'FAIL: output symlink followed' >&2; exit 1;
 }
-for case in missing no-log panic exit; do
+for case in missing no-log panic exit wrong-compiler; do
   if FAKE_QEMU_CASE=$case "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >"$work/out" 2>&1; then
     echo "FAIL: QEMU smoke accepted $case" >&2; cat "$work/out" >&2; exit 1
   fi

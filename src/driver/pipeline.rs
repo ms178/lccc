@@ -74,6 +74,8 @@ pub struct Driver {
     /// `-falign-functions[=N[:M]]` / `-fno-align-functions` control of
     /// function-entry alignment.
     pub(super) align_functions: crate::passes::loop_align::AlignControl,
+    /// Hard entry alignment floor, independent of size optimization and attributes.
+    pub(super) min_function_alignment: u32,
     /// Permit transformations that reassociate floating-point operations.
     /// False by default: ordinary -O levels preserve source evaluation order.
     /// Enabled explicitly by -ffast-math/-fassociative-math.
@@ -622,6 +624,7 @@ impl Driver {
             align_loops: crate::passes::loop_align::AlignControl::Auto,
             align_jumps: crate::passes::loop_align::AlignControl::Auto,
             align_functions: crate::passes::loop_align::AlignControl::Auto,
+            min_function_alignment: 0,
             fp_reassoc: false,
             math_errno: true,
             // Contraction default for C: FAST, matching GCC's C default
@@ -992,7 +995,7 @@ impl Driver {
             if self.dep_only {
                 let source = Self::read_source(input_file)?;
                 let mut preprocessor = Preprocessor::new();
-                self.configure_preprocessor(&mut preprocessor);
+                self.configure_preprocessor(&mut preprocessor)?;
                 let filename = if input_file == "-" {
                     "<stdin>"
                 } else {
@@ -1063,7 +1066,7 @@ impl Driver {
             let source = Self::read_source(input_file)?;
 
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             let filename = if input_file == "-" {
                 "<stdin>"
             } else {
@@ -1217,22 +1220,21 @@ impl Driver {
     /// so `printf '#include <stdio.h>\n' | lccc -x c - -fsyntax-only`
     /// compiled AND LINKED the stdin TU and failed on the missing `main`.
     /// Emit collected preprocessor diagnostics (`#warning` and friends)
-    /// through `diagnostics` with the [`crate::common::error::WarningKind::Cpp`]
-    /// kind, so `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control them exactly as
-    /// GCC does. Shared by every path that preprocesses without going
-    /// through `parse_and_analyze_c_tu`, which has the same drain inline.
+    /// through `diagnostics` with their own warning categories, so leaf
+    /// suppression, promotion and blanket -Werror apply in every mode.
+    /// Shared by preprocessing, syntax-only and full compilation.
     fn emit_preprocessor_warnings(
         &self,
         preprocessor: &Preprocessor,
         diagnostics: &mut DiagnosticEngine,
     ) {
-        for warn in preprocessor.warnings() {
+        for (index, warn) in preprocessor.warnings().iter().enumerate() {
             let diag = crate::common::error::Diagnostic::warning_with_kind(
                 warn.message.clone(),
-                crate::common::error::WarningKind::Cpp,
+                warn.kind,
             )
             .with_location(&warn.file, warn.line, warn.col);
-            diagnostics.emit(&diag);
+            diagnostics.emit_with_warning_config(&diag, preprocessor.warning_config_at(index));
         }
     }
 
@@ -1264,7 +1266,7 @@ impl Driver {
 
             let source = Self::read_source(input_file)?;
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             preprocessor.set_filename(filename);
             self.process_force_includes(&mut preprocessor)?;
             let preprocessed = preprocessor.preprocess(&source);
@@ -1311,7 +1313,8 @@ impl Driver {
             diagnostics.set_warning_config(self.effective_warning_config());
             diagnostics.set_color_mode(self.color_mode);
             diagnostics.set_source_manager(source_manager);
-            // Drain preprocessor warnings through the engine with the Cpp
+            diagnostics.build_warning_scopes();
+            // Drain preprocessor warnings through the engine with their own
             // kind — the full compile path does this, and without it
             // `-fsyntax-only` dropped `#warning` entirely (measured against
             // gcc-16.2, which reports it in every mode, `-fsyntax-only`
@@ -1386,7 +1389,7 @@ impl Driver {
         {
             let source = Self::read_source(input_file)?;
             let mut preprocessor = Preprocessor::new();
-            self.configure_preprocessor(&mut preprocessor);
+            self.configure_preprocessor(&mut preprocessor)?;
             preprocessor.define_macro("__ASSEMBLER__", "1");
             preprocessor.define_macro("_CET_H_INCLUDED", "1");
             if self.target == crate::backend::Target::X86_64 {
@@ -1824,7 +1827,11 @@ impl Driver {
     }
 
     /// Configure the preprocessor with CLI-defined macros and target.
-    pub(super) fn configure_preprocessor(&self, preprocessor: &mut Preprocessor) {
+    pub(super) fn configure_preprocessor(
+        &self,
+        preprocessor: &mut Preprocessor,
+    ) -> Result<(), String> {
+        preprocessor.set_warning_config(self.effective_warning_config());
         // Set target architecture macros
         match self.target {
             Target::Aarch64 => preprocessor.set_target("aarch64"),
@@ -2072,18 +2079,57 @@ impl Driver {
                 path.to_string()
             }
         }
+        let mut include_diagnostics = DiagnosticEngine::new();
+        include_diagnostics.set_warning_config(self.effective_warning_config());
+        include_diagnostics.set_color_mode(self.color_mode);
+        let mut check_directory = |path: &str| {
+            // GCC suppresses search-path diagnostics for dependency-only and
+            // macro-dump preprocessing, even under explicit -Werror=.
+            if self.dep_only || self.dump_defines {
+                return;
+            }
+            let mut diag = match std::fs::metadata(path) {
+                Ok(meta) if meta.is_dir() => return,
+                Ok(_) => {
+                    crate::common::error::Diagnostic::warning(format!("{path}: not a directory"))
+                }
+                Err(error) => {
+                    // Match GCC's OS diagnostic without Rust's extra errno suffix.
+                    let text = error.to_string();
+                    let text = text.split(" (os error ").next().unwrap_or(&text);
+                    crate::common::error::Diagnostic::warning_with_kind(
+                        format!("{path}: {text}"),
+                        crate::common::error::WarningKind::MissingIncludeDirs,
+                    )
+                }
+            };
+            diag.explicit_location = Some("cc1:".to_string());
+            include_diagnostics.emit(&diag);
+        };
         for path in &self.include_paths {
-            preprocessor.add_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_include_path(&path);
         }
         for path in &self.quote_include_paths {
-            preprocessor.add_quote_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_quote_include_path(&path);
         }
         for path in &self.isystem_include_paths {
-            preprocessor.add_system_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_system_include_path(&path);
         }
         for path in &self.after_include_paths {
-            preprocessor.add_after_include_path(&sysroot_include_path(path));
+            let path = sysroot_include_path(path);
+            check_directory(&path);
+            preprocessor.add_after_include_path(&path);
         }
+        if include_diagnostics.has_errors() {
+            return Err("include search path warning(s) promoted to errors".to_string());
+        }
+        Ok(())
     }
 
     /// Process force-included files (-include flag) through the preprocessor before
@@ -2258,7 +2304,7 @@ impl Driver {
 
         // Preprocess
         let mut preprocessor = Preprocessor::new();
-        self.configure_preprocessor(&mut preprocessor);
+        self.configure_preprocessor(&mut preprocessor)?;
         let filename = if input_file == "-" {
             "<stdin>"
         } else {
@@ -2279,17 +2325,9 @@ impl Driver {
         diagnostics.set_warning_config(self.effective_warning_config());
         diagnostics.set_color_mode(self.color_mode);
 
-        // Emit preprocessor warnings through diagnostic engine with Cpp kind
-        // so they can be controlled via -Wcpp / -Wno-cpp / -Werror=cpp.
-        // Preprocessor diagnostics carry file:line:col location info for GCC-compatible output.
-        for warn in preprocessor.warnings() {
-            let diag = crate::common::error::Diagnostic::warning_with_kind(
-                warn.message.clone(),
-                crate::common::error::WarningKind::Cpp,
-            )
-            .with_location(&warn.file, warn.line, warn.col);
-            diagnostics.emit(&diag);
-        }
+        // Preserve the warning's category on every driver path, not just
+        // -E and syntax-only. A -Wundef must never become a -Wcpp here.
+        self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
 
         // Check for #error directives and missing #include errors
         let pp_errors = preprocessor.errors();
@@ -2340,6 +2378,7 @@ impl Driver {
         // backward-compatible span_to_location() calls.
         let t2 = std::time::Instant::now();
         diagnostics.set_source_manager(source_manager);
+        diagnostics.build_warning_scopes();
         // Surface lexer diagnostics after the source manager is attached so
         // spans resolve to file:line:col.
         self.emit_lexer_diagnostics(&mut lexer, &mut diagnostics);
@@ -3840,6 +3879,7 @@ impl Driver {
             // section alignment keeps following GNU as semantics.
             // `-falign-functions[=N]`/`-fno-align-functions` override: a
             // custom alignment must be a power of two (validated at parse).
+            min_function_alignment: self.min_function_alignment,
             function_alignment: match self.align_functions {
                 crate::passes::loop_align::AlignControl::Off => 0,
                 crate::passes::loop_align::AlignControl::Custom { align, .. } => align,

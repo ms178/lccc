@@ -137,6 +137,15 @@ class OraclePinTest(unittest.TestCase):
         self.assertEqual(len(failures), 1, failures)
         self.assertIn('gcc no longer honours', failures[0][1])
 
+    def test_implemented_convention_requires_the_exact_table_verdict(self):
+        for verdict in ('Default', 'GccIgnored', 'OnlyAvailable32Bit', 'Unsupported', 'Implemented'):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as tmp:
+                gcc = write_script(Path(tmp), 'gcc', 'echo 16.2.0\n')
+                with mock.patch.object(matrix, 'gcc_observation', return_value=('honours', 'changed')):
+                    failures, _ = matrix.check_table_against_gcc(
+                        str(gcc), {('ms_abi', 'x86-64'): verdict}, False)
+                self.assertEqual(len(failures), int(verdict != 'Implemented'))
+
     def test_unknown_observation_is_reported(self):
         failures, _ = self._compare('16.2.0', 'shrugged')
         self.assertEqual(len(failures), 1, failures)
@@ -208,7 +217,7 @@ class RegistryTableTest(unittest.TestCase):
         expected = {
             ('regparm', 'i686'): 'Implemented',
             ('fastcall', 'i686'): 'Implemented',
-            ('ms_abi', 'x86-64'): 'Unsupported',
+            ('ms_abi', 'x86-64'): 'Implemented',
             ('ms_abi', 'i686'): 'Unsupported',
             ('ms_struct', 'x86-64'): 'Unsupported',
             ('gcc_struct', 'x86-64'): 'Default',
@@ -303,6 +312,19 @@ exit 0
         patch = mock.patch.object(matrix, 'check_sentinels', return_value=([], []))
         patch.start()
         self.addCleanup(patch.stop)
+
+    def test_microsoft_implementation_runs_the_native_sentinel(self):
+        for status in (0, 1):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                driver = self._driver(Path(tmp))
+                failed = subprocess.CompletedProcess([], 1, '', 'invalid arity')
+                sentinel = subprocess.CompletedProcess([], status, 'witness', 'detail')
+                with mock.patch.object(matrix, '_syntax_only', return_value=(failed, '')), \
+                     mock.patch.object(matrix, 'run_bounded', return_value=sentinel) as run:
+                    failures, _ = matrix.check_lccc({('ms_abi', 'x86-64'): 'Implemented'}, driver)
+                self.assertEqual(len(failures), int(status != 0))
+                self.assertEqual(Path(run.call_args.args[0][1]).name, 'check_ms_abi.sh')
+                self.assertEqual(run.call_args.kwargs['env']['CCC'], str(driver.resolve()))
 
     def test_default_must_be_silent(self):
         with tempfile.TemporaryDirectory() as tmp:

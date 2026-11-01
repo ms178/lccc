@@ -1883,6 +1883,8 @@ fn inline_run_with(
                                             has_inlined_calls: false,
                                             param_alloca_values: vec![],
                                             uses_sret: false,
+                                            calling_convention:
+                                                crate::common::types::CallingConvention::Default,
                                             is_fastcall: false,
                                             regparm: None,
                                             is_naked: false,
@@ -2221,6 +2223,8 @@ fn inline_run_with(
                                             has_inlined_calls: false,
                                             param_alloca_values: vec![],
                                             uses_sret: false,
+                                            calling_convention:
+                                                crate::common::types::CallingConvention::Default,
                                             is_fastcall: false,
                                             regparm: None,
                                             is_naked: false,
@@ -6865,6 +6869,7 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         // silently corrupting the binary128 payload.
         struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
+        calling_convention: info.calling_convention,
         is_fastcall: info.is_fastcall,
         regparm: info.regparm,
         is_pure: info.is_pure,
@@ -7859,6 +7864,7 @@ mod value_reference_tests {
             has_inlined_calls: false,
             param_alloca_values: vec![],
             uses_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             regparm: None,
             is_naked: false,
@@ -8358,6 +8364,7 @@ mod const_trip_tests {
             has_inlined_calls: false,
             param_alloca_values: vec![],
             uses_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             regparm: None,
             is_naked: false,
@@ -9902,6 +9909,7 @@ mod extern_admission_tests {
                         struct_arg_classes: vec![Vec::new()],
                         struct_arg_riscv_float_classes: vec![None],
                         is_sret: false,
+                        calling_convention: crate::common::types::CallingConvention::Default,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
                         ..CallInfo::default()
@@ -9921,6 +9929,7 @@ mod extern_admission_tests {
                         struct_arg_classes: Vec::new(),
                         struct_arg_riscv_float_classes: Vec::new(),
                         is_sret: false,
+                        calling_convention: crate::common::types::CallingConvention::Default,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
                         ..CallInfo::default()
@@ -9953,6 +9962,7 @@ mod extern_admission_tests {
                         struct_arg_classes: vec![Vec::new()],
                         struct_arg_riscv_float_classes: vec![None],
                         is_sret: false,
+                        calling_convention: crate::common::types::CallingConvention::Default,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
                         ..CallInfo::default()
@@ -10012,6 +10022,7 @@ mod extern_admission_tests {
             struct_arg_classes: vec![Vec::new(); n],
             struct_arg_riscv_float_classes: vec![None; n],
             is_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             ret_eightbyte_classes: Vec::new(),
             ..CallInfo::default()

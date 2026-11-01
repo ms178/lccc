@@ -43,6 +43,10 @@ impl Preprocessor {
         col: usize,
     ) -> Option<String> {
         let rest = rest.trim();
+        if self.diagnostic_pragmas.apply(rest) {
+            // Keep the directive at its exact output position for parser/sema.
+            return Some(format!("#pragma {rest}\n"));
+        }
         if rest.starts_with("STDC") && rest.split_whitespace().eq(["STDC", "FENV_ACCESS", "ON"]) {
             self.fenv_access_requested = true;
             return None;
@@ -124,6 +128,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), false, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -137,6 +142,7 @@ impl Preprocessor {
                 Some(end) => (r[..end].to_string(), true, &r[end + 1..]),
                 None => {
                     self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        kind: crate::common::error::WarningKind::Cpp,
                         file: self.current_file(),
                         line: line_num,
                         col,
@@ -147,6 +153,7 @@ impl Preprocessor {
             }
         } else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -156,6 +163,7 @@ impl Preprocessor {
         };
         let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
             self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,
@@ -183,7 +191,8 @@ impl Preprocessor {
                     filename, message
                 )
             };
-            self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+            self.push_warning(super::pipeline::PreprocessorDiagnostic {
+                kind: crate::common::error::WarningKind::Cpp,
                 file: self.current_file(),
                 line: line_num,
                 col,

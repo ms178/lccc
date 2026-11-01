@@ -9,6 +9,7 @@ use crate::ir::reexports::{IrConst, Operand, Value};
 impl RiscvCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig {
+            microsoft_x64: false,
             max_int_regs: 8,
             max_float_regs: 8,
             align_i128_pairs: true,

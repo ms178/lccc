@@ -8914,7 +8914,7 @@ fn x86_return_register_param_loads(func: &IrFunction) -> FxHashSet<u32> {
     }
     let classes = crate::backend::call_abi::classify_params(
         func,
-        &crate::backend::call_abi::CallAbiConfig::sysv_x86_64(),
+        &crate::backend::call_abi::CallAbiConfig::x86_64(func.calling_convention),
     );
     for (idx, load) in loads.iter().enumerate() {
         if let (
@@ -9423,7 +9423,7 @@ fn x86_64_sysv_call_classes(
             .unwrap_or(&[]),
         info.struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
         info.is_variadic,
-        &CallAbiConfig::sysv_x86_64(),
+        &CallAbiConfig::x86_64(info.calling_convention),
     );
     if classes.len() + skip != info.args.len()
         || classes
@@ -18226,6 +18226,7 @@ mod allocation_kernel_tests {
                             struct_arg_is_f128_sse: vec![],
                             ret_is_f128_sse: false,
                             is_sret: false,
+                            calling_convention: crate::common::types::CallingConvention::Default,
                             is_fastcall: false,
                             regparm: None,
                             is_pure: false,

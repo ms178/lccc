@@ -208,21 +208,12 @@ pub struct Lowerer {
     /// Wrapped in RefCell because many lowering methods take &self (not &mut self)
     /// but still need to emit diagnostics (same pattern as expr_ctype_cache).
     pub(super) diagnostics: RefCell<DiagnosticEngine>,
-    /// Maps `*const Expr` identity of compound literal nodes to their materialized
-    /// anonymous global names. Populated by `materialize_compound_literals_in_expr()`
-    /// before `eval_global_addr_expr()` is called, so that compound literals
-    /// embedded in pointer arithmetic (e.g., `(char*)(int[]){1,2,3} + 8`)
-    /// can be resolved as global addresses.
-    ///
-    /// Lifetime: entries persist for the entire lowering session since the AST
-    /// (and therefore Expr node addresses) lives through the full lowering pass.
-    /// If the same compound literal appears in multiple globals, it will be
-    /// materialized once and reused via this cache.
-    ///
-    /// Precondition: callers of `eval_global_addr_expr()` that may encounter
-    /// compound literals in arithmetic contexts must first call
-    /// `materialize_compound_literals_in_expr()` to populate this map.
-    pub(super) materialized_compound_literals: FxHashMap<usize, String>,
+    /// Source-span identity of materialized compound literals. Initializer
+    /// canonicalization clones Exprs into temporary allocations, so pointer
+    /// identity can be reused for DIFFERENT literals and silently alias them.
+    /// Preprocessed spans survive cloning and distinguish source occurrences.
+    /// Populate before querying symbolic addresses in a static initializer.
+    pub(super) materialized_compound_literals: FxHashMap<(u32, u32, u32), String>,
     /// Whether GNU89 inline semantics are in effect (-fgnu89-inline, -std=c89, etc).
     /// When true, `extern inline` without `__attribute__((gnu_inline__))` is treated
     /// as an inline-only definition (no external def emitted), matching the behaviour
@@ -666,6 +657,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -1086,7 +1078,7 @@ impl Lowerer {
                     for d in &declarator.derived {
                         match d {
                             DerivedDeclarator::Pointer(..) => ptr_count += 1,
-                            DerivedDeclarator::Function(p, v, _) => {
+                            DerivedDeclarator::Function(p, v, _, _) => {
                                 func_info = Some((p.clone(), *v));
                                 break;
                             }
@@ -1621,7 +1613,14 @@ impl Lowerer {
                         sret_size = Some(size);
                     }
                 } else {
-                    let abi = self.aggregate_return(&full_ret_ctype, size);
+                    let abi = self.aggregate_return(
+                        &full_ret_ctype,
+                        size,
+                        self.sema_functions
+                            .get(name)
+                            .map(|f| f.calling_convention)
+                            .unwrap_or_default(),
+                    );
                     sret_size = abi.sret_size;
                     two_reg_ret_size = abi.two_reg_size;
                     if abi.x87 || abi.x87_pair {
@@ -1667,42 +1666,50 @@ impl Lowerer {
         // Compute SysV eightbyte classification for two-register struct returns.
         // _Float128 returns are 16-byte SSE-class values (SysV psABI): ONE XMM
         // register (xmm0).
-        let mut ret_is_f128_sse = full_ret_ctype.is_half_float();
-        let ret_eightbyte_classes =
-            if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
-                ret_is_f128_sse = true;
-                vec![
-                    crate::common::types::EightbyteClass::Sse,
-                    crate::common::types::EightbyteClass::Sse,
-                ]
-            } else if let Some(classes) = crate::common::types::target_is_32bit()
-                .then(|| full_ret_ctype.i686_ext_vector_ret_carrier())
-                .flatten()
-                .map(|(_, classes)| classes)
-                .filter(|classes| !classes.is_empty())
-            {
-                // i686 carrier markers (x86-64 uses real eightbytes): three
-                // INTEGER classes encode the EAX:EDX:ECX lane-word bundle,
-                // `[Sse, SseUp]` a vector returned in %xmm0.
-                classes
-            } else if let Some(abi) = ret_aggregate_abi.as_ref().filter(|a| !a.classes.is_empty()) {
-                // x86-64 register return of an aggregate, any size up to 16:
-                // the psABI classes (`[Sse, SseUp]` = ONE %xmm0).
-                ret_is_f128_sse = abi.one_xmm;
-                abi.classes.clone()
-            } else if two_reg_ret_size.is_some() && ptr_count == 0 {
-                if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
-                    if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
-                        layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
-                    } else {
-                        Vec::new()
-                    }
+        let ms_integer128_return = matches!(full_ret_ctype, CType::Int128 | CType::UInt128)
+            && self.sema_functions.get(name).is_some_and(|f| {
+                f.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+            });
+        let mut ret_is_f128_sse = full_ret_ctype.is_half_float() || ms_integer128_return;
+        let ret_eightbyte_classes = if ms_integer128_return {
+            vec![
+                crate::common::types::EightbyteClass::Sse,
+                crate::common::types::EightbyteClass::SseUp,
+            ]
+        } else if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
+            ret_is_f128_sse = true;
+            vec![
+                crate::common::types::EightbyteClass::Sse,
+                crate::common::types::EightbyteClass::Sse,
+            ]
+        } else if let Some(classes) = crate::common::types::target_is_32bit()
+            .then(|| full_ret_ctype.i686_ext_vector_ret_carrier())
+            .flatten()
+            .map(|(_, classes)| classes)
+            .filter(|classes| !classes.is_empty())
+        {
+            // i686 carrier markers (x86-64 uses real eightbytes): three
+            // INTEGER classes encode the EAX:EDX:ECX lane-word bundle,
+            // `[Sse, SseUp]` a vector returned in %xmm0.
+            classes
+        } else if let Some(abi) = ret_aggregate_abi.as_ref().filter(|a| !a.classes.is_empty()) {
+            // x86-64 register return of an aggregate, any size up to 16:
+            // the psABI classes (`[Sse, SseUp]` = ONE %xmm0).
+            ret_is_f128_sse = abi.one_xmm;
+            abi.classes.clone()
+        } else if two_reg_ret_size.is_some() && ptr_count == 0 {
+            if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
+                if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
+                    layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                 } else {
                     Vec::new()
                 }
             } else {
                 Vec::new()
-            };
+            }
+        } else {
+            Vec::new()
+        };
 
         // A K&R definition needs the declared body types before default
         // promotions. A prototype declaration instead needs its callable
@@ -2526,6 +2533,7 @@ impl Lowerer {
                     struct_arg_riscv_float_classes: Vec::new(),
                     struct_arg_is_f128_sse: full_f128,
                     is_sret: true,
+                    calling_convention: crate::common::types::CallingConvention::Default,
                     is_fastcall: false,
                     regparm: None,
                     ret_eightbyte_classes: Vec::new(),
@@ -2580,6 +2588,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: arg_is_f128,
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -3053,6 +3062,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -3095,6 +3105,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -3133,6 +3144,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,

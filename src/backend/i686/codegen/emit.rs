@@ -3518,6 +3518,7 @@ impl ArchCodegen for I686Codegen {
         struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
         struct_arg_is_f128_sse: &[bool],
         is_sret: bool,
+        _calling_convention: crate::common::types::CallingConvention,
         is_fastcall: bool,
         is_regparm: Option<u8>,
         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],

@@ -1156,6 +1156,7 @@ impl Lowerer {
             is_weak: false,
             is_used: true,
             has_inlined_calls: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             regparm: None,
             is_naked: false,

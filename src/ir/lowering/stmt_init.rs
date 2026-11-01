@@ -110,7 +110,7 @@ impl Lowerer {
         // so the pointer count is the ABI-relevant summary the meta needs.
         let func_info = if DerivedDeclarator::declares_function(&declarator.derived) {
             match declarator.derived.last() {
-                Some(DerivedDeclarator::Function(p, v, _)) => Some((p.clone(), *v)),
+                Some(DerivedDeclarator::Function(p, v, _, _)) => Some((p.clone(), *v)),
                 _ => None,
             }
         } else {

@@ -1683,6 +1683,14 @@ impl Lowerer {
         // (integer, float). We decompose complex va_arg into two component
         // va_arg calls (one for real, one for imaginary) and reassemble.
         let ctype = self.type_spec_to_ctype(type_spec);
+        if self.target == crate::backend::Target::X86_64
+            && self.get_expr_ctype(ap_expr).is_some_and(|ct| {
+                matches!(ct,
+                CType::Pointer(inner, _) if *inner == CType::plain_char())
+            })
+        {
+            return self.lower_ms_va_arg(ap_expr, &ctype);
+        }
         if ctype.is_complex() {
             return self.lower_va_arg_complex(ap_expr, &ctype);
         }
@@ -1788,6 +1796,66 @@ impl Lowerer {
             result_ty,
         });
         Operand::Value(dest)
+    }
+
+    /// Microsoft lists are char* cursors over contiguous eight-byte slots,
+    /// including pointers to caller copies for non-register-sized objects.
+    fn lower_ms_va_arg(&mut self, ap: &Expr, ct: &CType) -> Operand {
+        let address = self.lower_address_of(ap);
+        let address = self.operand_to_value(address);
+        let cursor = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: cursor,
+            ptr: address,
+            ty: IrType::Ptr,
+            seg_override: AddressSpace::Default,
+        });
+        let next = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: next,
+            base: cursor,
+            offset: Operand::Const(IrConst::I64(8)),
+            ty: IrType::I8,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(next),
+            ptr: address,
+            ty: IrType::Ptr,
+            seg_override: AddressSpace::Default,
+        });
+        let size = self.resolve_ctype_size(ct);
+        let mut payload = cursor;
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            payload = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: payload,
+                ptr: cursor,
+                ty: IrType::Ptr,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        if ct.is_struct_or_union() || ct.is_vector() || ct.is_complex() {
+            let copy =
+                self.emit_entry_alloca(IrType::Ptr, size.max(1), self.ctype_align(ct), false);
+            self.emit(Instruction::Memcpy {
+                dest: copy,
+                src: payload,
+                size,
+            });
+            return Operand::Value(copy);
+        }
+        let result = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: result,
+            ptr: payload,
+            ty: IrType::from_ctype(ct),
+            seg_override: AddressSpace::Default,
+        });
+        Operand::Value(result)
     }
 
     /// Lower `va_arg` of a by-value vector. A vector is an aggregate on the

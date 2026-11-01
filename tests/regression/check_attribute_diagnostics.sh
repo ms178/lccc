@@ -118,7 +118,8 @@ done
 #   cdecl stdcall thiscall fastcall sseregparm -> gcc ignores them here
 #   preserve_none no_callee_saved_registers    -> real GCC 16.2 contracts: refused
 #   callee_pop_aggregate_return  -> gcc's "only available for 32-bit"
-#   ms_abi no_caller_saved_registers           -> refused
+#   ms_abi (x86-64 scalar ABI)                -> supported
+#   no_caller_saved_registers                 -> refused
 for a in sysv_abi; do
     expect "convention-default:$a" EMPTY "int f(void) __attribute__(($a));"
 done
@@ -176,7 +177,12 @@ refuse() { # refuse <case> <source>
         fail=1
     fi
 }
-refuse ms_abi 'int f(void) __attribute__((ms_abi));'
+printf '%s\n' 'int f(void) __attribute__((ms_abi));' > "$TMP/r.c"
+if ! "$CCC" -Werror=attributes -fsyntax-only "$TMP/r.c" > "$TMP/ms.out" 2>&1; then
+    echo 'FAIL scalar ms_abi declaration should be implemented on x86-64' >&2
+    cat "$TMP/ms.out" >&2
+    fail=1
+fi
 refuse no_caller_saved_registers 'int f(void) __attribute__((no_caller_saved_registers));'
 refuse no_callee_saved_registers 'int f(void) __attribute__((no_callee_saved_registers));'
 refuse preserve_none 'int f(void) __attribute__((preserve_none));'

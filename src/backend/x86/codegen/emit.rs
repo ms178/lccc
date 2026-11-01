@@ -7328,6 +7328,12 @@ impl X86Codegen {
 
         let _ = folded_global_addrs; // subset needs no fold-map interaction
 
+        // CallTyped's move plan is specifically SysV: it has no positional
+        // Microsoft GP/FP mapping or 32-byte home area. Keep that convention
+        // on the general ABI-aware path, even for integer-only register calls.
+        if info.calling_convention != crate::common::types::CallingConvention::Default {
+            return false;
+        }
         if self.machinst_disabled_kinds & MI_CALL_TYPED != 0 {
             return false;
         }
@@ -8317,6 +8323,10 @@ impl X86Codegen {
 }
 
 impl ArchCodegen for X86Codegen {
+    fn legalize_function_abi<'a>(&self, func: &'a IrFunction) -> std::borrow::Cow<'a, IrFunction> {
+        crate::backend::x86::ms_wide_abi::legalize(func)
+    }
+
     fn set_function_target_features(&mut self, features: &[String]) {
         use super::super::isa::{X86Isa, features_permit};
         use crate::common::x86_features::{X86Feature as F, effective};

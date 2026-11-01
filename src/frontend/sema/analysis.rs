@@ -140,6 +140,7 @@ pub type ExprTypeMap = FxHashMap<ExprId, CType>;
 /// Information about a function collected during semantic analysis.
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
+    pub calling_convention: crate::common::types::CallingConvention,
     pub return_type: CType,
     pub params: Vec<(CType, Option<String>)>,
     pub variadic: bool,
@@ -164,6 +165,7 @@ impl FunctionInfo {
     /// function-pointer inference. Lowering still reads `params` for the ABI.
     pub(super) fn call_type(&self) -> FunctionType {
         self.prototype.clone().unwrap_or_else(|| FunctionType {
+            calling_convention: self.calling_convention,
             return_type: self.return_type.clone(),
             params: Vec::new(),
             variadic: self.variadic,
@@ -260,6 +262,10 @@ pub struct SemanticAnalyzer {
     /// block-scope declaration finds the nested entity it belongs to instead of
     /// writing through the shared basename.
     function_nesting_stack: Vec<String>,
+    /// Explicit file-scope function declarations: name -> has prototype.
+    /// Implicit library knowledge and declarations inside another function
+    /// must not silence missing-declaration warnings.
+    prior_file_function_decls: FxHashMap<String, bool>,
     /// Whether ordinary hosted-library builtin folds are disabled.
     no_builtins: bool,
     builtin_policy: crate::common::pass_policy::BuiltinFlags,
@@ -319,6 +325,7 @@ impl SemanticAnalyzer {
             typeof_seen: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             function_nesting_stack: Vec::new(),
+            prior_file_function_decls: FxHashMap::default(),
             no_builtins: false,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             pre_c99: false,
@@ -490,6 +497,7 @@ impl SemanticAnalyzer {
     /// the file-scope rule). A separate record keyed by the mangled
     /// `parent.nested` name is added for the lowerer.
     fn analyze_nested_function_def(&mut self, func: &FunctionDef) {
+        let calling_convention = self.function_definition_cc(func);
         let parent = self
             .function_nesting_stack
             .last()
@@ -508,6 +516,7 @@ impl SemanticAnalyzer {
 
         let prototype = if func.has_prototype {
             Some(FunctionType {
+                calling_convention,
                 return_type: return_type.clone(),
                 params: params.clone(),
                 variadic: func.variadic,
@@ -525,6 +534,7 @@ impl SemanticAnalyzer {
                 })
         };
         let mut func_info = FunctionInfo {
+            calling_convention,
             return_type: return_type.clone(),
             params: params.clone(),
             variadic: func.variadic,
@@ -640,7 +650,93 @@ impl SemanticAnalyzer {
         self.symbol_table.pop_scope();
     }
 
+    // An absent ABI inherits a prior declaration. Explicit sysv_abi is NOT
+    // absence: it must conflict with a visible Microsoft ABI declaration.
+    fn function_definition_cc(
+        &self,
+        func: &FunctionDef,
+    ) -> crate::common::types::CallingConvention {
+        let prior = self.symbol_table.lookup_current(&func.name).and_then(|s| {
+            if let CType::Function(ft) = &s.ty {
+                Some(ft.calling_convention)
+            } else {
+                None
+            }
+        });
+        if let (Some(written), Some(prior)) = (func.calling_convention, prior) {
+            if written != prior {
+                self.diagnostics.borrow_mut().error(
+                    format!("conflicting calling convention for '{}'", func.name),
+                    func.span,
+                );
+            }
+        }
+        func.calling_convention.or(prior).unwrap_or_default()
+    }
+
+    fn check_ms_scalar_signature(
+        &self,
+        cc: crate::common::types::CallingConvention,
+        ret: &CType,
+        params: &[(CType, Option<String>)],
+        _variadic_definition: bool,
+        span: Span,
+    ) {
+        if cc != crate::common::types::CallingConvention::MicrosoftX64 {
+            return;
+        }
+        let supported = |ct: &CType| {
+            matches!(
+                ct,
+                CType::Void | CType::Pointer(..) | CType::Float | CType::Double
+            ) || (ct.is_integer() && ct.size() <= 8)
+        };
+        let record_size =
+            |ct: &CType| ct.size_ctx(&*self.result.type_context.borrow_struct_layouts());
+        let supported_return = supported(ret)
+            || matches!(ret, CType::Int128 | CType::UInt128)
+            || (ret.is_struct_or_union() && record_size(ret) > 0);
+        let supported_parameter = |ct: &CType| {
+            supported(ct)
+                || matches!(ct, CType::Int128 | CType::UInt128)
+                || (ct.is_struct_or_union() && record_size(ct) > 0)
+        };
+        if !supported_return || params.iter().any(|(ct, _)| !supported_parameter(ct)) {
+            self.diagnostics.borrow_mut().error("Microsoft x64 wide-scalar lowering is not implemented yet; refusing an incorrect ABI".to_string(), span);
+        }
+    }
+
     fn analyze_function_def_inner(&mut self, func: &FunctionDef) {
+        use crate::common::error::WarningKind;
+        if !func.has_prototype {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                "old-style function definition".to_string(),
+                func.span,
+                WarningKind::OldStyleDefinition,
+            );
+        }
+        let prior = self.prior_file_function_decls.get(&func.name).copied();
+        if func.name != "main" && !func.attrs.is_static() && !func.attrs.is_inline() {
+            let mut diagnostics = self.diagnostics.borrow_mut();
+            // GCC diagnoses only the more specific prototype condition when
+            // both leaves are enabled, including independent -Werror controls.
+            if !prior.unwrap_or(false)
+                && diagnostics.warning_enabled_at(WarningKind::MissingPrototypes, func.span)
+            {
+                diagnostics.warning_with_kind(
+                    format!("no previous prototype for '{}'", func.name),
+                    func.span,
+                    WarningKind::MissingPrototypes,
+                );
+            } else if prior.is_none() {
+                diagnostics.warning_with_kind(
+                    format!("no previous declaration for '{}'", func.name),
+                    func.span,
+                    WarningKind::MissingDeclarations,
+                );
+            }
+        }
+        let calling_convention = self.function_definition_cc(func);
         let return_type = self.function_def_return_ctype(func);
         if func.is_kr {
             for p in &func.params {
@@ -661,6 +757,14 @@ impl SemanticAnalyzer {
             .map(|p| (self.param_decl_ctype(p), p.name.clone()))
             .collect();
 
+        self.check_ms_scalar_signature(
+            calling_convention,
+            &return_type,
+            &params,
+            func.variadic,
+            func.span,
+        );
+
         // Preserve noreturn from a prior declaration (e.g., the prototype may have
         // __attribute__((noreturn)) even if the definition doesn't repeat it).
         let (prior_noreturn, prior_base_const, prior_levels) = self
@@ -676,6 +780,7 @@ impl SemanticAnalyzer {
             });
         let prototype = if func.has_prototype {
             Some(FunctionType {
+                calling_convention,
                 return_type: return_type.clone(),
                 params: params.clone(),
                 variadic: func.variadic,
@@ -688,6 +793,7 @@ impl SemanticAnalyzer {
                 .and_then(|info| info.prototype.clone())
         };
         let func_info = FunctionInfo {
+            calling_convention,
             return_type: return_type.clone(),
             params: params.clone(),
             variadic: func.variadic,
@@ -940,8 +1046,8 @@ impl SemanticAnalyzer {
     /// The parameter lists inside a declarator's function derivations.
     fn check_void_derived_params(&self, derived: &[DerivedDeclarator], span: Span) {
         for d in derived {
-            if let DerivedDeclarator::Function(params, variadic, _)
-            | DerivedDeclarator::FunctionPointer(params, variadic, _) = d
+            if let DerivedDeclarator::Function(params, variadic, _, _)
+            | DerivedDeclarator::FunctionPointer(params, variadic, _, _) = d
             {
                 self.check_void_params(params, *variadic, span);
             }
@@ -1141,7 +1247,7 @@ impl SemanticAnalyzer {
                     // Function typedef like `typedef int func_t(int x);` or
                     // `typedef int (*fn_t(int))(char);`. The typedef's own
                     // parameter list is the LAST derived.
-                    if let Some(DerivedDeclarator::Function(params, variadic, has_prototype)) =
+                    if let Some(DerivedDeclarator::Function(params, variadic, has_prototype, abi)) =
                         declarator.derived.last()
                     {
                         let return_type = super::type_context::build_prefix_return_type_spec(
@@ -1152,6 +1258,7 @@ impl SemanticAnalyzer {
                         self.result.type_context.function_typedefs.insert(
                             declarator.name.clone(),
                             FunctionTypedefInfo {
+                                calling_convention: abi.unwrap_or_default(),
                                 return_type,
                                 params: params.clone(),
                                 variadic: *variadic,
@@ -1374,6 +1481,26 @@ impl SemanticAnalyzer {
                     &init_decl.derived,
                 )
             };
+            if let CType::Function(ft) = &mut full_type {
+                let prior = if init_decl.attrs.is_nested_fn() {
+                    self.symbol_table.lookup_current(&init_decl.name)
+                } else {
+                    self.symbol_table.lookup(&init_decl.name)
+                };
+                if let Some(CType::Function(previous)) = prior.map(|s| &s.ty) {
+                    if matches!(
+                        init_decl.derived.last(),
+                        Some(DerivedDeclarator::Function(_, _, _, None))
+                    ) {
+                        ft.calling_convention = previous.calling_convention;
+                    } else if ft.calling_convention != previous.calling_convention {
+                        self.diagnostics.borrow_mut().error(
+                            format!("conflicting calling convention for '{}'", init_decl.name),
+                            init_decl.span,
+                        );
+                    }
+                }
+            }
             // The declaration-level named address space (`struct c __seg_gs *p`,
             // `struct c __seg_gs *f(void)`) qualifies the pointer it sits on.
             // Lowering applies the same rule (stmt.rs / global_decl.rs); sema must
@@ -1430,6 +1557,13 @@ impl SemanticAnalyzer {
 
             // Check if this is a function declaration (prototype)
             if let CType::Function(ref ft) = full_type {
+                if is_global {
+                    let entry = self
+                        .prior_file_function_decls
+                        .entry(init_decl.name.clone())
+                        .or_default();
+                    *entry |= ft.has_prototype;
+                }
                 let is_noreturn = init_decl.attrs.is_noreturn();
                 let prototype = ft.has_prototype.then(|| ft.as_ref().clone());
                 // A declaration inside a function body describes that body's view of
@@ -1484,6 +1618,7 @@ impl SemanticAnalyzer {
                                 self.result.functions.insert(
                                     mangled,
                                     FunctionInfo {
+                                        calling_convention: ft.calling_convention,
                                         return_type: ft.return_type.clone(),
                                         params: ft.params.clone(),
                                         variadic: ft.variadic,
@@ -1561,6 +1696,7 @@ impl SemanticAnalyzer {
                     self.result.functions.insert(
                         init_decl.name.clone(),
                         FunctionInfo {
+                            calling_convention: ft.calling_convention,
                             return_type: ft.return_type.clone(),
                             params: ft.params.clone(),
                             variadic: ft.variadic,
@@ -3642,6 +3778,16 @@ impl SemanticAnalyzer {
                 let checker = self.expr_type_checker();
                 if let Some(inner_ty) = checker.infer_expr_ctype(inner) {
                     let target_ty = self.type_spec_to_ctype(ts);
+                    if super::function_pointer_cast::incompatible(&inner_ty, &target_ty) {
+                        self.diagnostics.borrow_mut().warning_with_kind(
+                            format!(
+                                "cast between incompatible function types from '{}' to '{}'",
+                                inner_ty, target_ty
+                            ),
+                            *span,
+                            crate::common::error::WarningKind::CastFunctionType,
+                        );
+                    }
                     if Self::is_vector_scalar_size_mismatch(&inner_ty, &target_ty) {
                         // GCC's two messages: scalar -> vector is "cannot
                         // convert a value of type 'int' to vector type
@@ -3912,6 +4058,7 @@ impl SemanticAnalyzer {
             }
             if builtins::is_builtin(name) {
                 self.check_builtin_vector_arguments(name, args);
+                self.check_ms_varargs_builtin(name, args, *callee_span);
                 // A builtin under its own name carries no prototype, so
                 // nothing below could check the call and lowering used
                 // to pass whatever the user wrote straight through to
@@ -3960,6 +4107,7 @@ impl SemanticAnalyzer {
                     crate::common::error::WarningKind::ImplicitFunctionDeclaration,
                 );
                 let func_info = FunctionInfo {
+                    calling_convention: Default::default(),
                     return_type: CType::Int, // implicit return int
                     params: Vec::new(),
                     variadic: true, // unknown params
@@ -4034,6 +4182,32 @@ impl SemanticAnalyzer {
         // An empty prototype (`f(void)` in every dialect, or `f()` in C23)
         // still constrains calls to zero arguments. An unprototyped function
         // retains the legacy default-argument-promotion behavior.
+        if let Some(ft) = &signature {
+            self.check_ms_scalar_signature(
+                ft.calling_convention,
+                &ft.return_type,
+                &ft.params,
+                false,
+                expr.span(),
+            );
+            if ft.calling_convention == crate::common::types::CallingConvention::MicrosoftX64 {
+                let actual: Vec<_> = args
+                    .iter()
+                    .filter_map(|a| {
+                        self.expr_type_checker()
+                            .infer_expr_ctype(a)
+                            .map(|ct| (ct.decayed_value_ctype(), None))
+                    })
+                    .collect();
+                self.check_ms_scalar_signature(
+                    ft.calling_convention,
+                    &ft.return_type,
+                    &actual,
+                    false,
+                    expr.span(),
+                );
+            }
+        }
         if let Some(ft) = signature.filter(|ft| ft.has_prototype) {
             let name = match callee {
                 Expr::Identifier(name, _) => name.as_str(),
@@ -4391,6 +4565,61 @@ impl SemanticAnalyzer {
     /// Keep native vector arguments out of scalar/address positions and require
     /// each vector source's own width (not the destination width for widening).
     /// This prevents malformed raw calls reaching pointer-backed SIMD emission.
+    /// Microsoft cursors are char pointers, not SysV array-of-record lists.
+    /// Check before lowering, including syntax-only compilations.
+    fn check_ms_varargs_builtin(&self, name: &str, args: &[Expr], span: Span) {
+        let ms_builtin = matches!(
+            name,
+            "__builtin_ms_va_start" | "__builtin_ms_va_end" | "__builtin_ms_va_copy"
+        );
+        if !ms_builtin && name != "__builtin_va_start" {
+            return;
+        }
+        let function_name = self.function_nesting_stack.join(".");
+        let current = self.result.functions.get(&function_name);
+        let microsoft = current.is_some_and(|f| {
+            f.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+        });
+        let message = if name == "__builtin_va_start" && microsoft {
+            Some("use __builtin_ms_va_start in a Microsoft variadic function")
+        } else if name == "__builtin_ms_va_start"
+            && (!microsoft || !current.is_some_and(|f| f.variadic))
+        {
+            Some("__builtin_ms_va_start requires a Microsoft variadic function")
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            self.diagnostics
+                .borrow_mut()
+                .error(message.to_string(), span);
+        }
+        if !ms_builtin {
+            return;
+        }
+        let valid_count = match name {
+            "__builtin_ms_va_start" => (1..=2).contains(&args.len()),
+            "__builtin_ms_va_copy" => args.len() == 2,
+            _ => args.len() == 1,
+        };
+        if !valid_count {
+            self.diagnostics
+                .borrow_mut()
+                .error(format!("invalid argument count for '{name}'"), span);
+            return;
+        }
+        let cursor_args = if name == "__builtin_ms_va_copy" { 2 } else { 1 };
+        for arg in args.iter().take(cursor_args) {
+            let ty = self.expr_type_checker().infer_expr_ctype(arg);
+            if !matches!(ty, Some(CType::Pointer(ref inner, _)) if **inner == CType::plain_char()) {
+                self.diagnostics.borrow_mut().error(
+                    format!("'{name}' requires a Microsoft char-pointer va_list"),
+                    arg.span(),
+                );
+            }
+        }
+    }
+
     fn check_builtin_vector_arguments(&self, name: &str, args: &[Expr]) {
         let Some(widths) = crate::common::x86_builtin_types::argument_vector_widths(name) else {
             return;
@@ -10089,6 +10318,7 @@ dereference it before applying '->' to it?"
         for (name, ret_type, variadic) in &implicit_funcs {
             let is_noreturn = matches!(*name, "exit" | "abort" | "_Exit" | "quick_exit");
             let func_info = FunctionInfo {
+                calling_convention: Default::default(),
                 return_type: ret_type.clone(),
                 params: Vec::new(),
                 variadic: *variadic,
@@ -11165,6 +11395,7 @@ mod pointer_argument_compat_tests {
     /// ignores them: C23 6.7.6.3p15 keeps names out of the type.
     fn sig(ret: CType, params: Vec<CType>, named: bool) -> CType {
         CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: ret,
             params: params
                 .into_iter()

@@ -27,6 +27,7 @@ use std::rc::Rc;
 /// to resolve function declarations through typedefs).
 #[derive(Debug, Clone)]
 pub struct FunctionTypedefInfo {
+    pub calling_convention: crate::common::types::CallingConvention,
     /// The return TypeSpecifier of the function typedef
     pub return_type: TypeSpecifier,
     /// Parameters of the function typedef
@@ -52,14 +53,19 @@ pub fn build_prefix_return_type_spec(
     while i < prefix.len() {
         match &prefix[i] {
             DerivedDeclarator::Pointer(..) => {
-                if let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) =
-                    prefix.get(i + 1)
+                if let Some(DerivedDeclarator::FunctionPointer(
+                    params,
+                    variadic,
+                    has_prototype,
+                    abi,
+                )) = prefix.get(i + 1)
                 {
                     return_type = TypeSpecifier::FunctionPointer(
                         Box::new(return_type),
                         params.clone(),
                         *variadic,
                         *has_prototype,
+                        abi.unwrap_or_default(),
                     );
                     i += 2;
                 } else {
@@ -70,12 +76,13 @@ pub fn build_prefix_return_type_spec(
                     i += 1;
                 }
             }
-            DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
+            DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi) => {
                 return_type = TypeSpecifier::FunctionPointer(
                     Box::new(return_type),
                     params.clone(),
                     *variadic,
                     *has_prototype,
+                    abi.unwrap_or_default(),
                 );
                 i += 1;
             }
@@ -112,7 +119,8 @@ pub fn extract_fptr_typedef_info(
     base_type: &TypeSpecifier,
     derived: &[DerivedDeclarator],
 ) -> Option<FunctionTypedefInfo> {
-    let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) = derived.last()
+    let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi)) =
+        derived.last()
     else {
         return None;
     };
@@ -126,6 +134,7 @@ pub fn extract_fptr_typedef_info(
     };
     let return_type = build_prefix_return_type_spec(base_type, derived, prefix_len);
     Some(FunctionTypedefInfo {
+        calling_convention: abi.unwrap_or_default(),
         return_type,
         params: params.clone(),
         variadic: *variadic,
@@ -549,6 +558,61 @@ impl TypeContext {
         ];
         for (name, ct) in builtins {
             self.typedefs.insert(name.to_string(), ct.clone());
+        }
+        if crate::common::types::target_elf_machine() == 62 {
+            // Keep the SysV record distinct from Microsoft's char* cursor.
+            // A char[24] approximation makes a decayed SysV parameter
+            // indistinguishable from __builtin_ms_va_list in va_arg.
+            let tag = "__lccc_builtin_sysv_va_list";
+            let mut layout = StructLayout::empty();
+            layout.is_complete = true;
+            layout.size = 24;
+            layout.align = 8;
+            layout.fields = [
+                ("gp_offset", 0, CType::UInt),
+                ("fp_offset", 4, CType::UInt),
+                (
+                    "overflow_arg_area",
+                    8,
+                    CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
+                ),
+                (
+                    "reg_save_area",
+                    16,
+                    CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
+                ),
+            ]
+            .into_iter()
+            .map(
+                |(name, offset, ty)| crate::common::types::StructFieldLayout {
+                    name: name.to_string(),
+                    offset,
+                    ty,
+                    bit_offset: None,
+                    bit_width: None,
+                    sso: Default::default(),
+                    sso_storage_ty: None,
+                    base_volatile: false,
+                    base_const: false,
+                    object_volatile: false,
+                    object_const: false,
+                    counted_by: None,
+                    pointer_quals: Vec::new(),
+                    own_cvr: Some(0),
+                },
+            )
+            .collect();
+            self.struct_layouts
+                .borrow_mut()
+                .insert(tag.to_string(), Rc::new(layout));
+            let sysv = CType::Array(Box::new(CType::Struct(tag.into())), Some(1));
+            for name in ["va_list", "__builtin_va_list", "__gnuc_va_list"] {
+                self.typedefs.insert(name.to_string(), sysv.clone());
+            }
+            self.typedefs.insert(
+                "__builtin_ms_va_list".to_string(),
+                CType::Pointer(Box::new(CType::plain_char()), PtrQuals::GENERIC),
+            );
         }
     }
 

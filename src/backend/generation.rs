@@ -5574,9 +5574,18 @@ pub(crate) fn x86_inline_memset_len(func: &str, info: &CallInfo) -> Option<usize
 /// `-fpatchable-function-entry` with and without a leading pad, and the
 /// non-function-section path -- goes through here.
 fn fn_entry_align_log2(cg: &dyn ArchCodegen, attr: Option<Option<u32>>) -> Option<u32> {
-    match attr {
+    let preferred = match attr {
         Some(fixed) => fixed,
         None => cg.function_alignment_log2(),
+    };
+    let minimum = cg.state_ref().min_function_alignment;
+    // GCC 16 rounds this option DOWN to a power of two (17 means 16),
+    // unlike the optimization hint's alignment grammar. An explicit aligned(1)
+    // suppresses the hint, but cannot suppress this unconditional floor.
+    if minimum > 1 {
+        preferred.max(Some(minimum.ilog2()))
+    } else {
+        preferred
     }
 }
 
@@ -5591,6 +5600,8 @@ fn generate_function(
     source_mgr: Option<&SourceManager>,
     file_table: &FxHashMap<String, u32>,
 ) {
+    let physical = cg.legalize_function_abi(func);
+    let func = physical.as_ref();
     cg.set_function_target_features(&func.target_features);
     let mark = cg.state_ref().out.buf.len();
     generate_function_body(cg, attr_align, func, source_mgr, file_table);
@@ -5935,7 +5946,8 @@ fn generate_function_body(
             })
             .fold(0usize, |acc, s| acc.saturating_add(s))
             > 12_288;
-    cg.state().omit_frame_pointer = cg.state().fpo_requested
+    cg.state().omit_frame_pointer = func.calling_convention == crate::common::types::CallingConvention::Default
+        && cg.state().fpo_requested
         && !has_dyn_alloca
         && !large_clash_frame
         && !has_inline_asm_fp
@@ -7859,6 +7871,7 @@ fn generate_instruction_body(
                 &info.struct_arg_riscv_float_classes,
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
+                info.calling_convention,
                 info.is_fastcall,
                 info.regparm,
                 &info.ret_eightbyte_classes,
@@ -7888,6 +7901,7 @@ fn generate_instruction_body(
                 &info.struct_arg_riscv_float_classes,
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
+                info.calling_convention,
                 info.is_fastcall,
                 info.regparm,
                 &info.ret_eightbyte_classes,

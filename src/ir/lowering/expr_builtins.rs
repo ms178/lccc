@@ -44,6 +44,119 @@ enum CpuSupport {
 }
 
 impl Lowerer {
+    fn try_lower_varargs_builtin(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        // Handle va_start/va_end/va_copy specially.
+        // These builtins need a pointer to the va_list struct.
+        // Use lower_va_list_pointer which correctly handles both local va_list
+        // variables (array type, needs address-of) and va_list parameters
+        // (pointer type after array-to-pointer decay, needs value load).
+        if let Some(value) = self.try_lower_ms_varargs_builtin(name, args) {
+            return Some(value);
+        }
+        match name {
+            "__builtin_va_start" => {
+                if self
+                    .func_state
+                    .as_ref()
+                    .and_then(|f| self.sema_functions.get(&f.name))
+                    .is_some_and(|f| {
+                        f.calling_convention
+                            == crate::common::types::CallingConvention::MicrosoftX64
+                    })
+                {
+                    self.emit_error(
+                        "use __builtin_ms_va_start in a Microsoft variadic function",
+                        args.first()
+                            .map(|a| a.span())
+                            .unwrap_or_else(crate::common::source::Span::dummy),
+                    );
+                    return Some(Operand::Const(IrConst::I64(0)));
+                }
+                if let Some(ap_expr) = args.first() {
+                    let ap_ptr_op = self.lower_va_list_pointer(ap_expr);
+                    let ap_ptr = self.operand_to_value(ap_ptr_op);
+                    self.emit(Instruction::VaStart {
+                        va_list_ptr: ap_ptr,
+                    });
+                }
+                return Some(Operand::Const(IrConst::I64(0)));
+            }
+            "__builtin_va_end" => {
+                if let Some(ap_expr) = args.first() {
+                    let ap_ptr_op = self.lower_va_list_pointer(ap_expr);
+                    let ap_ptr = self.operand_to_value(ap_ptr_op);
+                    self.emit(Instruction::VaEnd {
+                        va_list_ptr: ap_ptr,
+                    });
+                }
+                return Some(Operand::Const(IrConst::I64(0)));
+            }
+            "__builtin_va_copy" => {
+                if args.len() >= 2 {
+                    let dest_op = self.lower_va_list_pointer(&args[0]);
+                    let src_op = self.lower_va_list_pointer(&args[1]);
+                    let dest_ptr = self.operand_to_value(dest_op);
+                    let src_ptr = self.operand_to_value(src_op);
+                    self.emit(Instruction::VaCopy { dest_ptr, src_ptr });
+                }
+                return Some(Operand::Const(IrConst::I64(0)));
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    fn try_lower_ms_varargs_builtin(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        match name {
+            "__builtin_ms_va_start" => {
+                if let Some(ap) = args.first() {
+                    let current = self
+                        .func_state
+                        .as_ref()
+                        .and_then(|f| self.sema_functions.get(&f.name));
+                    if !current.is_some_and(|f| {
+                        f.calling_convention
+                            == crate::common::types::CallingConvention::MicrosoftX64
+                            && f.variadic
+                    }) {
+                        self.emit_error(
+                            "__builtin_ms_va_start requires a Microsoft variadic function",
+                            ap.span(),
+                        );
+                    } else {
+                        let address = self.lower_address_of(ap);
+                        let va_list_ptr = self.operand_to_value(address);
+                        self.emit(Instruction::VaStart { va_list_ptr });
+                    }
+                }
+                return Some(Operand::Const(IrConst::I64(0)));
+            }
+            "__builtin_ms_va_copy" => {
+                if args.len() >= 2 {
+                    let cursor = self.lower_expr(&args[1]);
+                    let address = self.lower_address_of(&args[0]);
+                    let ptr = self.operand_to_value(address);
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val: cursor,
+                        ptr,
+                        ty: IrType::Ptr,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                    });
+                }
+                return Some(Operand::Const(IrConst::I64(0)));
+            }
+            "__builtin_ms_va_end" => {
+                if let Some(ap) = args.first() {
+                    self.lower_expr(ap);
+                }
+                return Some(Operand::Const(IrConst::I64(0)));
+            }
+            _ => None,
+        }
+    }
+
     /// Determine the return type for creal/crealf/creall/cimag/cimagf/cimagl based on function name.
     pub(super) fn creal_return_type(name: &str) -> IrType {
         match name {
@@ -320,43 +433,8 @@ impl Lowerer {
             }
             _ => {}
         }
-        // Handle va_start/va_end/va_copy specially.
-        // These builtins need a pointer to the va_list struct.
-        // Use lower_va_list_pointer which correctly handles both local va_list
-        // variables (array type, needs address-of) and va_list parameters
-        // (pointer type after array-to-pointer decay, needs value load).
-        match name {
-            "__builtin_va_start" => {
-                if let Some(ap_expr) = args.first() {
-                    let ap_ptr_op = self.lower_va_list_pointer(ap_expr);
-                    let ap_ptr = self.operand_to_value(ap_ptr_op);
-                    self.emit(Instruction::VaStart {
-                        va_list_ptr: ap_ptr,
-                    });
-                }
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-            "__builtin_va_end" => {
-                if let Some(ap_expr) = args.first() {
-                    let ap_ptr_op = self.lower_va_list_pointer(ap_expr);
-                    let ap_ptr = self.operand_to_value(ap_ptr_op);
-                    self.emit(Instruction::VaEnd {
-                        va_list_ptr: ap_ptr,
-                    });
-                }
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-            "__builtin_va_copy" => {
-                if args.len() >= 2 {
-                    let dest_op = self.lower_va_list_pointer(&args[0]);
-                    let src_op = self.lower_va_list_pointer(&args[1]);
-                    let dest_ptr = self.operand_to_value(dest_op);
-                    let src_ptr = self.operand_to_value(src_op);
-                    self.emit(Instruction::VaCopy { dest_ptr, src_ptr });
-                }
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-            _ => {}
+        if let Some(value) = self.try_lower_varargs_builtin(name, args) {
+            return Some(value);
         }
 
         // __builtin_expect(exp, c) - branch prediction hint.
@@ -603,6 +681,7 @@ impl Lowerer {
                         struct_arg_riscv_float_classes: Vec::new(),
                         struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
+                        calling_convention: crate::common::types::CallingConvention::Default,
                         is_fastcall: false,
                         regparm: None,
                         is_pure: false,
@@ -1779,6 +1858,7 @@ impl Lowerer {
                         struct_arg_riscv_float_classes: Vec::new(),
                         struct_arg_is_f128_sse: Vec::new(),
                         is_sret: false,
+                        calling_convention: crate::common::types::CallingConvention::Default,
                         is_fastcall: false,
                         regparm: None,
                         is_pure: false,
@@ -2052,6 +2132,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,

@@ -573,7 +573,9 @@ fn default_argument_promotion(ty: &CType) -> CType {
 /// The `params` stored on an unprototyped K&R definition describe its body,
 /// not its visible function type, so they are intentionally ignored here.
 fn function_types_compatible(a: &FunctionType, b: &FunctionType) -> bool {
-    if !ctypes_compatible(&a.return_type, &b.return_type) {
+    if a.calling_convention != b.calling_convention
+        || !ctypes_compatible(&a.return_type, &b.return_type)
+    {
         return false;
     }
 
@@ -661,6 +663,7 @@ fn composite_function_type(a: &FunctionType, b: &FunctionType) -> Option<Functio
     };
 
     Some(FunctionType {
+        calling_convention: a.calling_convention,
         return_type,
         params,
         variadic,
@@ -983,8 +986,18 @@ impl ExtVectorLayout {
     }
 }
 
+/// Calling convention is part of the FUNCTION type, including through pointers,
+/// typedefs, composites and indirect calls. It is not a property of a name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CallingConvention {
+    #[default]
+    Default,
+    MicrosoftX64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionType {
+    pub calling_convention: CallingConvention,
     pub return_type: CType,
     pub params: Vec<(CType, Option<String>)>,
     pub variadic: bool,
@@ -4065,7 +4078,9 @@ impl CType {
                             })
                     }
                 };
-                params_compatible && a.return_type.generic_association_matches(&b.return_type)
+                a.calling_convention == b.calling_convention
+                    && params_compatible
+                    && a.return_type.generic_association_matches(&b.return_type)
             }
             _ => self == assoc,
         }
@@ -5114,6 +5129,7 @@ mod conditional_type_tests {
     #[test]
     fn function_pointer_composite_keeps_prototype_from_either_arm() {
         let unprototyped = CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: CType::Int,
             // Body parameters on an unprototyped K&R definition are not a
             // prototype and do not constrain calls through its function type.
@@ -5122,6 +5138,7 @@ mod conditional_type_tests {
             has_prototype: false,
         }));
         let prototype = CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: CType::Int,
             params: Vec::new(),
             variadic: false,
@@ -5337,6 +5354,7 @@ mod pointer_qualifier_contract_tests {
     fn function_qualification_is_significant_but_parameter_names_are_not() {
         let function = |param, name: &str, ret| {
             CType::Function(Box::new(FunctionType {
+                calling_convention: crate::common::types::CallingConvention::Default,
                 return_type: ret,
                 params: vec![(param, Some(name.into()))],
                 variadic: false,

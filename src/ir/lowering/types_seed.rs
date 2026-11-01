@@ -180,8 +180,8 @@ impl Lowerer {
                 CType::Array(Box::new(CType::Char), Some(32))
             }
             Target::X86_64 => {
-                // x86-64: va_list is __va_list_tag[1], 24 bytes, represented as char[24]
-                CType::Array(Box::new(CType::Char), Some(24))
+                // Shared with sema: a real record, not a char-array stand-in.
+                self.types.typedefs["__builtin_va_list"].clone()
             }
             Target::I686 => {
                 // i686 cdecl: va_list = char* (simple pointer to stack args)

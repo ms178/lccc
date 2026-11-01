@@ -35,13 +35,16 @@ VERDICT = re.compile(
     r"\bFAIL\b|\berror\b|\bError\b|mismatch|panicked|Traceback|AssertionError"
     r"|^Err:|^E:|^W:.*[Ff]ailed"
 )
+# Compiler warnings often quote "-Werror" or "make this an error". They
+# must not displace the actual fatal diagnostic in a large parallel build.
+WARNING_DIAGNOSTIC = re.compile(r"^(?:.*?:\s*)?warning:")
 LIMIT = 4000
 
 
 def select(lines: list[str], context: int, tail: int) -> list[str]:
     keep = [False] * len(lines)
     for i, line in enumerate(lines):
-        if VERDICT.search(line):
+        if VERDICT.search(line) and not WARNING_DIAGNOSTIC.match(line):
             for j in range(i, min(len(lines), i + 1 + context)):
                 keep[j] = True
     chosen = [line for line, k in zip(lines, keep) if k]
@@ -92,9 +95,9 @@ def main() -> int:
         return 0
     chunks = pack(select(lines, args.context, args.tail), LIMIT)
     if len(chunks) > args.max:
-        # Keep the verdict-bearing end of the output: a gate that lists many
-        # failures states its summary last.
-        chunks = chunks[-args.max :]
+        # Keep the first cause AND the final summary. Parallel make can
+        # print thousands of lines between a compiler error and "Error 2".
+        chunks = chunks[:1] if args.max <= 1 else [chunks[0], *chunks[-(args.max - 1):]]
     total = len(chunks)
     for index, chunk in enumerate(chunks, 1):
         title = args.title if total == 1 else f"{args.title} [{index}/{total}]"

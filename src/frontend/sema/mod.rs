@@ -14,3 +14,5 @@ pub(crate) mod void_declarators;
 
 pub(crate) use analysis::{ExprTypeMap, FunctionInfo, SemanticAnalyzer};
 pub(crate) use const_eval::ConstMap;
+
+mod function_pointer_cast;

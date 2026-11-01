@@ -1984,13 +1984,34 @@ impl Lowerer {
         Vec::new()
     }
 
+    fn copy_ms_record_arguments(
+        &mut self,
+        arg_vals: &mut [Operand],
+        struct_arg_sizes: &[Option<usize>],
+    ) {
+        for (index, size) in struct_arg_sizes.iter().enumerate() {
+            if let Some(size) = *size {
+                if !matches!(size, 1 | 2 | 4 | 8) {
+                    let copy = self.emit_entry_alloca(IrType::Ptr, size.max(1), 16, false);
+                    let source = self.operand_to_value(arg_vals[index].clone());
+                    self.emit(Instruction::Memcpy {
+                        dest: copy,
+                        src: source,
+                        size,
+                    });
+                    arg_vals[index] = Operand::Value(copy);
+                }
+            }
+        }
+    }
+
     /// Emit the actual call instruction (direct, indirect via fptr, or general indirect).
     /// Returns the effective return type for narrowing.
     fn emit_call_instruction(
         &mut self,
         func: &Expr,
         dest: Value,
-        arg_vals: Vec<Operand>,
+        mut arg_vals: Vec<Operand>,
         arg_types: Vec<IrType>,
         struct_arg_sizes: Vec<Option<usize>>,
         struct_arg_aligns: Vec<Option<usize>>,
@@ -2001,6 +2022,10 @@ impl Lowerer {
         num_fixed_args: usize,
         ret_abi: &AggregateReturn,
     ) -> IrType {
+        let calling_convention = self.callee_calling_convention(func);
+        if calling_convention == crate::common::types::CallingConvention::MicrosoftX64 {
+            self.copy_ms_record_arguments(&mut arg_vals, &struct_arg_sizes);
+        }
         let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
         if ret_abi.two_reg_size.is_some() {
             indirect_ret_ty = IrType::I128;
@@ -2030,6 +2055,7 @@ impl Lowerer {
                             struct_arg_riscv_float_classes,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
+                            calling_convention,
                             is_fastcall: false,
                             regparm: None,
                             is_pure: false,
@@ -2071,7 +2097,8 @@ impl Lowerer {
                     }
                     let is_pure = self.pure_functions.contains(name.as_str());
                     let is_const = self.const_functions.contains(name.as_str());
-                    let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
+                    let call_ret_is_f128_sse =
+                        ret_abi.one_xmm || sig.is_some_and(|s| s.ret_is_f128_sse);
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {
@@ -2087,6 +2114,7 @@ impl Lowerer {
                             struct_arg_riscv_float_classes,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
+                            calling_convention,
                             is_fastcall: callee_is_fastcall,
                             regparm: callee_regparm,
                             is_pure,
@@ -2144,6 +2172,7 @@ impl Lowerer {
                         struct_arg_riscv_float_classes: sarfc,
                         struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                         is_sret: ret_abi.sret_size.is_some(),
+                        calling_convention,
                         is_fastcall: false,
                         regparm: None,
                         is_pure: false,
@@ -2215,7 +2244,8 @@ impl Lowerer {
                     }
                     let is_pure = self.pure_functions.contains(call_name.as_str());
                     let is_const = self.const_functions.contains(call_name.as_str());
-                    let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
+                    let call_ret_is_f128_sse =
+                        ret_abi.one_xmm || sig.is_some_and(|s| s.ret_is_f128_sse);
                     self.emit(Instruction::Call {
                         func: call_name,
                         info: CallInfo {
@@ -2231,6 +2261,7 @@ impl Lowerer {
                             struct_arg_riscv_float_classes: sarfc,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
+                            calling_convention,
                             is_fastcall: callee_is_fastcall,
                             regparm: callee_regparm,
                             is_pure,
@@ -2258,6 +2289,7 @@ impl Lowerer {
                             struct_arg_riscv_float_classes: sarfc,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
+                            calling_convention,
                             is_fastcall: false,
                             regparm: None,
                             is_pure: false,

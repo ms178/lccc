@@ -7,6 +7,7 @@ pub(crate) mod const_eval;
 pub(crate) mod cpu_is_table;
 pub(crate) mod cpu_probe;
 pub(crate) mod decimal;
+pub(crate) mod diagnostic_pragma;
 pub(crate) mod encoding;
 pub(crate) mod error;
 pub(crate) mod forwarding;

@@ -3079,6 +3079,14 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 "-fno-align-loops" => self.align_loops = AlignControl::Off,
                 "-falign-jumps" => self.align_jumps = AlignControl::Auto,
                 "-fno-align-jumps" => self.align_jumps = AlignControl::Off,
+                arg if arg.starts_with("-fmin-function-alignment=") => {
+                    let value = &arg["-fmin-function-alignment=".len()..];
+                    self.min_function_alignment = value.parse::<u32>()
+                        .ok()
+                        .filter(|n| *n <= i32::MAX as u32 && !value.is_empty()
+                            && value.bytes().all(|b| b.is_ascii_digit()))
+                        .ok_or_else(|| format!("argument to '-fmin-function-alignment=' must be a non-negative integer no bigger than {}", i32::MAX))?;
+                }
                 "-falign-functions" => self.align_functions = AlignControl::Auto,
                 "-fno-align-functions" => self.align_functions = AlignControl::Off,
                 arg if arg.starts_with("-falign-loops=")
@@ -6181,6 +6189,7 @@ mod cli_tests {
             "-fvar-tracking-assignments",
             "-falign-loops=32",
             "-falign-functions=16",
+            "-fmin-function-alignment=16",
             "-funroll-loops",
             "-ftree-vectorize",
             "-fno-tree-vectorize",
@@ -6722,7 +6731,9 @@ mod prefetch_isa_tests {
             // vectorizer ceiling; the resolved SSE3 level must agree with
             // the predefines.
             let mut pp = crate::frontend::preprocessor::Preprocessor::new();
-            driver.configure_preprocessor(&mut pp);
+            driver
+                .configure_preprocessor(&mut pp)
+                .expect("valid preprocessor configuration");
             let probe: String = [
                 "__SSE2__",
                 "__SSE3__",

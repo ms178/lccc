@@ -119,6 +119,29 @@ class OracleDiagnostics(unittest.TestCase):
         self.assertIn(lines[1], chosen)
         self.assertIn(lines[-1], chosen)
 
+    def test_warning_policy_text_is_not_a_fatal_verdict(self):
+        lines = ["warning: unsupported option; make this an error"] * 1000
+        lines += ["unit.c:7: error: actual root cause"]
+        chosen = ci_annotate_log.select(lines, context=0, tail=40)
+        self.assertEqual(chosen, [lines[-1]])
+
+    def test_annotation_budget_preserves_first_cause_and_last_summary(self):
+        with tempfile.TemporaryDirectory() as work:
+            log = Path(work) / "kernel.log"
+            text = "unit.c:1: error: ROOT_CAUSE_SENTINEL\n"
+            text += "warning: unsupported option; make this an error\n" * 1000
+            text += "other.c:2: error: " + "x" * 300 + "\n"
+            text += ("other.c:3: error: " + "x" * 300 + "\n") * 100
+            text += "make: Error 2 FINAL_SUMMARY_SENTINEL\n"
+            log.write_text(text)
+            proc = subprocess.run(
+                ["python3", str(ROOT / "scripts/ci_annotate_log.py"),
+                 "--max", "2", "--context", "0", str(log)],
+                capture_output=True, text=True, check=True)
+            self.assertEqual(proc.stdout.count("::error title="), 2)
+            self.assertIn("ROOT_CAUSE_SENTINEL", proc.stdout)
+            self.assertIn("FINAL_SUMMARY_SENTINEL", proc.stdout)
+
     def test_success_never_emits_failure_annotation(self):
         """A clean install prints no `::error`, so Checks stays quiet."""
         with tempfile.TemporaryDirectory() as name:

@@ -791,6 +791,13 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_va_start",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::VaStart),
     );
+    for (name, intrinsic) in [
+        ("__builtin_ms_va_start", BuiltinIntrinsic::VaStart),
+        ("__builtin_ms_va_end", BuiltinIntrinsic::VaEnd),
+        ("__builtin_ms_va_copy", BuiltinIntrinsic::VaCopy),
+    ] {
+        m.insert(name, BuiltinInfo::intrinsic(intrinsic));
+    }
     m.insert(
         "__builtin_va_end",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::VaEnd),

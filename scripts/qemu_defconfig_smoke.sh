@@ -67,7 +67,7 @@ publish "$work/qemu.err" "$BOOT_LOG.qemu-err"
 [[ -f "$serial" ]] || { echo "QEMU produced no serial log (status=$rc)" >&2; exit 1; }
 sed -i 's/\r$//' "$serial"
 publish "$serial" "$BOOT_LOG"
-for marker in '^LCCC_DEFCFG_BOOT_BEGIN$' '^LCCC_DEFCFG_CPUS=2$' '^LCCC_DEFCFG_SERIAL=the quick brown fox 0123456789 !\?$' '^LCCC_DEFCFG_BOOT_PASS$' 'reboot: Power down'; do
+for marker in 'Linux version .*lccc' '^LCCC_DEFCFG_BOOT_BEGIN$' '^LCCC_DEFCFG_CPUS=2$' '^LCCC_DEFCFG_SERIAL=the quick brown fox 0123456789 !\?$' '^LCCC_DEFCFG_BOOT_PASS$' 'reboot: Power down'; do
   grep -qE "$marker" "$BOOT_LOG" || { echo "missing marker: $marker" >&2; tail -100 "$BOOT_LOG"; exit 1; }
 done
 if grep -qE 'LCCC_SMOKE_FAIL|Kernel panic|Oops:' "$BOOT_LOG"; then echo 'kernel error in serial log' >&2; exit 1; fi

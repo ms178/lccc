@@ -320,6 +320,7 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_diagnose_as: Option<String>,
     /// `__attribute__((regparm(N)))` register-argument count.
     pub parsing_regparm: Option<u8>,
+    pub parsing_calling_convention: Option<crate::common::types::CallingConvention>,
     /// `__attribute__((stack_protect))` encountered.
     pub parsing_stack_protect: bool,
     /// `__attribute__((no_stack_protector))` encountered.
@@ -1283,6 +1284,7 @@ impl Parser {
             // <stdarg.h>
             "va_list",
             "__builtin_va_list",
+            "__builtin_ms_va_list",
             "__gnuc_va_list",
             // <locale.h>
             "locale_t",
@@ -2300,7 +2302,12 @@ impl Parser {
             // The attribute names the convention this target already emits.
             // Applying nothing is the whole implementation, and gcc is silent
             // here too, so silence is parity as well as correctness.
-            AbiEffect::Default => {}
+            AbiEffect::Default => {
+                if spelling == "sysv_abi" && !is_32bit {
+                    self.attrs.parsing_calling_convention =
+                        Some(crate::common::types::CallingConvention::Default);
+                }
+            }
             // Unreachable: `abi_effect` hands implemented conventions back to
             // the dispatcher instead of returning a verdict for them. Kept
             // explicit so a future table edit cannot silently swallow one.
@@ -2398,9 +2405,10 @@ impl Parser {
         explicit_only: bool,
     ) {
         if explicit_only
-            && !self
-                .diagnostics
-                .warning_explicitly_requested(crate::common::error::WarningKind::Attributes)
+            && !self.diagnostics.warning_explicitly_requested_at(
+                crate::common::error::WarningKind::Attributes,
+                span,
+            )
         {
             return;
         }
@@ -2645,6 +2653,21 @@ impl Parser {
             return;
         }
         match name {
+            "ms_abi" | "__ms_abi__" => {
+                if super::attribute_registry::abi_target()
+                    == super::attribute_registry::AbiTarget::X86_64
+                {
+                    self.attrs.parsing_calling_convention =
+                        Some(crate::common::types::CallingConvention::MicrosoftX64);
+                } else {
+                    self.attribute_warning(
+                        "'ms_abi' attribute ignored".to_string(),
+                        abi_span,
+                        false,
+                    );
+                }
+                self.advance();
+            }
             "constructor" | "__constructor__" => {
                 self.attrs.set_constructor(true);
                 self.advance();

@@ -608,6 +608,7 @@ mod binding_depth_tests {
         Symbol {
             name: name.to_string(),
             ty: CType::Function(Box::new(FunctionType {
+                calling_convention: crate::common::types::CallingConvention::Default,
                 return_type: CType::Int,
                 params: Vec::new(),
                 variadic: false,

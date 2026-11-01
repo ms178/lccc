@@ -268,7 +268,7 @@ line numbering. Nested `#if` blocks within inactive branches are tracked
 3. **Second `resolve_defined_in_expr` pass** -- Catches cases where macro
    expansion introduced new `__has_*()` calls.
 
-4. **`replace_remaining_idents_with_zero`** -- Per the C standard, any
+4. **`evaluate_condition`** -- Per the C standard, any
    remaining identifiers (except `true`/`false`) evaluate to `0`.
 
 5. **`evaluate_condition`** -- First expands simple object-like macros in
@@ -545,7 +545,7 @@ enabling GCC-compatible `file:line:col: error:` / `warning:` output formatting.
 | `pipeline.rs` | Core struct, `preprocess()` pipeline, directive dispatch (`process_directive`), line accumulation, and public configuration API. |
 | `macro_defs.rs` | `MacroDef` and `MacroTable` types. All macro expansion logic: `expand_text`, `expand_function_macro`, `handle_stringify_and_paste`, `substitute_params`, argument parsing, blue-paint markers, paste-protection markers, and anti-paste guards. |
 | `conditionals.rs` | `ConditionalStack` (push/pop state machine for `#if` nesting). `evaluate_condition` and `expand_condition_macros` for `#if` expression preprocessing. `eval_const_expr` recursive-descent expression evaluator and tokenizer. |
-| `expr_eval.rs` | `resolve_defined_in_expr` (replaces `defined()`, `__has_builtin()`, `__has_attribute()`, `__has_include()`, etc. with `0`/`1`). `replace_remaining_idents_with_zero` (C standard: undefined identifiers in `#if` are `0`). |
+| `expr_eval.rs` | `resolve_defined_in_expr` (replaces `defined()`, `__has_builtin()`, `__has_attribute()`, `__has_include()`, etc. with `0`/`1`). Conditional evaluation treats undefined identifiers as zero and records `-Wundef` only for evaluated operands, preserving short-circuit and inactive-branch behavior. |
 | `includes.rs` | `#include` / `#include_next` handling. Include path resolution with GCC-compatible search order. Include guard detection (`detect_include_guard`). Path caching, symlink-preserving absolute path construction, computed include normalization, recursive inclusion depth limiting, and builtin header injection. |
 | `predefined_macros.rs` | Static tables of predefined macros (standard C, platform, GCC compat, sizeof, type limits, float characteristics). `set_target` for architecture switching (`"aarch64"`, `"riscv64"`, `"i686"`, `"i386"`). `set_pic`, `set_optimize`, `set_gnu89_inline`, `set_sse_macros`, `set_extended_simd_macros`, `set_riscv_abi`, `set_riscv_march`, `set_strict_ansi` configuration methods. `bundled_include_dir` and `default_system_include_paths`. |
 | `pragmas.rs` | `handle_pragma` dispatcher. Handlers for `once`, `pack`, `push_macro`/`pop_macro`, `weak`, `redefine_extname`, and `GCC visibility push`/`pop`. Synthetic token emission for pack and visibility pragmas. |
@@ -622,3 +622,25 @@ i686, and i386.
 - **Expression evaluator does not support floating-point** -- `#if`
   expressions are evaluated using integer arithmetic only (standard-compliant,
   since preprocessor expressions are integer constant expressions).
+
+### Expansion effects and reproducibility diagnostics
+
+`-Wdate-time` diagnoses evaluated expansions of builtin `__DATE__`, `__TIME__`,
+and `__TIMESTAMP__`. Builtin origin survives `push_macro`/`pop_macro`; ordinary
+user redefinitions are not builtin expansions. Date/time diagnostics and
+`_Pragma` effects share an ordered queue, preserving same-line diagnostic scopes.
+Volatile time builtins are omitted from `-dM`, matching GCC; ordinary user
+redefinitions remain listed.
+
+Function macro arguments are expanded lazily, once per ordinary parameter, in
+first replacement-use order. Unused, stringified, and paste-only arguments do
+not trigger effects. `__VA_OPT__` presence checks expanded variadic tokens,
+including separating commas between empty operands. This is covered by the
+GCC-backed `tests/regression/check_date_time_warnings.py`, also invoked by the
+regular warning-precedence runner. This does not establish every C23 macro edge
+case (for example, stringification of `__VA_OPT__`).
+
+`__TIMESTAMP__` uses the physical input file's modification time, independent of
+`#line`, an overridden `__FILE__`, and `SOURCE_DATE_EPOCH`. Formatting currently
+uses UTC, like the existing date/time formatter. Differential timestamp-value
+checks force `TZ=UTC`; arbitrary local-timezone GCC parity is **not** claimed.

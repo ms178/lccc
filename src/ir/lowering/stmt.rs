@@ -547,7 +547,7 @@ impl Lowerer {
         // `[Pointer, FunctionPointer([char]), Pointer, FunctionPointer([long])]`),
         // the LAST `FunctionPointer` is the entity's own call signature and any
         // earlier `Pointer`/`FunctionPointer` layer means its return value is a pointer.
-        if let Some((i, DerivedDeclarator::FunctionPointer(params, variadic, _))) = declarator
+        if let Some((i, DerivedDeclarator::FunctionPointer(params, variadic, _, _))) = declarator
             .derived
             .iter()
             .enumerate()

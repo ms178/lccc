@@ -383,6 +383,7 @@ impl TerminatorSpans {
 /// An IR function.
 #[derive(Debug, Clone)]
 pub struct IrFunction {
+    pub calling_convention: crate::common::types::CallingConvention,
     /// Immutable language contract for this function; clones retain it and
     /// outlined functions inherit it. run_passes initializes it even at O0.
     pub pass_policy: crate::common::pass_policy::PassPolicy,
@@ -630,6 +631,7 @@ impl IrFunction {
             has_inlined_calls: false,
             param_alloca_values: Vec::new(),
             uses_sret: false,
+            calling_convention: crate::common::types::CallingConvention::Default,
             is_fastcall: false,
             regparm: None,
             is_naked: false,

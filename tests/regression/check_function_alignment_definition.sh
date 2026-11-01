@@ -105,11 +105,17 @@ EOF
 #   padding, so max is the effective alignment -- see trap 1 above.
 window_of() {
     awk -v fn="$1" '
+        # Metadata-section alignment must not leak into text placement.
+        /^[[:space:]]*\.(section|pushsection|popsection|previous|text|data|bss)([[:space:]]|$)/ { buf = ""; next }
         /^[[:space:]]*\.(p2align|align)[[:space:]]/ { buf = buf $2 " "; next }
         /^[A-Za-z_.][A-Za-z0-9_.]*:$/ {
             if ($0 == fn ":") { print buf; exit }
-            buf = ""
+            # A zero-byte patch-entry alias does not advance the location.
+            # Instructions below DO reset the window (including leading NOPs).
+            if ($0 !~ /^\.LPFE[0-9]+:$/) buf = ""
+            next
         }
+        /^[[:space:]]*[A-Za-z][A-Za-z0-9.]*([[:space:]]|$)/ { buf = "" }
     ' "$2"
 }
 
@@ -124,6 +130,28 @@ effective_align_of() {
     echo "${v:-0}"
 }
 directive_count_of() { window_of "$1" "$2" | wc -w | tr -d ' '; }
+
+# Adversarial checks for the measurement itself: aliases occupy zero bytes,
+# but a leading NOP or another section must not carry an alignment through.
+cat > "$tmp/window.s" <<'ASM'
+.section __patchable_function_entries,"awo",@progbits,.LPFE0
+.align 8
+.quad .LPFE0
+.section .text.probe,"ax",@progbits
+.p2align 4
+.LPFE0:
+probe:
+.p2align 6
+.LPFE1:
+nop
+probe_bad:
+.p2align 6
+.section .text.other,"ax",@progbits
+probe_other:
+ASM
+[[ $(effective_align_of probe "$tmp/window.s") == 4 ]]
+[[ $(effective_align_of probe_bad "$tmp/window.s") == 0 ]]
+[[ $(effective_align_of probe_other "$tmp/window.s") == 0 ]]
 
 fail=0
 expect() { # expect <fn> <log2> <why>
@@ -172,4 +200,37 @@ if [ "$fail" -ne 0 ]; then
     grep -vE '^\s*\.(cfi|loc|file|size|type|ident|weak)' "$tmp/a.s" >&2
     exit 1
 fi
+# Unlike the optimization hint, GCC 16's hard minimum applies at -O0 and
+# -Os, to cold functions, and even to an explicit aligned(1). Non-power-of-two
+# values round DOWN: measured GCC 16.2, 3 -> 2 and 17 -> 16.
+cat > "$tmp/min.c" <<'MIN'
+int __attribute__((aligned(1),noinline)) minimum_low(int x) { return x+1; }
+int __attribute__((cold,noinline)) minimum_cold(int x) { return x+2; }
+int __attribute__((aligned(64),noinline)) minimum_high(int x) { return x+3; }
+MIN
+for opt in -O0 -O2 -Os; do
+  for spec in 0:0 1:0 3:1 16:4 17:4 64:6; do
+    bytes=${spec%:*}; log2=${spec#*:}
+    "$CCC" "$opt" -fno-align-functions -fmin-function-alignment="$bytes" \
+      -S "$tmp/min.c" -o "$tmp/a.s"
+    expect "$log2" minimum_low "hard minimum survives aligned(1) at $opt"
+    expect "$log2" minimum_cold "hard minimum survives cold at $opt"
+    expect 6 minimum_high "minimum never lowers aligned(64)"
+  done
+ done
+"$CCC" -Os -fmin-function-alignment=16 -fno-align-functions \
+  -ffunction-sections -fpatchable-function-entry=2,0 -S "$tmp/min.c" -o "$tmp/a.s"
+expect 4 minimum_low "hard minimum survives function sections and patchable entry"
+expect 4 minimum_cold "hard minimum survives patchable cold entry"
+"$CCC" -Os -fmin-function-alignment=16 -fmin-function-alignment=0 \
+  -S "$tmp/min.c" -o "$tmp/a.s"
+expect 0 minimum_low "last minimum option wins"
+for invalid in -1 bogus 16:8 2147483648; do
+  if "$CCC" -fmin-function-alignment="$invalid" -S "$tmp/min.c" -o "$tmp/a.s" >"$tmp/error" 2>&1; then
+    echo "FAIL: accepted invalid hard function alignment $invalid" >&2
+    exit 1
+  fi
+  grep -q 'fmin-function-alignment' "$tmp/error"
+done
+if [ "$fail" -ne 0 ]; then exit 1; fi
 echo "check_function_alignment_definition: ok"

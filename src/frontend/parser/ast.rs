@@ -388,6 +388,8 @@ impl std::fmt::Debug for FunctionAttributes {
 /// A function definition.
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
+    /// None inherits a prior declaration; Some(Default) is explicit sysv_abi.
+    pub calling_convention: Option<crate::common::types::CallingConvention>,
     pub return_type: TypeSpecifier,
     /// Explicit `const` on the return type's base specifier (`const int *f(void)`).
     pub return_base_const: bool,
@@ -451,6 +453,7 @@ pub struct ParamDecl {
     /// Whether the pointed-to function's parameter list is a prototype. This
     /// distinguishes `int (*f)()` from `int (*f)(void)` in pre-C23 dialects.
     pub fptr_has_prototype: bool,
+    pub fptr_calling_convention: crate::common::types::CallingConvention,
     /// Whether this parameter's base type has a `const` qualifier.
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`.
     pub is_const: bool,
@@ -1311,9 +1314,21 @@ pub enum DerivedDeclarator {
     /// pointer levels, so the collected vector is indexed by level.
     Pointer(AddressSpace, u8),
     Array(Option<Box<Expr>>),
-    Function(Vec<ParamDecl>, bool, bool), // params, variadic, has_prototype
+    /// Parameters, variadic, prototype, and optional written convention.
+    /// Keep absence distinct from explicit sysv_abi until redeclaration merge.
+    Function(
+        Vec<ParamDecl>,
+        bool,
+        bool,
+        Option<crate::common::types::CallingConvention>,
+    ), // params, variadic, has_prototype
     /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
-    FunctionPointer(Vec<ParamDecl>, bool, bool), // params, variadic, has_prototype
+    FunctionPointer(
+        Vec<ParamDecl>,
+        bool,
+        bool,
+        Option<crate::common::types::CallingConvention>,
+    ), // params, variadic, has_prototype
 }
 
 impl DerivedDeclarator {
@@ -1351,8 +1366,8 @@ impl DerivedDeclarator {
     /// `int (*h)(void)` does not.
     pub fn has_unprototyped_function_type(derived: &[DerivedDeclarator]) -> bool {
         derived.iter().any(|d| match d {
-            DerivedDeclarator::Function(params, _, has_prototype)
-            | DerivedDeclarator::FunctionPointer(params, _, has_prototype) => {
+            DerivedDeclarator::Function(params, _, has_prototype, _)
+            | DerivedDeclarator::FunctionPointer(params, _, has_prototype, _) => {
                 !*has_prototype || Self::params_have_unprototyped_function_type(params)
             }
             DerivedDeclarator::Pointer(..) | DerivedDeclarator::Array(_) => false,
@@ -1413,6 +1428,7 @@ mod declarator_law_tests {
             fptr_params: None,
             fptr_variadic: false,
             fptr_has_prototype: false,
+            fptr_calling_convention: crate::common::types::CallingConvention::Default,
             is_const: false,
             is_volatile: false,
             is_restrict: false,
@@ -1429,11 +1445,11 @@ mod declarator_law_tests {
     }
 
     fn fnp(params: usize) -> DerivedDeclarator {
-        DerivedDeclarator::FunctionPointer(vec![param(); params], false, true)
+        DerivedDeclarator::FunctionPointer(vec![param(); params], false, true, None)
     }
 
     fn func(params: usize) -> DerivedDeclarator {
-        DerivedDeclarator::Function(vec![param(); params], false, true)
+        DerivedDeclarator::Function(vec![param(); params], false, true, None)
     }
 
     /// The canonical predicate pair: `declares_function` keys on the
@@ -1638,12 +1654,24 @@ pub enum TypeSpecifier {
     Array(Box<TypeSpecifier>, Option<Box<Expr>>),
     /// Function pointer type from cast/sizeof: return_type, params, variadic,
     /// has_prototype. E.g., `(jv (*)(void*, jv))` produces FunctionPointer(..., true).
-    FunctionPointer(Box<TypeSpecifier>, Vec<ParamDecl>, bool, bool),
+    FunctionPointer(
+        Box<TypeSpecifier>,
+        Vec<ParamDecl>,
+        bool,
+        bool,
+        crate::common::types::CallingConvention,
+    ),
     /// Bare function type (not a pointer): return_type, params, variadic, has_prototype
     /// This is produced by ctype_to_type_spec for CType::Function, used in typeof
     /// resolution. Unlike FunctionPointer which represents Pointer(Function(...)),
     /// this represents just Function(...) without the pointer wrapper.
-    BareFunction(Box<TypeSpecifier>, Vec<ParamDecl>, bool, bool),
+    BareFunction(
+        Box<TypeSpecifier>,
+        Vec<ParamDecl>,
+        bool,
+        bool,
+        crate::common::types::CallingConvention,
+    ),
     /// typeof(expr) - GCC extension: type of an expression. The flag is true for
     /// `typeof_unqual`, which also drops the expression's named address space.
     Typeof(Box<Expr>, bool),
@@ -2367,8 +2395,8 @@ impl TypeSpecifier {
                     f(bound);
                 }
             }
-            TypeSpecifier::FunctionPointer(ret, params, _, _)
-            | TypeSpecifier::BareFunction(ret, params, _, _) => {
+            TypeSpecifier::FunctionPointer(ret, params, _, _, _)
+            | TypeSpecifier::BareFunction(ret, params, _, _, _) => {
                 ret.for_each_expr(f);
                 for param in params {
                     param.for_each_type_expr(f);
@@ -2386,8 +2414,8 @@ impl DerivedDeclarator {
         match self {
             DerivedDeclarator::Pointer(..) | DerivedDeclarator::Array(None) => {}
             DerivedDeclarator::Array(Some(bound)) => f(bound),
-            DerivedDeclarator::Function(params, _, _)
-            | DerivedDeclarator::FunctionPointer(params, _, _) => {
+            DerivedDeclarator::Function(params, _, _, _)
+            | DerivedDeclarator::FunctionPointer(params, _, _, _) => {
                 for param in params {
                     param.for_each_type_expr(f);
                 }

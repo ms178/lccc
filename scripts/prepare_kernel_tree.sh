@@ -80,6 +80,7 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
 LCCC_CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/lccc
 KERNEL_WORK=${KERNEL_WORK:-$LCCC_CACHE/kernel-work}
 HOSTCC=${HOSTCC:-gcc}
@@ -385,9 +386,79 @@ lccc_make_prepare() {
   # olddefconfig FIRST, under the same CC: it answers NEW symbols with defaults
   # without reading stdin, so the syncconfig inside `prepare` cannot prompt
   # (the kernel's cc-option visibility differs between gcc and lccc).
-  make ARCH=x86_64 CC="$LCCC" HOSTCC="$HOSTCC" olddefconfig >/dev/null
-  make ARCH=x86_64 CC="$LCCC" HOSTCC="$HOSTCC" prepare -j"$(jobs_count)"
+  # Use the same target assembler/linker as the full build, including Kconfig probes.
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" HOSTCC="$HOSTCC" olddefconfig >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" HOSTCC="$HOSTCC" prepare -j"$(jobs_count)"
 }
+# Restore boot-only generated headers after preparation or compiler invalidation.
+# Never replace real Kbuild output that is already present.
+prepare_boot_headers() {
+  # capflags.c (mkcapflags.sh over cpufeatures.h)
+  if [[ ! -f arch/x86/kernel/cpu/capflags.c ]]; then
+    ( cd arch/x86/kernel/cpu && sh mkcapflags.sh capflags.c \
+        ../../include/asm/cpufeatures.h ../../include/asm/vmxfeatures.h )
+  fi
+
+  # cpustr.h (arch/x86/boot/Makefile builds it with the mkcpustr host tool;
+  # realmode_corpus.sh needs it for cpu.c but does not drive Kbuild).  Host tool.
+  if [[ ! -f arch/x86/boot/cpustr.h ]]; then
+    "$HOSTCC" -O2 -Iarch/x86/include -Iarch/x86/include/generated -Iinclude \
+        arch/x86/boot/mkcpustr.c -o "$WORK/mkcpustr"
+    "$WORK/mkcpustr" > arch/x86/boot/cpustr.h
+  fi
+
+  # utsversion.h (init/Makefile normally builds it from the build banner)
+  mkdir -p include/generated
+  [[ -f include/generated/utsversion.h ]] || printf '#define UTS_VERSION "#1 SMP PREEMPT_DYNAMIC"\n' > include/generated/utsversion.h
+
+  # zoffset.h / voffset.h (normally nm of compressed/vmlinux and vmlinux).
+  # header.o only consumes them as immediates, so code size is unaffected;
+  # efi32/efi64 entries must satisfy the CONFIG_EFI_MIXED .if in header.S.
+  if [[ ! -f arch/x86/boot/zoffset.h ]]; then
+    cat > arch/x86/boot/zoffset.h <<'EOF'
+/* STUB zoffset.h — normally generated from compressed/vmlinux (nm).
+ * Values are immediates only; they do not affect setup.elf size. */
+#define ZO_startup_32 0x1000
+#define ZO_efi32_stub_entry 0x1000
+#define ZO_efi64_stub_entry 0x1200
+#define ZO_efi_pe_entry 0x1300
+#define ZO_efi32_pe_entry 0x1400
+#define ZO_input_data 0x200000
+#define ZO_kernel_info 0x1500
+#define ZO__end 0x800000
+#define ZO__ehead 0x200
+#define ZO__text 0x210
+#define ZO__data 0x300
+#define ZO__edata 0x800000
+#define ZO__sbat 0x400
+#define ZO__esbat 0x410
+#define ZO_z_input_len 0x100000
+#define ZO_z_output_len 0x400000
+#define ZO_z_extract_offset 0x0
+#define ZO_z_min_extract_offset 0x1000
+#define ZO_z_extra_bytes 0x10000
+#define ZO_INIT_SIZE 0x500000
+EOF
+  fi
+  if [[ ! -f arch/x86/boot/voffset.h ]]; then
+    cat > arch/x86/boot/voffset.h <<'EOF'
+/* STUB voffset.h — normally generated from vmlinux (nm). Immediates only. */
+#define VO__text 0x100000
+#define VO__end  0x800000
+EOF
+  fi
+}
+
+# Preparation has already performed the authoritative Kbuild clean and rebuilt
+# compiler-dependent headers. Publish that fact so the full-build identity gate
+# does not clean them a second time (and remove boot-only canaries again).
+record_prepared_compiler_hash() {
+  local tmp
+  tmp=$(mktemp "$KDIR/.lccc-compiler-stamp.tmp.XXXXXX")
+  sha256_of "$LCCC" > "$tmp"
+  mv -f "$tmp" "$KDIR/.lccc-compiler-stamp"
+}
+
 canaries_ok() {
   local c
   for c in "${LCCC_PREPARED_CANARIES[@]}"; do
@@ -413,8 +484,10 @@ if [[ -f "$KDIR/.lccc-prepared" ]] && [[ -f "$KDIR/${LCCC_PREPARED_CANARIES[0]}"
     echo "prepare_kernel_tree: compiler content changed; cleaning and re-running LCCC make prepare"
     # Kbuild does not fingerprint the compiler executable. A content change must
     # invalidate generated headers/asm-offsets, not just relink them.
-    (cd "$KDIR" && make ARCH=x86_64 CC="$LCCC" HOSTCC="$HOSTCC" clean >/dev/null)
-    (cd "$KDIR" && lccc_make_prepare)
+    (cd "$KDIR" && make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" HOSTCC="$HOSTCC" clean >/dev/null)
+    (cd "$KDIR"; lccc_make_prepare; prepare_boot_headers)
+    canaries_ok
+    record_prepared_compiler_hash
     # Preserve source/config/patch provenance while updating only compiler identity.
     stamp_tmp=$(mktemp "$KDIR/.lccc-prepared.tmp.XXXXXX")
     trap 'rm -f -- "$stamp_tmp"' EXIT
@@ -650,60 +723,14 @@ cp "$PKGDIR/config" .config
 # broke.
 lccc_make_prepare
 
-# ---- 5. boot-code stubs a full Kbuild would generate ------------------------
-# capflags.c (mkcapflags.sh over cpufeatures.h)
-( cd arch/x86/kernel/cpu && sh mkcapflags.sh capflags.c \
-    ../../include/asm/cpufeatures.h ../../include/asm/vmxfeatures.h )
-
-# cpustr.h (arch/x86/boot/Makefile builds it with the mkcpustr host tool;
-# realmode_corpus.sh needs it for cpu.c but does not drive Kbuild).  Host tool.
-if [[ ! -f arch/x86/boot/cpustr.h ]]; then
-  "$HOSTCC" -O2 -Iarch/x86/include -Iarch/x86/include/generated -Iinclude \
-      arch/x86/boot/mkcpustr.c -o "$WORK/mkcpustr"
-  "$WORK/mkcpustr" > arch/x86/boot/cpustr.h
-fi
-
-# utsversion.h (init/Makefile normally builds it from the build banner)
-mkdir -p include/generated
-printf '#define UTS_VERSION "#1 SMP PREEMPT_DYNAMIC"\n' > include/generated/utsversion.h
-
-# zoffset.h / voffset.h (normally nm of compressed/vmlinux and vmlinux).
-# header.o only consumes them as immediates, so code size is unaffected;
-# efi32/efi64 entries must satisfy the CONFIG_EFI_MIXED .if in header.S.
-cat > arch/x86/boot/zoffset.h <<'EOF'
-/* STUB zoffset.h — normally generated from compressed/vmlinux (nm).
- * Values are immediates only; they do not affect setup.elf size. */
-#define ZO_startup_32 0x1000
-#define ZO_efi32_stub_entry 0x1000
-#define ZO_efi64_stub_entry 0x1200
-#define ZO_efi_pe_entry 0x1300
-#define ZO_efi32_pe_entry 0x1400
-#define ZO_input_data 0x200000
-#define ZO_kernel_info 0x1500
-#define ZO__end 0x800000
-#define ZO__ehead 0x200
-#define ZO__text 0x210
-#define ZO__data 0x300
-#define ZO__edata 0x800000
-#define ZO__sbat 0x400
-#define ZO__esbat 0x410
-#define ZO_z_input_len 0x100000
-#define ZO_z_output_len 0x400000
-#define ZO_z_extract_offset 0x0
-#define ZO_z_min_extract_offset 0x1000
-#define ZO_z_extra_bytes 0x10000
-#define ZO_INIT_SIZE 0x500000
-EOF
-cat > arch/x86/boot/voffset.h <<'EOF'
-/* STUB voffset.h — normally generated from vmlinux (nm). Immediates only. */
-#define VO__text 0x100000
-#define VO__end  0x800000
-EOF
+# ---- 5. boot-code headers -----------------------------------------------
+prepare_boot_headers
 
 # Verify every canary before stamping: a half-prepared tree must never pass.
 for c in "${LCCC_PREPARED_CANARIES[@]}"; do
   [[ -f "$c" ]] || { echo "prepare_kernel_tree: post-check failed, missing: $c" >&2; exit 1; }
 done
+record_prepared_compiler_hash
 stamp_tmp=$(mktemp .lccc-prepared.tmp.XXXXXX)
 trap 'rm -f -- "$stamp_tmp"' EXIT
 {

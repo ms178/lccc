@@ -629,6 +629,16 @@ impl X86Codegen {
             }
         }
 
+        if self.state.func_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+        {
+            let offset = 16 + self.state.num_params as i64 * 8;
+            self.state
+                .emit_fmt(format_args!("    leaq {}(%rbp), %r11", offset));
+            self.state.emit("    movq %r11, (%rax)");
+            return;
+        }
+
         // gp_offset = #named GP eightbytes * 8, fp_offset = 48 + #named FP * 16.
         // Two 32-bit stores (GCC's shape) — smaller than Clang's movabsq+movq
         // packed store and equal uop count on modern cores.

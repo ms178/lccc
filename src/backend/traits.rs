@@ -1181,6 +1181,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
         struct_arg_is_f128_sse: &[bool],
         is_sret: bool,
+        calling_convention: crate::common::types::CallingConvention,
         _is_fastcall: bool,
         // i686: per-callee `__attribute__((regparm(N)))` override.
         _is_regparm: Option<u8>,
@@ -1206,7 +1207,11 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         self.state().call_fp_arg_count = None;
 
         use super::call_abi::*;
-        let config = self.call_abi_config();
+        self.state().call_calling_convention = calling_convention;
+        let mut config = self.call_abi_config();
+        config.microsoft_x64 =
+            calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
+
         // x86-64 `%ymm0`/`%zmm0` aggregate return (AVX ABI level): the IR
         // passes the result buffer's address as argument 0 in the sret
         // shape, but the psABI gives it no register. Classify the real
@@ -1422,6 +1427,11 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
 
     /// Return the ABI configuration for this architecture's function calls.
     fn call_abi_config(&self) -> super::call_abi::CallAbiConfig;
+
+    /// A backend-only physical ABI view, after all semantic optimizers.
+    fn legalize_function_abi<'a>(&self, func: &'a IrFunction) -> std::borrow::Cow<'a, IrFunction> {
+        std::borrow::Cow::Borrowed(func)
+    }
 
     /// Store a `bytes`-byte aggregate that came back in ONE vector register
     /// (`%ymm0` / `%zmm0`, x86-64 AVX ABI level) through the caller's result

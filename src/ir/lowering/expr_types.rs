@@ -1750,6 +1750,7 @@ impl Lowerer {
                 if let Some(func_info) = self.sema_functions.get(name.as_str()) {
                     let callable_type = func_info.prototype.clone().unwrap_or_else(|| {
                         crate::common::types::FunctionType {
+                            calling_convention: func_info.calling_convention,
                             return_type: func_info.return_type.clone(),
                             params: Vec::new(),
                             variadic: func_info.variadic,

@@ -551,6 +551,8 @@ impl X86Codegen {
         }
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
+        self.state.func_calling_convention = func.calling_convention;
+        self.state.num_params = func.params.len();
         // The IPA-RA keep set answers for one function (set below, after
         // the caller-saved pool is final).
         self.ipa_keep = 0;
@@ -800,7 +802,9 @@ impl X86Codegen {
         // stress abi fn3 `union A3 fn3(long, float, uchar, A3, ull, A3, ...)`
         // expects gp_offset = 32 = sret(rdi) + a0(rsi) + a3(rdx) + a5(rcx)).
         {
-            let config = self.call_abi_config_impl();
+            let mut config = self.call_abi_config_impl();
+            config.microsoft_x64 =
+                func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
             let classification = crate::backend::call_abi::classify_params_full(func, &config);
             let mut named_gp = 0usize;
             let mut named_fp = 0usize;
@@ -2577,8 +2581,19 @@ impl X86Codegen {
         // from a Tier 3 mapping that no longer exists; it cost 8-16 bytes of
         // stack and a `subq` in every calling function with callee saves
         // (GCC: `pushq %rbx; ...; call; ...; popq %rbx`, no `subq`).
+        let ms_abi =
+            func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
+        if ms_abi {
+            // These are scratch homes under SysV; MS entry must preserve them
+            // even across calls to SysV functions and string-copy expansion.
+            self.used_callee_saved.extend([PhysReg(14), PhysReg(15)]);
+        }
         let n_callee = self.used_callee_saved.len() as i64;
-        let callee_save_reserve = n_callee * 8;
+        let callee_save_reserve = if ms_abi && !self.no_sse {
+            ((n_callee * 8 + 15) & !15) + 160
+        } else {
+            n_callee * 8
+        };
         // Capture before `self.state` is mutably borrowed by the layout closure.
         let fpo = self.state.omit_frame_pointer;
         self.state.ra_accumulator_values =
@@ -3070,7 +3085,9 @@ impl X86Codegen {
             }
         }
 
-        if func.is_variadic {
+        if func.is_variadic
+            && func.calling_convention != crate::common::types::CallingConvention::MicrosoftX64
+        {
             if self.no_sse {
                 space += 48;
             } else {
@@ -3347,9 +3364,16 @@ impl X86Codegen {
             }
 
             // Save callee-saved registers with pushq
-            for &reg in &used_regs {
+            for (idx, &reg) in used_regs.iter().enumerate() {
                 let reg_name = phys_reg_name(reg);
                 self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
+                if matches!(reg.0, 14 | 15) {
+                    self.state.emit_fmt(format_args!(
+                        "    # CFI_NONVOL_SAVE {} {}",
+                        reg_name,
+                        -16 - (idx as i64 + 1) * 8
+                    ));
+                }
             }
 
             // Allocate remaining stack space for local variables
@@ -3380,6 +3404,24 @@ impl X86Codegen {
                         .out
                         .emit_instr_imm_reg("    subq", local_size, "rsp");
                 }
+            }
+        }
+
+        if func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+            && !self.no_sse
+        {
+            let base = ((used_regs.len() as i64 * 8 + 15) & !15) + 16;
+            for n in 0..10 {
+                self.state.emit_fmt(format_args!(
+                    "    movdqu %xmm{}, {}(%rbp)",
+                    n + 6,
+                    -base - n * 16
+                ));
+                self.state.emit_fmt(format_args!(
+                    "    # CFI_NONVOL_SAVE xmm{} {}",
+                    n + 6,
+                    -base - n * 16 - 16
+                ));
             }
         }
 
@@ -3440,6 +3482,10 @@ impl X86Codegen {
         } else {
             ret_xmm_mask
         };
+        let ms_preserved = func.calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+            && !self.no_sse;
+        let ret_xmm_mask = ret_xmm_mask | if ms_preserved { 0xffc0 } else { 0 };
         self.state
             .emit_fmt(format_args!("    # LCCC_RET_XMM {}", ret_xmm_mask));
         // How many low bits of those registers a `ret` reads: the late
@@ -3452,12 +3498,35 @@ impl X86Codegen {
             ret_xmm_mask & 2 != 0,
             vector_ret_in_xmm0,
         );
+        let ret_xmm_bits = if ms_preserved {
+            ret_xmm_bits.max(128)
+        } else {
+            ret_xmm_bits
+        };
         self.state
             .emit_fmt(format_args!("    # LCCC_RET_XMM_BITS {}", ret_xmm_bits));
 
         self.emit_gp_return_liveness_markers(func, vector_ret_in_xmm0);
 
-        if func.is_variadic {
+        if func.is_variadic
+            && func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+        {
+            // The caller supplies these four contiguous 8-byte home slots.
+            // Unnamed FP values are duplicated in the corresponding GP regs;
+            // no SysV register-save area or AL-based XMM census belongs here.
+            // va_start begins after ALL fixed IR parameters (including an
+            // implicit sret pointer). Named slots can never be consumed by
+            // this cursor; only save registers carrying unnamed arguments.
+            for (slot, reg) in ["rcx", "rdx", "r8", "r9"]
+                .iter()
+                .enumerate()
+                .skip(func.params.len().min(4))
+            {
+                self.state
+                    .out
+                    .emit_instr_reg_rbp("    movq", reg, 16 + slot as i64 * 8);
+            }
+        } else if func.is_variadic {
             let base = self.reg_save_area_offset;
 
             // Save only the GP registers that can hold VARIADIC arguments: the
@@ -3515,6 +3584,18 @@ impl X86Codegen {
         let used_regs = self.used_callee_saved.clone();
         let num_saved = used_regs.len() as i64;
         let omit_fp = self.state.omit_frame_pointer;
+        let ms_abi = self.state.func_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64;
+        if ms_abi && !self.no_sse {
+            let base = ((num_saved * 8 + 15) & !15) + 16;
+            for n in 0..10 {
+                self.state.emit_fmt(format_args!(
+                    "    movdqu {}(%rbp), %xmm{}",
+                    -base - n * 16,
+                    n + 6
+                ));
+            }
+        }
 
         if omit_fp {
             let use_push_pop = num_saved > 0;
@@ -3557,6 +3638,38 @@ impl X86Codegen {
     }
 
     /// Capture-store a 64-bit GPR into the parameter home slot.
+    // Copy exactly the bytes of an indirect Microsoft record parameter.
+    // RAX is the source, R11 may hold an aligned destination, and no incoming
+    // argument register may be clobbered. Preserve R10's static-chain role.
+    fn emit_capture_byref_record(&mut self, dst: CaptureDst, size: usize) {
+        self.state.emit("    pushq %r10");
+        let mut offset = 0;
+        for (width, op, reg) in [
+            (8, "movq", "r10"),
+            (4, "movl", "r10d"),
+            (2, "movw", "r10w"),
+            (1, "movb", "r10b"),
+        ] {
+            while size - offset >= width {
+                self.state
+                    .emit_fmt(format_args!("    {} {}(%rax), %{}", op, offset, reg));
+                match dst {
+                    CaptureDst::Raw(base) => self.state.emit_fmt(format_args!(
+                        "    {} %{}, {}(%rbp)",
+                        op,
+                        reg,
+                        base + offset as i64
+                    )),
+                    CaptureDst::Aligned => self
+                        .state
+                        .emit_fmt(format_args!("    {} %{}, {}(%r11)", op, reg, offset)),
+                }
+                offset += width;
+            }
+        }
+        self.state.emit("    popq %r10");
+    }
+
     fn emit_capture_store_qword(&mut self, dst: CaptureDst, src_reg: &str, off: i64) {
         match dst {
             CaptureDst::Raw(b) => {
@@ -3630,7 +3743,9 @@ impl X86Codegen {
         let xmm_regs = [
             "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
         ];
-        let config = self.call_abi_config_impl();
+        let mut config = self.call_abi_config_impl();
+        config.microsoft_x64 =
+            func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
         let param_classes = classify_params(func, &config);
         self.state.param_classes = param_classes.clone();
         self.state.num_params = func.params.len();
@@ -4144,11 +4259,20 @@ impl X86Codegen {
                         self.emit_capture_store_qword(dst, "rax", qi as i64 * 8);
                     }
                 }
+                ParamClass::LargeStructByRefReg { reg_idx, size } => {
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %rax", X86_ARG_REGS[reg_idx]));
+                    self.emit_capture_byref_record(dst, size);
+                }
+                ParamClass::LargeStructByRefStack { offset, size } => {
+                    self.state
+                        .out
+                        .emit_instr_rbp_reg("    movq", stack_base + offset, "rax");
+                    self.emit_capture_byref_record(dst, size);
+                }
                 ParamClass::F128FpReg { .. }
                 | ParamClass::F128GpPair { .. }
                 | ParamClass::F128Stack { .. }
-                | ParamClass::LargeStructByRefReg { .. }
-                | ParamClass::LargeStructByRefStack { .. }
                 | ParamClass::StructSplitRegStack { .. }
                 | ParamClass::ZeroSizeSkip => {}
                 // Homed at the top of the loop (no incoming register).

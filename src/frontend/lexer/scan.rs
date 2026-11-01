@@ -353,7 +353,10 @@ impl Lexer {
             // These are emitted by the preprocessor and must not be lexed as tokens.
             // A line marker is a '#' at the start of a line (after optional whitespace)
             // followed by a digit.
-            if self.at_line_start && self.input[self.pos] == b'#' && self.is_line_marker() {
+            if self.at_line_start
+                && self.input[self.pos] == b'#'
+                && (self.is_line_marker() || self.is_diagnostic_pragma())
+            {
                 // Skip the entire line
                 while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
                     self.pos += 1;
@@ -420,6 +423,21 @@ impl Lexer {
             }
         }
         (val, overflow)
+    }
+
+    /// Diagnostic pragmas remain in preprocessed text for the diagnostic
+    /// engine's byte-offset timeline, but are not C tokens.
+    fn is_diagnostic_pragma(&self) -> bool {
+        let bytes = &self.input[self.pos + 1..];
+        let end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or(bytes.len());
+        let text = std::str::from_utf8(&bytes[..end]).unwrap_or("");
+        text.trim_start()
+            .strip_prefix("pragma")
+            .filter(|s| s.starts_with(char::is_whitespace))
+            .is_some_and(crate::common::diagnostic_pragma::is_diagnostic_pragma)
     }
 
     fn is_line_marker(&self) -> bool {
