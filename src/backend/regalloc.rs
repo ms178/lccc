@@ -7856,6 +7856,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecMulF64x4
                 | O::VecMulF32x4
                 | O::VecMulF32x8
+                | O::VecMinU32x8
+                | O::VecMaxU32x8
                 | O::VecMinI32x8
                 | O::VecMaxI32x8
                 | O::VecSubI8x32
@@ -9408,7 +9410,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // (I32x8) lets the Copy-web connect the backedge so the accumulator
             // stays register-homed (no per-iter stack round-trip, which made
             // the vectorized find_max SLOWER than scalar).
-            O::VecBroadcastI32x8 | O::VecMaxI32x8 | O::VecMinI32x8 => Some(5),
+            O::VecBroadcastI32x8
+            | O::VecMaxI32x8
+            | O::VecMinI32x8
+            | O::VecMinU32x8
+            | O::VecMaxU32x8 => Some(5),
             O::VecZeroI32x4
             | O::VecLoadI32x4
             | O::VecLoadStrided2I32x4
@@ -9567,6 +9573,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // accumulator (read+write); the horizontal max reduces
                     // it. Both lowerings confine scratch to xmm0/xmm1.
                     | O::VecMaxI32x8
+                    | O::VecMinU32x8 | O::VecMaxU32x8
                     | O::VecMinI32x8
                     | O::VecHorizontalMaxI32x8
                     | O::VecHorizontalMinI32x8
@@ -9826,12 +9833,15 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // their horizontal reduce — lowerings
                                 // confine scratch to xmm0/xmm1, exempt them.
                                 | O::VecMaxI32x8
+                                | O::VecMinU32x8 | O::VecMaxU32x8
                                 | O::VecMinI32x8
                                 | O::VecHorizontalMaxI32x8
                                 | O::VecHorizontalMinI32x8
                                 | O::VecHorizontalMaxI32x4
                                 | O::VecSmaxI32x4
                                 | O::VecSminI32x4
+                                | O::VecMinU32x4
+                                | O::VecMaxU32x4
                                 | O::VecLoadWidenI32ToI64x2
                                 // Byte-predicate counting loops carry the
                                 // map-family byte ops (compare masks, the
@@ -10135,6 +10145,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecCmpI64x4
                     | O::VecBlendvI32x8
                     // Integer min/max maps: the broadcast is a clamp bound.
+                    | O::VecMinU32x8 | O::VecMaxU32x8
                     | O::VecMinI32x8
                     | O::VecMaxI32x8
                     // Bitwise lane maps: the broadcast is the operand of
@@ -10538,6 +10549,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecCmpI32x8
         | O::VecCmpI64x4
         | O::VecBlendvI32x8
+        | O::VecMinU32x8 | O::VecMaxU32x8
         | O::VecMinI32x8
         | O::VecMaxI32x8
      // Byte-lane map intermediates (AVX2 32xI8): identical home-
@@ -10662,6 +10674,8 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecOrI64x2
         | O::VecXorI64x2
         | O::VecSminI32x4
+        | O::VecMinU32x4
+        | O::VecMaxU32x4
         | O::VecSmaxI32x4
         // Byte/word 128-bit loads and bitwise ops: the GNU-vector
         // `v16c`/`v8s` shapes.  Home-direct `movdqu` loads (the I32x4
@@ -10793,6 +10807,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecCmpI32x8
                     | O::VecCmpI64x4
                     | O::VecBlendvI32x8
+                    | O::VecMinU32x8 | O::VecMaxU32x8
                     | O::VecMinI32x8
                     | O::VecMaxI32x8
                     | O::VecAddI8x32
@@ -10923,6 +10938,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI64x2
                     | O::VecXorI64x2
                     | O::VecSminI32x4
+                    | O::VecMinU32x4
+                    | O::VecMaxU32x4
                     | O::VecSmaxI32x4
                     | O::VecStoreI64x2
                     // Byte/word 128-bit bitwise ops and stores (the

@@ -719,9 +719,12 @@ pub enum IntrinsicOp {
     /// reduction matches sequential scalar max bit-for-bit (levkropp 8b139820).
     VecSmaxI32x4,
     /// Lane-wise signed minimum of two 4×I32 vectors. The SSE4.1
-    /// `pminsd` twin of `VecSmaxI32x4`; the SSE2-only baseline lowers it
-    /// to the exact 4-op pcmpgtd+and/andn/or select in the emitter.
+    /// `pminsd` twin of `VecSmaxI32x4`; x86 producers require SSE4.1.
+    /// The SSE2-only baseline uses a compare/select pack instead.
     VecSminI32x4,
+    /// Lane-wise unsigned dword min/max; x86 requires SSE4.1.
+    VecMinU32x4,
+    VecMaxU32x4,
     /// NEON smaxv: horizontal signed max of 4xI32 lanes; dest = scalar I32.
     VecHorizontalMaxI32x4,
     /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
@@ -970,6 +973,9 @@ pub enum IntrinsicOp {
     /// The map vectorizer's integer min/max fold produces it from exact
     /// ternary shapes (`l < r ? l : r` and friends — no FP special cases).
     VecMinI32x8,
+    /// Lane-wise unsigned dword min/max, AVX2 8xU32.
+    VecMinU32x8,
+    VecMaxU32x8,
     // ---- Byte-lane (I8/U8) map ops -------------------------------------
     //
     // The byte casefold / char-class family (`gzip`, `expat`, `curl`
@@ -2135,6 +2141,7 @@ impl IntrinsicOp {
             | VecBroadcastF32x8 | VecZeroF32x8
             | VecMinF32x8 | VecMaxF32x8 | VecCmpF32x8 | VecBlendvF32x8
             | VecMinF64x4 | VecMaxF64x4 | VecCmpF64x4 | VecBlendvF64x4
+            | VecMinU32x8 | VecMaxU32x8
             | VecCmpI32x8 | VecCmpI64x4 | VecBlendvI32x8 | VecMinI32x8
             | VecLoadI8x32 | VecBroadcastI8x32
             | VecCmpI8x32 | VecBlendvI8x32 | VecMinU8x32 | VecMaxU8x32
@@ -2290,6 +2297,7 @@ impl IntrinsicOp {
             | VecSadbwU8x16
             | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4 | VecSminI32x4
+            | VecMaxU32x4 | VecMinU32x4
             // BB-SLP 128-bit families: I64x2 bitwise, I16x8/I8x16
             // load/store/bitwise, and the 2-lane gather/extract pairs.
             | VecAndI64x2 | VecOrI64x2 | VecXorI64x2
@@ -2393,6 +2401,7 @@ impl IntrinsicOp {
             IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
             IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
             | IntrinsicOp::VecMaxI32x8
+            | IntrinsicOp::VecMinU32x8 | IntrinsicOp::VecMaxU32x8
             | IntrinsicOp::VecMinI32x8
             | IntrinsicOp::VecMinU8x32
             | IntrinsicOp::VecMinU8x16
@@ -2665,6 +2674,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecFnmsF32x4
                 | IntrinsicOp::VecAddI32x8
                 | IntrinsicOp::VecMaxI32x8
+                | IntrinsicOp::VecMinU32x8 | IntrinsicOp::VecMaxU32x8
                 | IntrinsicOp::VecMinI32x8
                 | IntrinsicOp::VecAddI32x4
                 | IntrinsicOp::VecSubI32x8
@@ -2828,6 +2838,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecSmlalHiI32x4
                 | IntrinsicOp::VecSmaxI32x4
                 | IntrinsicOp::VecSminI32x4
+                | IntrinsicOp::VecMinU32x4
+                | IntrinsicOp::VecMaxU32x4
                 | IntrinsicOp::VecMinF32x8
                 | IntrinsicOp::VecMinF32x4
                 | IntrinsicOp::VecMinF64x4
@@ -3118,7 +3130,7 @@ mod vector_width_tests {
 
         // (name suffix token) -> (type bytes, lanes). Searched as exact
         // substrings; the LAST occurrence in the name wins.
-        const SHAPES: [(&str, u32, u32); 16] = [
+        const SHAPES: [(&str, u32, u32); 18] = [
             ("I16x16", 2, 16),
             ("I16x8", 2, 8),
             ("U16x16", 2, 16),
@@ -3127,6 +3139,8 @@ mod vector_width_tests {
             ("I8x16", 1, 16),
             ("U8x32", 1, 32),
             ("U8x16", 1, 16),
+            ("U32x8", 4, 8),
+            ("U32x4", 4, 4),
             ("I32x8", 4, 8),
             ("I32x4", 4, 4),
             ("I64x4", 8, 4),
@@ -3289,6 +3303,8 @@ mod vector_width_tests {
             "VecMaxF64x4" => IntrinsicOp::VecMaxF64x4,
             "VecMaxI32x8" => IntrinsicOp::VecMaxI32x8,
             "VecMinI32x8" => IntrinsicOp::VecMinI32x8,
+            "VecMinU32x8" => IntrinsicOp::VecMinU32x8,
+            "VecMaxU32x8" => IntrinsicOp::VecMaxU32x8,
             "VecMinF32x4" => IntrinsicOp::VecMinF32x4,
             "VecMinF32x8" => IntrinsicOp::VecMinF32x8,
             "VecMinF64x2" => IntrinsicOp::VecMinF64x2,
@@ -3305,6 +3321,8 @@ mod vector_width_tests {
             "VecSadalpI32x4" => IntrinsicOp::VecSadalpI32x4,
             "VecSmaxI32x4" => IntrinsicOp::VecSmaxI32x4,
             "VecSminI32x4" => IntrinsicOp::VecSminI32x4,
+            "VecMinU32x4" => IntrinsicOp::VecMinU32x4,
+            "VecMaxU32x4" => IntrinsicOp::VecMaxU32x4,
             "VecSmlalHiI32x4" => IntrinsicOp::VecSmlalHiI32x4,
             "VecSmlalLoI32x4" => IntrinsicOp::VecSmlalLoI32x4,
             "VecSqrtF32x4" => IntrinsicOp::VecSqrtF32x4,
@@ -3830,6 +3848,34 @@ mod ssse3_native_contract_tests {
             // destination slot; match the existing horizontal-add contract.
             assert_eq!(op.is_pure(), Phaddd128.is_pure());
             assert!(op.is_vector_op());
+        }
+    }
+}
+
+#[cfg(test)]
+mod unsigned_dword_minmax_contract_tests {
+    use super::IntrinsicOp;
+
+    #[test]
+    fn unsigned_minmax_are_pure_register_values_without_memory_effects() {
+        for (op, width) in [
+            (IntrinsicOp::VecMinU32x4, 16),
+            (IntrinsicOp::VecMaxU32x4, 16),
+            (IntrinsicOp::VecMinU32x8, 32),
+            (IntrinsicOp::VecMaxU32x8, 32),
+        ] {
+            assert_eq!(op.vector_result_width(), Some(width));
+            assert_eq!(op.vector_home_width(), Some(width));
+            assert!(op.produces_vector_value());
+            assert!(op.is_pure());
+            // This legacy allowlist admits all vector-valued families; it
+            // is NOT a statement that this two-vector-operand op loads memory.
+            assert_eq!(
+                op.reads_pointer_arg(),
+                IntrinsicOp::VecSminI32x4.reads_pointer_arg()
+            );
+            assert!(!op.writes_memory_via_args());
+            assert!(!op.may_read_memory());
         }
     }
 }

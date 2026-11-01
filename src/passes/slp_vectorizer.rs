@@ -48,7 +48,9 @@ use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
 use crate::ir::reexports::IrFunction;
 use crate::passes::CfgAnalysis;
-use crate::passes::vectorize::{x86_avx2_available_pub, x86_simd_available_pub};
+use crate::passes::vectorize::{
+    x86_avx2_available_pub, x86_simd_available_pub, x86_sse41_available_pub,
+};
 
 /// Hashable lane encoding for pack dedup. Exact — no lossy constant
 /// folding, so distinct constants can never collide into one pack.
@@ -810,8 +812,7 @@ enum Fold {
 /// the signed instruction reads it as negative and selects the wrong
 /// operand (`max(0x80000000u32, 5u32)` would return 5).
 ///
-/// Where no unsigned form exists — dword (`pminud`/`pmaxud` are encodable
-/// SSE4.1 but have no `IntrinsicOp`) and the 128-bit unsigned halfword —
+/// Where no unsigned form exists — the 128-bit unsigned halfword —
 /// the lookup fails closed and the caller falls through to the cmp+blendv
 /// composite, which handles unsigned predicates correctly by emulating
 /// them with a sign-bit flip. Signed bytes likewise have no pre-AVX512
@@ -822,13 +823,40 @@ fn packed_int_minmax(
     width: usize,
     unsigned: bool,
 ) -> Option<IntrinsicOp> {
+    packed_int_minmax_for_isa(
+        is_max,
+        ty,
+        width,
+        unsigned,
+        x86_avx2_available_pub(),
+        x86_sse41_available_pub(),
+    )
+}
+
+fn packed_int_minmax_for_isa(
+    is_max: bool,
+    ty: IrType,
+    width: usize,
+    unsigned: bool,
+    avx2: bool,
+    sse41: bool,
+) -> Option<IntrinsicOp> {
     // Signedness of the order must match the instruction's order.
     if unsigned != !ty.is_signed() {
         return None;
     }
     let width = reg_width_for(ty, width);
-    let avx2 = x86_avx2_available_pub();
     match (ty, width) {
+        (IrType::U32, 4) if sse41 => Some(if is_max {
+            IntrinsicOp::VecMaxU32x4
+        } else {
+            IntrinsicOp::VecMinU32x4
+        }),
+        (IrType::U32, 8) if avx2 => Some(if is_max {
+            IntrinsicOp::VecMaxU32x8
+        } else {
+            IntrinsicOp::VecMinU32x8
+        }),
         (IrType::I32, 8) => Some(if is_max {
             IntrinsicOp::VecMaxI32x8
         } else {
@@ -6583,6 +6611,29 @@ fn rewrite_term_uses_in_place(term: &mut Terminator, map: &FxHashMap<u32, Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsigned_dword_minmax_requires_exact_order_width_and_isa() {
+        for (avx2, sse41) in [(false, false), (false, true), (true, true)] {
+            for (is_max, narrow, wide) in [
+                (false, IntrinsicOp::VecMinU32x4, IntrinsicOp::VecMinU32x8),
+                (true, IntrinsicOp::VecMaxU32x4, IntrinsicOp::VecMaxU32x8),
+            ] {
+                let choose = |ty, width, unsigned| {
+                    packed_int_minmax_for_isa(is_max, ty, width, unsigned, avx2, sse41)
+                };
+                assert_eq!(choose(IrType::U32, 4, true), sse41.then_some(narrow));
+                assert_eq!(choose(IrType::U32, 8, true), avx2.then_some(wide));
+                // Pair registers use the full four-lane operation.
+                assert_eq!(choose(IrType::U32, 2, true), sse41.then_some(narrow));
+                assert_eq!(choose(IrType::U32, 4, false), None);
+                assert_eq!(choose(IrType::I32, 4, true), None);
+                assert_eq!(choose(IrType::U32, 3, true), None);
+                assert_eq!(choose(IrType::U32, 16, true), None);
+                assert_eq!(choose(IrType::U64, 2, true), None);
+            }
+        }
+    }
 
     fn copy(dest: u32, src: Operand) -> Instruction {
         Instruction::Copy {

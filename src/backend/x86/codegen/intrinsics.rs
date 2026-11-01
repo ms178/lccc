@@ -82,7 +82,7 @@ impl X86Codegen {
                 | "pand" | "por" | "pxor" | "xorps" | "xorpd"
                 // Integer min/max (no FP unordered/±0 asymmetry).
                 | "pminub" | "pmaxub" | "pminsw" | "pmaxsw"
-                | "pminsd" | "pmaxsd"
+                | "pminsd" | "pmaxsd" | "pminud" | "pmaxud"
                 // Sum of absolute byte differences: |a - b| is symmetric.
                 | "psadbw"
         )
@@ -6837,6 +6837,17 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "pminsw");
                 }
             }
+            IntrinsicOp::VecMinU32x4 | IntrinsicOp::VecMaxU32x4 => {
+                assert!(self.isa.sse41, "unsigned dword min/max requires SSE4.1");
+                if let Some(d) = dest {
+                    let inst = if *op == IntrinsicOp::VecMaxU32x4 {
+                        "pmaxud"
+                    } else {
+                        "pminud"
+                    };
+                    self.emit_sse_binary_128(d, args, inst);
+                }
+            }
             IntrinsicOp::VecSminI32x4 => {
                 if let Some(d) = dest {
                     self.emit_sminmax_i32x4(d, args, false);
@@ -7724,6 +7735,17 @@ impl X86Codegen {
                 // and the freshly-loaded 8 lanes fold into a new accumulator.
                 if let Some(d) = dest {
                     self.emit_avx_binary_256(d, args, "vpmaxsd", true);
+                }
+            }
+            IntrinsicOp::VecMinU32x8 | IntrinsicOp::VecMaxU32x8 => {
+                assert!(self.avx2_enabled, "unsigned 8-dword min/max requires AVX2");
+                if let Some(d) = dest {
+                    let inst = if *op == IntrinsicOp::VecMaxU32x8 {
+                        "vpmaxud"
+                    } else {
+                        "vpminud"
+                    };
+                    self.emit_avx_binary_256(d, args, inst, true);
                 }
             }
             IntrinsicOp::VecMinI32x8 => {

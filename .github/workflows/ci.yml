@@ -1344,6 +1344,7 @@ jobs:
         set -euo pipefail
         python3 -m unittest discover -s tests/simd -p 'test_*.py'
         python3 tests/simd/check_scoreboard.py --check-clock-failure --lccc target/fastbuild/lccc --reference gcc-16
+        python3 tests/simd/check_lightpixel.py --require-native --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/aos_pair_shapes.py --lccc target/fastbuild/lccc --reference gcc-16
         python3 tests/simd/aos_pair_shapes.py --guarded --mixed --stride 4 \
           --lccc target/fastbuild/lccc --reference gcc-16
@@ -3257,6 +3258,10 @@ jobs:
       run: |
         python3 tests/simd/check_scoreboard.py --check-clock-failure --lccc target/fastbuild/lccc \
           --reference "$LCCC_ICX_BIN -fp-model=strict" --json intel-evidence/simd-scoreboard.json
+    - name: LightPixel unsigned clamp and reduction against authenticated ICX
+      run: |
+        python3 tests/simd/check_lightpixel.py --require-native --lccc target/fastbuild/lccc \
+          --reference "$LCCC_ICX_BIN" --json intel-evidence/lightpixel.json
     - name: Qualifier composition against authenticated ICX
       run: |
         python3 tests/regression/check_qualifier_composition.py \
