@@ -1747,15 +1747,31 @@ impl X86Codegen {
         lane_bytes: usize,
         wide: bool,
     ) -> bool {
-        let lane = match args.first() {
-            Some(Operand::Const(IrConst::I8(v))) if lane_bytes == 1 => *v as u8 as u64,
-            Some(Operand::Const(IrConst::I16(v))) if lane_bytes == 2 => *v as u16 as u64,
-            Some(Operand::Const(IrConst::I32(v))) if lane_bytes == 4 => *v as u32 as u64,
-            Some(Operand::Const(IrConst::I64(v))) if lane_bytes == 8 => *v as u64,
+        // Match the generic movd/movq path: wider integer constants are
+        // truncated to the consuming lane, not tiled at their source width.
+        // Narrower constants still need the generic sign-extension policy.
+        if ![1, 2, 4, 8].contains(&lane_bytes) {
+            return false;
+        }
+        let (bits, natural_width) = match args.first() {
+            Some(Operand::Const(IrConst::I8(v))) => (*v as u8 as u64, 1),
+            Some(Operand::Const(IrConst::I16(v))) => (*v as u16 as u64, 2),
+            Some(Operand::Const(IrConst::I32(v))) => (*v as u32 as u64, 4),
+            Some(Operand::Const(IrConst::I64(v))) => (*v as u64, 8),
             _ => return false,
         };
+        if natural_width < lane_bytes {
+            return false;
+        }
+        let mask = u64::MAX >> (64 - 8 * lane_bytes);
+        let lane = bits & mask;
+        // Test the TRUNCATED lane. Passing the original wider constant to
+        // these helpers would miss zeros/ones present only in its low bits.
         if lane == 0 {
-            return self.try_zero_splat(args, dest, wide);
+            return self.try_zero_splat(&[Operand::Const(IrConst::Zero)], dest, wide);
+        }
+        if lane == mask {
+            return self.try_all_ones_splat(&[Operand::Const(IrConst::I64(-1))], dest, wide);
         }
         let total = if wide { 32 } else { 16 };
         let mut bytes = vec![0u8; total];
@@ -13618,6 +13634,80 @@ mod bounded_vector_control_tests {
                     .is_err(),
                     "accepted {arg:?} for {range:?}"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod truncated_splat_tests {
+    use super::*;
+
+    #[test]
+    fn wide_constants_tile_only_consuming_lane_bytes() {
+        let cases = [
+            IrConst::I64(0x1234_5678_89ab_cdef),
+            IrConst::I64(-257),
+            IrConst::I32(0x1234_abcd),
+            IrConst::I16(0x1234),
+        ];
+        for constant in cases {
+            let width = match constant {
+                IrConst::I64(_) => 8,
+                IrConst::I32(_) => 4,
+                _ => 2,
+            };
+            for lane_bytes in [1, 2, 4, 8] {
+                for wide in [false, true] {
+                    let mut cg = X86Codegen::new();
+                    cg.avx2_enabled = wide;
+                    let accepted = cg.try_const_splat_load(
+                        &[Operand::Const(constant.clone())],
+                        &None,
+                        lane_bytes,
+                        wide,
+                    );
+                    assert_eq!(accepted, lane_bytes <= width);
+                    if !accepted {
+                        continue;
+                    }
+                    let mask = u64::MAX >> (64 - lane_bytes * 8);
+                    let lane = constant.to_i64().unwrap() as u64 & mask;
+                    if lane == 0 || lane == mask {
+                        assert!(cg.state.vec_const_pool.is_empty());
+                    } else {
+                        let expected = lane.to_le_bytes()[..lane_bytes].repeat(if wide {
+                            32 / lane_bytes
+                        } else {
+                            16 / lane_bytes
+                        });
+                        assert!(cg.state.vec_const_pool.contains_key(&expected));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_zero_and_ones_do_not_read_a_constant_pool() {
+        for (constant, lane_bytes) in [
+            (IrConst::I64(1 << 32), 4),
+            (IrConst::I64(0xffff_ffff), 4),
+            (IrConst::I32(0x1_0000), 2),
+            (IrConst::I32(0x1_ffff), 2),
+            (IrConst::I16(0x100), 1),
+            (IrConst::I16(0x1ff), 1),
+        ] {
+            for wide in [false, true] {
+                let mut cg = X86Codegen::new();
+                cg.avx2_enabled = wide;
+                assert!(cg.try_const_splat_load(
+                    &[Operand::Const(constant.clone())],
+                    &None,
+                    lane_bytes,
+                    wide,
+                ));
+                assert!(cg.state.vec_const_pool.is_empty());
             }
         }
     }

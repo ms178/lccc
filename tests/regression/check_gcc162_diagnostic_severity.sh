@@ -33,7 +33,6 @@ set -euo pipefail
 # script ends badly.
 last_command=
 trap 'last_command=$BASH_COMMAND' DEBUG
-trap 'rc=$?; if ((rc)); then echo "::error::severity gate exited $rc; last command: $last_command"; fi' EXIT
 redteam_runner=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/check_diagnostic_redteam.py
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -45,7 +44,7 @@ CCC=$(cd "$(dirname -- "$CCC")" && pwd)/$(basename -- "$CCC")
 GCC=${GCC:-gcc-16}
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-gcc162-severity.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+trap 'rc=$?; trap - DEBUG; rm -rf "$tmp"; if ((rc)); then echo "::error::severity gate exited $rc; last command: $last_command"; fi' EXIT
 cd "$tmp"
 
 # The message also becomes a GitHub annotation, so a red step names its own

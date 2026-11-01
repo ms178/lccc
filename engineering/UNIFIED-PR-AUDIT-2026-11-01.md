@@ -287,3 +287,55 @@ The open-PR refresh additionally found #1061 and #1062; their unique changes
 still require audit/integration without deleting retained improvements. Latest
 main remains `013983d6a0c94d9cabb700aa8fdde5c3cfa16e88`. Actual patched-LLVM
 comparison and fresh whole-computation runtime measurements remain unrun.
+
+## Open-PR refresh and measured follow-up (2026-11-01)
+
+Reviewed #1050/#1051/#1060 plus newly opened #1061/#1062 at fetched heads
+`a62b7d708`, `130f9e0cb`, `e7d7de9af`, `66f5d7088`, `673baafc6`.
+The older-base trees must not replace this unified tree: their inverse diffs
+remove retained ABI safety, literal-consumer whitelisting, i686 alloca address
+handling and regression coverage. The i686 sret-coalescing work in #1061 is
+already present; its unique source-span cleanup repair is now integrated.
+The unique wider-constant splat optimization in #1062 is adapted without moving
+or deleting the retained literal-operand emitter. Narrower integer constants
+still decline the fast path (generic sign extension); wider ones truncate to
+consuming lane width. Additional zero/all-ones truncation cases use register
+idioms instead of pool reads. Two table-driven unit tests cover lane widths
+1/2/4/8 and vector widths 16/32. The additional #1060 diagnostic-trap cleanup
+fix is integrated; its SIGPIPE concern was already fixed with a draining grep.
+
+Validation receipts:
+- Rust 1.99.1 fastbuild: 7,432 library tests PASS, ten ignored; linker unit
+  PASS. Clippy `--all-targets -- -D warnings` and fresh fastbuild binaries PASS.
+  Log: `/home/user/unified-rust-pr1062-serial.log`.
+- The first two-job attempt exhausted available swap; it was stopped, not
+  counted as a pass. Serial validation completed successfully with the 4 GiB
+  swap active. No legacy compiler was substituted.
+- SSE2/SSE4.1/AVX2 dword-constant runtime/codegen at O2/O3 PASS (six pairs).
+  The v6 gate including the sanitized modern GCC oracle PASS. The original
+  i686 narrow-output fixture compiles under `CCC_VERIFY_IR=1 -O2 -g`.
+- Both complete LightPixel and joint-pixel differential/legality suites PASS
+  at O2/O3 across SSE2, SSE4.1 and AVX2. All benchmark hashes agree with the
+  independent O0 reference.
+- 1,617 diagnostic red-team contracts and exact GCC 16.2 severity/column parity
+  PASS; 315 scripts pass the pipefail/SIGPIPE audit. Invocation parity remains
+  493 commands / 27 contracts. All four failure-annotation unit tests PASS.
+- Native and AArch64 binutils 2.47 now pass their official provisioner fast
+  paths with valid source/binary provenance, and kernel relocs v7.3 passes its
+  official verified-source stamp fast path. `MAKEFLAGS=MAKEINFO=true` was
+  needed to suppress manual regeneration; plain MAKEINFO was not sufficient.
+
+Fresh 12-round, single-CPU, order-balanced medians are recorded in
+`engineering/unified-pixel-summary-2026-11-01.json`. The by-value kernel takes
+3.724 ms with LCCC versus 4.853 ms GCC 16.2 / 4.672 ms Clang 23.1.4.
+The separate-buffer kernel takes 3.640 ms versus 3.823 ms GCC / 3.380 ms Clang:
+LCCC LOSES to Clang on that measurement. The original source's complete
+compute/reduce/store is measured, not merely its packed arithmetic. The emitted
+vector path has a longer widening/multiply/narrow/reduction dependency chain
+than Clang's scalar path; no unsupported narrowing, out-of-bounds load or
+floating conversion was introduced to manufacture a win. These data disprove a
+universal significant-superiority claim; tiny min/max differences are not
+claimed as meaningful wins. No ICX or patched-LLVM timing is claimed locally.
+
+Full frozen modern fast-suite rerun and current-head hosted acceptance remain
+required; earlier hosted results do not certify these additional changes.
