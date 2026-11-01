@@ -38,23 +38,32 @@ if objdump -d -M intel --disassemble=ret "$work/probe" \
     symbol_disassembly=$(tr '\n' ';' < "$work/disassembly")
     printf '::notice title=i686 ret function disassembly::%s\n' "$symbol_disassembly"
 fi
-if objdump -d -M intel --disassemble=vector_small_packed_wrappers_test_main \
-    "$work/probe" >"$work/caller-disassembly" 2>/dev/null; then
-    call_window=$(grep -m1 -B100 -A8 -E 'call.*<ret>' "$work/caller-disassembly" || true)
-    call_site=$(printf '%s\n' "$call_window" | grep -E 'j[a-z]+|loop[a-z]*|call.*<ret>|lea.*[[]esp|mov.*[[]esp' || true)
-    call_site=${call_site//$'\n'/;}
-    printf '::notice title=i686 ret caller control flow and stack setup::%s\n' "$call_site"
-fi
 registers=$(grep -m1 '^SIGSEGV EIP=' "$work/run.err" || true)
 stack_words=$(grep -m1 '^STACK=' "$work/run.err" || true)
 if [[ -n $stack_words ]]; then
     echo "::notice title=i686 fault stack words at ESP+0x40::$stack_words"
+fi
+return_addr=$(sed -n 's/^RETADDR=//p' "$work/run.err" | head -n 1)
+if [[ -n $return_addr ]]; then
+    echo "::notice title=i686 faulting call return address::$return_addr"
 fi
 eip=$(sed -n 's/^SIGSEGV EIP=0x\([[:xdigit:]]\{8\}\).*/0x\1/p' "$work/run.err" | head -n 1)
 if [[ -n $eip ]]; then
     source_line=$(addr2line -e "$work/probe" -f -C "$eip" 2>/dev/null | tr '\n' ' ')
     echo "::notice title=i686 vector fault registers::$registers"
     echo "::notice title=i686 vector fault address::EIP=$eip $source_line (rc=$rc)"
+    if [[ -n $return_addr ]]; then
+        printf -v caller_pc '%x' "$((return_addr))"
+        if objdump -d -M intel "$work/probe" >"$work/full-disassembly" 2>/dev/null; then
+            return_line=$(grep -n -m1 -E "^[[:space:]]*${caller_pc}:" "$work/full-disassembly" | cut -d: -f1 || true)
+            if [[ -n $return_line ]]; then
+                context_start=$((return_line > 36 ? return_line - 36 : 1))
+                context_end=$((return_line + 2))
+                call_context=$(sed -n "${context_start},${context_end}p" "$work/full-disassembly" | tr '\n' ';')
+                printf '::notice title=i686 faulting return-address call-site context::%s\n' "$call_context"
+            fi
+        fi
+    fi
     addr=$((eip))
     lo=$((addr > 24 ? addr - 24 : 0))
     hi=$((addr + 24))
