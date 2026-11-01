@@ -2293,10 +2293,10 @@ jobs:
     # steps are a partition: tests/regression/check_ci_shard_partition.py
     # fails if a gate appears in both, disappears from both, or reappears in a
     # third step.
-    # lane-split: 88 of 192 independent gate invocations from the
+    # lane-split: 89 of 193 independent gate invocations from the
     # lane-split: single step that used to run them all in sequence, assigned by
     # lane-split: longest-processing-time over measured per-gate cost (438 s of
-    # lane-split: 876 s). The shards are a partition:
+    # lane-split: 877 s). The shards are a partition:
     # lane-split: tests/regression/check_ci_shard_partition.py fails if a gate appears in
     # lane-split: both, disappears from both, or reappears in a third step, and
     # lane-split: tests/regression/check_ci_lane_plan.py fails if a shard drifts from
@@ -2511,6 +2511,12 @@ jobs:
         # -O3 agreement over every boundary value.  Mirrored in
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_lowest_set_bit_fold.sh
+        # The narrow negate: `(T)(-(W)(T)v)` is `-(T)v` (the extension dies in
+        # the truncation) and `0 - x` is a `Neg`.  Pins the emitted shapes, the
+        # CCC_SIMPLIFY_SKIP=negcast/zeroneg ownership, the widening and float
+        # controls, and bit-exact -O0..-O3 agreement over every 8/16-bit input.
+        # Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_narrow_negate_fold.sh
         # Predicate differences and ranges: difference compares, interval and
         # membership tests, sign-magnitude selects, five near-miss controls.
         python3 tests/regression/check_predicate_differences_and_ranges.py

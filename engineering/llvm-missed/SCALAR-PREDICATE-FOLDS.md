@@ -13,8 +13,10 @@ then implemented, then re-measured against the same three compilers.
 **Round 2 (2026-11-01)** closed two of the items this document listed as "not
 done" — the lowest-set-bit matcher and a ring-correct interval width that lets
 windows crossing zero fold — and added the `0 - x` negation canonicalisation
-they depend on. Sections 6, 7 and 8 below are new; the measurements table and
-the "What is not done" list are updated in place.
+they depend on, plus a truncated-negate fold (§9) that removes the last
+extension/truncation round trip around a 32-bit negation. Sections 6–9 below
+are new; the measurements table and the "What is not done" list are updated in
+place.
 
 ## Names
 
@@ -30,10 +32,12 @@ in the tree is called a batch:
 | matcher (`bit_idioms.rs`) | `fold_unit_interval_test` | `(x == 0) \| (x == 1)` → `x <=u 1` |
 | matcher (`bit_idioms.rs`) | `fold_lowest_set_bit` | `1 << Ctz(~x)` → `(x + 1) & ~x`, plus the exact `~x == 0` arm |
 | rule (`simplify.rs`) | `zeroneg` | `0 - x` → `Neg x` (the modular negate, canonically spelled) |
+| rule (`simplify.rs`) | `negcast` | `(i32)(-(i64)(i32)v)` → `-(i32)v` (a truncation distributes over a negate) |
 | tests (`bit_idioms_mask_interval_tests.rs`) | — | production-matcher tests for the two matchers |
 | gate (`check_predicate_differences_and_ranges.py`) | `predicate-differences-and-ranges` | the three passes |
 | gate (`check_mask_and_interval_folds.py`) | `mask-and-interval-folds` | the two matchers |
 | gate (`check_lowest_set_bit_fold.sh`) | `lowest-set-bit-fold` | the lowest-set-bit matcher and `zeroneg` |
+| gate (`check_narrow_negate_fold.sh`) | `narrow-negate-fold` | `zeroneg` and `negcast`, with the untouched widths pinned as controls |
 | tests (`bit_idioms_lowest_bit_tests.rs`) | — | executes the rewritten block against the reference semantics |
 
 ## The five rewrites
@@ -237,6 +241,44 @@ biased compare (`leal 7(%rdi); cmpl $15; setb`), and the gate's brute-force
 sweep — which previously skipped every such window by the same guard — now
 asserts them.
 
+### 9. Truncated negate — `negcast`
+
+```c
+int f(int x) { return -(x != 0); }        /* 7 -> 6 */
+```
+
+The C integer promotions carry a 32-bit negation at 64 bits:
+`trunc32(neg64(sext64(cmp))`. Negation is a ring operation and the extension's
+high bits die in the truncation, so the whole expression is `-(i32)cmp` and
+both the extension and the second copy disappear:
+
+```text
+before   testl %edi,%edi; setne %sil; movzbl %sil,%esi; movslq %esi,%rdx;
+         negq %rdx; movl %edx,%eax
+after    testl %edi,%edi; setne %sil; movzbl %sil,%esi; negl %esi;
+         movl %esi,%eax                                    (GCC: 3, via sbb)
+```
+
+The fold is restricted to a 64-bit source and a 32-bit destination, because
+that is the only width pair where it measured as a pure win. The two shapes it
+does not touch were measured too, and both were net pessimisations over the
+2,791-file sweep:
+
+* a **32-bit source** (`trunc16(neg32(ext32(v)))`, the packed-mask idiom
+  `(u16)(0 - (u16)(a < b))`) removes two instructions per site but flipped the
+  vectorizer's decision in `packed_mask_shifts.c` to a worse 128-bit form: +60
+  instructions across four functions against -1 or -2 at each scalar site;
+* a **16-bit destination** leaves a partial-register negate whose consumers
+  re-extend it, and register allocation paid for it (`bb_slp_unary_demote.c`
+  +3, `sib_index_narrow_sext.c` +1, both spills rather than folds).
+
+Both are pinned as controls in `check_narrow_negate_fold.sh`: their instruction
+counts must not move, so widening the fold later has to arrive with a fresh
+measurement instead of slipping in. The same gate records the one site where
+`zeroneg` costs an instruction (`x & (u16)(0 - x)`: 5 with the subtraction,
+6 with the narrow negate, because the 16-bit consumers mask it) rather than
+hiding it — see "What is not done".
+
 ## Measurements
 
 x86-64, `-O2`, instructions counted inside each function body including `ret`.
@@ -264,7 +306,8 @@ installed in this sandbox, so its column is absent rather than guessed.
 | `x & (0u - x)` | 5 | 5 | 4 | 4 | count-neutral; the copy is allocation |
 | `x > -8 && x < 8` (crossing window) | 7 | **5** | 5 | 5 | round 2, ring-correct width |
 | `x > -8 && x <= 7` / `x >= -7 && x < 8` | 7 | **5** | 5 | 5 | round 2, all strictness mixes |
-
+| `-(x != 0)` (int) | 7 | **6** | 3 | 4 | round 2 (`negcast`); the rest is the missing `neg`/`sbb` idiom |
+| `(unsigned short)-x` | 4 | 4 | 3 | 3 | unchanged: the 32 → 16 fold measured as a loss |
 Honest attribution, measured by re-running with
 `CCC_DISABLE_PASSES=diffcmp,interval,signmag`: `diff_gt`/`diff_ge` 5 → 4,
 `range_bitand` 9 → 5, `range_short` 7 → 5, `member_short` 7 → 4 and
@@ -277,8 +320,9 @@ two different values, and a select whose arms disagree) keep their original
 shape at every level.
 
 Round 2 was attributed the same way, with `CCC_NO_LOWEST_SET_BIT=1
-CCC_SIMPLIFY_SKIP=zeroneg`: the lowest-set-bit matcher owns the `lsb32`/`lsb64`
-rows, `zeroneg` owns the packed-mask negates, and the interval width fix is not
+CCC_SIMPLIFY_SKIP=zeroneg,negcast`: the lowest-set-bit matcher owns the
+`lsb32`/`lsb64` rows, `zeroneg` owns the packed-mask negates, `negcast` owns the
+`-(x != 0)` row (7 with the switch, 6 without), and the interval width fix is not
 gated by a knob — it is attributed by the eight crossing-window cases in
 `predicate_differences_and_ranges.c`, each of which the gate asserts is a single
 compare. The pass-off run leaves `range_crossing_control` (`x > -8 && x < 1`, a
@@ -289,9 +333,10 @@ accident.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --profile fastbuild --locked --lib` | **7,144 passed, 0 failed, 10 ignored** |
+| `cargo test --profile fastbuild --locked --lib` | **7,160 passed, 0 failed, 10 ignored** |
 | `check_predicate_differences_and_ranges.py` | PASS — values at `-O0`…`-O3`, per-fold mechanism, five controls, attribution, GCC 16.2 length oracle (1.7 s) |
 | `check_lowest_set_bit_fold.sh` | PASS — both widths, both arms of the zero select, plain forms pinned at ≤5/≤6 |
+| `check_narrow_negate_fold.sh` | PASS — `negcast` ownership, `zeroneg` shapes, widening/float controls, the untouched widths pinned exactly, `-O0`…`-O3` + both switches + GCC agree on a 65,536-row checksum |
 | `Interval::width` unit tests | crossing window `[-7, 7]` = 15, inverted `[-5, -9]` = 0, `[7, 7]` = 1, 64-bit span unchanged |
 | `check_mask_and_interval_folds.py` | PASS (0.6 s) |
 | Exhaustive matcher tests | 8/16-bit rings brute-forced for interval and membership; 32/64-bit boundary sweeps; refusal tables |
@@ -312,20 +357,27 @@ instructions in each output:
 | largest single win | `predicate_differences_and_ranges.c` −60 |
 | largest vector win | `vec_range_mask_fusion.c` and its SSE2 twin −10 each |
 
-Round 2 repeats the sweep over the same corpus with the two new IR rules as the
-only difference (`CCC_NO_LOWEST_SET_BIT=1 CCC_SIMPLIFY_SKIP=zeroneg` versus the
-default):
+Round 2 repeats the sweep over the same corpus with the three new IR rules as
+the only difference (`CCC_NO_LOWEST_SET_BIT=1
+CCC_SIMPLIFY_SKIP=zeroneg,negcast` versus the default):
 
 | metric | value |
 |---|---|
-| files compiled both ways | 2,790 (710 skipped for missing headers) |
+| files compiled both ways | 2,791 (710 skipped for missing headers) |
 | shorter with the rules | **16** |
 | longer with the rules | 1 |
 | net instruction change | **−986** |
 | largest wins | `packed_mask_shifts.c` −499, `packed_vector_relations.c` −446 (both `zeroneg`: `negw`/`negq` replacing `xorl; subq`) |
 | the one longer file | `ext_vector_layout.c` +1 |
 
-That single +1 is worth naming rather than hiding: `main` there is a
+`negcast` contributes nothing to that total and costs nothing: it fires on the
+32-bit-negation shapes the probe corpus carries (`-(x != 0)`, 7 → 6) and no test
+file in this corpus happens to contain one. The same sweep is what restricted it
+in the first place: the unrestricted version measured **−929** with **three**
+longer files, and the +60 it added to `packed_mask_shifts.c` was a vectorization
+flip, not a fold (§9).
+
+The one +1 is worth naming rather than hiding: `main` there is a
 663-instruction boolean-chain checker, and the two Compiler-IRs are identical in
 shape (502 instructions, 116 blocks, before and after — verified with
 `CCC_DUMP_EACH_PASS`), so the extra instruction comes from how the backend
@@ -339,10 +391,14 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
   with the arm), and Clang's four-instruction form depends on `ctz(0)` being
   undefined. It becomes worth revisiting when the backend can select `blsi`
   under BMI1, where the isolated bit is one instruction without an arm.
-* **Narrow negate truncation** — `unsigned short f(unsigned short x) { return -x; }`
-  still reloads through a 16-bit truncation (`movzwl; negl; movzwl`) where a
-  single `negw` would do; `zeroneg` produces the `Neg`, so this is purely the
-  backend's narrow `Neg` selection.
+* **Narrow negate at 8/16 bits** — `unsigned short f(unsigned short x) { return -x; }`
+  still reloads through a truncation (`movzwl; negl; movzwl`) where GCC spends
+  three instructions. The 32 → 16 fold of §9 recovers that and was measured as
+  a *loss* (+60 on `packed_mask_shifts.c` from a vectorization flip, +4 from two
+  spills), so it is not applied; the fix belongs in the narrow ALU lattice --
+  an `And` at the narrow width should not need both operands masked
+  (`x & (u16)(0 - x)`: 6 instructions now, 5 with the subtraction), which is the
+  one site where `zeroneg` costs an instruction.
 * **32-bit `bsf` zero fixup** — `Ctz` at 32 bits relies on `bsf` leaving its
   destination untouched and so needs a `mov $32, %ecx` that GCC/Clang do not
   pay. An instruction-selection detail of `Ctz`, not of the fold.
@@ -353,7 +409,9 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
   promotes those widths, so the shape does not arise, and admitting it would
   require a no-overflow proof the IR does not carry.
 * **The other 143 audited reports** stay deferred with their reasons in
-  [audit-2026-10-31-sources.json](audit-2026-10-31-sources.json). Round 2 cleared
-  two of the eight measured gaps (the lowest-set-bit idiom and the crossing
-  window, which was not on the list because the pass looked like it already
-  handled intervals — it handled the non-crossing ones only); six remain.
+  [audit-2026-10-31-sources.json](audit-2026-10-31-sources.json). Round 2 closed
+  three items this list used to carry: the lowest-set-bit idiom, the truncated
+  negate (at 64 → 32 bits; its 32 → 16 half is the narrow-ALU item above), and
+  the crossing window -- which was never on the list, because `interval` looked
+  like it already handled intervals and handled only the non-crossing ones. The
+  backend items above and the remaining audited reports are the queue.
