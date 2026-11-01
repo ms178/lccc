@@ -36,7 +36,8 @@ def find_gcc():
         if not cand:
             continue
         p = shutil.which(cand)
-        if p and b'16.2' in abi_matrix.run_bounded(
+        # `run_bounded` always runs in text mode, so this compares str to str.
+        if p and '16.2' in abi_matrix.run_bounded(
                 [p, '--version'], timeout=abi_matrix.COMPILE_TIMEOUT).stdout:
             return p
     return None

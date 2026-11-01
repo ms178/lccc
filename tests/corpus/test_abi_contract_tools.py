@@ -73,6 +73,13 @@ class RunBoundedTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.strip(), 'hello')
 
+    def test_output_is_text(self):
+        # Callers compare substrings (`'16.2' in stdout`); a bytes/str mismatch
+        # is a TypeError deep inside a gate, so the mode is part of the contract.
+        proc = matrix.run_bounded(['/bin/sh', '-c', 'echo 16.2'], timeout=30)
+        self.assertIsInstance(proc.stdout, str)
+        self.assertIn('16.2', proc.stdout)
+
 
 @unittest.skipUnless(os.name == 'posix', 'fake compilers are POSIX shell scripts')
 class OraclePinTest(unittest.TestCase):
