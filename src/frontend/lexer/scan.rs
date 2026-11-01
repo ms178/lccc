@@ -1,6 +1,6 @@
 use super::token::{Token, TokenKind, UnicodeCharKind};
 use crate::common::encoding::decode_pua_byte;
-use crate::common::error::{Diagnostic, WarningKind};
+use crate::common::error::{Diagnostic, Severity, WarningKind};
 use crate::common::source::Span;
 
 /// C lexer that tokenizes source input with source locations.
@@ -79,6 +79,17 @@ struct RawEscape {
     /// A hex or octal escape wrote more digits than 32 bits can hold
     /// (`\x100000000`), so its value already wrapped.
     blew: bool,
+    /// How many characters GCC counts this escape for when it *rejects* it,
+    /// as reported by `multi-character literal with N characters exceeds 'int'
+    /// size of 4 bytes`. `None` on the paths where the count follows from the
+    /// value (one character, or the length of its UTF-8 encoding in a narrow
+    /// literal); `Some(0)` for the escapes GCC's error recovery consumes
+    /// without producing anything (`'\xg'` is a ONE-character constant, so it
+    /// warns about neither a multi-character constant nor the 'int' size), and
+    /// `Some(n)` for the two recovery shapes that count as `n` characters
+    /// (`'\N{NO SUCH NAME}'` counts as two). Measured on gcc-16.2, because
+    /// these counts are what the diagnostics say.
+    contributed: Option<u8>,
 }
 
 impl RawEscape {
@@ -212,6 +223,18 @@ impl Lexer {
                 self.warn(message, at);
             }
         }
+    }
+
+    /// Whether the diagnostics recorded since `from` include an error.
+    ///
+    /// GCC reports the empty character constant only for a literal that was
+    /// empty on its own terms: `'\x'` and `'\N{unterminated'` consume every
+    /// character they were given while reporting an error, and GCC does not
+    /// pile an "empty character constant" on top (measured).
+    fn saw_error_since(&self, from: usize) -> bool {
+        self.diagnostics[from.min(self.diagnostics.len())..]
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error)
     }
 
     /// The location GCC reports a string-literal escape's range at: one byte
@@ -1436,6 +1459,7 @@ impl Lexer {
     /// * `''` is `empty character constant`, an error in every form.
     fn lex_wide_char(&mut self, start: usize, kind: Option<UnicodeCharKind>) -> Token {
         self.pos += 1; // skip opening '
+        let diagnostics_before = self.diagnostics.len();
         // Width of one code unit of this literal: the clamp for byte escapes.
         let max_unit: u32 = match kind {
             Some(UnicodeCharKind::Utf8) => 0xFF,
@@ -1456,18 +1480,33 @@ impl Lexer {
         // The constant denotes the last character, so only that one decides the
         // encodability diagnostics.
         let mut last_character_overflows = false;
-        // …and a character above U+10FFFF cannot become a UTF-16 unit at all.
-        // Any character of the literal can be one GCC cannot convert to UTF-16,
-        // wherever it appears (measured: `u'\U00110000a'` errors too).
-        let mut any_escape_above_ucs = false;
         while self.pos < self.input.len() && self.input[self.pos] != b'\'' {
             last_character_overflows = false;
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 let escape = self.lex_escape_raw();
-                characters += 1;
+                if escape.is_character()
+                    && escape.out_of_ucs
+                    && matches!(kind, Some(UnicodeCharKind::Utf16))
+                {
+                    // A code point above U+10FFFF has no UTF-16 unit at all.
+                    // GCC reports the conversion failure where it meets the
+                    // escape — once per offending escape, in scan order — and
+                    // the escape contributes no character to the literal
+                    // (`u'\U00110000a'` is a ONE-character constant, so it
+                    // warns about no encoding prefix).
+                    self.emit_lex_diag(
+                        "converting UCN to execution character set: \
+                         Invalid or incomplete multibyte or wide character",
+                        escape.span.start as usize,
+                        escape.span.end as usize,
+                    );
+                    continue;
+                }
+                // A rejected escape can contribute no character at all
+                // (`u'\xg'` is a one-character constant in GCC too).
+                characters += usize::from(escape.contributed.unwrap_or(1) > 0);
                 if escape.is_character() {
-                    any_escape_above_ucs |= escape.out_of_ucs;
                     last_character_overflows = unit_overflow(escape.value);
                     value = escape.value;
                 } else {
@@ -1517,7 +1556,9 @@ impl Lexer {
         }
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
         if characters == 0 {
-            self.emit_lex_diag("empty character constant", start, self.pos);
+            if !self.saw_error_since(diagnostics_before) {
+                self.emit_lex_diag("empty character constant", start, self.pos);
+            }
             return Token::new(
                 match kind {
                     Some(unit_kind) => TokenKind::UnicodeCharLiteral(0, unit_kind),
@@ -1546,33 +1587,21 @@ impl Lexer {
             }
             Some(unit_kind @ UnicodeCharKind::Utf16) => {
                 let mut unit_value = value;
-                if any_escape_above_ucs {
-                    // `u'\U00110000'` cannot be converted to UTF-16 at all; GCC
-                    // 16.2 follows its own warning with exactly this error and
-                    // says nothing about the literal being multi-character.
-                    self.emit_lex_diag(
-                        "converting UCN to execution character set: \
-                         Invalid or incomplete multibyte or wide character",
-                        start,
-                        self.pos,
+                if multi {
+                    self.warn(
+                        "multi-character literal cannot have an encoding prefix",
+                        span,
                     );
-                } else {
-                    if multi {
-                        self.warn(
-                            "multi-character literal cannot have an encoding prefix",
-                            span,
-                        );
+                }
+                if last_character_overflows {
+                    // The value is the LAST character's low surrogate even
+                    // when the literal is multi-character (`u'a\U0001F600'`
+                    // is 0xDE00), but GCC then reports only the encoding
+                    // prefix.
+                    if !multi {
+                        self.warn("character not encodable in a single code unit", span);
                     }
-                    if last_character_overflows {
-                        // The value is the LAST character's low surrogate even
-                        // when the literal is multi-character
-                        // (`u'a\U0001F600'` is 0xDE00), but GCC then reports
-                        // only the encoding prefix.
-                        if !multi {
-                            self.warn("character not encodable in a single code unit", span);
-                        }
-                        unit_value = Self::low_surrogate(value);
-                    }
+                    unit_value = Self::low_surrogate(value);
                 }
                 Token::new(TokenKind::UnicodeCharLiteral(unit_value, unit_kind), span)
             }
@@ -1615,13 +1644,24 @@ impl Lexer {
     ///   keeps its own width.
     fn lex_char(&mut self, start: usize) -> Token {
         self.pos += 1; // skip opening '
+        let diagnostics_before = self.diagnostics.len();
         let mut value: i32 = 0;
         let mut characters = 0usize;
         while self.pos < self.input.len() && self.input[self.pos] != b'\'' {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 let escape = self.lex_escape_raw();
-                if escape.is_character() {
+                if let Some(contributed) = escape.contributed {
+                    // A rejected escape: GCC's recovery decides how many
+                    // characters (if any) it leaves in the constant, and adds
+                    // no bytes of its own (`'\xg'` is just `g`).
+                    if contributed > 0 {
+                        let at = Span::new(start as u32, escape.span.end, self.file_id);
+                        self.warn_escape_range(escape, 0xFF, at);
+                        value = (value << 8) | ((escape.value & 0xFF) as i32);
+                        characters += contributed as usize;
+                    }
+                } else if escape.is_character() {
                     // A universal character name is a CHARACTER: the execution
                     // character set maps it to 1-6 bytes of UTF-8. `'\u00e9'`
                     // is C3 A9 — a two-character constant, which GCC warns
@@ -1653,7 +1693,9 @@ impl Lexer {
         }
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
         if characters == 0 {
-            self.emit_lex_diag("empty character constant", start, self.pos);
+            if !self.saw_error_since(diagnostics_before) {
+                self.emit_lex_diag("empty character constant", start, self.pos);
+            }
             return Token::new(TokenKind::IntLiteral(0), span);
         }
         if characters > 4 {
@@ -1755,6 +1797,7 @@ impl Lexer {
             span: Span::new(esc_start as u32, esc_start as u32, self.file_id),
             out_of_ucs: false,
             blew: false,
+            contributed: None,
         };
         if self.pos >= self.input.len() {
             return escape;
@@ -1768,6 +1811,8 @@ impl Lexer {
             b'\\' => escape.value = '\\' as u32,
             b'\'' => escape.value = '\'' as u32,
             b'"' => escape.value = '"' as u32,
+            // A standard escape, spelled so that a trigraph cannot form.
+            b'?' => escape.value = '?' as u32,
             b'a' => escape.value = 0x07,
             b'b' => escape.value = 0x08,
             b'e' | b'E' => escape.value = 0x1b, // GNU extension: ESC
@@ -1778,9 +1823,10 @@ impl Lexer {
                 // brace `\o` is not an escape at all.
                 escape.kind = EscapeKind::Octal;
                 if self.pos < self.input.len() && self.input[self.pos] == b'{' {
-                    let (value, blew) = self.lex_delimited_escape(8, b'o', esc_start);
+                    let (value, blew, contributed) = self.lex_delimited_escape(8, b'o', esc_start);
                     escape.value = value;
                     escape.blew = blew;
+                    escape.contributed = contributed;
                 } else {
                     self.emit_lex_diag("'\\o' not followed by '{'", esc_start, self.pos);
                     escape.kind = EscapeKind::Simple;
@@ -1791,9 +1837,10 @@ impl Lexer {
                 escape.kind = EscapeKind::Hex;
                 if self.pos < self.input.len() && self.input[self.pos] == b'{' {
                     // C2y / GCC 15+ delimited hex escape: \x{...}
-                    let (value, blew) = self.lex_delimited_escape(16, b'x', esc_start);
+                    let (value, blew, contributed) = self.lex_delimited_escape(16, b'x', esc_start);
                     escape.value = value;
                     escape.blew = blew;
+                    escape.contributed = contributed;
                 } else {
                     // Hex escape: \xNN - consumes all hex digits. The value is
                     // kept whole: whether it fits is the literal's decision.
@@ -1805,6 +1852,10 @@ impl Lexer {
                             esc_start,
                             self.pos,
                         );
+                        // The failed escape contributed nothing: `'\xg'` is a
+                        // one-character constant in GCC, which is why it
+                        // carries no multi-character diagnostic at all.
+                        escape.contributed = Some(0);
                     }
                     escape.value = value;
                     escape.blew = blew;
@@ -1814,9 +1865,10 @@ impl Lexer {
                 escape.kind = EscapeKind::Universal;
                 if self.pos < self.input.len() && self.input[self.pos] == b'{' {
                     // C2y / GCC 15+ delimited universal character name: \u{...}
-                    let (value, blew) = self.lex_delimited_escape(16, b'u', esc_start);
+                    let (value, blew, contributed) = self.lex_delimited_escape(16, b'u', esc_start);
                     escape.value = value;
                     escape.blew = blew;
+                    escape.contributed = contributed;
                 } else {
                     Self::take_ucn(&mut escape, self.lex_ucn_digits(4));
                 }
@@ -1825,14 +1877,18 @@ impl Lexer {
                 escape.kind = EscapeKind::Universal;
                 Self::take_ucn(&mut escape, self.lex_ucn_digits(8));
             }
-            b'N' => match self.lex_named_ucn() {
-                Some(value) => {
-                    escape.kind = EscapeKind::Named;
-                    escape.value = value;
+            b'N' => {
+                if !self.lex_named_ucn(&mut escape) {
+                    // Without its `{NAME}` GCC reads `\N` exactly like `\u`:
+                    // four hex digits, the same "incomplete" error echoing
+                    // what it read, and the same character count — so
+                    // `'\Nabcd'` is U+ABCD (three UTF-8 bytes, which makes it
+                    // a multi-character constant) while `'\Na'` is one
+                    // character and says nothing further.
+                    escape.kind = EscapeKind::Universal;
+                    Self::take_ucn(&mut escape, self.lex_ucn_digits(4));
                 }
-                // `'\N' not followed by '{'` is the letter N, not a character.
-                None => escape.value = 'N' as u32,
-            },
+            }
             b'0'..=b'7' => {
                 // Octal escape: \0 through \377 (1-3 octal digits)
                 escape.kind = EscapeKind::Octal;
@@ -1850,7 +1906,26 @@ impl Lexer {
                 }
                 escape.value = value;
             }
-            other => escape.value = other as u32,
+            // Everything else is an unknown escape: GCC warns (no flag, so
+            // only `-w` and `-Werror` act on it) and keeps the character. The
+            // three exceptions are measured: `\%`, `\[` and `\{` are silent.
+            // A non-graphical byte is spelled in octal (`'\040'` for a space,
+            // `'\303'` for the first byte of `é`), which is why the message is
+            // built from the byte and not from the source text.
+            other => {
+                if !matches!(other, b'%' | b'[' | b'{') {
+                    let spelled = if other.is_ascii_graphic() {
+                        (other as char).to_string()
+                    } else {
+                        format!("{:03o}", other)
+                    };
+                    self.warn(
+                        format!("unknown escape sequence: '\\{}'", spelled),
+                        Span::new(esc_start as u32, self.pos as u32, self.file_id),
+                    );
+                }
+                escape.value = other as u32;
+            }
         }
         escape.span = Span::new(esc_start as u32, self.pos as u32, self.file_id);
         if matches!(escape.kind, EscapeKind::Universal | EscapeKind::Named) {
@@ -1930,19 +2005,33 @@ impl Lexer {
     /// `'\x{' not terminated with '}' after \x{41` (echoing what was read, and
     /// what `\o{7x}` and `\u{12z}` also report). That is why `'\x{z}'` still
     /// reaches the multi-character literal warning while `'\x{}'` does not.
-    fn lex_delimited_escape(&mut self, radix: u32, letter: u8, esc_start: usize) -> (u32, bool) {
-        let brace = self.pos; // at '{'
-        self.pos += 1;
+    fn lex_delimited_escape(
+        &mut self,
+        radix: u32,
+        letter: u8,
+        esc_start: usize,
+    ) -> (u32, bool, Option<u8>) {
+        self.pos += 1; // consume '{'
         let digits_start = self.pos;
         let (value, blew) = self.lex_radix_digits(radix);
         let digits_end = self.pos;
         if self.pos < self.input.len() && self.input[self.pos] == b'}' {
             self.pos += 1;
+            // A terminated escape contributes its character, except `\x{}`
+            // and `\o{}`: the empty hex and octal forms contribute nothing,
+            // while the empty `\u{}` is one NUL character (measured).
             if digits_end == digits_start {
                 self.emit_lex_diag("empty delimited escape sequence", esc_start, self.pos);
+                if letter != b'u' {
+                    return (value, blew, Some(0));
+                }
             }
-            return (value, blew);
+            return (value, blew, None);
         }
+        // Unterminated: GCC keeps what it read (or the digits and brace for
+        // `\x{`), resumes at the character that broke the escape, and counts
+        // the escape as nothing for `\x{`/`\o{` but as one character for
+        // `\u{` (all measured, and all observable in the count GCC prints).
         let text = self.escape_text(Span::new(esc_start as u32, digits_end as u32, self.file_id));
         if digits_end == digits_start && letter == b'x' {
             self.emit_lex_diag(
@@ -1950,8 +2039,6 @@ impl Lexer {
                 esc_start,
                 digits_end,
             );
-            // The braces are ordinary characters: keep the `{`.
-            self.pos = brace;
         } else {
             self.emit_lex_diag(
                 format!(
@@ -1961,11 +2048,12 @@ impl Lexer {
                 esc_start,
                 digits_end,
             );
-            // Keep the character that broke the escape for the literal to scan
-            // as an ordinary character.
-            self.pos = digits_end;
         }
-        (0, false)
+        // Resume at the character that broke the escape; `\x{` has already
+        // consumed its brace, so the byte after it is the first ordinary
+        // character (`'\x{zz}'` is a TWO-character constant: `z` and `}`).
+        self.pos = digits_end;
+        (0, false, Some(if letter == b'u' { 1 } else { 0 }))
     }
 
     /// Parse a universal character name (`\uNNNN` or `\UNNNNNNNN`) and return
@@ -1999,19 +2087,22 @@ impl Lexer {
         Some(value)
     }
 
-    /// Parse C++23's named universal character escape `\N{NAME}` and return the
-    /// code point it names. `None` means the escape was not one (`\N` without a
-    /// `{`), so the caller falls back to reading `N` as an ordinary escape.
-    fn lex_named_ucn(&mut self) -> Option<u32> {
+    /// Parse C++23's named universal character escape `\N{NAME}` into
+    /// `escape`, returning whether it *was* one.
+    ///
+    /// `false` means the name is missing its `{`: GCC reports that and then
+    /// reads the escape the way `\u` is read, which is the caller's job
+    /// because only it knows how many hex digits `\u` takes. Every other
+    /// shape fills in `escape` completely, including the character count its
+    /// error recovery leaves behind (see [`RawEscape::contributed`]).
+    fn lex_named_ucn(&mut self, escape: &mut RawEscape) -> bool {
         let esc_start = self.pos.saturating_sub(2);
         if self.pos >= self.input.len() || self.input[self.pos] != b'{' {
+            // GCC reports the missing brace and then re-reads the escape the
+            // way `\u` is read; the caller does that, because only it knows
+            // how many hex digits `\u` would take.
             self.emit_lex_diag("'\\N' not followed by '{'", esc_start, self.pos);
-            self.emit_lex_diag(
-                "incomplete universal character name \\N",
-                esc_start,
-                self.pos,
-            );
-            return None;
+            return false;
         }
         self.pos += 1; // consume '{'
         let name_start = self.pos;
@@ -2023,6 +2114,7 @@ impl Lexer {
         {
             self.pos += 1;
         }
+        escape.kind = EscapeKind::Named;
         if self.pos >= self.input.len() || self.input[self.pos] != b'}' {
             self.emit_lex_diag(
                 format!(
@@ -2032,7 +2124,13 @@ impl Lexer {
                 esc_start,
                 self.pos,
             );
-            return Some('\u{FFFD}' as u32);
+            // GCC gives up on the literal here: the escape comes out of the
+            // count entirely, so the constant is neither multi-character nor
+            // "empty" — it only has the one error.
+            escape.value = '\u{FFFD}' as u32;
+            escape.kind = EscapeKind::Simple;
+            escape.contributed = Some(0);
+            return true;
         }
         self.pos += 1; // consume '}'
         let name = &self.input[name_start..self.pos - 1];
@@ -2042,10 +2140,16 @@ impl Lexer {
                 esc_start,
                 self.pos,
             );
-            return Some('\u{FFFD}' as u32);
+            escape.value = '\u{FFFD}' as u32;
+            escape.kind = EscapeKind::Simple;
+            escape.contributed = Some(1);
+            return true;
         }
         match super::ucn_name::lookup(name) {
-            Some(value) => Some(value),
+            Some(value) => {
+                escape.value = value;
+                true
+            }
             None => {
                 self.emit_lex_diag(
                     format!(
@@ -2055,7 +2159,12 @@ impl Lexer {
                     esc_start,
                     self.pos,
                 );
-                Some('\u{FFFD}' as u32)
+                // An invalid name counts as two characters in GCC's tally
+                // (`'\N{NO SUCH NAME}zzzz'` is six, not seven).
+                escape.value = '\u{FFFD}' as u32;
+                escape.kind = EscapeKind::Named;
+                escape.contributed = Some(2);
+                true
             }
         }
     }
@@ -3149,6 +3258,189 @@ mod escape_tests {
                 "multi-character character constant"
             ]
         );
+    }
+
+    #[test]
+    fn unknown_escapes_warn_with_gcc_wording() {
+        // GCC keeps the character and warns with no `-W` name, so `-w` and
+        // `-Werror` are the only switches that act on it. Three letters are
+        // silently accepted (`\\%`, `\\[`, `\\{`), and a non-graphical byte is
+        // spelled in octal — a space is `'\\040'`, and the first byte of `é`
+        // is `'\\303'`, not the character.
+        for source in [r"'\q'", r"'\8'", r"'\9'", r"'\-'", r"'\@'", r"'\A'"] {
+            let (_, messages) = narrow_char_with_diagnostics(source);
+            assert_eq!(
+                messages,
+                vec![format!("unknown escape sequence: '{}'", &source[1..3])],
+                "{source}"
+            );
+        }
+        // The value is the character itself, one character wide.
+        assert!(matches!(
+            narrow_char_with_diagnostics(r"'\q'").0,
+            TokenKind::CharLiteral('q')
+        ));
+        assert!(matches!(
+            narrow_char_with_diagnostics(r"'\8'").0,
+            TokenKind::CharLiteral('8')
+        ));
+        for source in [r"'\%'", r"'\['", r"'\{'", r"'\?'"] {
+            let (_, messages) = narrow_char_with_diagnostics(source);
+            assert!(messages.is_empty(), "{source}: {messages:?}");
+        }
+        let (_, messages) = narrow_char_with_diagnostics(r"'\ '");
+        assert_eq!(messages, vec!["unknown escape sequence: '\\040'"]);
+        let (_, messages) = narrow_char_with_diagnostics("'\\é'");
+        assert_eq!(
+            messages,
+            vec![
+                "unknown escape sequence: '\\303'",
+                "multi-character character constant"
+            ]
+        );
+        // Strings share the escape reader, so they share the warning.
+        let mut lexer = Lexer::new("\"\\q\"", 0);
+        lexer.tokenize();
+        assert_eq!(
+            lexer.diagnostics[0].message,
+            "unknown escape sequence: '\\q'"
+        );
+    }
+
+    #[test]
+    fn rejected_escapes_contribute_no_character() {
+        // Measured on gcc-16.2: `'\xg'` is a ONE-character constant, so it
+        // warns about neither a multi-character constant nor the 'int' size,
+        // and it does not collect an `empty character constant` on top of its
+        // own error. The `}` of `'\x{zz}'` is an ordinary character and counts.
+        let (kind, messages) = narrow_char_with_diagnostics(r"'\xg'");
+        assert!(matches!(kind, TokenKind::CharLiteral('g')));
+        assert_eq!(messages, vec!["'\\x' used with no following hex digits"]);
+
+        let (_, messages) = narrow_char_with_diagnostics(r"'\xgabde'");
+        assert_eq!(
+            messages,
+            vec![
+                "'\\x' used with no following hex digits",
+                "multi-character literal with 5 characters exceeds 'int' size of 4 bytes"
+            ]
+        );
+
+        let (_, messages) = narrow_char_with_diagnostics(r"'\x{zzzzz}'");
+        assert_eq!(
+            messages,
+            vec![
+                "'\\x' used with no following hex digits",
+                "multi-character literal with 6 characters exceeds 'int' size of 4 bytes"
+            ]
+        );
+
+        // An unterminated name consumes the literal and says nothing further.
+        let (_, messages) = narrow_char_with_diagnostics(r"'\N{zzzzzzzz'");
+        assert_eq!(
+            messages,
+            vec!["'\\N{' not terminated with '}' after \\N{zzzzzzzz"]
+        );
+
+        // An invalid name is two characters in a narrow literal and one in a
+        // wide one, which is exactly what GCC reports.
+        let (_, messages) = narrow_char_with_diagnostics(r"'\N{NO SUCH NAME}zzzz'");
+        assert_eq!(
+            messages,
+            vec![
+                "'\\N{NO SUCH NAME}' is not a valid universal character",
+                "multi-character literal with 6 characters exceeds 'int' size of 4 bytes"
+            ]
+        );
+        assert_eq!(
+            narrow_wide_messages(r"u'\N{NO SUCH NAME}'"),
+            vec!["'\\N{NO SUCH NAME}' is not a valid universal character"]
+        );
+        assert_eq!(
+            narrow_wide_messages(r"u8'\N{NO SUCH NAME}'"),
+            vec![
+                "'\\N{NO SUCH NAME}' is not a valid universal character",
+                "character not encodable in a single code unit"
+            ]
+        );
+    }
+
+    #[test]
+    fn named_escape_without_braces_reads_four_hex_digits() {
+        // GCC reads `\N` without its `{NAME}` exactly like `\u`: four hex
+        // digits, one character when it cannot complete them, and the UTF-8
+        // bytes of the code point when it can (`'\Nabcd'` is U+ABCD).
+        // U+ABCD is the three UTF-8 bytes EA AF 8D, so the constant is a
+        // three-character one and carries the `-Wmultichar` warning with it.
+        let (kind, messages) = narrow_char_with_diagnostics(r"'\Nabcd'");
+        assert!(matches!(kind, TokenKind::IntLiteral(0xEAAF8D)));
+        assert_eq!(
+            messages,
+            vec![
+                "'\\N' not followed by '{'",
+                "multi-character character constant"
+            ]
+        );
+        let (_, messages) = narrow_char_with_diagnostics(r"'\Na'");
+        assert_eq!(
+            messages,
+            vec![
+                "'\\N' not followed by '{'",
+                "incomplete universal character name \\Na"
+            ]
+        );
+        let (_, messages) = narrow_char_with_diagnostics(r"'\Nabczzzzzzz'");
+        assert_eq!(
+            messages,
+            vec![
+                "'\\N' not followed by '{'",
+                "incomplete universal character name \\Nabc",
+                "multi-character literal with 8 characters exceeds 'int' size of 4 bytes"
+            ]
+        );
+    }
+
+    #[test]
+    fn utf16_conversion_failure_is_reported_at_the_escape() {
+        // The escape above U+10FFFF contributes no character, so
+        // `u'\U00110000a'` is a one-character constant with no prefix warning,
+        // while three surviving characters keep theirs. The error is emitted in
+        // scan order, once per offending escape.
+        assert_eq!(
+            narrow_wide_messages(r"u'\U00110000a'"),
+            vec![
+                "\\U00110000 is outside the UCS codespace",
+                "converting UCN to execution character set: Invalid or incomplete multibyte or wide character"
+            ]
+        );
+        assert_eq!(
+            narrow_wide_messages(r"u'\n\x1FF\U00110000Z'"),
+            vec![
+                "\\U00110000 is outside the UCS codespace",
+                "converting UCN to execution character set: Invalid or incomplete multibyte or wide character",
+                "multi-character literal cannot have an encoding prefix"
+            ]
+        );
+        assert_eq!(
+            narrow_wide_messages(r"u'\U00110000\U00110000'"),
+            vec![
+                "\\U00110000 is outside the UCS codespace",
+                "converting UCN to execution character set: Invalid or incomplete multibyte or wide character",
+                "\\U00110000 is outside the UCS codespace",
+                "converting UCN to execution character set: Invalid or incomplete multibyte or wide character"
+            ]
+        );
+    }
+
+    /// Every diagnostic message of a wide character constant, in order.
+    fn narrow_wide_messages(source: &str) -> Vec<String> {
+        let mut lexer = Lexer::new(source, 0);
+        lexer.tokenize();
+        lexer
+            .diagnostics
+            .iter()
+            .map(|diag| diag.message.clone())
+            .collect()
     }
 
     #[test]

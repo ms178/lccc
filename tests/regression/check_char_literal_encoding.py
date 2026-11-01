@@ -188,6 +188,57 @@ CASES = [
     ("u'\U0001F600'", NARROW, ("-Wno-multichar",)),
     (r"u'\U0001F600'", NARROW, ("-Werror",)),
     (r"u8'\u00e9'", C23, ("-w",)),
+    # --- unknown escapes: accepted, but never silently ---------------------
+    # GCC warns with no label, so only `-w` and `-Werror` act on it; the
+    # character itself is kept, and `\%`, `\[` and `\{` are the measured
+    # exceptions that stay silent.
+    (r"'\q'", NARROW, ()),
+    (r"'\8'", NARROW, ()),
+    (r"'\9'", NARROW, ()),
+    (r"'\-'", NARROW, ()),
+    (r"'\%'", NARROW, ()),
+    (r"'\['", NARROW, ()),
+    (r"'\{'", NARROW, ()),
+    (r"'\?'", NARROW, ()),
+    (r"'\ '", NARROW, ()),
+    (r"'\q\q'", NARROW, ()),
+    (r"u'\q'", NARROW, ()),
+    (r"U'\-'", NARROW, ()),
+    (r"L'\q'", NARROW, ()),
+    (r"u8'\q'", C23, ()),
+    # --- a rejected escape contributes no character ------------------------
+    # `'\xg'` is a ONE-character constant for GCC, so it carries no
+    # multi-character diagnostic at all; the closing `}` of `'\x{zz}'` is an
+    # ordinary character and is counted.
+    (r"'\xg'", NARROW, ()),
+    (r"'\xgabde'", NARROW, ()),
+    (r"'\x\377'", NARROW, ()),
+    (r"'\x{}'", NARROW, ()),
+    (r"'\x{zz}'", NARROW, ()),
+    (r"'\x{zzzzz}'", NARROW, ()),
+    (r"'\o{}'", NARROW, ()),
+    (r"'\o{8}'", NARROW, ()),
+    (r"'\u{}'", NARROW, ()),
+    (r"'\N{}'", NARROW, ()),
+    (r"'\N{NO SUCH NAME}'", NARROW, ()),
+    (r"'\N{NO SUCH NAME}zzzz'", NARROW, ()),
+    (r"u'\N{NO SUCH NAME}'", NARROW, ()),
+    (r"u8'\N{NO SUCH NAME}'", C23, ()),
+    (r"'\N{zzzzzzzz'", NARROW, ()),
+    (r"'\xe'", NARROW, ()),
+    # --- `\N` without its braces is `\u` to GCC -------------------------
+    (r"'\Na'", NARROW, ()),
+    (r"'\Nabc'", NARROW, ()),
+    (r"'\Nabcd'", NARROW, ()),
+    (r"'\Nabcz'", NARROW, ()),
+    (r"'\Nabczzzzzzz'", NARROW, ()),
+    # --- a code point above U+10FFFF in `u''` -----------------------------
+    (r"u'\U00110000a'", NARROW, ()),
+    (r"u'a\U00110000'", NARROW, ()),
+    (r"u'\U00110000\U00110000'", NARROW, ()),
+    (r"u'\n\x1FF\U00110000Z'", NARROW, ()),
+    (r"u'\U00200000\x41\x100#\u0\U00010000\400'", NARROW, ()),
+    (r"U'\U00110000a'", NARROW, ()),
 ]
 
 # ---------------------------------------------------------------------------
@@ -206,6 +257,24 @@ DEVIATIONS = [
         literal, because a string literal's payload is a Rust `String` and
         cannot hold a code point above U+10FFFF (backlog GP-29). Character
         constants above U+10FFFF are fully supported.""",
+    ),
+    (
+        "char *s = u'\\U7FFFFFFF\\U0001F600';",
+        (),
+        [
+            "warning: \\U7FFFFFFF is outside the UCS codespace",
+            "error: converting UCN to execution character set: Invalid or "
+            "incomplete multibyte or wide character",
+            "warning: character not encodable in a single code unit",
+        ],
+        """GCC 16.2 reports the encoding prefix for this literal where LCCC
+        reports the encodability of the astral character. The escape above
+        U+10FFFF contributes no character to either compiler, so the literal
+        holds one character; GCC nevertheless counts the SOURCE characters for
+        its prefix rule when an unconvertible escape precedes an astral
+        character, and no later diagnostic depends on the difference. Every
+        other combination of the two is byte-identical, so this is pinned as a
+        decision rather than left as a surprise (backlog GP-31).""",
     ),
 ]
 
@@ -266,6 +335,186 @@ def run_case(compiler: str, language: str, literal: str, flags) -> tuple[list[st
         return diagnostics_of(built.stderr, source), ran.stdout.strip()
 
 
+# ---------------------------------------------------------------------------
+# Generated sweep.
+#
+# The table above is curated: every row was a decision. A curated table can
+# only pin what someone thought of, so `--sweep N` crosses the same atoms
+# mechanically (`N` deterministic literals, seeded) and compares them the same
+# way. It batches 25 literals per translation unit because LCCC renders at most
+# 200 errors and 200 warnings per unit; each literal is on its own line, so the
+# diagnostics map back by line number.
+# ---------------------------------------------------------------------------
+
+SWEEP_ATOMS = [
+    "a", "Z", "0", " ", "#", "é", "ß", "€", "漢", "😀",
+    r"\n", r"\t", r"\a", r"\v", r"\f", r"\r", r"\0", r"\?", r"\'", r"\\",
+    r"\7", r"\77", r"\377", r"\400", r"\777", r"\3777", r"\8",
+    r"\x41", r"\xff", r"\x100", r"\x1FF", r"\xg",
+    r"\u0041", r"\u00e9", r"\u20ac", r"\uFFFF", r"\u0",
+    r"\U0001F600", r"\U00010000", r"\U0010FFFF", r"\U00110000",
+    r"\U7FFFFFFF", r"\U80000000", r"\U00200000",
+    r"\N{SNOWMAN}", r"\N{DIGIT ONE}", r"\N{NO SUCH NAME}", r"\N",
+    r"\x{41}", r"\x{1FF}", r"\o{777}", r"\u{1F600}", r"\q",
+]
+SWEEP_PREFIXES = ["", "u8", "u", "U", "L"]
+SWEEP_DIALECTS = ("c23", "gnu23", "gnu17")
+
+
+def sweep_literals(count: int, seed: int) -> list[tuple[str, str]]:
+    """`count` deterministic literals, covering every atom and prefix once."""
+    import random
+
+    # `u8'x'` is a C23 literal: in C17 GCC reads `u8` as an ordinary
+    # identifier, which is a lexical difference (documented, and pinned in the
+    # curated table), not a character-constant one.
+    entries = [
+        (f"{prefix}'{atom}'", dialect)
+        for prefix in SWEEP_PREFIXES
+        for atom in SWEEP_ATOMS
+        for dialect in SWEEP_DIALECTS
+        if prefix != "u8" or dialect != "gnu17"
+    ]
+    rng = random.Random(seed)
+    seen = set(entries)
+    while len(entries) < count:
+        prefix = rng.choice(SWEEP_PREFIXES)
+        body = "".join(rng.choice(SWEEP_ATOMS) for _ in range(rng.randint(1, 7)))
+        dialect = rng.choice(SWEEP_DIALECTS)
+        if prefix == "u8" and dialect == "gnu17":
+            continue
+        entry = (f"{prefix}'{body}'", dialect)
+        if entry in seen:
+            continue
+        seen.add(entry)
+        entries.append(entry)
+    return entries
+
+
+# One class of literal is exempt from the sweep's strict comparison: a `u'…'`
+# constant that mixes a code point above U+10FFFF (which no compiler can turn
+# into a UTF-16 unit, so it contributes no character to either) with an astral
+# character (two code units of one). Both compilers reject the literal; GCC
+# reports the encoding prefix where LCCC reports the encodability of the astral
+# character. The curated table pins one representative of the class (GP-31), and
+# the sweep reports the class separately instead of counting it as a pass.
+def is_pinned_u16_mix(literal: str) -> bool:
+    if not literal.startswith("u'"):
+        return False
+    values = [int(match, 16) for match in re.findall(r"\\U([0-9A-Fa-f]{8})", literal)]
+    values += [ord(ch) for ch in literal if ord(ch) > 0xFFFF]
+    return any(value > 0x10FFFF for value in values) and any(
+        0x1_0000 <= value <= 0x10FFFF for value in values
+    )
+
+
+def _diagnostics_by_line(stderr: str) -> dict[int, list[str]]:
+    by_line: dict[int, list[str]] = {}
+    for line in stderr.splitlines():
+        match = re.match(r"^[^:]+:(\d+):(?:\d+:)? (.*)$", line)
+        if match is None:
+            continue
+        text = match.group(2)
+        if is_driver_summary(text):
+            continue
+        by_line.setdefault(int(match.group(1)), []).append(text)
+    return by_line
+
+
+def run_sweep(ccc: str, gcc: str, count: int, seed: int, verbose: bool) -> tuple[int, int]:
+    """Compare `count` generated literals; returns (checked, failures)."""
+    work = sweep_literals(count, seed)
+    compilers = {"gcc": [gcc, "-fmax-errors=0"], "lccc": [ccc]}
+    chunk = 25
+    # One dialect per translation unit: the literals are lexed differently.
+    batches = []
+    for dialect in SWEEP_DIALECTS:
+        same = [entry for entry in work if entry[1] == dialect]
+        for base in range(0, len(same), chunk):
+            batches.append(same[base:base + chunk])
+    failures = 0
+    checked = 0
+    pinned = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for piece in batches:
+            dialect = piece[0][1]
+            body = ["int main(void) {"]
+            for literal, _ in piece:
+                body.append(f"    (void)({literal});")
+            body += ["    return 0;", "}"]
+            text = "\n".join(body) + "\n"
+            diagnostic: dict[str, dict[int, list[str]]] = {}
+            for label, command in compilers.items():
+                source = os.path.join(tmp, f"diag-{label}.c")
+                with open(source, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                proc = subprocess.run(
+                    command + [f"-std={dialect}", "-fsyntax-only", source],
+                    capture_output=True,
+                    text=True,
+                )
+                diagnostic[label] = _diagnostics_by_line(proc.stderr)
+            accepted = []
+            for offset, (literal, _) in enumerate(piece):
+                line = offset + 2  # line 1 is `int main(void) {`
+                expected = diagnostic["gcc"].get(line, [])
+                actual = diagnostic["lccc"].get(line, [])
+                if is_pinned_u16_mix(literal):
+                    pinned += 1
+                    if verbose:
+                        print(f"ok   (sweep, pinned deviation) {literal} [{dialect}]")
+                    continue
+                checked += 1
+                if expected != actual:
+                    failures += 1
+                    print(f"FAIL (sweep) {literal} [{dialect}]")
+                    print(f"      oracle: {expected}")
+                    print(f"        lccc: {actual}")
+                elif all("error:" not in message for message in expected):
+                    accepted.append((offset, literal))
+            if not accepted:
+                continue
+            body = ["#include <stdio.h>", "int main(void) {"]
+            for offset, literal in accepted:
+                body.append(
+                    f'    printf("{offset} %llX %zu\\n", '
+                    f"(unsigned long long)(long long)({literal}), sizeof({literal}));"
+                )
+            body += ["    return 0;", "}"]
+            text = "\n".join(body) + "\n"
+            measured: dict[str, dict[int, str]] = {}
+            for label, command in compilers.items():
+                source = os.path.join(tmp, f"value-{label}.c")
+                binary = os.path.join(tmp, f"value-{label}")
+                with open(source, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                built = subprocess.run(
+                    command + [f"-std={dialect}", source, "-o", binary],
+                    capture_output=True,
+                    text=True,
+                )
+                if built.returncode != 0:
+                    measured[label] = {}
+                    continue
+                ran = subprocess.run([binary], capture_output=True, text=True)
+                measured[label] = {
+                    int(parts[0]): " ".join(parts[1:])
+                    for parts in (line.split() for line in ran.stdout.splitlines())
+                    if parts
+                }
+            for offset, literal in accepted:
+                if measured["gcc"].get(offset) != measured["lccc"].get(offset):
+                    failures += 1
+                    print(f"FAIL (sweep value) {literal} [{dialect}]")
+                    print(f"      oracle: {measured['gcc'].get(offset)!r}")
+                    print(f"        lccc: {measured['lccc'].get(offset)!r}")
+                elif verbose:
+                    print(f"ok   (sweep) {literal} [{dialect}]")
+    if pinned:
+        print(f"sweep: {pinned} literal(s) in the pinned u''/astral class (GP-31)")
+    return checked, failures
+
+
 def main() -> int:
     repository = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -280,6 +529,15 @@ def main() -> int:
         default=min(8, os.cpu_count() or 1),
         help="compilers to run at once (the check is subprocess-bound)",
     )
+    parser.add_argument(
+        "--sweep",
+        type=int,
+        default=0,
+        metavar="N",
+        help="additionally compare N generated literals (deterministic seed), "
+        "batched one translation unit per compiler chunk",
+    )
+    parser.add_argument("--sweep-seed", type=int, default=7)
     args = parser.parse_args()
 
     def check(entry) -> tuple[str, str | None]:
@@ -332,6 +590,13 @@ def main() -> int:
             print(f"          lccc: {actual}")
         elif args.verbose:
             print(f"ok   (documented deviation) {source}")
+
+    if args.sweep:
+        swept, sweep_failures = run_sweep(
+            args.ccc, args.gcc, args.sweep, args.sweep_seed, args.verbose
+        )
+        checks += swept
+        failures += sweep_failures
 
     print(f"checked {checks} case(s): {checks - failures} match, {failures} differ")
     if failures:

@@ -433,6 +433,8 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "return of the address of a local variable, parameter or label"
+    ),
+    warning!(
         Multichar,
         "multichar",
         true,

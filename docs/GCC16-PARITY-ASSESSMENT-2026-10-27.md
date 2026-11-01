@@ -240,10 +240,13 @@ decides what fits from the literal's width, not from the escape: `u'\x100'` is
 
 Evidence. `tests/regression/check_char_literal_encoding.py` is differential: it
 compiles and **runs** every case under both compilers and compares the value,
-`sizeof`, and the ordered `warning:`/`error:` stream — 343 checks over 120
-literals in {`c23`, `gnu23`, `gnu17`} (17 of them C23-only) plus five flag sets
-(`-Wno-multichar`, `-Werror=multichar`, `-w`, `-Werror` and a clean run), `0`
-differences, plus one pinned deviation (GP-29).
+`sizeof`, and the ordered `warning:`/`error:` stream — 466 checks over 121
+literals in {`c23`, `gnu23`, `gnu17`} (C23-only where the spelling is) plus five
+flag sets (`-Wno-multichar`, `-Werror=multichar`, `-w`, `-Werror` and a clean
+run), `0` differences, plus two pinned deviations (GP-29, GP-31). `--sweep N`
+crosses the same atoms mechanically (N deterministic, seeded literals) and runs
+in the same gate with `--sweep 400`: 1,208 checks in ~13 s, `0` differences, and
+a class-level report for the one combination pinned as GP-31.
 Two further sweeps were run during the fix: 84 literals x 4 flag sets (336
 checks) and 420 randomly composed literals drawn from a prefix x content grammar
 over 31 atoms (raw ASCII, raw multibyte, simple/hex/octal/UCN/named/delimited

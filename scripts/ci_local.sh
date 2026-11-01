@@ -239,7 +239,7 @@ gate "ucn-identifier-table" fast \
 # compares value, sizeof and the ordered diagnostic stream.
 gate "char-literal-encoding" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" \
-    python3 tests/regression/check_char_literal_encoding.py
+    python3 tests/regression/check_char_literal_encoding.py --sweep 400
 gate "asm-operand-diagnostics" fast \
     env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm \
     CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 \

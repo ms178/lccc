@@ -2372,6 +2372,67 @@ New register items from this pass:
   `"\x{1FF}"`, `u"\x10000"`), lccc points at the escape. Same message, same
   severity. Cosmetic; not pinned byte for byte.
 
+#### 2026-11-01 fourth pass — the escapes the first pass never compared
+
+The third pass compared **values** and the diagnostics of *literals*. A
+red-team question it did not answer: what happens to the escape forms nobody
+wrote a case for? Crossing the 95 printable bytes after a backslash, in both
+`'…'` and `"…"`, produced **130 divergences** — every unknown escape letter.
+None of them was a value error (`'\q'` was already 0x71 in both compilers); all
+130 were a diagnostic GCC prints and lccc did not. That is the difference
+between "the number is right" and "the compiler is right", and it is the kind of
+gap a curated table cannot find by construction.
+
+Fixed in this pass, each measured against gcc-16.2 first:
+
+* **`unknown escape sequence: '\X'`** now exists (it did not, anywhere: not in
+  character constants, not in strings). It has no `-W` name — `-w` silences it
+  and `-Werror` promotes it — and three letters are silently accepted
+  (`\%`, `\[`, `\{`, measured). A non-graphical byte is spelled in octal, so
+  `'\ '` reports `'\040'` and `'\é'` reports `'\303'` (the first byte of the
+  UTF-8 sequence, not the character).
+* **A rejected escape contributes no character.** `'\xg'` is a *one*-character
+  constant in GCC, so it carries no `-Wmultichar` and no "exceeds 'int' size"
+  diagnostic at all; lccc counted the failed `\x` as a character and warned.
+  The same holds for `'\x{}'`, `'\o{}'`, `'\x{'`-unterminated and
+  `'\o{'`-unterminated: GCC consumes them, counts nothing, and resumes at the
+  first character it did not consume — which is why `'\x{zz}'` is a
+  two-character constant (the `z` and the `}`) and `'\x{zzzzz}'` reports six.
+  `'\u{…'` and `'\N{…'` are the measured exceptions: one character and zero.
+  A literal that ends up with no characters *because of an error* gets no
+  `empty character constant` on top (GCC's rule, now lccc's).
+* **`\N` without its braces is `\u`.** `'\Nabcd'` is U+ABCD (three UTF-8
+  bytes, hence a multi-character constant) and `'\Na'` is `incomplete
+  universal character name \Na` — one character. lccc always said `\N` and
+  always counted one, so its diagnostic text and its character count both
+  disagreed.
+* **A code point above U+10FFFF in `u'…'`** is reported *at the escape*, once
+  per offending escape, and contributes no character: `u'\U00110000a'` is a
+  one-character constant in GCC (no encoding-prefix warning), while
+  `u'\n\x1FF\U00110000Z'` keeps three characters and warns about the prefix.
+  lccc emitted the conversion error once, at the end of the literal, which also
+  put it in the wrong order.
+* **`\?`** is a standard escape and stays silent; it had been falling through
+  to the unknown-escape path after the fix above.
+
+The instrument that found all of this is committed: `check_char_literal_encoding.py
+--sweep N` crosses prefix x atom x dialect mechanically and batches 25 literals
+per translation unit (lccc renders at most 200 errors and 200 warnings per unit,
+so batching is what makes a few thousand cases cheap). At `--sweep 400` the gate
+runs 1,208 checks in ~13 s; the 2,500-literal run used here reported 2,936
+checks with **0 differences** and 30 literals in the pinned class below.
+
+* **GP-31 · `u'…'` mixing an unconvertible escape with an astral character.**
+  `u'\U7FFFFFFF\U0001F600'`: both compilers reject it and both report the
+  codespace warning and the conversion error, but GCC then reports the encoding
+  prefix where lccc reports `character not encodable in a single code unit`.
+  The escape above U+10FFFF contributes no character to either, so the literal
+  holds one astral character (two UTF-16 units); GCC appears to count *source*
+  characters for the prefix rule when an unconvertible escape comes first. No
+  later diagnostic depends on the choice, every other combination of the two is
+  byte-identical, and the checker pins one representative and reports the class
+  separately instead of silently exempting it.
+
 
 ### 12.1 Ranked register
 
