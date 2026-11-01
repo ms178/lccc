@@ -26,20 +26,20 @@
 #   * a valid translation unit still compiles (a gate that only asserted
 #     rejections would pass with every construct deleted).
 set -euo pipefail
-# A bare `set -e` abort names nothing in the CI check UI. A DEBUG trap records
-# the last command executed (it never changes control flow, which matters here:
-# the gate deliberately runs compilers that must fail, so an ERR trap would
-# abort on the first intended rejection) and the EXIT trap reports it when the
-# script ends badly.
-last_command=
+# A bare `set -e` abort names nothing in the CI check UI, and this gate runs
+# compilers that are *meant* to fail, so no DEBUG or ERR trap may be installed:
+# either one runs between a failing compiler and the `local rc=$?` that reads
+# its status, which silently reports success instead. `$BASH_COMMAND` inside
+# this single EXIT trap already names the command that ended the script, and
+# the trap is installed before the first fallible command so an early abort is
+# reported too. No section notices either: GitHub keeps ten annotations per
+# step, and a progress notice that crowds out the failure is worse than none.
 tmp=
-trap 'last_command=$BASH_COMMAND' DEBUG
 report_on_exit() {
     local rc=$?
-    trap - DEBUG
-    if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+    [ -n "${tmp:-}" ] && rm -rf "$tmp"
     if ((rc)); then
-        echo "::error::severity gate exited $rc; last command: $last_command"
+        echo "::error::severity gate exited $rc; last command: $BASH_COMMAND"
     fi
     return 0
 }
@@ -371,8 +371,13 @@ echo "PASS: gcc-16.2 diagnostic severity, message and column parity"
 
 if ! redteam=$(CCC="$CCC" GCC="$GCC" python3 "$redteam_runner" 2>&1); then
     printf '%s\n' "$redteam" >&2
-    printf '::error::%s\n' "$(printf '%s\n' "$redteam" \
-        | grep -E 'FAIL|Traceback|error:' | sed -n '1p' || printf 'redteam matrix failed')"
+    # `grep -m1` would stop reading early and turn a real producer failure into
+    # a SIGPIPE under `pipefail` (scripts/check_pipefail_sigpipe.py), so the
+    # whole match set is collected and the first line taken here.
+    matches=$(printf '%s\n' "$redteam" | grep -E 'FAIL|Traceback|error:'; :)
+    first=${matches%%$'\n'*}
+    [ -n "$first" ] || first='red-team matrix failed (no FAIL line in its output)'
+    printf '::error::%s\n' "$first"
     exit 1
 fi
 printf '%s\n' "$redteam"

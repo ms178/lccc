@@ -39,6 +39,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
+# mkcpustr is a host generator, never a kernel translation unit.
+HOSTCC=${HOSTCC:-cc}
 
 # Fail fast with an actionable message: without these, the first failure is a
 # bare "No such file or directory" from the assemble loop, dozens of lines in.
@@ -78,7 +80,7 @@ lccc_boot_stage_header "$header_stage"
 # ---- generated headers -----------------------------------------------------
 # cpustr.h (needs the mkcpustr host tool)
 if [[ ! -f arch/x86/boot/cpustr.h ]]; then
-  gcc -O2 -Iarch/x86/include -Iarch/x86/include/generated -Iinclude \
+  "$HOSTCC" -O2 -Iarch/x86/include -Iarch/x86/include/generated -Iinclude \
       arch/x86/boot/mkcpustr.c -o "$OUT/mkcpustr"
   "$OUT/mkcpustr" > arch/x86/boot/cpustr.h
 fi

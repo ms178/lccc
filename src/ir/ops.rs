@@ -104,12 +104,13 @@ pub enum IrBinOp {
     /// or more -- an undefined C shift that may sit in dead code -- still
     /// compiles and still agrees with the constant folder.
     ///
-    /// Typed 8/16/32/64-bit integers, and the bit index is the second operand:
-    /// the operation is NOT commutative.  Passes synthesize it from the
-    /// shift/OR pair, so every backend must lower it; the portable lowering
-    /// is `lhs | (1 << (rhs mod W))` at the operation's width, which is why
-    /// a 64-bit operation may not appear on a 32-bit target (the wide-int
-    /// pair path has no bit-set lowering).
+    /// Typed at the integer widths I8/U8/I16/U16/I32/U32/I64/U64 (and Ptr),
+    /// and the bit index is the second operand: the operation is NOT
+    /// commutative.  Passes synthesize it from the shift/OR pair, so every
+    /// backend must lower it at the operation's width and canonicalize narrow
+    /// results; the portable lowering is `lhs | (1 << (rhs mod W))`.  A
+    /// 64-bit operation may not appear on a 32-bit target (the wide-int pair
+    /// path has no bit-set lowering).
     BitSet,
     /// Clear one bit: `BitClear(x, n)` is `x & ~(1 << (n mod W))`, the
     /// canonical form of `x & ~(1u << n)` -- x86 `btr`, and the portable

@@ -61,7 +61,7 @@ gate re-derives every cell from a live gcc on every CI run, so a gcc that
 changes its mind fails the gate instead of silently redefining what parity
 means.
 
-Two verdicts are deliberately *not* "ignore it because gcc does":
+Three verdicts are deliberately *not* "ignore it because gcc does":
 
 * `preserve_none` and `no_callee_saved_registers` are refused on both x86
   targets. Preserving extra registers is not a sufficient ABI proof: measured

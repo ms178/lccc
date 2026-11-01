@@ -77,11 +77,11 @@ C
 CCC_SIMPLIFY_SKIP=negcast "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_negcast.s"
 CCC_SIMPLIFY_SKIP=zeroneg "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_zeroneg.s"
 CCC_SIMPLIFY_SKIP=notcast "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_notcast.s"
-# `bit_select` owns the bit-clear shape itself (it turns it into a `BitClear`
-# and one `btr`), so `notcast`'s own effect is measured with that fold off.
-CCC_NO_BIT_SELECT=1 "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_bitsel.s"
-CCC_NO_BIT_SELECT=1 CCC_SIMPLIFY_SKIP=notcast "$CCC" -O2 -S "$tmp/shapes.c" \
-    -o "$tmp/no_bitsel_no_notcast.s"
+# The single-bit selection fold now owns the eligible `x & ~(1 << n)` shapes.
+# Disable it to keep testing the older complement-width fold underneath, and
+# disable both to prove which pass owns the remaining extension/not pair.
+CCC_NO_BIT_SELECT=1 "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_bit_select.s"
+CCC_NO_BIT_SELECT=1 CCC_SIMPLIFY_SKIP=notcast "$CCC" -O2 -S "$tmp/shapes.c" -o "$tmp/no_notcast_no_select.s"
 
 fn_body() { # $1 = asm file, $2 = label; body between the label and ret
     sed -n "/^$2:/,/ret/p" "$1"
@@ -152,45 +152,42 @@ if ! has "$(fn_body "$tmp/no_negcast.s" notzero)" 'negq'; then
     exit 1
 fi
 
-# ── 2b. The complement's round trip is gone ────────────────────────────────
-# Default pipeline: `bit_select` finishes the shape, so it is one `btr` and
-# neither the complement nor the shift survives at all.
-after=$(fn_body "$tmp/shapes.s" bclear)
-if ! has "$after" 'btrl'; then
-    echo "bclear is not a BitClear in the default pipeline:" >&2
-    echo "$after" >&2
-    exit 1
-fi
-lacks "$after" 'notl\|notq\|cltq\|shll' "bclear keeps a complement or a shift"
+# ── 2b. The eligible bit-clear is now a single BTR; notcast still owns the
+#       fallback underneath it ─────────────────────────────────────────────
+# `bit_idioms` recognizes `x & ~(1 << n)` as BitClear, so the production shape
+# is the native bit instruction, not a 32-bit NOT.  Pin that win, then disable
+# the selection fold to keep the original complement-width contract covered.
 expect bclear 3 shapes.s
-# `notcast` owns the shape once `bit_select` is off: 8 with the rule, 9 without.
-no_bitsel=$(fn_body "$tmp/no_bitsel.s" bclear)
-n=$(count "$tmp/no_bitsel.s" bclear)
-[ "$n" -le 8 ] || {
-    echo "bclear costs $n instructions with bit_select off; the complement is widened:" >&2
-    echo "$no_bitsel" >&2
-    exit 1
-}
-lacks "$no_bitsel" 'notq\|cltq' "bclear complements at 64 bits"
-if ! has "$no_bitsel" 'notl'; then
-    echo "bclear must complement at 32 bits:" >&2
-    echo "$no_bitsel" >&2
-    exit 1
-fi
-expect bclear 8 no_bitsel.s
-expect bclear 9 no_bitsel_no_notcast.s
-if ! has "$(fn_body "$tmp/no_bitsel_no_notcast.s" bclear)" 'notq'; then
-    echo "CCC_SIMPLIFY_SKIP=notcast does not restore the 64-bit complement:" >&2
-    fn_body "$tmp/no_bitsel_no_notcast.s" bclear >&2
-    exit 1
-fi
-# Controls: the unsigned spelling never widened, and a widening cast keeps its
-# wide complement in both builds.
 expect bclearu 3 shapes.s
-expect bclearu 8 no_bitsel.s
-expect bclearu 8 no_bitsel_no_notcast.s
+for label in bclear bclearu; do
+    if ! has "$(fn_body "$tmp/shapes.s" "$label")" 'btrl'; then
+        echo "$label must select the native bit-clear:" >&2
+        fn_body "$tmp/shapes.s" "$label" >&2
+        exit 1
+    fi
+    lacks "$(fn_body "$tmp/shapes.s" "$label")" 'not[q l]\|cltq\|shl' \
+        "$label still spells the bit-clear as shift/complement"
+done
+# With selection disabled, `notcast` owns the 32-bit complement: 8 instructions
+# folded, 9 with the rule off, and the wide NOT returns only in the latter.
+expect bclear 8 no_bit_select.s
+expect bclearu 8 no_bit_select.s
+if ! has "$(fn_body "$tmp/no_bit_select.s" bclear)" 'notl'; then
+    echo "bclear fallback must complement at 32 bits:" >&2
+    fn_body "$tmp/no_bit_select.s" bclear >&2
+    exit 1
+fi
+expect bclear 9 no_notcast_no_select.s
+if ! has "$(fn_body "$tmp/no_notcast_no_select.s" bclear)" 'notq'; then
+    echo "CCC_SIMPLIFY_SKIP=notcast does not restore the 64-bit complement:" >&2
+    fn_body "$tmp/no_notcast_no_select.s" bclear >&2
+    exit 1
+fi
+# A widening cast keeps its wide complement in every build.
 expect notw 4 shapes.s
 expect notw 4 no_notcast.s
+expect notw 4 no_bit_select.s
+expect notw 4 no_notcast_no_select.s
 if ! has "$(fn_body "$tmp/shapes.s" notw)" 'notq'; then
     echo "notw must complement at 64 bits (`~(unsigned long)x` observes all of it):" >&2
     fn_body "$tmp/shapes.s" notw >&2

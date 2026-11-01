@@ -11,7 +11,6 @@
 # the IR verifier this gate exists to exercise.  Excluded rather than
 # re-sampled because the rest of the list is unchanged and a regeneration would
 # shift all 84 entries.
-#
 # clang-c/Sema/cast.c is ineligible under that same rule: it carries
 # `expected-error {{pointer cannot be cast to type}}` for a C11 6.5.4p2
 # violation, and lccc now enforces that constraint (GCC 16.2 parity), so the
@@ -109,3 +108,9 @@ tests/regression/widen_i32_i64_sse2_reduction.c
 # Removed: tests/corpus/clang-c/Sema/inline-asm-validate-m68k.c (m68k-only
 # constraint letters; with operand validation in place it is rejected here
 # exactly as gcc 16.2 rejects it on x86-64, so it cannot reach the IR).
+# Every entry below must *compile*; a corpus file whose own RUN line expects
+# diagnostics can never satisfy that, whatever its subject matter.
+# The atomics/aggregate fixture replaces the same Clang negative test with
+# atomics, compare-and-swap, aggregate moves across calls and pointer punning
+# through the optimiser under CCC_VERIFY_IR=abort.
+tests/regression/verify_ir_atomics_aggregates.c
