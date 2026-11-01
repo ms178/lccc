@@ -8982,7 +8982,10 @@ f:
         assert!(thread_trampolines(&mut lines, &mut kinds, n));
         assert_eq!(lines[1], "    b .Lreal", "entry hop not resolved");
         assert_eq!(lines[3], ".Ltramp:", "the label itself is never removed");
-        assert_eq!(lines[4], "    b .Lreal", "second hop of the chain not folded");
+        assert_eq!(
+            lines[4], "    b .Lreal",
+            "second hop of the chain not folded"
+        );
         assert_eq!(lines[11], "    mov x0, #7", "unrelated code is untouched");
     }
 
