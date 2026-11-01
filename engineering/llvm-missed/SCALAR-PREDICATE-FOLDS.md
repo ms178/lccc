@@ -10,6 +10,13 @@ Everything here was driven by measurement, not by taste: every rewrite was
 first reproduced as a three-compiler instruction-count gap on x86-64 at `-O2`,
 then implemented, then re-measured against the same three compilers.
 
+**Round 3 (2026-11-01)** adds the two rewrites §10 and §11 describe: comparison
+dominance (`(x != 0) & (x > 4)` is `x > 4`) and the truncated complement
+(`trunc32(not64(sext64 v))` is `~v`). Both were reproduced as three-compiler
+gaps on a 53-idiom scalar probe (`/home/user/probe3/probe.c` in the session that
+wrote them; the shapes are reproduced in the gate scripts), and both are
+measured on the same 2,791-file sweep as the earlier rounds.
+
 **Round 2 (2026-11-01)** closed two of the items this document listed as "not
 done" — the lowest-set-bit matcher and a ring-correct interval width that lets
 windows crossing zero fold — and added the `0 - x` negation canonicalisation
@@ -30,15 +37,19 @@ in the tree is called a batch:
 | pass (`src/passes/sign_magnitude.rs`) | `signmag` | `|x|` and `|a - b|` → mask, XOR, subtract |
 | matcher (`bit_idioms.rs`) | `fold_shift_pair_into_mask` | `(x << k) >>u k` → `x & (2^(W-k)-1)` |
 | matcher (`bit_idioms.rs`) | `fold_unit_interval_test` | `(x == 0) \| (x == 1)` → `x <=u 1` |
+| matcher (`bit_idioms_compare_dominance.rs`) | `fold_compare_dominance` | `(x != 0) & (x > 4)` → `x > 4`; a join of two comparisons of one value is its stronger (or weaker) operand |
 | matcher (`bit_idioms.rs`) | `fold_lowest_set_bit` | `1 << Ctz(~x)` → `(x + 1) & ~x`, plus the exact `~x == 0` arm |
 | rule (`simplify.rs`) | `zeroneg` | `0 - x` → `Neg x` (the modular negate, canonically spelled) |
 | rule (`simplify.rs`) | `negcast` | `(i32)(-(i64)(i32)v)` → `-(i32)v` (a truncation distributes over a negate) |
+| rule (`simplify.rs`) | `notcast` | `(i32)(~(i64)(i32)v)` → `~(i32)v` (a truncation distributes over a complement) |
 | tests (`bit_idioms_mask_interval_tests.rs`) | — | production-matcher tests for the two matchers |
 | gate (`check_predicate_differences_and_ranges.py`) | `predicate-differences-and-ranges` | the three passes |
 | gate (`check_mask_and_interval_folds.py`) | `mask-and-interval-folds` | the two matchers |
 | gate (`check_lowest_set_bit_fold.sh`) | `lowest-set-bit-fold` | the lowest-set-bit matcher and `zeroneg` |
-| gate (`check_narrow_negate_fold.sh`) | `narrow-negate-fold` | `zeroneg` and `negcast`, with the untouched widths pinned as controls |
+| gate (`check_narrow_negate_fold.sh`) | `narrow-negate-fold` | `zeroneg`, `negcast` and `notcast`, with the untouched widths pinned as controls |
+| gate (`check_compare_dominance_fold.sh`) | `compare-dominance-fold` | `fold_compare_dominance`, both directions, with the two non-dominant shapes pinned as controls |
 | tests (`bit_idioms_lowest_bit_tests.rs`) | — | executes the rewritten block against the reference semantics |
+| tests (`bit_idioms_compare_dominance_tests.rs`) | — | evaluates the join and the returned `Copy` over the whole 8-/16-bit ring |
 
 ## The five rewrites
 
@@ -287,6 +298,75 @@ measurement instead of slipping in. The same gate records the one site where
 6 with the narrow negate, because the 16-bit consumers mask it) rather than
 hiding it — see "What is not done".
 
+### 10. Comparison dominance — `fold_compare_dominance`
+
+```c
+int f1(int x)       { return (x != 0) & (x > 4); }    /* 9 -> 4 */
+int f2(int x)       { return (x > 0)  & (x > 99); }   /* 9 -> 4 */
+unsigned f3(unsigned x) { return (x < 10) & (x < 5); } /* 9 -> 4 */
+int f4(int x)       { return (x != 0) | (x > 4); }    /* 9 -> 4 */
+```
+
+Two comparisons of the same value joined by `&` or `|` are how C spells a range
+guard (`if (n && n > 4)`, `p && p->len > 8` once `p` has been proved non-null,
+`assert(i < n && i < max)`). If one comparison's value set contains the other's,
+the join collapses to one of its own operands: `A & B` is `B` when `B` implies
+`A`, `A | B` is `A` under the same implication. Both oracles fold all four
+shapes to four instructions; LCCC emitted the second compare, its
+materialization, the logic op and the joining move (nine).
+
+```text
+before   testl %edi,%edi; setne %sil; movzbl %sil,%esi; cmpl $4,%edi;
+         setg %dl; movzbl %dl,%edx; andl %edx,%esi; movl %esi,%eax
+after    xorl %eax,%eax; cmpl $4,%edi; setg %al
+```
+
+Three properties keep it cheap to trust:
+
+* **The replacement copies an operand of the join verbatim.** No compare is
+  rebuilt, no type is re-derived and no boolean carrier is chosen: `(x != 0) &
+  (x > 4)` becomes a `Copy` of the `x > 4` value, whatever its width and
+  whatever casts sit around it. A wrong answer is therefore impossible unless
+  the implication itself is wrong.
+* **The implication is decided in the comparison's own ordering, exactly.** A
+  compare denotes an interval, a singleton (`==`) or a co-singleton (`!=`) over
+  the ordering it was written in; containment is decided over `i128` with
+  sentinel infinities, with a sign- or zero-extension of the ring constant. Two
+  ordering comparisons are only combined when they agree on the ordering
+  (`x < 5` and `x <u 5` are refused); `Eq`/`Ne` participate in either. Sets that
+  are empty *in their own ring* (`u32 x < 0`) are simply unmatched — in `i128`
+  they look non-empty, so the fold misses and never guesses.
+* **Both operands must be comparison results**, so `&`/`|` really are the
+  Boolean conjunction/disjunction; a bitwise join of wider values is refused.
+
+The first draft attributed `(x != 0) & (x > 4)` to `x != 0` — it kept the
+operand that is implied rather than the one that implies. The instruction
+counts fell the same way in both directions (9 → 4), so the matcher tests do not
+assert an operand: they evaluate the ORIGINAL pair and the returned `Copy` over
+every value of the 8- and 16-bit rings and compare the answers. The sweep is
+what the first draft failed.
+
+### 11. Truncated complement — `notcast`
+
+```c
+int f(int x, int n) { return x & ~(1 << n); }   /* 9 -> 8 */
+```
+
+The C promotions carry a 32-bit complement at 64 bits in exactly the shapes the
+negate of §9 appears in: `~(1 << n)` reaches the backend as
+`trunc32(not64(sext64(shl 1, n)))`, so the bit-clear pays `cltq; notq` where
+`notl` is the whole complement. `Not` is bitwise, so it commutes with truncation
+outright — the low bits of `~ext(v)` ARE `~v` — and the fold needs no width pair
+restriction and no signedness argument, unlike the negate. What it does need is
+a NARROWING outer cast: `ext(~v)` and `~ext(v)` differ in the high bits, so a
+widening step cannot be dropped, and the two controls in
+`check_narrow_negate_fold.sh` (`~(unsigned long)x`, and the unsigned spelling
+that never widened) pin that.
+
+The remaining gap on that shape is instruction selection, not folding: GCC and
+Clang reach three instructions with `btr`, which LCCC's IR has no operation for
+(see "What is not done").
+
 ## Measurements
 
 x86-64, `-O2`, instructions counted inside each function body including `ret`.
@@ -316,6 +396,14 @@ installed in this sandbox, so its column is absent rather than guessed.
 | `x > -8 && x <= 7` / `x >= -7 && x < 8` | 7 | **5** | 5 | 5 | round 2, all strictness mixes |
 | `-(x != 0)` (int) | 7 | **6** | 3 | 4 | round 2 (`negcast`); the rest is the missing `neg`/`sbb` idiom |
 | `(unsigned short)-x` | 4 | 4 | 3 | 3 | unchanged: the 32 → 16 fold measured as a loss |
+| `(x != 0) & (x > 4)` | 9 | **4** | 4 | 4 | round 3 (`fold_compare_dominance`), now level |
+| `(x != 0) & (x >= 7)` unsigned | 9 | **4** | 4 | 4 | round 3, now level |
+| `(x > 0) & (x > 99)` | 9 | **4** | 4 | 4 | round 3, now level |
+| `(x < 10) & (x < 5)` unsigned | 9 | **4** | 4 | 4 | round 3, now level |
+| `(x != 0) \| (x > 4)` | 9 | **4** | 4 | 4 | round 3: the disjunction keeps the guard |
+| `x & ~(1 << n)` | 9 | **8** | 3 | 3 | round 3 (`notcast`); the rest is `btr` selection |
+| `x & ~(1u << n)` unsigned | 8 | 8 | 3 | 3 | never widened; the rest is `btr` selection |
+| `~(unsigned long)x` | 4 | 4 | 3 | 3 | control: a widening cast keeps the 64-bit complement |
 Honest attribution, measured by re-running with
 `CCC_DISABLE_PASSES=diffcmp,interval,signmag`: `diff_gt`/`diff_ge` 5 → 4,
 `range_bitand` 9 → 5, `range_short` 7 → 5, `member_short` 7 → 4 and
@@ -341,10 +429,13 @@ accident.
 
 | Check | Result |
 | --- | --- |
-| `cargo test --profile fastbuild --locked --lib` | **7,161 passed, 0 failed, 10 ignored** |
+| `cargo test --profile fastbuild --locked --lib` | **7,177 passed, 0 failed, 10 ignored** (round 3: +16) |
+| `check_compare_dominance_fold.sh` | PASS — four dominant shapes in both directions, 8/16/32/64-bit widths, `CCC_NO_COMPARE_DOMINANCE=1` restores every one of them, the two non-dominant shapes pinned at 9 in both builds, `-O0`…`-O3` + the switch + GCC agree on a 65,536-row checksum |
+| `bit_idioms_compare_dominance_tests.rs` | 14 tests — exhaustive 8-bit product of all ten comparison kinds × six constants in both joins, a reduced 16-bit product, and the refusal tables (different value, different width, mixed ordering, non-comparison operand, float) |
+| `notcast` unit tests | `truncated_complement_of_an_extension_folds_to_the_narrow_complement`, `truncated_complement_controls` (widening cast, different-width extension, already-narrow operand) |
 | `check_predicate_differences_and_ranges.py` | PASS — values at `-O0`…`-O3`, per-fold mechanism, five controls, attribution, GCC 16.2 length oracle (1.7 s) |
 | `check_lowest_set_bit_fold.sh` | PASS — both widths, both arms of the zero select, plain forms pinned at ≤5/≤6 |
-| `check_narrow_negate_fold.sh` | PASS — `negcast` ownership, `zeroneg` shapes, widening/float controls, the untouched widths pinned exactly, `-O0`…`-O3` + both switches + GCC agree on a 65,536-row checksum |
+| `check_narrow_negate_fold.sh` | PASS — `negcast`/`notcast` ownership, `zeroneg` shapes, widening/float controls, the untouched widths pinned exactly, `-O0`…`-O3` + all three switches + GCC agree on a 65,536-row checksum |
 | `Interval::width` unit tests | crossing window `[-7, 7]` = 15, inverted `[-5, -9]` = 0, `[7, 7]` = 1, unsigned wrapping window (`u32` and `u64`) refused, brute-force sweeps at every signed width |
 | `check_mask_and_interval_folds.py` | PASS (0.6 s) |
 | Exhaustive matcher tests | 8/16-bit rings brute-forced for interval and membership; 32/64-bit boundary sweeps; refusal tables |
@@ -378,6 +469,29 @@ CCC_SIMPLIFY_SKIP=zeroneg,negcast` versus the default):
 | largest wins | `packed_mask_shifts.c` −499, `packed_vector_relations.c` −446 (both `zeroneg`: `negw`/`negq` replacing `xorl; subq`) |
 | the one longer file | `ext_vector_layout.c` +1 |
 
+Round 3 repeats the sweep over the same 2,802-file glob with the two new rules
+as the only difference, once per rule:
+
+| metric | `fold_compare_dominance` | `notcast` |
+|---|---|---|
+| files compiled both ways | 2,086 (716 skipped for missing headers) | 2,086 (716 skipped) |
+| shorter with the rule | **1** | **1** |
+| longer with the rule | 0 | 0 |
+| net instruction change | **−10** | **−1** |
+| the file | `predicate_differences_and_ranges.c` −10 | `bb_slp_unary_demote.c` −1 |
+
+Both are honest near-zeroes on this corpus, and the reason is the corpus, not
+the rules: the test tree is 2,086 single-function files whose guards are written
+as `&&` (already if-converted into branches by `cfg_simplify`) rather than as
+the `&`/`|` of two comparisons these folds answer, and it contains almost no
+`x & ~(1 << n)` bit-clears. The `-10` is `predicate_differences_and_ranges.c`
+itself, whose five near-miss controls are exactly the shapes the round-3 probe
+added to it. The evidence for the folds is therefore the probe measurements
+above (9 → 4 on four idioms, 9 → 8 on the bit-clear), each level with or within
+one instruction of both oracles, plus the exhaustive matcher tests — not this
+sweep. What the sweep does establish is that neither rule pessimises anything:
+zero longer files across 2,086 translation units for each.
+
 `negcast` contributes nothing to that total and costs nothing: it fires on the
 32-bit-negation shapes the probe corpus carries (`-(x != 0)`, 7 → 6) and no test
 file in this corpus happens to contain one. The same sweep is what restricted it
@@ -394,6 +508,17 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
 
 ## What is not done
 
+* **`bt`/`bts`/`btr` instruction selection** — `x & ~(1 << n)`, `x | (1 << n)` and
+  `(x & (1 << n)) != 0` are the bit-clear/bit-set/bit-test idioms, and both
+  oracles select the one-instruction `btr`/`bts`/`bt` for them (3 instructions
+  against LCCC's 8, 6 and 8). The IR has `BitTest` but no bit-set or bit-clear
+  operation, so this needs a new IR operation plus an x86 lowering and a generic
+  fallback for the other backends — the largest remaining item in this file's
+  probe corpus, and the reason §11's shape still costs 8.
+* **`__builtin_popcount` / parity** — the SWAR expansion is 17 instructions
+  where GCC calls `__popcountdi2` (5) and Clang inlines 16; `popcount(x) & 1`
+  adds the `andl $1` on top (18 against 7). Selecting `popcnt` (or the library
+  call) is a target-support question, not a fold.
 * **`1u << __builtin_ctz(y)` (no complement)** — refused on purpose: with the
   exact `Ctz(0) == width` arm it is no shorter than the count path (5/6 vs 8/8
   with the arm), and Clang's four-instruction form depends on `ctz(0)` being
