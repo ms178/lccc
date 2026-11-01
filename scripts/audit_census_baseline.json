@@ -3,7 +3,7 @@
   "fns_over_300": 232,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 550,
+  "knob_literals": 551,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",

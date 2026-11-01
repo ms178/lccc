@@ -1,6 +1,52 @@
 # Unified PR audit — 2026-11-01
 
-## Scope and acceptance status
+## Latest integration checkpoint (supersedes older revision status below)
+
+- All five hosted workflows for `6d2b5c78a` completed successfully, including
+  Targeted compiler research (`41308567423`). The frozen local fast suite at
+  that revision passed **543 gates, 0 failed, 9 explicitly skipped**. These
+  results do **not** validate the newer tree.
+- Rebased with `--rebase-merges` onto upstream main
+  `734290ddbb3c1556d7c7f4c0d30312d876486b5c`, which merged #1063.
+  The existing inline, SLP, and x86 intrinsic work was preserved exactly.
+- #1063 permits narrow integer bit-modify IR, but its ARM and RISC-V emitters
+  reduced indices modulo register width instead of IR width. The independently
+  reproduced `U8 BitSet(0, 8)` counterexample requires 1, not 0. The correction
+  passes actual `IrType` into the ARM helpers, declines narrow register-direct
+  emission before any write, reduces narrow dynamic indices explicitly, and
+  derives the RISC-V mask from the actual IR width. Existing 32/64-bit
+  instruction shapes are retained. IR documentation now names all accepted
+  widths. New direct-emitter unit tests cover both operations and signed and
+  unsigned 8/16/32/64-bit types. Rust 1.99.1 fastbuild with warnings denied:
+  3 focused tests passed, then **7448 library tests passed / 0 failed / 10
+  ignored**. GNU 2.47 plus QEMU 11.1.2 executed the actual captured emitter
+  streams: **480 AArch64 and 80 RISC-V cases passed**, with relocation-free
+  static ELF witnesses. Indices include 0, W-1, W, W+1 and maximum unsigned
+  values; ARM additionally exercises immediate 4095. Results are compared at
+  the IR width, not as a claim about upper-register normalization.
+  A final test-only assertion tightening (matching the whole immediate shift,
+  not an ambiguous suffix) is included in the next full-suite run.
+- The rebase exposed an overwritten census literal count: upstream introduced
+  `CCC_NO_BIT_SELECT`, so the measured count is 551, not 550. The documented
+  baseline is restored to 551; the other census metrics do not grow.
+- Re-read updated open heads #1060 (`5b68bdae5`) and #1062 (`0994c3e23`).
+  The wider-constant splat optimization is already present here, including
+  stricter lane-width and truncated zero/all-ones handling. This branch already
+  refuses both register-preservation contracts. Do not copy their broad SIMD
+  literal fallback over the consumer-specific safety guards. Do not silently
+  accept `force_align_arg_pointer` on the assertion that frame offsets are
+  aligned: that does not establish alignment for a misaligned incoming stack.
+  Existing explicit refusal is retained until realignment is implemented.
+- The first new test build exhausted the filesystem (8.3 GB of incremental
+  caches). Only disposable `target/fastbuild/incremental` contents were removed;
+  no sources, toolchains, snapshots, or benchmark evidence were removed. A
+  fresh serial modern-toolchain build succeeded. The external raw-ELF harness
+  also needed executable file permissions; after fixing that harness, both
+  actual-emitter QEMU runs passed. Full fast-suite and hosted validation of the
+  updated revision remain required. No production-readiness claim or
+  current-revision CI success is asserted.
+
+## Scope and acceptance status (historical integration record)
 
 The requested consolidation now covers #1050 (`a62b7d708`), #1051 (updated to
 `130f9e0cb`), #1060 (`d26a1ab63`), and #1056, on `arena/b673aa4d-lccc`. All three other heads are ancestors
