@@ -380,28 +380,39 @@ fn elf_has_rwx_load<R: Read + Seek>(input: &mut R) -> Result<bool, String> {
 
     let flags_off = if wide { 4usize } else { 24usize };
     let read_len = min_phentsize as usize;
-    let mut phdr = [0u8; 56];
-    let mut off = phoff;
-    for _ in 0..phnum {
-        input.seek(SeekFrom::Start(off)).map_err(|_| invalid())?;
-        input
-            .read_exact(&mut phdr[..read_len])
-            .map_err(|_| invalid())?;
-        let p_type = u32::from_le_bytes([phdr[0], phdr[1], phdr[2], phdr[3]]);
-        let p_flags = u32::from_le_bytes([
-            phdr[flags_off],
-            phdr[flags_off + 1],
-            phdr[flags_off + 2],
-            phdr[flags_off + 3],
-        ]);
-        // PF_W | PF_X == 3. Other permission bits (and processor-specific
-        // bits) do not affect this diagnostic.
-        if p_type == 1 && p_flags & 3 == 3 {
-            return Ok(true);
+
+    // The program-header table is contiguous.  Seek once and read it in
+    // bounded chunks instead of paying a seek+read pair per segment: a
+    // kernel image with hundreds of PHDRs turns hundreds of syscall pairs
+    // into a handful, while memory stays capped at 64 KiB (one phentsize is
+    // at most u16::MAX, so even an oversized stride fits in one chunk).
+    const CHUNK_BYTES: u64 = 64 * 1024;
+    let entries_per_chunk = (CHUNK_BYTES / phentsize).max(1);
+    let chunk_cap = (entries_per_chunk * phentsize).min(table_size);
+    let mut buf = vec![0u8; chunk_cap as usize];
+    input.seek(SeekFrom::Start(phoff)).map_err(|_| invalid())?;
+    let mut remaining = phnum;
+    while remaining != 0 {
+        let entries = remaining.min(entries_per_chunk);
+        let len = (entries * phentsize) as usize;
+        input.read_exact(&mut buf[..len]).map_err(|_| invalid())?;
+        for i in 0..entries as usize {
+            let base = i * phentsize as usize;
+            let phdr = &buf[base..base + read_len];
+            let p_type = u32::from_le_bytes([phdr[0], phdr[1], phdr[2], phdr[3]]);
+            let p_flags = u32::from_le_bytes([
+                phdr[flags_off],
+                phdr[flags_off + 1],
+                phdr[flags_off + 2],
+                phdr[flags_off + 3],
+            ]);
+            // PF_W | PF_X == 3. Other permission bits (and processor-specific
+            // bits) do not affect this diagnostic.
+            if p_type == 1 && p_flags & 3 == 3 {
+                return Ok(true);
+            }
         }
-        // table_end <= file_len bounds every stride; checked_add keeps the
-        // invariant explicit and host-width independent.
-        off = off.checked_add(phentsize).ok_or_else(invalid)?;
+        remaining -= entries;
     }
     Ok(false)
 }
@@ -434,7 +445,70 @@ pub fn check_rwx_segments(path: impl AsRef<Path>, warn: bool, fatal: bool) -> Re
 #[cfg(test)]
 mod rwx_tests {
     use super::elf_has_rwx_load;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    /// Counts the operations that become syscalls on a real file.  The
+    /// batching contract is measurable without timing noise: a table of N
+    /// headers must not cost N seek/read pairs.
+    struct CountingIo {
+        inner: Cursor<Vec<u8>>,
+        reads: usize,
+        seeks: usize,
+    }
+
+    impl CountingIo {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: Cursor::new(bytes),
+                reads: 0,
+                seeks: 0,
+            }
+        }
+    }
+
+    impl Read for CountingIo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for CountingIo {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.seeks += 1;
+            self.inner.seek(pos)
+        }
+    }
+
+    fn multi_image(wide: bool, count: u16, rwx_index: Option<u16>) -> Vec<u8> {
+        let header_len = if wide { 64 } else { 52 };
+        let phentsize = if wide { 56usize } else { 32usize };
+        let mut elf = vec![0u8; header_len + usize::from(count) * phentsize];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = if wide { 2 } else { 1 };
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        if wide {
+            elf[32..40].copy_from_slice(&(header_len as u64).to_le_bytes());
+            elf[52..54].copy_from_slice(&(header_len as u16).to_le_bytes());
+            elf[54..56].copy_from_slice(&(phentsize as u16).to_le_bytes());
+            elf[56..58].copy_from_slice(&count.to_le_bytes());
+        } else {
+            elf[28..32].copy_from_slice(&(header_len as u32).to_le_bytes());
+            elf[40..42].copy_from_slice(&(header_len as u16).to_le_bytes());
+            elf[42..44].copy_from_slice(&(phentsize as u16).to_le_bytes());
+            elf[44..46].copy_from_slice(&count.to_le_bytes());
+        }
+        let flags_off = if wide { 4 } else { 24 };
+        for i in 0..count {
+            let base = header_len + usize::from(i) * phentsize;
+            elf[base..base + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            let flags = if rwx_index == Some(i) { 7u32 } else { 5u32 };
+            elf[base + flags_off..base + flags_off + 4].copy_from_slice(&flags.to_le_bytes());
+        }
+        elf
+    }
 
     fn image(wide: bool, flags: u32) -> Vec<u8> {
         let header_len = if wide { 64 } else { 52 };
@@ -515,10 +589,18 @@ mod rwx_tests {
                 elf[48..50].copy_from_slice(&1u16.to_le_bytes());
                 elf[shoff + 28..shoff + 32].copy_from_slice(&1u32.to_le_bytes());
             }
-            assert!(has(&elf).unwrap());
+            let mut io = CountingIo::new(elf.clone());
+            assert!(elf_has_rwx_load(&mut io).unwrap());
+            // The extended count adds exactly one section-header read/seek;
+            // the one-entry program-header table still takes one chunk read.
+            assert_eq!(io.reads, 4);
+            assert_eq!(io.seeks, 4);
             let info = shoff + if wide { 44 } else { 28 };
             elf[info..info + 4].fill(0);
-            assert!(!has(&elf).unwrap());
+            let mut io = CountingIo::new(elf.clone());
+            assert!(!elf_has_rwx_load(&mut io).unwrap());
+            assert_eq!(io.reads, 3);
+            assert_eq!(io.seeks, 3);
             // A truncated section header must not be trusted.
             assert!(has(&elf[..shoff + shentsize - 1]).is_err());
         }
@@ -612,6 +694,80 @@ mod rwx_tests {
             let phnum = if wide { 56 } else { 44 };
             elf[phnum..phnum + 2].fill(0);
             assert!(!has(&elf).unwrap());
+        }
+    }
+
+    #[test]
+    fn batching_bounds_io_and_crosses_chunks() {
+        for wide in [false, true] {
+            // 4096 headers span several 64 KiB chunks on both classes.
+            let count = 4096u16;
+            let elf = multi_image(wide, count, None);
+            let mut io = CountingIo::new(elf.clone());
+            assert!(!elf_has_rwx_load(&mut io).unwrap());
+            // Two exact header reads followed by one read per full or partial
+            // chunk.  Pin the exact count: I/O grows with table bytes, not
+            // with one seek+read pair per header (4096 pairs in the old loop).
+            let phentsize = if wide { 56u64 } else { 32u64 };
+            let entries_per_chunk = (64 * 1024) / phentsize;
+            let expected_reads = 2 + (u64::from(count).div_ceil(entries_per_chunk)) as usize;
+            assert_eq!(io.reads, expected_reads, "unexpected chunk read count");
+            assert_eq!(io.seeks, 3, "unexpected seek count");
+
+            // The RWX header sits in the last chunk: chunked scanning must
+            // still find it, and must stop at the first hit.
+            let elf = multi_image(wide, count, Some(count - 1));
+            let mut io = CountingIo::new(elf);
+            assert!(elf_has_rwx_load(&mut io).unwrap());
+            assert_eq!(io.reads, expected_reads);
+            assert_eq!(io.seeks, 3);
+
+            // A hit in the first chunk must not read the rest of the table.
+            let elf = multi_image(wide, count, Some(0));
+            let mut io = CountingIo::new(elf);
+            assert!(elf_has_rwx_load(&mut io).unwrap());
+            assert_eq!(io.reads, 3, "early hit read an extra chunk");
+            assert_eq!(io.seeks, 3);
+        }
+    }
+
+    #[test]
+    fn oversized_phentsize_is_one_entry_per_chunk() {
+        for wide in [false, true] {
+            let header_len = if wide { 64 } else { 52 };
+            let stride = usize::from(u16::MAX);
+            let mut elf = vec![0u8; header_len + 2 * stride];
+            elf[..4].copy_from_slice(b"\x7fELF");
+            elf[4] = if wide { 2 } else { 1 };
+            elf[5] = 1;
+            elf[6] = 1;
+            elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+            if wide {
+                elf[32..40].copy_from_slice(&(header_len as u64).to_le_bytes());
+                elf[52..54].copy_from_slice(&(header_len as u16).to_le_bytes());
+                elf[54..56].copy_from_slice(&u16::MAX.to_le_bytes());
+                elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+            } else {
+                elf[28..32].copy_from_slice(&(header_len as u32).to_le_bytes());
+                elf[40..42].copy_from_slice(&(header_len as u16).to_le_bytes());
+                elf[42..44].copy_from_slice(&u16::MAX.to_le_bytes());
+                elf[44..46].copy_from_slice(&2u16.to_le_bytes());
+            }
+            let flags_off = if wide { 4 } else { 24 };
+            let second = header_len + stride;
+            elf[second..second + 4].copy_from_slice(&1u32.to_le_bytes());
+            elf[second + flags_off..second + flags_off + 4].copy_from_slice(&7u32.to_le_bytes());
+            let mut io = CountingIo::new(elf.clone());
+            assert!(elf_has_rwx_load(&mut io).unwrap());
+            assert_eq!(io.reads, 4);
+            assert_eq!(io.seeks, 3);
+            elf[second + flags_off..second + flags_off + 4].copy_from_slice(&5u32.to_le_bytes());
+            let mut io = CountingIo::new(elf.clone());
+            assert!(!elf_has_rwx_load(&mut io).unwrap());
+            assert_eq!(io.reads, 4);
+            assert_eq!(io.seeks, 3);
+            // Truncating the oversized table must still fail closed.
+            assert!(has(&elf[..elf.len() - 1]).is_err());
         }
     }
 }
