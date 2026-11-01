@@ -157,9 +157,12 @@ class SignatureRenderingTest(unittest.TestCase):
     """Evidence has to survive the shapes `abi_signature` actually returns."""
 
     def test_code_probe_signature(self):
-        self.assertEqual(matrix.attr_pair((('rax', 'rdi'), (('ret', '4'),)),
-                                          (('rax',), ())),
-                         'attr=[[rax rdi] [[ret 4]]] plain=[[rax] []]')
+        self.assertEqual(
+            matrix.attr_pair((('rax', 'rdi'), (('rbx', 'push'),), True,
+                              (('ret', '$4'),)),
+                             (('rax',), (), False, ())),
+            'attr=[[rax rdi] [[rbx push]] True [[ret $4]]] '
+            'plain=[[rax] [] False []]')
 
     def test_record_probe_signature(self):
         self.assertEqual(matrix.attr_pair(('4', '8'), ('4',)),
@@ -175,7 +178,8 @@ class SignatureRenderingTest(unittest.TestCase):
         def listing(prologue: str) -> str:
             return (f'f:\n pushq {prologue}\n ret\n.size f, .-f\n'
                     'h:\n addsd %xmm1, %xmm0\n ret\n.size h, .-h\n'
-                    'ha:\n movq %rdi, %rax\n ret\n.size ha, .-ha\n')
+                    'ha:\n movq %rdi, %rax\n ret\n.size ha, .-ha\n'
+                    'ps:\n movq %rdi, %rax\n ret\n.size ps, .-ps\n')
 
         def fake_compile(_cc, source, _flags):
             return (0, listing('%rbx'), '') if 'ms_abi' in source else \
