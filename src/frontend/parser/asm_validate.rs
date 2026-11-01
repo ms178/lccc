@@ -1444,7 +1444,10 @@ mod tests {
         let p = validate(
             "addl %1,%0",
             &[named("=r", Constness::Unknown, "sum")],
-            &[ named("[sum]", Constness::Unknown, "sum"), op("r", Constness::Unknown), ],
+            &[
+                named("[sum]", Constness::Unknown, "sum"),
+                op("r", Constness::Unknown),
+            ],
             0,
             AsmTarget::X86,
         );
@@ -1487,7 +1490,11 @@ mod tests {
         let p = validate(
             "",
             &[],
-            &[Operand { constraint: "I", constant: constness(&expr, &ctx, false), name: None, }],
+            &[Operand {
+                constraint: "I",
+                constant: constness(&expr, &ctx, false),
+                name: None,
+            }],
             0,
             AsmTarget::X86,
         );

@@ -1369,7 +1369,8 @@ mod reg_view_tests {
                 RegView::HighByte,
                 &excluded,
             );
-            assert!(matches!(reg.as_str(), "rax" | "rbx" | "rcx" | "rdx"), "{reg}");
+            let legacy = matches!(reg.as_str(), "rax" | "rbx" | "rcx" | "rdx");
+            assert!(legacy, "{reg}");
             excluded.push(reg);
         }
     }

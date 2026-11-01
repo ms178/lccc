@@ -1960,7 +1960,11 @@ mod tests {
         let operands: Vec<AsmOperand> = names
             .iter()
             .map(|name| {
-                let name = if name.is_empty() { None } else { Some(name.to_string()) };
+                let name = if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
                 AsmOperand::new(AsmOperandKind::GpReg, name)
             })
             .collect();
@@ -1969,7 +1973,8 @@ mod tests {
 
     #[test]
     fn reg_views_flag_the_byte_and_high_byte_modifiers() {
-        assert_eq!(views_for("movb %b0, %h1", &["", ""]), vec![RegView::Byte, RegView::HighByte]);
+        let mv = views_for("movb %b0, %h1", &["", ""]);
+        assert_eq!(mv, vec![RegView::Byte, RegView::HighByte]);
         // Unmodified, other-width and non-register modifiers impose nothing:
         // `%w`/`%k`/`%q` are same-register width names, `%c`/`%P`/`%a`/`%n`
         // print constants, and a bare `%0` is the natural width.
@@ -2015,7 +2020,8 @@ mod tests {
         assert_eq!(views_for("%b[unknown]", &[""]), vec![RegView::Full]);
         assert_eq!(views_for("%", &[""]), vec![RegView::Full]);
         assert_eq!(views_for("%b", &[""]), vec![RegView::Full]);
-        assert_eq!(views_for("%b99999999999999999999999", &[""]), vec![RegView::Full]);
+        let saturated = views_for("%b99999999999999999999999", &[""]);
+        assert_eq!(saturated, vec![RegView::Full]);
     }
 
     #[test]
