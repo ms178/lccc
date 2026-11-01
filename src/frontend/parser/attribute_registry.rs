@@ -385,6 +385,18 @@ pub(crate) fn unimplemented_names() -> impl Iterator<Item = &'static str> {
 //     diagnosing forbidden `xmm`/`x87` use), so silently accepting it could
 //     hand a caller a clobbered register. It is refused instead of ignored.
 //
+// `ms_struct` is the one verdict that rejects a program gcc accepts, and that is
+// deliberate rather than an unfinished edge. On a tag gcc really does apply the
+// Microsoft layout (measured: `{char; int:5; int:3;}` grows from 4 to 8 bytes)
+// and lccc has no bit-field layout for it, so the choice is between emitting a
+// gcc-compatible *layout* and refusing; emitting the SysV layout under an
+// `ms_struct` tag is precisely the silent miscompile this table removes. gcc's
+// own behaviour on the conflict (`struct {...} __attribute__((gcc_struct))
+// __attribute__((ms_struct)) v;` -> `warning: 'ms_struct' incompatible
+// attribute ignored`, first attribute wins, exit status 0) is measured and
+// recorded here so the eventual layout implementation has the oracle it needs,
+// and `CCC_ALLOW_UNSUPPORTED_ABI` keeps all-lccc builds unblocked meanwhile.
+//
 // Placement matters for the two record-layout names: on a `struct`/`union` tag
 // gcc honours `ms_struct` (and measured: the layout really changes — a
 // `{char; int:5; int:3;}` record grows from 4 to 8 bytes) and honours
