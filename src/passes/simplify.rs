@@ -4055,6 +4055,24 @@ fn simplify_binop(
                     src: Operand::Const(IrConst::zero(ty)),
                 });
             }
+            if !is_float && lhs_zero && !simplify_skip("zeroneg") {
+                // `0 - x => -x` (integers only: -0.0 - x is not -x for x = 0.0).
+                // The ring identity makes this a pure canonicalisation, but it
+                // is worth stating because the two forms do NOT lower alike:
+                // the subtraction has to materialise the zero first (`xor;sub`
+                // on x86) and every consumer that understands a negate -- the
+                // `x & -x` lowest-set-bit recognition, `try_cancel_add_sub`, the
+                // backends' negate/flag folds -- only speaks `Neg`. Source
+                // negation reaches the IR as `Neg` anyway; this is the signed-
+                // zero and macro-expanded spelling of the same value (e.g. the
+                // `x & -x` idiom, whose `0u - x` reaches the IR as this Sub).
+                return Some(Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::Neg,
+                    src: *rhs,
+                    ty,
+                });
+            }
             if !is_float {
                 // Modular ring cancellation: `(x + y) - x => y`, `(y + x) - x => y`,
                 // `x - (x - y) => y`.
@@ -8551,6 +8569,100 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // === Constant-zero negation tests ===
+
+    #[test]
+    fn test_zero_minus_x_folds_to_neg() {
+        // `0 - x` is the modular negate; canonicalising it to `Neg` is a ring
+        // identity, and it is the difference between `xor;sub` (which has to
+        // materialise the zero) and one `negl` on x86 -- and between the
+        // `x & -x` lowest-set-bit idiom being recognisable or not.
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ] {
+            let inst = Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Sub,
+                lhs: Operand::Const(IrConst::from_i64(0, ty)),
+                rhs: Operand::Value(Value(1)),
+                ty,
+            };
+            match simplify_default(&inst) {
+                Some(Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::Neg,
+                    src: Operand::Value(v),
+                    ty: t,
+                }) => {
+                    assert_eq!(dest.0, 3);
+                    assert_eq!(v.0, 1);
+                    assert_eq!(t, ty);
+                }
+                other => panic!("expected Neg for {ty:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_zero_minus_x_float_is_not_negated() {
+        // IEEE 754: `0.0 - x` is not `-x` for `x = +0.0` (it is `+0.0`, while
+        // `-x` is `-0.0`), and it is not `-x` for NaN payloads either.
+        for ty in [IrType::F64, IrType::F32] {
+            let (zero, one) = if ty == IrType::F64 {
+                (IrConst::F64(0.0), IrConst::F64(1.0))
+            } else {
+                (IrConst::F32(0.0), IrConst::F32(1.0))
+            };
+            let inst = Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Sub,
+                lhs: Operand::Const(zero),
+                rhs: Operand::Const(one),
+                ty,
+            };
+            assert!(
+                !matches!(
+                    simplify_default(&inst),
+                    Some(Instruction::UnaryOp {
+                        op: IrUnaryOp::Neg,
+                        ..
+                    })
+                ),
+                "{ty:?}: float zero minus x must not become a negate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_minus_x_keeps_rhs_zero_case() {
+        // Order matters: `0 - 0` is the zero test, not a negation.
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Sub,
+            lhs: Operand::Const(IrConst::I32(0)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        };
+        let result = simplify_default(&inst).expect("0 - 0 must fold");
+        assert!(
+            matches!(
+                result,
+                Instruction::Copy {
+                    src: Operand::Const(_),
+                    ..
+                }
+            ),
+            "expected a constant, got {result:?}"
+        );
     }
 
     // === Unsigned comparison simplification tests ===

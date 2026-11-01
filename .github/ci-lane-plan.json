@@ -336,7 +336,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 428.73,
+      "predicted_gate_seconds": 429.43,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -563,6 +563,10 @@
         {
           "measured_s": 0.4,
           "name": "bash tests/regression/check_iabs_cmp_fold.sh"
+        },
+        {
+          "measured_s": 0.7,
+          "name": "bash tests/regression/check_lowest_set_bit_fold.sh"
         },
         {
           "measured_s": 0.25,

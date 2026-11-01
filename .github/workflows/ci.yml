@@ -2824,6 +2824,12 @@ jobs:
         # and the -fwrapv INT_MIN contract.  Mirrored in
         # scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_iabs_cmp_fold.sh
+        # Lowest-set-bit recognition (1 << Ctz(y) -> y & -y with the exact
+        # y == 0 arm) and the `0 - x` -> Neg canonicalisation: emitted shapes,
+        # kill-switch ownership (CCC_NO_LOWEST_SET_BIT / zeroneg) and -O0/-O2/
+        # -O3 agreement over every boundary value.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_lowest_set_bit_fold.sh
         python3 scripts/edg_changes_mine.py verify-artifacts
         # Mask and interval folds: shift-pair masks and {0,1} membership, with a
         # {0,2} negative control and a disabled-pass attribution leg.

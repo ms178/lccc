@@ -1775,6 +1775,13 @@ gate "unsigned-reduction-codegen" fast \
 gate "iabs-cmp-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_iabs_cmp_fold.sh
 
+# Lowest-set-bit recognition: `1 << Ctz(y)` becomes `y & -y` with a `cmov` for
+# the exact `y == 0` arm, and `0 - x` canonicalises to `Neg` (one `negl` where
+# the subtraction had to materialise the zero first).  Pins the emitted shapes,
+# the ownership of both kill switches and bit-exact -O0/-O2/-O3 agreement.
+gate "lowest-set-bit-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_lowest_set_bit_fold.sh
+
 # Observable-access gates.  Three instruments, because each catches a
 # different way the `volatile` contract gets broken and each was proved to do
 # so by mutation (reintroducing the guard deletion in licm.rs):

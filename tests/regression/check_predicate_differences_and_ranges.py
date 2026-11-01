@@ -43,6 +43,8 @@ RANGE_FOLDED = (
     "outside_short",
     "member_short",
     "member_bitand",
+    "range_crossing",
+    "range_crossing_bitand",
 )
 MAGNITUDE_FOLDED = ("abs_select", "abs_select64", "absdiff_select")
 CONTROLS = ("diff_control", "range_union", "member_gap", "two_values", "abs_control")
@@ -136,7 +138,7 @@ def main():
         # ---- controls: one token away, must not fold ----------------------
         if not has_subtraction(body(text, "diff_control")):
             problems.append("diff_control folded although its constant is 5, not 0")
-        for name in ("range_union", "member_gap", "two_values"):
+        for name in ("range_union", "member_gap", "two_values", "range_crossing_control"):
             if len(compares(body(text, name))) < 2:
                 problems.append(
                     f"{name} lost a comparison although it is not one interval: "
@@ -159,6 +161,8 @@ def main():
         # range_check and set_membership, so the claim there is only "not
         # worse" -- an honest attribution rather than a borrowed win.
         improved = (
+            "range_crossing",
+            "range_crossing_bitand",
             "diff_gt",
             "diff_ge",
             "range_bitand",

@@ -166,8 +166,21 @@ struct Interval {
 }
 
 impl Interval {
+    /// Number of values in the window, computed IN THE OPERAND RING.
+    ///
+    /// Bounds are stored the way `predicate` normalised them (`ring`, i.e.
+    /// masked to the type's width), so a window that starts below zero stores
+    /// its lower bound as a large unsigned value: `[-7, 7]` at 32 bits is
+    /// `[0xFFFF_FFF9, 7]`. A plain 64-bit subtraction reads that as a window of
+    /// ~2^64 values and refuses it, which is why `x > -8 && x < 8` used to keep
+    /// its two compares and a select while `x > 3 && x < 10` folded. Masking
+    /// the span at the operand width gives the true count (15 there), and the
+    /// empty and inverted windows still fall out: `[10, 5]` spans `0xFFFF_FFFB`
+    /// and `[7, 7]` spans 1.
     fn width(&self) -> u64 {
-        self.upper.wrapping_sub(self.lower_bound).wrapping_add(1)
+        let bits = bits_of(self.ty);
+        let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        self.upper.wrapping_sub(self.lower_bound).wrapping_add(1) & mask
     }
 }
 
@@ -196,9 +209,12 @@ fn interval(logic: IrBinOp, lhs: Predicate, rhs: Predicate) -> Option<Interval> 
             };
             let lower = lower_bounds(&lo_pred)?;
             let upper = upper_bounds(&hi_pred)?;
-            if lower > upper {
-                return None;
-            }
+            // No `lower > upper` test here: the bounds live in the operand
+            // ring, where a window that legitimately starts below zero stores
+            // its lower bound above its upper one. `Interval::width` performs
+            // the ring-correct emptiness test, and `emit` refuses an empty or
+            // too-wide window (0 or > 2^31-1 values), so an inverted window
+            // (`x >= 10 && x <= 5`) still declines.
             (lo_pred.value, (lower, upper, true))
         }
         IrBinOp::Or => {
@@ -689,6 +705,58 @@ mod tests {
     }
 
     #[test]
+    fn window_that_crosses_zero_folds_like_any_other() {
+        // `x > -8 && x < 8` is the window `[-7, 7]`: 15 values whose lower
+        // bound, in the operand ring, sits ABOVE the upper one. The width must
+        // be counted in that ring (15, not ~2^64), or the fold declines and
+        // the shape keeps two compares plus a select -- which is exactly what
+        // `x > 3 && x < 10` (a window that does not cross zero) never did.
+        for (ty, lower, width_const) in [(IrType::I32, -8i64, 8i64), (IrType::I64, -8, 8)] {
+            let mut func = and_fixture(ty);
+            func.blocks[0].instructions[1] = Instruction::Cmp {
+                dest: Value(1),
+                op: IrCmpOp::Sgt,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::from_i64(lower, ty)),
+                ty,
+            };
+            func.blocks[0].instructions[2] = Instruction::Cmp {
+                dest: Value(2),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::from_i64(width_const, ty)),
+                ty,
+            };
+            assert_eq!(run(&mut func), 1, "{ty:?}: crossing window not folded");
+            let unsigned = unsigned_of(ty).unwrap();
+            let bits = bits_of(ty);
+            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let placed = Interval {
+                lower_bound: (-7i64 as u64) & mask,
+                upper: 7u64 & mask,
+                inside: true,
+                ty,
+                value: Operand::Value(Value(0)),
+            };
+            assert_eq!(placed.width(), 15, "{ty:?}: ring-crossing width");
+            // The emitted compare is the biased one: `(unsigned)(x + 7) < 15`.
+            let last = func.blocks[0].instructions.last().unwrap();
+            assert!(
+                matches!(
+                    last,
+                    Instruction::Cmp {
+                        op: IrCmpOp::Ult,
+                        rhs: Operand::Const(c),
+                        ty: t,
+                        ..
+                    } if c.to_i64() == Some(15) && *t == unsigned
+                ),
+                "{ty:?}: expected `(unsigned)(x - L) < 15`, got {last:?}"
+            );
+        }
+    }
+
+    #[test]
     fn empty_and_oversized_windows_are_refused() {
         // x > 3 & x < 3 is empty.
         let mut empty = and_fixture(IrType::I32);
@@ -700,6 +768,26 @@ mod tests {
             ty: IrType::I32,
         };
         assert_eq!(run(&mut empty), 0);
+
+        // An inverted window whose LOWER bound is negative first: the ring
+        // makes `[-5, -9]` look like a 2^64-wide window, and the ring-correct
+        // width must still reject it as empty.
+        let mut inverted = and_fixture(IrType::I32);
+        inverted.blocks[0].instructions[1] = Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Sge,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I32(-5)),
+            ty: IrType::I32,
+        };
+        inverted.blocks[0].instructions[2] = Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Sle,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I32(-9)),
+            ty: IrType::I32,
+        };
+        assert_eq!(run(&mut inverted), 0, "an inverted window must be refused");
 
         // A window spanning the whole ring is not a range test.
         let mut wide = and_fixture(IrType::I32);
