@@ -40,11 +40,16 @@ if objdump -d -M intel --disassemble=ret "$work/probe" \
 fi
 if objdump -d -M intel --disassemble=vector_small_packed_wrappers_test_main \
     "$work/probe" >"$work/caller-disassembly" 2>/dev/null; then
-    call_site=$(grep -m1 -B18 -A8 -E 'call.*<ret>' "$work/caller-disassembly" || true)
+    call_window=$(grep -m1 -B100 -A8 -E 'call.*<ret>' "$work/caller-disassembly" || true)
+    call_site=$(printf '%s\n' "$call_window" | grep -E 'j[a-z]+|loop[a-z]*|call.*<ret>|lea.*[[]esp|mov.*[[]esp' || true)
     call_site=${call_site//$'\n'/;}
-    printf '::notice title=i686 ret caller call-site::%s\n' "$call_site"
+    printf '::notice title=i686 ret caller control flow and stack setup::%s\n' "$call_site"
 fi
 registers=$(grep -m1 '^SIGSEGV EIP=' "$work/run.err" || true)
+stack_words=$(grep -m1 '^STACK=' "$work/run.err" || true)
+if [[ -n $stack_words ]]; then
+    echo "::notice title=i686 fault stack words at ESP+0x40::$stack_words"
+fi
 eip=$(sed -n 's/^SIGSEGV EIP=0x\([[:xdigit:]]\{8\}\).*/0x\1/p' "$work/run.err" | head -n 1)
 if [[ -n $eip ]]; then
     source_line=$(addr2line -e "$work/probe" -f -C "$eip" 2>/dev/null | tr '\n' ' ')

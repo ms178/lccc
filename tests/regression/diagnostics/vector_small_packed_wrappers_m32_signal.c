@@ -25,6 +25,16 @@ static void report_fault(int sig, siginfo_t *info, void *context)
     append_hex(message, 44, (unsigned long)uc->uc_mcontext.gregs[REG_EBP]);
     append_hex(message, 60, (unsigned long)info->si_addr);
     (void)write(STDERR_FILENO, message, sizeof(message));
+    const char stack_prefix[] =
+        "STACK=00000000,00000000,00000000,00000000,00000000\n";
+    char stack_message[sizeof(stack_prefix) - 1];
+    for (unsigned i = 0; i < sizeof(stack_message); ++i)
+        stack_message[i] = stack_prefix[i];
+    const unsigned long *sp =
+        (const unsigned long *)uc->uc_mcontext.gregs[REG_ESP];
+    for (unsigned i = 0; i < 5; ++i)
+        append_hex(stack_message, 6 + 9 * i, sp[16 + i]);
+    (void)write(STDERR_FILENO, stack_message, sizeof(stack_message));
     _exit(128 + sig);
 }
 
