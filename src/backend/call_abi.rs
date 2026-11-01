@@ -403,6 +403,7 @@ pub fn hidden_vector_return_bytes(
 
 /// ABI configuration for call argument classification.
 pub struct CallAbiConfig {
+    pub microsoft_x64: bool,
     /// Maximum GP registers for arguments (x86: 6, ARM/RISC-V: 8).
     pub max_int_regs: usize,
     /// Maximum FP registers for arguments (all: 8).
@@ -550,8 +551,15 @@ impl CallAbiConfig {
     /// stack-layout dead-parameter-alloca predicate
     /// (`stack_layout::analysis`): both must classify a vector parameter
     /// identically, or the layout drops a slot the prologue still stores to.
+    pub fn x86_64(convention: crate::common::types::CallingConvention) -> CallAbiConfig {
+        let mut config = Self::sysv_x86_64();
+        config.microsoft_x64 = convention == crate::common::types::CallingConvention::MicrosoftX64;
+        config
+    }
+
     pub fn sysv_x86_64() -> CallAbiConfig {
         CallAbiConfig {
+            microsoft_x64: false,
             max_int_regs: 6,
             max_float_regs: 8,
             align_i128_pairs: false,
@@ -776,6 +784,34 @@ fn classify_args_core(
     real_variadic: bool,
     config: &CallAbiConfig,
 ) -> CoreClassification {
+    if config.microsoft_x64 {
+        // Microsoft x64 allocates a POSITION, not independent GP/FP counters.
+        // Index into the existing x86 register-name table: rcx,rdx,r8,r9.
+        const GP: [usize; 4] = [3, 2, 4, 5];
+        let classes = args
+            .iter()
+            .enumerate()
+            .map(|(slot, info)| {
+                if slot >= 4 {
+                    return CoreArgClass::Stack;
+                }
+                if info.is_float && !info.is_long_double {
+                    CoreArgClass::FloatReg { reg_idx: slot }
+                } else if let Some(size) = info.struct_size {
+                    CoreArgClass::StructByValReg {
+                        base_reg_idx: GP[slot],
+                        size,
+                    }
+                } else {
+                    CoreArgClass::IntReg { reg_idx: GP[slot] }
+                }
+            })
+            .collect();
+        return CoreClassification {
+            classes,
+            int_reg_idx: args.len().min(4),
+        };
+    }
     let mut result = Vec::with_capacity(args.len());
     let mut int_idx = 0usize;
     let mut float_idx = 0usize;
@@ -1484,7 +1520,7 @@ fn classify_param_slice(
     // Convert CoreArgClass -> ParamClass, assigning stack offsets.
     let slot_size = crate::common::types::target_ptr_size();
     let slot_align_mask = (slot_size - 1) as i64;
-    let mut stack_offset: i64 = 0;
+    let mut stack_offset: i64 = if config.microsoft_x64 { 32 } else { 0 };
     let mut classes = Vec::with_capacity(core.classes.len());
 
     for (i, c) in core.classes.iter().enumerate() {
@@ -1896,6 +1932,7 @@ mod tests {
     /// The i686 `-mregparm=3` configuration (`I686Codegen::call_abi_config_impl`).
     fn i686_regparm3() -> CallAbiConfig {
         CallAbiConfig {
+            microsoft_x64: false,
             max_int_regs: 3,
             max_float_regs: 0,
             align_i128_pairs: false,
@@ -1926,6 +1963,37 @@ mod tests {
             struct_align: None,
             eightbyte_classes: classes,
             riscv_float_class: None,
+        }
+    }
+
+    #[test]
+    fn microsoft_x64_scalar_positions_are_shared_by_gp_and_fp_arguments() {
+        let config = CallAbiConfig::x86_64(crate::common::types::CallingConvention::MicrosoftX64);
+        for count in 0..9 {
+            let args: Vec<_> = (0..count)
+                .map(|slot| ArgInfo {
+                    is_float: slot % 2 == 1,
+                    ..scalar(&[])
+                })
+                .collect();
+            for variadic in [false, true] {
+                let result = classify_args_core(&args, variadic, variadic, &config);
+                assert_eq!(result.classes.len(), count);
+                for (slot, class) in result.classes.iter().enumerate() {
+                    if slot >= 4 {
+                        assert!(matches!(class, CoreArgClass::Stack));
+                    } else if slot % 2 == 1 {
+                        assert!(
+                            matches!(class, CoreArgClass::FloatReg { reg_idx } if *reg_idx == slot)
+                        );
+                    } else {
+                        let expected = [3, 2, 4, 5][slot];
+                        assert!(
+                            matches!(class, CoreArgClass::IntReg { reg_idx } if *reg_idx == expected)
+                        );
+                    }
+                }
+            }
         }
     }
 

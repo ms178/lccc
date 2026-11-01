@@ -4773,6 +4773,7 @@ mod typed_indirect_calls {
                 struct_arg_is_f128_sse: vec![],
                 ret_is_f128_sse: false,
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,

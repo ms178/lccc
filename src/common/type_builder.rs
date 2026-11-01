@@ -213,7 +213,7 @@ pub trait TypeConvertContext {
                     .and_then(|e| self.eval_array_bound_len(e, &elem_ctype));
                 CType::Array(Box::new(elem_ctype), size)
             }
-            TypeSpecifier::FunctionPointer(return_type, params, variadic, has_prototype) => {
+            TypeSpecifier::FunctionPointer(return_type, params, variadic, has_prototype, abi) => {
                 let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
                 let param_ctypes: Vec<(CType, Option<String>)> = params
                     .iter()
@@ -230,6 +230,7 @@ pub trait TypeConvertContext {
                     .collect();
                 CType::Pointer(
                     Box::new(CType::Function(Box::new(FunctionType {
+                        calling_convention: *abi,
                         return_type: ret_ctype,
                         params: param_ctypes,
                         variadic: *variadic,
@@ -238,7 +239,7 @@ pub trait TypeConvertContext {
                     PtrQuals::of(AddressSpace::Default),
                 )
             }
-            TypeSpecifier::BareFunction(return_type, params, variadic, has_prototype) => {
+            TypeSpecifier::BareFunction(return_type, params, variadic, has_prototype, abi) => {
                 // Bare function type (no pointer wrapper) — produced by typeof on
                 // function names. Resolves to CType::Function, NOT Pointer(Function).
                 let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
@@ -256,6 +257,7 @@ pub trait TypeConvertContext {
                     })
                     .collect();
                 CType::Function(Box::new(FunctionType {
+                    calling_convention: *abi,
                     return_type: ret_ctype,
                     params: param_ctypes,
                     variadic: *variadic,
@@ -862,6 +864,7 @@ fn param_ctype_unrecorded(
             })
             .collect();
         let func_type = CType::Function(Box::new(FunctionType {
+            calling_convention: param.fptr_calling_convention,
             return_type: actual_return,
             params: param_types,
             variadic: param.fptr_variadic,
@@ -1071,11 +1074,13 @@ pub fn build_qualified_ctype_with_callbacks(
                         params,
                         variadic,
                         has_prototype,
+                        abi,
                     )) = derived.get(i + 1)
                     {
                         let param_types =
                             convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
                         let func_type = CType::Function(Box::new(FunctionType {
+                            calling_convention: abi.unwrap_or_default(),
                             return_type: result,
                             params: param_types,
                             variadic: *variadic,
@@ -1094,9 +1099,10 @@ pub fn build_qualified_ctype_with_callbacks(
                         i += 1;
                     }
                 }
-                DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
+                DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi) => {
                     let param_types = convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
                     let func_type = CType::Function(Box::new(FunctionType {
+                        calling_convention: abi.unwrap_or_default(),
                         return_type: result,
                         params: param_types,
                         variadic: *variadic,
@@ -1105,9 +1111,10 @@ pub fn build_qualified_ctype_with_callbacks(
                     result = CType::Pointer(Box::new(func_type), PtrQuals::GENERIC);
                     i += 1;
                 }
-                DerivedDeclarator::Function(params, variadic, has_prototype) => {
+                DerivedDeclarator::Function(params, variadic, has_prototype, abi) => {
                     let param_types = convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
                     let func_type = CType::Function(Box::new(FunctionType {
+                        calling_convention: abi.unwrap_or_default(),
                         return_type: result,
                         params: param_types,
                         variadic: *variadic,
@@ -1468,6 +1475,7 @@ mod address_space_tests {
         // `T __seg_fs f(void);` — the space belongs to the returned pointer, not
         // to the function designator (srcu_read_lock_fast call sites).
         let mut ty = CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC),
             params: Vec::new(),
             variadic: false,
@@ -1546,6 +1554,7 @@ mod address_space_tests {
         // `__percpu struct device *f(void);` — a function returning a pointer:
         // the `*` is in the declarator, so the return type absorbs.
         let mut ty = CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: ptr.clone(),
             params: Vec::new(),
             variadic: false,
@@ -1556,7 +1565,7 @@ mod address_space_tests {
             AddressSpace::SegGs,
             &[
                 DerivedDeclarator::Pointer(AddressSpace::Default, 0),
-                DerivedDeclarator::Function(Vec::new(), false, true)
+                DerivedDeclarator::Function(Vec::new(), false, true, None)
             ]
         ));
 
@@ -1609,11 +1618,11 @@ mod address_space_tests {
         // Function pointers count as declarator-supplied pointers.
         assert!(declarator_supplies_pointer(&[
             DerivedDeclarator::Pointer(AddressSpace::Default, 0),
-            DerivedDeclarator::FunctionPointer(Vec::new(), false, true)
+            DerivedDeclarator::FunctionPointer(Vec::new(), false, true, None)
         ]));
         assert!(!declarator_supplies_pointer(&[
             DerivedDeclarator::Array(None),
-            DerivedDeclarator::Function(Vec::new(), false, true)
+            DerivedDeclarator::Function(Vec::new(), false, true, None)
         ]));
     }
 }
@@ -1753,6 +1762,7 @@ mod seg_placement_tests {
     }
     fn func_returning(ret: CType) -> CType {
         CType::Function(Box::new(FunctionType {
+            calling_convention: crate::common::types::CallingConvention::Default,
             return_type: ret,
             params: Vec::new(),
             variadic: false,
@@ -1915,7 +1925,12 @@ mod seg_placement_tests {
         // typedef long L;  L __seg_gs (*fp)(void);  -> fp is generic
         assert!(!named_space_qualifies_whole_type(
             &td,
-            &[DerivedDeclarator::FunctionPointer(Vec::new(), false, true)]
+            &[DerivedDeclarator::FunctionPointer(
+                Vec::new(),
+                false,
+                true,
+                None
+            )]
         ));
         // A plain base type never qualifies the whole object by itself.
         assert!(!named_space_qualifies_whole_type(&TypeSpecifier::Int, &[]));

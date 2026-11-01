@@ -1142,7 +1142,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // typeof(expr): try to infer the expression's type
                 self.infer_expr_ctype(expr).unwrap_or(CType::Int)
             }
-            TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype) => {
+            TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype, abi) => {
                 let ret_ct = self.resolve_type_spec(ret);
                 // Full per-parameter conversion (param_decl_to_ctype_with): a
                 // nested function-pointer parameter inside the type name
@@ -1171,6 +1171,7 @@ impl<'a> ExprTypeChecker<'a> {
                     .collect();
                 CType::Pointer(
                     Box::new(CType::Function(Box::new(FunctionType {
+                        calling_convention: *abi,
                         return_type: ret_ct,
                         params: param_cts,
                         variadic: *variadic,
@@ -1179,7 +1180,7 @@ impl<'a> ExprTypeChecker<'a> {
                     PtrQuals::of(AddressSpace::Default),
                 )
             }
-            TypeSpecifier::BareFunction(ret, params, variadic, has_prototype) => {
+            TypeSpecifier::BareFunction(ret, params, variadic, has_prototype, abi) => {
                 let ret_ct = self.resolve_type_spec(ret);
                 let param_cts: Vec<(CType, Option<String>)> = params
                     .iter()
@@ -1201,6 +1202,7 @@ impl<'a> ExprTypeChecker<'a> {
                     })
                     .collect();
                 CType::Function(Box::new(FunctionType {
+                    calling_convention: *abi,
                     return_type: ret_ct,
                     params: param_cts,
                     variadic: *variadic,

@@ -1362,6 +1362,12 @@ impl Lowerer {
             has_inlined_calls: false,
             param_alloca_values: param_alloca_vals,
             uses_sret,
+            calling_convention: func.calling_convention.unwrap_or_else(|| {
+                self.sema_functions
+                    .get(&func.name)
+                    .map(|f| f.calling_convention)
+                    .unwrap_or_default()
+            }),
             is_fastcall: func.attrs.is_fastcall(),
             regparm: func.attrs.regparm,
             is_naked: func.attrs.is_naked(),

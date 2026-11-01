@@ -27,6 +27,7 @@ use std::rc::Rc;
 /// to resolve function declarations through typedefs).
 #[derive(Debug, Clone)]
 pub struct FunctionTypedefInfo {
+    pub calling_convention: crate::common::types::CallingConvention,
     /// The return TypeSpecifier of the function typedef
     pub return_type: TypeSpecifier,
     /// Parameters of the function typedef
@@ -52,14 +53,19 @@ pub fn build_prefix_return_type_spec(
     while i < prefix.len() {
         match &prefix[i] {
             DerivedDeclarator::Pointer(..) => {
-                if let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) =
-                    prefix.get(i + 1)
+                if let Some(DerivedDeclarator::FunctionPointer(
+                    params,
+                    variadic,
+                    has_prototype,
+                    abi,
+                )) = prefix.get(i + 1)
                 {
                     return_type = TypeSpecifier::FunctionPointer(
                         Box::new(return_type),
                         params.clone(),
                         *variadic,
                         *has_prototype,
+                        abi.unwrap_or_default(),
                     );
                     i += 2;
                 } else {
@@ -70,12 +76,13 @@ pub fn build_prefix_return_type_spec(
                     i += 1;
                 }
             }
-            DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
+            DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi) => {
                 return_type = TypeSpecifier::FunctionPointer(
                     Box::new(return_type),
                     params.clone(),
                     *variadic,
                     *has_prototype,
+                    abi.unwrap_or_default(),
                 );
                 i += 1;
             }
@@ -112,7 +119,8 @@ pub fn extract_fptr_typedef_info(
     base_type: &TypeSpecifier,
     derived: &[DerivedDeclarator],
 ) -> Option<FunctionTypedefInfo> {
-    let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) = derived.last()
+    let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype, abi)) =
+        derived.last()
     else {
         return None;
     };
@@ -126,6 +134,7 @@ pub fn extract_fptr_typedef_info(
     };
     let return_type = build_prefix_return_type_spec(base_type, derived, prefix_len);
     Some(FunctionTypedefInfo {
+        calling_convention: abi.unwrap_or_default(),
         return_type,
         params: params.clone(),
         variadic: *variadic,

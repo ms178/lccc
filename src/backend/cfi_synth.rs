@@ -1476,6 +1476,24 @@ fn synthesize_function<'b>(
     for (k, l) in body.iter().enumerate() {
         let t = l.trim();
         let LineCtx { in_fn, app } = ctx[k];
+        if in_fn
+            && !app
+            && let Some(save) = t.strip_prefix("# LCCC_CFI_SAVE ")
+        {
+            let mut parts = save.split_whitespace();
+            if let (Some(reg), Some(off), None) = (parts.next(), parts.next(), parts.next()) {
+                if off.parse::<i64>().is_ok()
+                    && (matches!(reg, "rdi" | "rsi")
+                        || reg
+                            .strip_prefix("xmm")
+                            .and_then(|n| n.parse::<u8>().ok())
+                            .is_some_and(|n| (6..16).contains(&n)))
+                {
+                    let _ = writeln!(out, "    .cfi_offset %{}, {}", reg, off);
+                }
+            }
+            continue;
+        }
         // Any CFI outside user asm is dropped: this function's CFI is
         // derived here in full.
         if in_fn && !app && t.starts_with(".cfi_") {

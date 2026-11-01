@@ -7328,6 +7328,12 @@ impl X86Codegen {
 
         let _ = folded_global_addrs; // subset needs no fold-map interaction
 
+        // CallTyped's move plan is specifically SysV: it has no positional
+        // Microsoft GP/FP mapping or 32-byte home area. Keep that convention
+        // on the general ABI-aware path, even for integer-only register calls.
+        if info.calling_convention != crate::common::types::CallingConvention::Default {
+            return false;
+        }
         if self.machinst_disabled_kinds & MI_CALL_TYPED != 0 {
             return false;
         }

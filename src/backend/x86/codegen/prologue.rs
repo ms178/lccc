@@ -800,7 +800,9 @@ impl X86Codegen {
         // stress abi fn3 `union A3 fn3(long, float, uchar, A3, ull, A3, ...)`
         // expects gp_offset = 32 = sret(rdi) + a0(rsi) + a3(rdx) + a5(rcx)).
         {
-            let config = self.call_abi_config_impl();
+            let mut config = self.call_abi_config_impl();
+            config.microsoft_x64 =
+                func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
             let classification = crate::backend::call_abi::classify_params_full(func, &config);
             let mut named_gp = 0usize;
             let mut named_fp = 0usize;
@@ -2577,8 +2579,19 @@ impl X86Codegen {
         // from a Tier 3 mapping that no longer exists; it cost 8-16 bytes of
         // stack and a `subq` in every calling function with callee saves
         // (GCC: `pushq %rbx; ...; call; ...; popq %rbx`, no `subq`).
+        let ms_abi =
+            func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
+        if ms_abi {
+            // These are scratch homes under SysV; MS entry must preserve them
+            // even across calls to SysV functions and string-copy expansion.
+            self.used_callee_saved.extend([PhysReg(14), PhysReg(15)]);
+        }
         let n_callee = self.used_callee_saved.len() as i64;
-        let callee_save_reserve = n_callee * 8;
+        let callee_save_reserve = if ms_abi && !self.no_sse {
+            ((n_callee * 8 + 15) & !15) + 160
+        } else {
+            n_callee * 8
+        };
         // Capture before `self.state` is mutably borrowed by the layout closure.
         let fpo = self.state.omit_frame_pointer;
         self.state.ra_accumulator_values =
@@ -3347,9 +3360,16 @@ impl X86Codegen {
             }
 
             // Save callee-saved registers with pushq
-            for &reg in &used_regs {
+            for (idx, &reg) in used_regs.iter().enumerate() {
                 let reg_name = phys_reg_name(reg);
                 self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
+                if matches!(reg.0, 14 | 15) {
+                    self.state.emit_fmt(format_args!(
+                        "    # LCCC_CFI_SAVE {} {}",
+                        reg_name,
+                        -16 - (idx as i64 + 1) * 8
+                    ));
+                }
             }
 
             // Allocate remaining stack space for local variables
@@ -3380,6 +3400,24 @@ impl X86Codegen {
                         .out
                         .emit_instr_imm_reg("    subq", local_size, "rsp");
                 }
+            }
+        }
+
+        if func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+            && !self.no_sse
+        {
+            let base = ((used_regs.len() as i64 * 8 + 15) & !15) + 16;
+            for n in 0..10 {
+                self.state.emit_fmt(format_args!(
+                    "    movdqu %xmm{}, {}(%rbp)",
+                    n + 6,
+                    -base - n * 16
+                ));
+                self.state.emit_fmt(format_args!(
+                    "    # LCCC_CFI_SAVE xmm{} {}",
+                    n + 6,
+                    -base - n * 16 - 16
+                ));
             }
         }
 
@@ -3440,6 +3478,10 @@ impl X86Codegen {
         } else {
             ret_xmm_mask
         };
+        let ms_preserved = func.calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+            && !self.no_sse;
+        let ret_xmm_mask = ret_xmm_mask | if ms_preserved { 0xffc0 } else { 0 };
         self.state
             .emit_fmt(format_args!("    # LCCC_RET_XMM {}", ret_xmm_mask));
         // How many low bits of those registers a `ret` reads: the late
@@ -3452,6 +3494,11 @@ impl X86Codegen {
             ret_xmm_mask & 2 != 0,
             vector_ret_in_xmm0,
         );
+        let ret_xmm_bits = if ms_preserved {
+            ret_xmm_bits.max(128)
+        } else {
+            ret_xmm_bits
+        };
         self.state
             .emit_fmt(format_args!("    # LCCC_RET_XMM_BITS {}", ret_xmm_bits));
 
@@ -3515,6 +3562,19 @@ impl X86Codegen {
         let used_regs = self.used_callee_saved.clone();
         let num_saved = used_regs.len() as i64;
         let omit_fp = self.state.omit_frame_pointer;
+        let ms_abi = self.current_func.is_some_and(|f| unsafe {
+            (*f).calling_convention == crate::common::types::CallingConvention::MicrosoftX64
+        });
+        if ms_abi && !self.no_sse {
+            let base = ((num_saved * 8 + 15) & !15) + 16;
+            for n in 0..10 {
+                self.state.emit_fmt(format_args!(
+                    "    movdqu {}(%rbp), %xmm{}",
+                    -base - n * 16,
+                    n + 6
+                ));
+            }
+        }
 
         if omit_fp {
             let use_push_pop = num_saved > 0;
@@ -3630,7 +3690,9 @@ impl X86Codegen {
         let xmm_regs = [
             "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
         ];
-        let config = self.call_abi_config_impl();
+        let mut config = self.call_abi_config_impl();
+        config.microsoft_x64 =
+            func.calling_convention == crate::common::types::CallingConvention::MicrosoftX64;
         let param_classes = classify_params(func, &config);
         self.state.param_classes = param_classes.clone();
         self.state.num_params = func.params.len();

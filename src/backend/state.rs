@@ -595,6 +595,8 @@ pub struct CodegenState {
     /// when the callee is variadic; for a prototyped non-variadic callee the
     /// `xorl %eax,%eax` is pure waste. GCC omits it there.
     pub call_is_variadic: bool,
+    pub call_calling_convention: crate::common::types::CallingConvention,
+    pub call_shadow_active: bool,
     /// Does the call being emitted pass a 256/512-bit vector in a YMM/ZMM
     /// register (`CallArgClass::StructXmmReg` wider than 16 bytes)?
     ///
@@ -991,6 +993,8 @@ impl CodegenState {
             indirect_branch_thunk: false,
             indirect_branch_thunk_inline: false,
             call_is_variadic: false,
+            call_calling_convention: Default::default(),
+            call_shadow_active: false,
             call_passes_wide_vector: false,
             chain_call: false,
             call_gp_arg_count: 6,

@@ -864,7 +864,8 @@ impl X86Codegen {
             // armed sibling call can never be dynamically realigned (its
             // zero-stack-argument guard rules the whole realignment arm out).
             debug_assert!(stack_arg_space > 0);
-            let area = (stack_arg_space + 15) & !15;
+            let area =
+                ((stack_arg_space + 15) & !15) + if self.state.call_shadow_active { 32 } else { 0 };
             self.state
                 .out
                 .emit_instr_mem_reg("    movq", area as i64, "rsp", "r10");
@@ -872,7 +873,9 @@ impl X86Codegen {
             return;
         }
         let need_align_pad = stack_arg_space % 16 != 0;
-        let pushed_bytes = stack_arg_space + if need_align_pad { 8 } else { 0 };
+        let pushed_bytes = stack_arg_space
+            + if need_align_pad { 8 } else { 0 }
+            + if self.state.call_shadow_active { 32 } else { 0 };
         if pushed_bytes == 0 {
             // No outgoing stack area (this includes every armed sibling call):
             // the parked slot is the top of %rsp, so reload and reclaim it
@@ -1617,6 +1620,24 @@ impl X86Codegen {
         // value-shape pass. Emitted right after the call text by
         // `emit_call_instruction_impl` (same discharge contract as
         // `call_gp_arg_count`).
+        // Microsoft FP register numbers follow argument positions, not a
+        // compact FP census. Preserve the whole live prefix through the
+        // highest occupied position in the count-based peephole contract.
+        if self.state.call_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+        {
+            float_count = arg_classes
+                .iter()
+                .filter_map(|c| {
+                    if let CallArgClass::FloatReg { reg_idx } = c {
+                        Some(reg_idx + 1)
+                    } else {
+                        None
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+        }
         self.state.call_fp_arg_count = Some(float_count.min(8));
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
@@ -1629,6 +1650,19 @@ impl X86Codegen {
             if self.state.out.use_rsp_addressing {
                 self.state.out.rsp_frame_size -= hazard_area as i64;
             }
+        }
+        if self.state.call_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+            && self.state.call_is_variadic
+        {
+            for class in arg_classes {
+                if let CallArgClass::FloatReg { reg_idx } = *class {
+                    const GP: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
+                    self.state
+                        .emit_fmt(format_args!("    movq %xmm{}, %{}", reg_idx, GP[reg_idx]));
+                }
+            }
+            self.state.call_gp_arg_count = 6;
         }
         // Restore the original RSP frame size.
         if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
@@ -1663,6 +1697,16 @@ impl X86Codegen {
         _indirect: bool,
         stack_arg_space: usize,
     ) {
+        if self.state.call_calling_convention
+            == crate::common::types::CallingConvention::MicrosoftX64
+        {
+            self.reload_spilled_indirect_fptr_to_r10(stack_arg_space);
+            self.state.emit("    subq $32, %rsp");
+            self.state.call_shadow_active = true;
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size += 32;
+            }
+        }
         // Lazy flush: the call clobbers all XMM registers — a pending
         // deferred vector-result store must hit its slot first.
         self.flush_pending_vec_store_impl();
@@ -1849,7 +1893,10 @@ impl X86Codegen {
         // marker lands immediately after the call text (before any
         // subsequent emission), and absent marker ⇒ non-variadic ⇒ %rax
         // unread.
-        if self.state.call_is_variadic {
+        if self.state.call_is_variadic
+            && self.state.call_calling_convention
+                == crate::common::types::CallingConvention::Default
+        {
             self.emit_call_marker("    # LCCC_VA_CALL".to_string());
         }
         // Call-argument count marker (the same authority contract as the
@@ -1929,6 +1976,13 @@ impl X86Codegen {
         _f128_temp_space: usize,
         _indirect: bool,
     ) {
+        if self.state.call_shadow_active {
+            self.state.emit("    addq $32, %rsp");
+            self.state.call_shadow_active = false;
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size -= 32;
+            }
+        }
         // Dynamically realigned outgoing area: after the call %rsp points at
         // the first stack argument (the anchor). Skip the statically-pushed
         // argument area (16-rounded) to the save slot written by
@@ -2128,6 +2182,14 @@ impl X86Codegen {
     /// call-alignment pad of a function whose every call converts) share it,
     /// so the two can never disagree.
     pub(super) fn sibcall_abi_admits(&self, info: &CallInfo) -> Option<bool> {
+        if info.calling_convention != crate::common::types::CallingConvention::Default
+            || self.current_func.is_some_and(|f| unsafe {
+                (*f).calling_convention != crate::common::types::CallingConvention::Default
+            })
+        {
+            return None;
+        }
+
         // i686: cdecl stages every argument through the outgoing stack area
         // (see the `%esp`-relative staging in the probe for PR #255), so the
         // zero-stack-argument premise of §5b never holds there. Refused

@@ -666,6 +666,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -1016,7 +1017,7 @@ impl Lowerer {
                     for d in &declarator.derived {
                         match d {
                             DerivedDeclarator::Pointer(..) => ptr_count += 1,
-                            DerivedDeclarator::Function(p, v, _) => {
+                            DerivedDeclarator::Function(p, v, _, _) => {
                                 func_info = Some((p.clone(), *v));
                                 break;
                             }
@@ -2474,6 +2475,7 @@ impl Lowerer {
                     struct_arg_riscv_float_classes: Vec::new(),
                     struct_arg_is_f128_sse: full_f128,
                     is_sret: true,
+                    calling_convention: crate::common::types::CallingConvention::Default,
                     is_fastcall: false,
                     regparm: None,
                     ret_eightbyte_classes: Vec::new(),
@@ -2528,6 +2530,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: arg_is_f128,
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -3001,6 +3004,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -3043,6 +3047,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,
@@ -3081,6 +3086,7 @@ impl Lowerer {
                 struct_arg_riscv_float_classes: Vec::new(),
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
+                calling_convention: crate::common::types::CallingConvention::Default,
                 is_fastcall: false,
                 regparm: None,
                 is_pure: false,

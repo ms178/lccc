@@ -2001,6 +2001,17 @@ impl Lowerer {
         num_fixed_args: usize,
         ret_abi: &AggregateReturn,
     ) -> IrType {
+        let calling_convention = self
+            .get_expr_ctype(func)
+            .and_then(|ct| match ct {
+                CType::Function(ft) => Some(ft.calling_convention),
+                CType::Pointer(inner, _) => match *inner {
+                    CType::Function(ft) => Some(ft.calling_convention),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or_default();
         let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
         if ret_abi.two_reg_size.is_some() {
             indirect_ret_ty = IrType::I128;
@@ -2030,6 +2041,7 @@ impl Lowerer {
                             struct_arg_riscv_float_classes,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
+                            calling_convention,
                             is_fastcall: false,
                             regparm: None,
                             is_pure: false,
@@ -2087,6 +2099,7 @@ impl Lowerer {
                             struct_arg_riscv_float_classes,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
+                            calling_convention,
                             is_fastcall: callee_is_fastcall,
                             regparm: callee_regparm,
                             is_pure,
@@ -2144,6 +2157,7 @@ impl Lowerer {
                         struct_arg_riscv_float_classes: sarfc,
                         struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                         is_sret: ret_abi.sret_size.is_some(),
+                        calling_convention,
                         is_fastcall: false,
                         regparm: None,
                         is_pure: false,
@@ -2231,6 +2245,7 @@ impl Lowerer {
                             struct_arg_riscv_float_classes: sarfc,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
+                            calling_convention,
                             is_fastcall: callee_is_fastcall,
                             regparm: callee_regparm,
                             is_pure,
@@ -2258,6 +2273,7 @@ impl Lowerer {
                             struct_arg_riscv_float_classes: sarfc,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
+                            calling_convention,
                             is_fastcall: false,
                             regparm: None,
                             is_pure: false,

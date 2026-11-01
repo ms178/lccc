@@ -5944,7 +5944,8 @@ fn generate_function_body(
             })
             .fold(0usize, |acc, s| acc.saturating_add(s))
             > 12_288;
-    cg.state().omit_frame_pointer = cg.state().fpo_requested
+    cg.state().omit_frame_pointer = func.calling_convention == crate::common::types::CallingConvention::Default
+        && cg.state().fpo_requested
         && !has_dyn_alloca
         && !large_clash_frame
         && !has_inline_asm_fp
@@ -7868,6 +7869,7 @@ fn generate_instruction_body(
                 &info.struct_arg_riscv_float_classes,
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
+                info.calling_convention,
                 info.is_fastcall,
                 info.regparm,
                 &info.ret_eightbyte_classes,
@@ -7897,6 +7899,7 @@ fn generate_instruction_body(
                 &info.struct_arg_riscv_float_classes,
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
+                info.calling_convention,
                 info.is_fastcall,
                 info.regparm,
                 &info.ret_eightbyte_classes,
