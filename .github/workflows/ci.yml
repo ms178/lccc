@@ -966,13 +966,13 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
     - name: Verify restored linker oracle versions
       run: bash tests/regression/check_linker_oracle_versions.sh
-    needs:
-    - build
     - name: Microsoft x64 scalar, record and variadic ABI interoperability and unwind contracts
       run: |
         env CCC=target/fastbuild/lccc bash tests/regression/check_ms_abi.sh
         env CCC=target/fastbuild/lccc bash tests/regression/check_ms_abi_records.sh
         env CCC=target/fastbuild/lccc bash tests/regression/check_ms_abi_varargs.sh
+    needs:
+    - build
   frontend-c:
     name: Frontend and ABI contracts (shard c of 3)
     runs-on: ubuntu-24.04
