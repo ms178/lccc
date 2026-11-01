@@ -17,7 +17,7 @@ Every probe runs both compilers; expectations are gcc's own first
 diagnostic, so the gate fails on any wording drift.
 """
 from __future__ import annotations
-import os, re, shutil, subprocess, sys, tempfile
+import os, re, shutil, sys, tempfile
 from pathlib import Path
 
 # Probes compare GCC's English text byte for byte; under a UTF-8 locale GCC
@@ -36,7 +36,8 @@ def find_gcc():
         if not cand:
             continue
         p = shutil.which(cand)
-        if p and b'16.2' in subprocess.run([p, '--version'], capture_output=True).stdout:
+        if p and b'16.2' in abi_matrix.run_bounded(
+                [p, '--version'], timeout=abi_matrix.COMPILE_TIMEOUT).stdout:
             return p
     return None
 
@@ -205,10 +206,15 @@ def registry_abi_names() -> list[str]:
 
 
 def has_multilib(gcc: str) -> bool:
-    """Whether this gcc can target i686 at all (the -m32 half of the table)."""
-    return subprocess.run([gcc, '-m32', '-E', '-x', 'c', '-', '-o', os.devnull],
-                          input='int x;\n', capture_output=True, text=True,
-                          env=ENV).returncode == 0
+    """Whether this gcc can target i686 at all (the -m32 half of the table).
+
+    Bounded like every other probe: gcc hanging on a broken multilib install
+    must fail the gate, not stall the job until its six-hour limit.
+    """
+    return abi_matrix.run_bounded(
+        [gcc, '-m32', '-E', '-x', 'c', '-', '-o', os.devnull],
+        timeout=abi_matrix.COMPILE_TIMEOUT, env=ENV,
+        input='int x;\n').returncode == 0
 
 
 def first_diag(stderr: str) -> str:
@@ -222,8 +228,8 @@ def run(cc, src, flags):
         f.write(src + '\n')
         path = f.name
     try:
-        r = subprocess.run([cc, '-fsyntax-only', '-std=gnu23', *flags, path],
-                           capture_output=True, text=True, env=ENV)
+        r = abi_matrix.run_bounded([cc, '-fsyntax-only', '-std=gnu23', *flags, path],
+                                   timeout=abi_matrix.COMPILE_TIMEOUT, env=ENV)
         return r.returncode, r.stderr
     finally:
         os.unlink(path)
@@ -270,8 +276,11 @@ def main() -> int:
     # lower are proved end-to-end by a cross-compiler runtime sentinel.
     abi_failures, abi_notes = abi_matrix.check_table_against_gcc(
         gcc, abi_matrix.registry_verdicts(), has_multilib(gcc))
+    # One resolved driver for both directions: the caller already knows the
+    # artifact under test, and a second guess inside the matrix could name a
+    # stale binary (`LCCC` unset) while this gate measured the right one.
     abi_lccc_failures, abi_lccc_notes = abi_matrix.check_lccc(
-        abi_matrix.registry_verdicts())
+        abi_matrix.registry_verdicts(), LCCC)
     for note in abi_notes + abi_lccc_notes:
         print(f'  note: {note}')
     failures.extend(abi_failures)
