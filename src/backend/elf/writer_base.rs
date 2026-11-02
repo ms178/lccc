@@ -569,18 +569,31 @@ impl ElfWriterBase {
 
     /// `.loc FILE LINE COLUMN`: a line row at the current location (in
     /// `.text` before any section directive, as in GNU as).
+    ///
+    /// A file number no `.file` declared is refused, which is what GNU as does
+    /// (`Error: unassigned file number 2`, measured on binutils 2.47, with or
+    /// without `-g`).  Dropping the row instead is worse than refusing it: the
+    /// statements that follow silently inherit the previous row's file and
+    /// line, and when *every* row names an undeclared file the object comes out
+    /// of a `-g` compile with no debug information at all.
     pub fn debug_loc(
         &mut self,
         file: u32,
         line: u32,
         column: u32,
         options: super::dwarf::DwarfLocOptions,
-    ) {
+    ) -> Result<(), String> {
+        if !self.debug_files.iter().any(|(number, _)| *number == file) {
+            return Err(format!(
+                "unassigned file number {file} in .loc (no `.file {file}` before it)"
+            ));
+        }
         self.ensure_text_section();
         let label = format!(".Lloc\u{1}{}", self.debug_rows.len());
         let at = (self.current_section.clone(), self.current_offset());
         self.labels.insert(label.clone(), at);
         self.debug_rows.push((label, file, line, column, options));
+        Ok(())
     }
 
     /// GNU as `dwarf2_finish`: the `.loc` rows become a `.debug_line`, and an
@@ -603,7 +616,7 @@ impl ElfWriterBase {
             DwarfFunction, DwarfLineLocation, DwarfSectionInfo, DwarfStrings,
             build_dwarf_info_sections, build_dwarf_line_section,
         };
-        if self.debug_rows.is_empty() || self.sections.contains_key(".debug_line") {
+        if self.debug_rows.is_empty() {
             return Ok(());
         }
         let index_of: FxHashMap<&str, usize> = self
@@ -689,9 +702,35 @@ impl ElfWriterBase {
         // their paths in `.debug_line_str`, the units and subprograms their
         // names in `.debug_str`. Each is emitted last, once nothing more can
         // be interned into it.
-        let mut strings = DwarfStrings::new();
-        let mut line_strings = DwarfStrings::new();
-        if let Some(line) = build_dwarf_line_section(
+        // An input may already have begun the debug sections: `gcc -S -g`
+        // writes `.debug_info` and leaves `.debug_line` empty for the assembler
+        // to fill, and may spell some strings itself.  The generated program is
+        // appended to those bytes, and the two string tables continue the
+        // input's sections so that an interned offset stays inside one
+        // coordinate system.
+        let line_prefix = self
+            .sections
+            .get(".debug_line")
+            .map_or_else(Vec::new, |section| section.data.clone());
+        let str_prefix = self
+            .sections
+            .get(".debug_str")
+            .map_or_else(Vec::new, |section| section.data.clone());
+        let line_str_prefix = self
+            .sections
+            .get(".debug_line_str")
+            .map_or_else(Vec::new, |section| section.data.clone());
+        let mut strings = DwarfStrings::continuing(&str_prefix);
+        let mut line_strings = DwarfStrings::continuing(&line_str_prefix);
+        // `DW_AT_stmt_list` binds the input's unit to the generated program, so
+        // the program speaks the unit's dialect unless the command line pinned
+        // one (see `DwarfConfig::continuing_unit`).
+        let config = config.continuing_unit(
+            self.sections
+                .get(".debug_info")
+                .and_then(|section| super::dwarf::unit_version(&section.data)),
+        );
+        if let Some(mut line) = build_dwarf_line_section(
             &self.debug_files,
             &locations,
             &section_info,
@@ -703,11 +742,13 @@ impl ElfWriterBase {
             &mut line_strings,
             labelled.as_deref_mut(),
         )? {
+            let stmt_list = super::dwarf::place_line_build(&mut line, &line_prefix)?;
             if !self.sections.contains_key(".debug_info")
                 && !self.sections.contains_key(".debug_abbrev")
             {
                 if let Some(info) = build_dwarf_info_sections(
                     &line.code_sections,
+                    stmt_list,
                     &self.debug_files,
                     &locations,
                     &section_info,
@@ -746,7 +787,12 @@ impl ElfWriterBase {
         };
         self.labels.extend(made);
         for section in built {
-            self.section_order.push(section.name.clone());
+            // A section the input already listed is replaced in place, never
+            // listed twice: `gcc -S -g` declares `.debug_line` itself and the
+            // generated program is appended to it.
+            if !self.sections.contains_key(&section.name) {
+                self.section_order.push(section.name.clone());
+            }
             self.sections.insert(section.name.clone(), section);
         }
         Ok(())

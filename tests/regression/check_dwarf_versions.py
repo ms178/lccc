@@ -269,9 +269,9 @@ def addr2line_resolve(addr2line: str, path: Path, address: int) -> tuple[str, st
 
 def asm_loc_rows(assembly: str) -> set[tuple[str, int]]:
     """Every `(file, line)` a `.loc` directive names, as the source recorded it."""
-    files = dict(re.findall(r'^\.file (\d+) "(.*)"', assembly, re.MULTILINE))
+    files = dict(re.findall(r'^\s*\.file\s+(\d+)\s+"(.*)"', assembly, re.MULTILINE))
     rows = set()
-    for number, line in re.findall(r"^\.loc (\d+) (\d+)", assembly, re.MULTILINE):
+    for number, line in re.findall(r"^\s*\.loc\s+(\d+)\s+(\d+)", assembly, re.MULTILINE):
         name = files.get(number)
         if name is not None:
             rows.add((Path(name).name, int(line)))
@@ -310,6 +310,26 @@ def arange_pairs(readelf: str, path: Path) -> set[tuple[int, int]]:
             if length:
                 pairs.add((address, length))
     return pairs
+
+
+BASE = 16
+
+
+def function_symbols(nm: str, path: Path) -> list[tuple[str, str, str, str]]:
+    """Every defined function symbol as ``(address, size, kind, name)``.
+
+    ``nm -S`` prints `address size kind name` for a sized symbol and only
+    `address kind name` for an unsized one, which is why the kind is located by
+    its one-character width rather than by position.
+    """
+    symbols = []
+    for line in run_ok([nm, "-S", "--defined-only", str(path)]).splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and len(fields[2]) == 1:
+            symbols.append((fields[0], fields[1], fields[2], " ".join(fields[3:])))
+        elif len(fields) == 3 and len(fields[1]) == 1:
+            symbols.append((fields[0], "0", fields[1], " ".join(fields[2:])))
+    return symbols
 
 
 def symbol_addresses(nm: str, path: Path) -> dict[str, int]:
@@ -570,6 +590,134 @@ def check_version_and_dialect(
     )
 
 
+def section_headers(readelf: str, path: Path) -> dict[str, tuple[str, int, int]]:
+    """``name -> (flags, sh_entsize, size)`` from the section header table.
+
+    Only the three fields this gate reasons about are decoded: the flags string
+    readelf prints (``MS`` for ``SHF_MERGE|SHF_STRINGS``, empty when there is
+    none), the entry size, and the size.
+    """
+    headers: dict[str, tuple[str, int, int]] = {}
+    for line in readelf_dump(readelf, path, "-SW").splitlines():
+        parts = line.split()
+        if not parts or not parts[0].startswith("["):
+            continue
+        index = 2 if parts[0] == "[" else 1
+        if index == 2 and (len(parts) < 2 or not parts[1].endswith("]")):
+            continue
+        fields = parts[index:]
+        if len(fields) < 10:
+            continue
+        name, sh_type, _addr, _offset, size, entsize = fields[:6]
+        flags = "".join(fields[6:-3])
+        if not sh_type.isupper():
+            continue
+        headers[name] = (flags, int(entsize, 16), int(size, 16))
+    return headers
+
+
+def check_gas_assembly_input(
+    directory: Path,
+    lccc: str,
+    gcc: str,
+    readelf: str,
+    addr2line: str,
+    nm: str,
+    version: int,
+) -> None:
+    """Assemble GCC 16.2's own ``-S -g`` output and hold lccc to it.
+
+    ``gcc -S -g`` emits the compilation unit as assembly: ``.debug_info``,
+    ``.debug_abbrev`` and ``.debug_aranges`` as directives and an empty
+    ``.debug_line`` for the assembler to fill.  An assembler that *replaces*
+    those sections instead of continuing them throws away a unit it was handed,
+    and one that writes a second copy of a section hands the consumer two.
+
+    So: every debug section the input declares must appear exactly once, the
+    line program must decode to the rows the ``.loc`` directives asked for --
+    the same set GNU as produces from the same input -- and the string pools
+    must keep the ``MS``/entry-size-1 shape a linker merges.
+    """
+    source = write_fixture(directory)
+    assembly = directory / f"gas-{version}.s"
+    ours_object = directory / f"gas-{version}-lccc.o"
+    reference_object = directory / f"gas-{version}-as.o"
+    label = f"gcc -S -g -gdwarf-{version} assembled"
+    run_ok(
+        [gcc, "-g", f"-gdwarf-{version}", "-O0", "-S", str(source), "-o", str(assembly)]
+    )
+    run_ok([lccc, "-c", str(assembly), "-o", str(ours_object)])
+    require_clean_readelf(readelf, ours_object, label)
+
+    # 1. One of each declared debug section: a duplicate header is what a
+    #    replacement that kept the old entry in the section table looks like,
+    #    and the consumer then reads whichever copy it finds first.
+    names = [
+        line.split()[2] if line.split()[0] == "[" else line.split()[1]
+        for line in readelf_dump(readelf, ours_object, "-SW").splitlines()
+        if line.strip().startswith("[")
+    ]
+    duplicated = sorted({name for name in names if names.count(name) > 1})
+    require(not duplicated, f"{label}: duplicated sections {duplicated}")
+    assembly_text = assembly.read_text(encoding="utf-8")
+    declared = set(
+        re.findall(r"^\s*\.section\s+(\.[^,\s]+)", assembly_text, re.MULTILINE)
+    ) - {".debug_loc"}
+    for section in sorted(declared):
+        require(section in names, f"{label}: input declares {section}, object has none")
+
+    # 2. The line program is the one the `.loc` directives asked for, and it is
+    #    the same set of rows GNU as produces from this exact assembly.
+    asked = asm_loc_rows(assembly_text)
+    require(asked, f"{label}: the input has no .loc rows")
+    decoded = decoded_line_rows(readelf, ours_object)
+    require(
+        decoded == asked,
+        f"{label}: line program decodes to {sorted(decoded)}, source asked for "
+        f"{sorted(asked)}",
+    )
+    run_ok([resolve_command("as"), "--64", "-o", str(reference_object), str(assembly)])
+    reference = decoded_line_rows(readelf, reference_object)
+    require(
+        decoded == reference,
+        f"{label}: rows {sorted(decoded)} differ from GNU as {sorted(reference)}",
+    )
+
+    # 3. The pools keep the shape a linker merges (`MS`, one byte per entry).
+    headers = section_headers(readelf, ours_object)
+    for section in (".debug_str", ".debug_line_str"):
+        if section not in headers:
+            continue
+        flags, entsize, size = headers[section]
+        require(
+            "M" in flags and "S" in flags,
+            f"{label}: {section} flags {flags!r} lack SHF_MERGE|SHF_STRINGS",
+        )
+        require(
+            entsize == 1,
+            f"{label}: mergeable {section} states sh_entsize {entsize}, not 1",
+        )
+        require(size > 0, f"{label}: {section} is empty")
+
+    # 4. And the unit the input carried still resolves to the source.
+    image = directory / f"gas-{version}.elf"
+    run_ok([lccc, "-nostartfiles", "-o", str(image), str(ours_object)])
+    addresses = symbol_addresses(nm, image)
+    for function, file_name in (("alpha", source.name), ("beta", source.name)):
+        require(function in addresses, f"{label}: {function} missing from the link")
+        found, resolved_file, line = addr2line_resolve(
+            addr2line, image, addresses[function]
+        )
+        require(
+            found == function and Path(resolved_file).name == file_name,
+            f"{label}: {function} resolved to {found} {resolved_file}:{line}",
+        )
+    print(
+        f"PASS gcc -S -g -gdwarf-{version}: the input's sections are continued, "
+        f"exactly one of each, rows equal to GNU as, pools mergeable"
+    )
+
+
 def link_image(
     compiler: str, source: Path, output: Path, version: int | None, extra: list[str]
 ) -> None:
@@ -725,6 +873,13 @@ def main() -> int:
                 "PASS multi-object links: both translation units resolve at every "
                 "version (string tables are relocated, not baked in)"
             )
+
+            # GCC's own assembly input: the sections it declares are continued,
+            # not replaced or duplicated, and its units still resolve.
+            for version in versions:
+                check_gas_assembly_input(
+                    directory, lccc, gcc, readelf, addr2line, nm, version
+                )
 
             # The command-line boundary, measured on GCC 16.2:
             #   `-gdwarf-N` alone enables debug info, `-g0` after it disables it,
@@ -885,15 +1040,33 @@ def main() -> int:
                             "address map",
                         )
                         continue
-                    # Every function is its own unit here, so the address map has
-                    # exactly one range per function -- at the addresses the
-                    # linker gave them, which is what a debugger searches.
+                    # The address map names exactly the sized function symbols
+                    # of the image, at the addresses the linker gave them and
+                    # with their sizes -- that is what a debugger searches.
+                    #
+                    # "Sized function symbol", not "function from the source":
+                    # GAS 2.47 covers every `.text` section that carries a
+                    # `.type @function` symbol with a size, rows or no rows
+                    # (measured: a two-function file with one rowless stub
+                    # section yields three ranges), and the i686 PIC thunk
+                    # `__x86.get_pc_thunk.bx` is exactly such a symbol. Skipping
+                    # it here would only let a dropped range pass unseen.
                     mapped = arange_pairs(readelf, image)
-                    expected = {(addresses[function], None) for function in ENTRY_LINE}
+                    expected = {
+                        (int(address, BASE), int(size, BASE))
+                        for address, size, kind, _name in function_symbols(nm, image)
+                        if kind in "tT" and int(size, BASE) > 0
+                    }
                     require(
                         {address for address, _ in mapped} == {a for a, _ in expected},
-                        f"{stem}: the address map covers {sorted(mapped)}, the link "
-                        f"put the functions at {sorted(a for a, _ in expected)}",
+                        f"{stem}: the address map covers {sorted(mapped)}, the "
+                        f"link put the function symbols at {sorted(expected)}",
+                    )
+                    require(
+                        {(address, length) for address, length in mapped if length}
+                        == expected,
+                        f"{stem}: the address map's ranges are {sorted(mapped)}, "
+                        f"the function symbols are {sorted(expected)}",
                     )
             print(
                 "PASS -ffunction-sections: one unit, one line program, one address "

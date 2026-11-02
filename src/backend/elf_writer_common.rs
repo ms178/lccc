@@ -2268,6 +2268,21 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
             }
             AsmItem::Loc(file_number, line, column, options) => {
+                // GNU as refuses a row for a file number no `.file` declared
+                // and so does this writer: a dropped row would silently
+                // attribute the statements after it to the previous file, and
+                // a row set that is dropped entirely leaves a `-g` compile with
+                // no debug information at all.
+                if !self
+                    .debug_files
+                    .iter()
+                    .any(|(number, _)| number == file_number)
+                {
+                    return Err(format!(
+                        "unassigned file number {file_number} in .loc \
+                         (no `.file {file_number}` before it)"
+                    ));
+                }
                 self.ensure_section()?;
                 let section_index = self.current_section.ok_or("no active section for .loc")?;
                 let offset = self.sections[section_index].cursor();
@@ -4127,9 +4142,32 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut debug_line_units: Vec<usize> = Vec::new();
         // Two string tables per object, as DWARF 5 splits them: paths in
         // `.debug_line_str`, names in `.debug_str` (see `elf::dwarf`).
-        let mut debug_strings = elf_mod::DwarfStrings::new();
-        let mut debug_line_strings = elf_mod::DwarfStrings::new();
-        if !shared_sections.contains_key(".debug_line") {
+        // An input may already have begun the debug sections: `gcc -S -g`
+        // writes `.debug_info` itself and leaves `.debug_line` empty for the
+        // assembler to fill, exactly as GAS does.  The generated program is
+        // appended to those bytes and the string tables continue the input's
+        // sections, so a `DW_FORM_strp` offset stays inside one section.
+        let line_prefix = shared_sections
+            .get(".debug_line")
+            .map_or_else(Vec::new, |section| section.data.clone());
+        let str_prefix = shared_sections
+            .get(".debug_str")
+            .map_or_else(Vec::new, |section| section.data.clone());
+        let line_str_prefix = shared_sections
+            .get(".debug_line_str")
+            .map_or_else(Vec::new, |section| section.data.clone());
+        let mut debug_strings = elf_mod::DwarfStrings::continuing(&str_prefix);
+        let mut debug_line_strings = elf_mod::DwarfStrings::continuing(&line_str_prefix);
+        // `DW_AT_stmt_list` binds the input's unit to the program generated
+        // here, so the program speaks the unit's dialect unless the command
+        // line pinned one (see `DwarfConfig::continuing_unit`).
+        let config = self.debug_config.continuing_unit(
+            shared_sections
+                .get(".debug_info")
+                .and_then(|section| elf_mod::unit_version(&section.data)),
+        );
+        let mut stmt_list = 0u64;
+        {
             let section_info: Vec<elf_mod::DwarfSectionInfo<'_>> = self
                 .sections
                 .iter()
@@ -4151,11 +4189,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 A::reloc_abs(address_size),
                 A::reloc_abs(4),
                 &comp_dir,
-                self.debug_config,
+                config,
                 &mut debug_line_strings,
                 None,
             )?;
-            if let Some(built) = built {
+            if let Some(mut built) = built {
+                stmt_list = elf_mod::place_line_build(&mut built, &line_prefix)?;
                 let elf_mod::DwarfLineBuild {
                     mut line,
                     code_sections: units,
@@ -4164,8 +4203,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     fold_rel_addends(&mut line)?;
                 }
                 debug_line_units = units;
-                section_names.push(line.name.clone());
+                // The input may already have listed the section (see the
+                // `.debug_line` prefix above); replacing the entry keeps one
+                // header per name, and listing it again would emit the section
+                // twice.
+                let listed = shared_sections.contains_key(&line.name);
                 shared_sections.insert(line.name.clone(), line);
+                if !listed {
+                    section_names.push(String::from(".debug_line"));
+                }
             }
         }
 
@@ -4362,6 +4408,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let address_size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
             let built = elf_mod::build_dwarf_info_sections(
                 &debug_line_units,
+                stmt_list,
                 &self.debug_files,
                 &self.debug_line_locations,
                 &section_info,
@@ -4372,24 +4419,41 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 address_size,
                 A::reloc_abs(4),
                 A::reloc_abs(address_size),
-                self.debug_config,
+                config,
                 &mut debug_strings,
                 &mut debug_line_strings,
                 None,
             )?;
+            let mut sections = Vec::new();
             if let Some(info) = built {
-                let mut sections = vec![info.info, info.abbrev];
+                sections.extend([info.info, info.abbrev]);
                 sections.extend(info.aranges);
                 sections.extend(info.ranges);
                 sections.extend(debug_strings.into_section(".debug_str"));
-                sections.extend(debug_line_strings.into_section(".debug_line_str"));
-                for mut section in sections {
-                    if A::uses_rel_format() {
-                        fold_rel_addends(&mut section)?;
-                    }
-                    section_names.push(section.name.clone());
-                    shared_sections.insert(section.name.clone(), section);
+            }
+            for mut section in sections {
+                if A::uses_rel_format() {
+                    fold_rel_addends(&mut section)?;
                 }
+                let listed = shared_sections.contains_key(&section.name);
+                let name = section.name.clone();
+                shared_sections.insert(name.clone(), section);
+                if !listed {
+                    section_names.push(name);
+                }
+            }
+        }
+        // The program names its files through `.debug_line_str` in a dialect
+        // that has that table, and that is independent of whether a unit is
+        // built here: `-c` on an input that brings its own `.debug_info`, or
+        // `-gdwarf-5` on a version-2 one, still points into the table, and a
+        // section that is missing makes every file name in it unreadable.
+        if let Some(section) = debug_line_strings.into_section(".debug_line_str") {
+            let listed = shared_sections.contains_key(&section.name);
+            let name = section.name.clone();
+            shared_sections.insert(name.clone(), section);
+            if !listed {
+                section_names.push(name);
             }
         }
 
@@ -6716,6 +6780,37 @@ mod tests {
     }
 
     /// Assemble a text blob and return the raw `.text` bytes (test-only).
+    /// `.loc` names its file by number, so a number no `.file` assigned has no
+    /// name to put in the line table's file column.  Refusing it is what GAS
+    /// does (`Error: unassigned file number 2`, binutils 2.47) and what keeps
+    /// the failure visible: a skipped row hands every following statement the
+    /// previous row's file and line, and when *every* row names an undeclared
+    /// file a `-g` compile yields an object with no line information at all.
+    /// `.file 0` names the primary file (the DWARF 5 file table's entry 0) and
+    /// does not assign number 1.
+    #[test]
+    fn a_loc_naming_an_undeclared_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("lccc_loc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = ScratchDir(dir.clone());
+        let out = dir.join("loc.o");
+        let out = out.to_str().unwrap();
+        for asm in [
+            "f:\n.loc 1 1 1\n ret\n",
+            ".file 0 \"d\" \"a.c\"\nf:\n.loc 1 1 1\n ret\n",
+        ] {
+            let err = assemble(asm, out, None).expect_err("no `.file 1` was declared");
+            assert!(
+                err.contains("unassigned file number 1"),
+                "{err:?} from {asm:?}"
+            );
+        }
+        // With the number declared the same row is accepted.
+        assemble(".file 1 \"a.c\"\nf:\n.loc 1 1 1\n ret\n", out, None).unwrap();
+        // And `.loc 0` is the primary file, which always exists.
+        assemble(".file 0 \"d\" \"a.c\"\nf:\n.loc 0 1 1\n ret\n", out, None).unwrap();
+    }
+
     fn assemble_object(asm: &str) -> Vec<u8> {
         let dir = std::env::temp_dir().join(format!(
             "lccc_tight_{}_{}",

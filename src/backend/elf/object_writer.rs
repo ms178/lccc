@@ -740,7 +740,7 @@ pub fn write_relocatable_object(
                 0,
                 0,
                 section.sh_addralign,
-                0,
+                section_entsize(section),
             );
         }
         // Reloc sections
@@ -829,6 +829,27 @@ pub fn write_relocatable_object(
 /// neither folded into its section nor emitted as a symbol) became a SIGSEGV
 /// at run time instead of a diagnostic at assembly time.  GAS has no such
 /// state: every referenced name is defined, folded, or an undefined global.
+/// `sh_entsize` of an emitted section.
+///
+/// A `SHF_MERGE|SHF_STRINGS` section is a list of equal-sized entries whose size
+/// the header must state -- `0` there is malformed and every linker rejects the
+/// object (bfd: "section `.debug_str` has invalid sh_entsize").  lccc emits such
+/// a section for exactly one shape, the byte-wide string pools (`entsize` 1, one
+/// NUL-terminated string per entry -- see `dwarf::debug_section_flags`), and
+/// every other content section it writes is a plain byte stream, which is what
+/// `sh_entsize == 0` means.  Symbol and relocation tables fill their own headers
+/// in and never reach this path.
+fn section_entsize(section: &ObjSection) -> u64 {
+    if section.sh_type == SHT_PROGBITS
+        && section.sh_flags & SHF_MERGE != 0
+        && section.sh_flags & SHF_STRINGS != 0
+    {
+        1
+    } else {
+        0
+    }
+}
+
 fn find_symbol_index_shared(
     name: &str,
     sym_entries: &[SymEntry],
