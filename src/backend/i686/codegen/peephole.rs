@@ -24204,7 +24204,10 @@ f:
         let asm = pair_fn("    andl $65535, %eax\n    movl %eax, (%edi)\n");
         let out = peephole_optimize(asm);
         assert!(!out.contains("andl $65535"), "word mask shortened:\n{out}");
-        assert!(out.contains("movzwl %ax, %eax"), "word zero extension:\n{out}");
+        assert!(
+            out.contains("movzwl %ax, %eax"),
+            "word zero extension:\n{out}"
+        );
         let wide = pair_fn("    andl $65535, %ebx\n    movl %ebx, (%edi)\n");
         let out = peephole_optimize(wide);
         assert!(!out.contains("andl $65535"), "word mask on %ebx:\n{out}");
