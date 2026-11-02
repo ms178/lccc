@@ -2247,15 +2247,16 @@ mod dialect_severity_redteam_tests {
                 .iter()
                 .any(|entry| entry.groups.contains(&WarningGroup::Pedantic))
         );
-        // Diagnostic labels: `-Wformat` prints with a trailing `=`.
+        // GCC leveled-warning labels retain a trailing `=`.
         for entry in WARNING_REGISTRY {
             let suffix = entry.kind.flag_suffix();
             assert_eq!(
                 suffix,
-                if entry.kind == WarningKind::Format {
-                    "format="
-                } else {
-                    entry.name
+                match entry.kind {
+                    WarningKind::Format => "format=",
+                    WarningKind::UnusedConstVariable => "unused-const-variable=",
+                    WarningKind::UnusedButSetVariable => "unused-but-set-variable=",
+                    _ => entry.name,
                 },
                 "{} label",
                 entry.name
