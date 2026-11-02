@@ -1154,6 +1154,18 @@ class HostedStepsMirroredTest(unittest.TestCase):
         self.assertEqual(
             parity.check_hosted_steps_mirrored(self.local, self.hosted), 0)
 
+    def test_enum_callback_abi_requires_a_direct_local_mirror(self) -> None:
+        command = ('python3 tests/regression/check_enum_forward_abi.py '
+                   '--lccc "$LCCC" --require-cross')
+        self.assertEqual(self.local.count(command), 1)
+        # A comment or a transitive import in the warning runner must not
+        # conceal removal of the dedicated executable gate.
+        local = self.local.replace(command, '# removed enum callback ABI', 1)
+        with redirect_stderr(StringIO()) as errors:
+            self.assertEqual(
+                parity.check_hosted_steps_mirrored(local, self.hosted), 1)
+        self.assertIn('tests/regression/check_enum_forward_abi.py', errors.getvalue())
+
     def test_hosted_only_script_fails(self) -> None:
         hosted = self.hosted + "\npython3 scripts/check_new_gate.py\n"
         with redirect_stderr(StringIO()):

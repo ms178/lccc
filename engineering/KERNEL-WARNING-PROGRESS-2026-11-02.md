@@ -167,3 +167,25 @@ SIMD and qualifier gates. This closes the previously unmeasured *hosted* ICX
 lane for that revision, not the local ICX provisioning limitation. The hosted
 kernel job is now building full bzImage; no hosted kernel boot result exists.
 No PR readiness or all-CI-green claim is made.
+
+### Hosted parity failure repaired, not allowlisted
+
+The 4a1fc85a0 fast-contract shards failed when the reverse hosted/local audit
+found that the dedicated hosted `check_enum_forward_abi.py` invocation had no
+**direct** `ci_local.sh` entry. Although the warning runner already invokes the
+same matrix transitively, the parity guard deliberately does not interpret
+Python imports. Added an actual fast local gate with `--require-cross`, not a
+comment, a hosted-only allowlist exception, or a disabled validator. This costs
+one additional small ABI matrix locally; it preserves the warning integration
+and the mandatory authenticated hosted ICX comparison unchanged.
+
+Reproduction: `check_ci_gate_parity.py` failed explicitly with the missing script
+before the repair. Afterward: parity PASS (503 commands, 27 invocation contracts),
+**83 parity regression tests PASS**, including a new negative mutation which
+removes the direct enum gate and must fail. The exact added ABI command also
+passed: **54 measured executions, zero unmeasured cross executions**. Local ICX
+remains unavailable and is reported explicitly; the earlier hosted ICX check is
+successful. `bash -n scripts/ci_local.sh` and `git diff --check` pass. No compiler
+source changed during this host/CI repair; the local full kernel process remains
+on the previously validated compiler binaries. The new revision still needs
+fresh hosted CI and the outstanding acceptance gates listed above.

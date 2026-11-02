@@ -935,6 +935,12 @@ gate "warning-compatibility" fast \
 gate "warning-precedence" fast \
     python3 tests/regression/check_warning_precedence.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# The warning runner also invokes this ABI matrix, but hosted/local parity
+# audits executable entry points rather than Python's transitive import graph.
+# Keep a directly runnable mirror of the dedicated authenticated vendor gate;
+# all four LCCC targets must execute locally, never silently skip a runtime.
+gate "enum-forward-callback-abi" fast \
+    python3 tests/regression/check_enum_forward_abi.py --lccc "$LCCC" --require-cross
 gate "macro-parity" fast \
     python3 tests/regression/check_macro_parity.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
