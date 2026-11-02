@@ -613,6 +613,9 @@ fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
         // Exact match only, so `-soname`/`-shared` are not shadowed.
         "-s" | "--strip-all" => result.strip_all = true,
         "-S" | "--strip-debug" => result.strip_debug = true,
+        // Explicit default: retain local symbols. Strip-all is independent,
+        // and still removes the regular table, as with GNU ld.
+        "--discard-none" => {}
         "-t" | "--trace" => result.trace_files = true,
         "--fatal-warnings" => result.fatal_warnings = true,
         "--no-fatal-warnings" => result.fatal_warnings = false,

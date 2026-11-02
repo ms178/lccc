@@ -247,6 +247,8 @@ pub struct SemanticAnalyzer {
     /// check. Uses RefCell for interior mutability since resolve_struct_or_union
     /// takes &self.
     defined_structs: RefCell<FxHashSet<String>>,
+    /// Type resolution can revisit a definition; report its layout once.
+    packed_alignment_checked: RefCell<FxHashSet<(u32, u32, u32)>>,
     /// Occurrence spans whose `typeof(expr)` has already had the
     /// expression's constraint checks run (C11 6.7.3 walk; GCC reports per
     /// occurrence and `type_spec_to_ctype` resolves each occurrence
@@ -268,6 +270,7 @@ pub struct SemanticAnalyzer {
     prior_file_function_decls: FxHashMap<String, bool>,
     /// Whether ordinary hosted-library builtin folds are disabled.
     no_builtins: bool,
+    file_scope_unused_diagnostics: bool,
     builtin_policy: crate::common::pass_policy::BuiltinFlags,
     /// The dialect predates C99 (`-std=c90`/`gnu89`/`iso9899:199409`): GCC
     /// then still treats an overflowing signed left shift as a constant.
@@ -281,6 +284,8 @@ pub struct SemanticAnalyzer {
     /// `void *` is silent) while the constraint errors still fire, so the
     /// warning sites consult this. Measured on gcc-16.2.
     unevaluated_depth: Cell<u32>,
+    discarded_expr: Cell<bool>,
+    statement_expr_value: Cell<Option<Span>>,
     /// Depth of operands whose evaluation is guaranteed not to happen:
     /// the right side of a `&&`/`||` whose left side is a constant that
     /// decides it, and the untaken arm of a `?:` with a constant
@@ -322,17 +327,21 @@ impl SemanticAnalyzer {
             result: SemaResult::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
+            packed_alignment_checked: RefCell::new(FxHashSet::default()),
             typeof_seen: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             function_nesting_stack: Vec::new(),
             prior_file_function_decls: FxHashMap::default(),
             no_builtins: false,
+            file_scope_unused_diagnostics: true,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             pre_c99: false,
             pending_loop_labels: Vec::new(),
             active_break_targets: Vec::new(),
             active_continue_targets: Vec::new(),
             unevaluated_depth: Cell::new(0),
+            discarded_expr: Cell::new(false),
+            statement_expr_value: Cell::new(None),
             div_zero_quiet: Cell::new(0),
             address_of_operand: Cell::new(false),
             function_scope_floor: usize::MAX,
@@ -363,7 +372,9 @@ impl SemanticAnalyzer {
         }
         // File-scope internal-linkage objects participate in -Wunused-variable
         // too, and their uses can occur in declarations processed later.
-        self.warn_unused_scope();
+        if self.file_scope_unused_diagnostics {
+            self.warn_unused_scope();
+        }
         // Validate `__attribute__((ifunc("resolver")))` / `[[gnu::ifunc("resolver")]]`
         // resolver targets across the translation unit (GCC 16.2 parity).
         let has_toplevel_asm = tu
@@ -454,6 +465,10 @@ impl SemanticAnalyzer {
 
     /// Disable ordinary hosted-library builtin folds (`-fno-builtin`).
     /// Compiler-prefixed `__builtin_*` forms remain available.
+    pub fn set_file_scope_unused_diagnostics(&mut self, enabled: bool) {
+        self.file_scope_unused_diagnostics = enabled;
+    }
+
     pub fn set_no_builtins(&mut self, no_builtins: bool) {
         self.no_builtins = no_builtins;
     }
@@ -2565,6 +2580,7 @@ impl SemanticAnalyzer {
                 Some(ty) => EnumConstant {
                     value,
                     ty: ty.clone(),
+                    origin: None,
                 },
                 None => EnumConstant::provisional(value),
             };
@@ -2733,8 +2749,76 @@ impl SemanticAnalyzer {
 
     // === Statement analysis ===
 
+    /// GNU's packed warning concerns explicitly aligned RECORD types, not
+    /// ordinary scalar/vector alignment, nor aligned scalar typedefs.
+    fn warn_packed_record_alignment(
+        &self,
+        name: &Option<String>,
+        fields: &[StructFieldDecl],
+        layout: &StructLayout,
+    ) {
+        let Some(first) = fields.first() else { return };
+        if !self.packed_alignment_checked.borrow_mut().insert((
+            first.span.file_id,
+            first.span.start,
+            first.span.end,
+        )) {
+            return;
+        }
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let record = format!(
+            "{} {}",
+            if layout.is_union { "union" } else { "struct" },
+            name.as_deref().unwrap_or("<anonymous>")
+        );
+        for (index, field) in layout.fields.iter().enumerate() {
+            // GCC checks record-typed members, not arrays of records.
+            let (CType::Struct(key) | CType::Union(key)) = &field.ty else {
+                continue;
+            };
+            let Some(inner) = layouts.get(key.as_ref()) else {
+                continue;
+            };
+            if !inner.user_align {
+                continue;
+            }
+            let alignment = inner.align;
+            let span = fields.get(index).map_or(first.span, |field| field.span);
+            if layout.align < alignment {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!(
+                        "alignment {} of '{record}' is less than {alignment}",
+                        layout.align
+                    ),
+                    span,
+                    crate::common::error::WarningKind::PackedNotAligned,
+                );
+            }
+            if field.offset % alignment != 0 {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!(
+                        "'{}' offset {} in '{record}' isn't aligned to {alignment}",
+                        field.name, field.offset
+                    ),
+                    span,
+                    crate::common::error::WarningKind::PackedNotAligned,
+                );
+            }
+        }
+    }
+
     fn warn_unused_scope(&mut self) {
-        for (name, span) in self.symbol_table.unused_local_objects() {
+        for (name, span, level) in self.symbol_table.unused_local_objects() {
+            if let Some(level) = level {
+                self.diagnostics
+                    .borrow_mut()
+                    .unused_set_variable(&name, span, level);
+                continue;
+            }
+            if self.symbol_table.at_file_scope() && self.symbol_table.is_top_const(&name) {
+                self.diagnostics.borrow_mut().unused_file_const(&name, span);
+                continue;
+            }
             self.diagnostics.borrow_mut().warning_with_kind(
                 format!("unused variable '{name}'"),
                 span,
@@ -2852,7 +2936,11 @@ impl SemanticAnalyzer {
     fn analyze_stmt_in_scope(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Expr(Some(expr)) => {
-                self.analyze_expr(expr);
+                if self.statement_expr_value.get() == Some(expr.span()) {
+                    self.analyze_expr(expr);
+                } else {
+                    self.analyze_discarded_expr(expr);
+                }
             }
             Stmt::Expr(None) => {}
             Stmt::Return(Some(expr), span) => {
@@ -2960,7 +3048,7 @@ impl SemanticAnalyzer {
                             self.analyze_declaration(decl, false);
                         }
                         ForInit::Expr(expr) => {
-                            self.analyze_expr(expr);
+                            self.analyze_discarded_expr(expr);
                         }
                     }
                 }
@@ -2969,7 +3057,7 @@ impl SemanticAnalyzer {
                     self.check_scalar_condition(cond);
                 }
                 if let Some(inc) = inc {
-                    self.analyze_expr(inc);
+                    self.analyze_discarded_expr(inc);
                 }
                 self.analyze_substatement(body);
                 self.warn_unused_scope();
@@ -3556,7 +3644,33 @@ impl SemanticAnalyzer {
 
     // === Expression analysis ===
 
+    fn analyze_discarded_expr(&mut self, expr: &Expr) {
+        self.discarded_expr.set(true);
+        self.analyze_expr(expr);
+    }
+
+    fn write_only_root<'a>(&self, expr: &'a Expr) -> Option<&'a str> {
+        match expr {
+            Expr::Identifier(name, _) => Some(name),
+            Expr::MemberAccess(base, ..) => self.write_only_root(base),
+            Expr::ArraySubscript(base, ..)
+                if matches!(self.exact_operand_ctype(base), Some(CType::Array(..))) =>
+            {
+                self.write_only_root(base)
+            }
+            _ => None, // *p and p->member READ the pointer; they don't set p.
+        }
+    }
+
+    fn analyze_write_operand(&mut self, expr: &Expr, discarded: bool, level: u8) {
+        self.analyze_expr(expr);
+        if discarded && let Some(name) = self.write_only_root(expr) {
+            self.symbol_table.mark_write_only(name, level);
+        }
+    }
+
     fn analyze_expr(&mut self, expr: &Expr) {
+        let discarded = self.discarded_expr.replace(false);
         self.declare_type_name_tags(expr);
         match expr {
             Expr::Identifier(name, span) => {
@@ -3606,7 +3720,11 @@ impl SemanticAnalyzer {
                 self.check_binary_operands(*op, lhs, rhs, *span);
             }
             Expr::UnaryOp(op, operand, span) => {
-                self.analyze_expr(operand);
+                self.analyze_write_operand(
+                    operand,
+                    discarded && matches!(op, UnaryOp::PreInc | UnaryOp::PreDec),
+                    2,
+                );
                 if let Some(ty) = self.constraint_operand(operand) {
                     let message = match op {
                         UnaryOp::PreInc => operand_constraints::increment(true, &ty),
@@ -3634,7 +3752,7 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::PostfixOp(op, operand, span) => {
-                self.analyze_expr(operand);
+                self.analyze_write_operand(operand, discarded, 2);
                 if let Some(ty) = self.constraint_operand(operand) {
                     let message = operand_constraints::increment(*op == PostfixOp::PostInc, &ty);
                     self.constraint_error(message, *span);
@@ -3653,7 +3771,7 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::Assign(lhs, rhs, span) => {
-                self.analyze_expr(lhs);
+                self.analyze_write_operand(lhs, discarded, 1);
                 self.analyze_expr(rhs);
                 self.check_void_assignment_target(lhs, *span);
                 if !self.check_ext_vector_assignable(lhs, *span) {
@@ -3686,7 +3804,7 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::CompoundAssign(op, lhs, rhs, span) => {
-                self.analyze_expr(lhs);
+                self.analyze_write_operand(lhs, discarded, 3);
                 self.analyze_expr(rhs);
                 // A `void` lvalue (`*p` on a `void *`) cannot be read and
                 // written back: GCC reports its "invalid use" form here, not
@@ -3965,14 +4083,26 @@ impl SemanticAnalyzer {
                 self.check_indirection_operand(inner, *span, address_of);
             }
             Expr::Comma(lhs, rhs, _) => {
-                self.analyze_expr(lhs);
-                self.analyze_expr(rhs);
+                self.analyze_discarded_expr(lhs);
+                if discarded {
+                    self.analyze_discarded_expr(rhs);
+                } else {
+                    self.analyze_expr(rhs);
+                }
             }
             Expr::CompoundLiteral(ts, init, span, storage) => {
                 self.analyze_compound_literal_expr(expr, ts, init, *span, storage);
             }
             Expr::StmtExpr(compound, _) => {
+                // GCC treats the last operand as the statement-expression's
+                // value even when its enclosing expression is discarded.
+                let value = match compound.items.last() {
+                    Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) => Some(expr.span()),
+                    _ => None,
+                };
+                let old = self.statement_expr_value.replace(value);
                 self.analyze_compound_stmt(compound);
+                self.statement_expr_value.set(old);
             }
             Expr::VaArg(ap_expr, ts, span) => {
                 self.check_void_type_name(ts, *span);
@@ -5166,6 +5296,49 @@ impl SemanticAnalyzer {
             .is_some_and(|from_ty| self.rejects_address_space(&from_ty, to, from))
     }
 
+    fn enum_conversion_source(&self, expr: &Expr) -> Option<CType> {
+        match expr {
+            Expr::Identifier(name, _) if self.symbol_table.is_enumerator(name) => self
+                .result
+                .type_context
+                .enum_constants
+                .get(name)
+                .and_then(|c| c.origin.as_ref())
+                .map(|origin| CType::Enum((**origin).clone())),
+            Expr::Comma(_, rhs, _) => self.enum_conversion_source(rhs),
+            // Arithmetic and conditional operators erase enumerator
+            // provenance; explicit casts instead have their target C type.
+            _ => self.expr_type_checker().infer_expr_ctype(expr),
+        }
+    }
+
+    fn check_enum_conversion(&self, expr: &Expr, to: &CType, span: Span) {
+        if !self
+            .diagnostics
+            .borrow()
+            .warning_enabled_at(crate::common::error::WarningKind::EnumConversion, span)
+        {
+            return;
+        }
+        let CType::Enum(target) = to else {
+            return;
+        };
+        let Some(CType::Enum(source)) = self.enum_conversion_source(expr) else {
+            return;
+        };
+        if source != *target {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                format!(
+                    "implicit conversion from '{}' to '{}'",
+                    CType::Enum(source),
+                    to
+                ),
+                span,
+                crate::common::error::WarningKind::EnumConversion,
+            );
+        }
+    }
+
     /// Simple assignment and the conversions "as if by assignment"
     /// (initialization, argument passing, `return`; C23 6.5.16.1p1) for a
     /// record, `void` or `nullptr_t` operand. Whether it reported an error.
@@ -5191,6 +5364,7 @@ impl SemanticAnalyzer {
             }
             IConvContext::Assignment => span,
         };
+        self.check_enum_conversion(from, to, span);
         // GCC 16.2: an integer that is not a null-pointer constant used
         // where a pointer is expected (initialization, assignment, argument
         // passing, `return`) is `-Wint-conversion`, a default error from
@@ -6872,6 +7046,7 @@ dereference it before applying '->' to it?"
     /// `check_initializer_element_spaces`). Only pointer targets have a
     /// named-space conversion to check.
     fn check_element_space(&self, target: &CType, expr: &Expr) {
+        self.check_enum_conversion(expr, target, expr.span());
         if !matches!(target, CType::Pointer(..)) {
             return;
         }
@@ -10689,6 +10864,9 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             }
         }
         if let Some(layout) = defined_layout {
+            if let Some(fields) = fields {
+                self.warn_packed_record_alignment(name, fields, &layout);
+            }
             self.result
                 .type_context
                 .insert_struct_layout_scoped_from_ref(&key, layout);

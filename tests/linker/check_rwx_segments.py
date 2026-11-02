@@ -234,6 +234,8 @@ def main() -> int:
             else:
                 print(f"SKIP {target}: qemu-{qemu_name} runtime (not installed)")
 
+    from check_discard_none import run as check_discard_none
+    check_discard_none(ld)
     return 0
 
 

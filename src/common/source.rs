@@ -136,6 +136,11 @@ impl SourceManager {
         }
     }
 
+    /// Input spelling before preprocessing line markers rename locations.
+    pub fn main_file_name(&self) -> Option<&str> {
+        self.files.first().map(|file| file.name.as_str())
+    }
+
     pub fn add_file(&mut self, name: String, content: String) -> u32 {
         let line_offsets = compute_line_offsets(&content);
         let id = self.files.len() as u32;

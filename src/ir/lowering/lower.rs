@@ -3230,6 +3230,7 @@ impl Lowerer {
                         Some(ty) => crate::frontend::sema::type_context::EnumConstant {
                             value: next_val,
                             ty: ty.clone(),
+                            origin: None,
                         },
                         None => {
                             crate::frontend::sema::type_context::EnumConstant::provisional(next_val)

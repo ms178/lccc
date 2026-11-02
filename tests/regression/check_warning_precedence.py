@@ -300,6 +300,13 @@ def main() -> int:
     check_include_paths(lccc, gcc)
     from check_date_time_warnings import run as check_dates
     check_dates(lccc, gcc)
+    from check_layout_unused_warnings import run as check_layout_unused, check_rejected_negative_levels
+    check_layout_unused(lccc, gcc)
+    check_rejected_negative_levels(lccc, gcc)
+    from check_enum_conversion import check as check_enums
+    check_enums(lccc, gcc)
+    from check_verbose_asm import run as check_assembly_comments
+    check_assembly_comments(lccc)
     return 0
 
 

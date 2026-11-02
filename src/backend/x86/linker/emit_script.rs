@@ -3830,10 +3830,25 @@ fn link_with_script_machine(
                 if !sym.is_local() || sym.name.is_empty() {
                     continue;
                 }
-                if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE {
+                if sym.sym_type() == STT_SECTION {
                     continue;
                 }
-                if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON {
+                if sym.shndx == SHN_ABS {
+                    local_sym_index.insert((oi, sidx), symtab.len() as u32);
+                    add_sym_vis(
+                        machine,
+                        &sym.name,
+                        sym.value,
+                        sym.size,
+                        sym.info,
+                        sym.other,
+                        SHN_ABS,
+                        &mut symtab,
+                        &mut strtab,
+                    )?;
+                    continue;
+                }
+                if sym.shndx == SHN_UNDEF || sym.shndx == SHN_COMMON {
                     continue;
                 }
                 let Some(&base) = placed_map.get(&(oi, sym.shndx as usize)) else {

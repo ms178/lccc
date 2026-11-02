@@ -221,6 +221,7 @@ pub struct Driver {
     pub(super) cf_protection_value: Option<&'static str>,
     /// `-fstack-clash-protection`: probe 4096-byte pages of static/dynamic frames.
     pub(super) stack_clash_protection: bool,
+    pub(super) verbose_asm: bool,
     /// `-fstack-protector{,-strong,-all,-explicit}` mode.
     pub(super) stack_protector_mode: crate::backend::stack_protector::StackProtectorMode,
     /// `--param=ssp-buffer-size=N` threshold for `-fstack-protector` (default 8).
@@ -696,6 +697,7 @@ impl Driver {
             cf_protection_branch: false,
             cf_protection_value: None,
             stack_clash_protection: false,
+            verbose_asm: false,
             stack_protector_mode: crate::backend::stack_protector::StackProtectorMode::None,
             ssp_buffer_size: 8,
             stack_protector_guard: crate::backend::stack_protector::StackProtectorGuard::default(),
@@ -1340,6 +1342,7 @@ impl Driver {
 
             // Semantic analysis.
             let mut sema = SemanticAnalyzer::new();
+            sema.set_file_scope_unused_diagnostics(false);
             sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_pre_c99_dialect(self.pre_c99_dialect());
             sema.set_weak_pragma_names(
@@ -2062,6 +2065,12 @@ impl Driver {
         // (infinite recursion or wrong control flow). Undefining _FORTIFY_SOURCE
         // prevents these wrappers from being emitted.
         preprocessor.undefine_macro("_FORTIFY_SOURCE");
+        self.configure_include_paths(preprocessor)
+    }
+
+    /// Install explicit search paths and report invocation-level path errors.
+    /// Kept separate from architecture predefined-macro configuration.
+    fn configure_include_paths(&self, preprocessor: &mut Preprocessor) -> Result<(), String> {
         // User/system include directories use the legacy LCCC_SYSROOT overlay:
         // prefixed paths are preferred when present, with a host fallback.
         // This differs from GNU --sysroot and is not an isolation boundary.
@@ -3940,6 +3949,13 @@ impl Driver {
             .target
             .generate_assembly_with_opts_and_debug(module, &opts, source_manager);
         self.validate_target_assembly(module, &asm, input_file)?;
+        // Annotate AFTER optimization and target validation: presentation must
+        // not introduce peephole barriers or alter instruction selection.
+        let asm = if self.verbose_asm {
+            self.annotate_verbose_assembly(module, &asm, source_manager)
+        } else {
+            asm
+        };
         if time_phases {
             eprintln!(
                 "[TIME] codegen: {:.3}s ({} bytes asm)",
@@ -4687,6 +4703,58 @@ impl Driver {
     /// follows it where the dialects differ.
     pub(crate) fn pre_c99_dialect(&self) -> bool {
         matches!(self.stdc_version, Some(None) | Some(Some("199409L")))
+    }
+
+    fn annotate_verbose_assembly(
+        &self,
+        module: &crate::ir::module::IrModule,
+        asm: &str,
+        source_manager: Option<&SourceManager>,
+    ) -> String {
+        let prefix = if self.target == Target::Aarch64 {
+            "//"
+        } else {
+            "#"
+        };
+        let functions: crate::common::fx_hash::FxHashMap<_, _> = module
+            .functions
+            .iter()
+            .filter(|function| !function.is_declaration)
+            .map(|function| (function.name.as_str(), function))
+            .collect();
+        let mut result = format!(
+            "{prefix} LCCC -fverbose-asm: target {:?}, optimization level {}\n",
+            self.target, self.opt_level
+        );
+        for line in asm.split_inclusive('\n') {
+            result.push_str(line);
+            let Some(name) = line.trim().strip_suffix(':') else {
+                continue;
+            };
+            let Some(function) = functions.get(name) else {
+                continue;
+            };
+            // Debug formatting escapes line breaks and other control bytes in
+            // user-provided names/paths, keeping commentary non-executable.
+            let instructions: usize = function
+                .blocks
+                .iter()
+                .map(|block| block.instructions.len())
+                .sum();
+            result.push_str(&format!(
+                "{prefix} Function {:?}: {} blocks, {instructions} IR instructions\n",
+                function.name,
+                function.blocks.len()
+            ));
+            if let Some(sm) = source_manager {
+                let location = sm.resolve_span(function.body_span);
+                result.push_str(&format!(
+                    "{prefix} Source {:?}:{}\n",
+                    location.file, location.line
+                ));
+            }
+        }
+        result
     }
 
     /// The warning config every diagnostic engine in this pipeline should

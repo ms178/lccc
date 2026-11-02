@@ -544,6 +544,9 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             // Forwarded like `-s` below: the built-in emitters read it out
             // of `parse_linker_args`.
+            // All defined local symbols are retained by default. Unlike -s,
+            // this policy does not suppress the regular symbol table.
+            "--discard-none" => passthrough.push(a.to_string()),
             "--strip-debug" | "-S" => {
                 strip_debug = true;
                 passthrough.push("--strip-debug".to_string());

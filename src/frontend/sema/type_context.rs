@@ -152,6 +152,10 @@ pub fn extract_fptr_typedef_info(
 pub struct EnumConstant {
     pub value: i64,
     pub ty: CType,
+    /// Diagnostic provenance is distinct from the enumerator's C type,
+    /// which can be int in C11. Stored with the scoped constant so shadowing
+    /// and scope undo preserve both together.
+    pub origin: Option<Rc<crate::common::types::EnumType>>,
 }
 
 impl EnumConstant {
@@ -168,7 +172,11 @@ impl EnumConstant {
         } else {
             CType::LongLong
         };
-        Self { value, ty }
+        Self {
+            value,
+            ty,
+            origin: None,
+        }
     }
 }
 
@@ -903,10 +911,14 @@ impl TypeContext {
         scoped: bool,
     ) -> CType {
         let ty = enum_type.constant_ctype();
+        // Share provenance: copying all variants into every enumerator is
+        // quadratic in the size of large kernel enum declarations.
+        let origin = Rc::new(enum_type.clone());
         for (name, value) in &enum_type.variants {
             let constant = EnumConstant {
                 value: *value,
                 ty: ty.clone(),
+                origin: Some(Rc::clone(&origin)),
             };
             if scoped {
                 self.insert_enum_scoped(name.clone(), constant);

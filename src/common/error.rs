@@ -112,6 +112,14 @@ pub enum WarningKind {
     DateTime,
     /// An explicitly supplied include search directory does not exist.
     MissingIncludeDirs,
+    /// A packed record or member violates an explicitly aligned record type.
+    PackedNotAligned,
+    /// Implicit conversion between distinct enumeration types.
+    EnumConversion,
+    /// An unreferenced file-scope const object with internal linkage.
+    UnusedConstVariable,
+    /// A local variable is written but its value is not used.
+    UnusedButSetVariable,
     /// Control reaches end of non-void function, or non-void function does
     /// not return a value in all control paths.
     /// GCC flag: -Wreturn-type
@@ -272,6 +280,14 @@ macro_rules! warning {
 /// a hard error, not an emitted warning. Pedantic has no implemented members.
 pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
     warning!(
+        EnumConversion,
+        "enum-conversion",
+        false,
+        [Extra],
+        false,
+        "implicit conversion between distinct enumeration types"
+    ),
+    warning!(
         Undeclared,
         "undeclared",
         true,
@@ -335,6 +351,30 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "nonexistent explicit include search directory"
+    ),
+    warning!(
+        PackedNotAligned,
+        "packed-not-aligned",
+        false,
+        [All],
+        false,
+        "packed record member violates an explicitly requested type alignment"
+    ),
+    warning!(
+        UnusedButSetVariable,
+        "unused-but-set-variable",
+        false,
+        [All, Unused],
+        false,
+        "local object is set but its value is not used"
+    ),
+    warning!(
+        UnusedConstVariable,
+        "unused-const-variable",
+        false,
+        [],
+        false,
+        "unused internal-linkage file-scope const object"
     ),
     warning!(
         ReturnType,
@@ -535,6 +575,8 @@ impl WarningKind {
     pub fn flag_suffix(self) -> &'static str {
         match self {
             WarningKind::Format => "format=",
+            WarningKind::UnusedConstVariable => "unused-const-variable=",
+            WarningKind::UnusedButSetVariable => "unused-but-set-variable=",
             other => other.flag_name(),
         }
     }
@@ -572,6 +614,8 @@ pub struct WarningConfig {
     bare_return_enabled: bool,
     pub werror_all: bool,
     inhibit_all: bool,
+    unused_const_level: u8,
+    unused_but_set_level: u8,
 }
 
 impl WarningConfig {
@@ -594,6 +638,8 @@ impl WarningConfig {
             bare_return_enabled: true,
             werror_all: false,
             inhibit_all: false,
+            unused_const_level: 2,
+            unused_but_set_level: 3,
         }
     }
 
@@ -613,6 +659,20 @@ impl WarningConfig {
         {
             return;
         }
+        // -Wunused-variable selects the level-1 const subwarning, but a
+        // specifically selected -Wunused-const-variable takes precedence.
+        if kind == WarningKind::UnusedVariable {
+            let child = WarningKind::UnusedConstVariable;
+            let child_priority = priority.min(2);
+            if self
+                .enable_priority
+                .get(&child)
+                .is_none_or(|&p| p <= child_priority)
+            {
+                self.unused_const_level = 1;
+                self.select(child, enabled, child_priority);
+            }
+        }
         self.enable_priority.insert(kind, priority);
         if enabled {
             self.enabled.insert(kind);
@@ -630,6 +690,12 @@ impl WarningConfig {
     }
 
     pub fn enable(&mut self, kind: WarningKind) {
+        if kind == WarningKind::UnusedConstVariable {
+            self.unused_const_level = 2;
+        }
+        if kind == WarningKind::UnusedButSetVariable {
+            self.unused_but_set_level = 3;
+        }
         self.select(kind, true, 3);
         self.explicit_enable.insert(kind);
     }
@@ -649,6 +715,10 @@ impl WarningConfig {
     pub fn set_werror(&mut self, kind: WarningKind) {
         self.errors.insert(kind);
         self.not_errors.remove(&kind);
+        if kind == WarningKind::UnusedVariable {
+            self.errors.insert(WarningKind::UnusedConstVariable);
+            self.not_errors.remove(&WarningKind::UnusedConstVariable);
+        }
         self.enable(kind);
     }
 
@@ -677,6 +747,10 @@ impl WarningConfig {
                 self.select(entry.kind, true, group.priority());
                 self.errors.insert(entry.kind);
                 self.not_errors.remove(&entry.kind);
+                if entry.kind == WarningKind::UnusedVariable {
+                    self.errors.insert(WarningKind::UnusedConstVariable);
+                    self.not_errors.remove(&WarningKind::UnusedConstVariable);
+                }
             }
         }
     }
@@ -792,6 +866,17 @@ impl WarningConfig {
                 if let Some(kind) = WarningKind::from_flag_name(name) {
                     self.clear_werror(kind);
                     true
+                } else if let Some((base, level)) = name.split_once('=') {
+                    if let Some(kind) = WarningKind::from_flag_name(base)
+                        && Self::valid_warning_level(kind, level)
+                    {
+                        // Demotion neither enables the warning nor changes its
+                        // numeric level (including under an existing =1).
+                        self.clear_werror(kind);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     // GCC 16.2 accepts group demotions but does not expand
                     // them to the leaf warning classifications we emit.
@@ -818,12 +903,8 @@ impl WarningConfig {
                     self.select_group(group, true);
                     true
                 } else if let Some((base, level)) = flag.split_once('=') {
-                    // `-W<name>=<level>`: only leveled warnings accept
-                    // levels. Measured on gcc-16.2: `-Wformat=0|1|2` are
-                    // recognized (2 = the -Wformat family, of which LCCC
-                    // implements -Wformat-security); every other
-                    // `-W<name>=N` is a driver error there, and false lets
-                    // the tolerated-option diagnostic stand in.
+                    // Only implemented leveled families accept numeric
+                    // arguments; do not advertise option tolerance as support.
                     if !level.is_empty() && level.bytes().all(|b| b.is_ascii_digit()) {
                         self.apply_level(base, level, false)
                     } else {
@@ -836,17 +917,35 @@ impl WarningConfig {
         }
     }
 
-    /// Apply a numeric level to a leveled warning: GCC 16.2 accepts levels
-    /// only for `-Wformat` (measured — `=0` disables, `=1` enables, `=2`
-    /// enables the -Wformat family, of which LCCC implements the core
-    /// warning and -Wformat-security). `promote` marks the
+    /// GNU's leveled warnings reject `-Wno-name=N` as a malformed option,
+    /// rather than silently accepting it as an unknown negative warning.
+    pub fn rejects_negative_level(flag: &str) -> bool {
+        flag.strip_prefix("no-")
+            .and_then(|name| name.split_once('='))
+            .and_then(|(name, _)| WarningKind::from_flag_name(name))
+            .is_some_and(|kind| Self::valid_warning_level(kind, "0"))
+    }
+
+    fn valid_warning_level(kind: WarningKind, level: &str) -> bool {
+        match kind {
+            WarningKind::UnusedButSetVariable => matches!(level, "0" | "1" | "2" | "3"),
+            WarningKind::Format | WarningKind::UnusedConstVariable => {
+                matches!(level, "0" | "1" | "2")
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply a supported numeric warning level. `=0` disables; positive
+    /// levels enable with family-specific semantics. Format level 2 also
+    /// enables the implemented format-security warning. `promote` marks the
     /// `-Werror=<name>=<level>` spelling, where `>=1` also promotes.
     /// Returns false for anything GCC would not recognize here.
     fn apply_level(&mut self, base: &str, level: &str, promote: bool) -> bool {
         let Some(kind) = WarningKind::from_flag_name(base) else {
             return false;
         };
-        if kind != WarningKind::Format || !matches!(level, "0" | "1" | "2") {
+        if !Self::valid_warning_level(kind, level) {
             return false;
         }
         match level {
@@ -855,13 +954,19 @@ impl WarningConfig {
             "0" => self.disable(kind),
             _ => {
                 self.enable(kind);
-                if level == "2" {
+                if kind == WarningKind::Format && level == "2" {
                     self.enable(WarningKind::FormatSecurity);
                 }
                 if promote {
                     self.set_werror(kind);
                 }
             }
+        }
+        if kind == WarningKind::UnusedConstVariable {
+            self.unused_const_level = level.parse().unwrap_or(0);
+        }
+        if kind == WarningKind::UnusedButSetVariable {
+            self.unused_but_set_level = level.parse().unwrap_or(0);
         }
         true
     }
@@ -1453,6 +1558,36 @@ impl DiagnosticEngine {
     }
 
     /// Emit a categorized warning with a message, span, and kind.
+    /// Level 1 omits included headers, level 2 includes non-system headers.
+    /// GCC compares the declaration's logical filename with the main input
+    /// spelling. In particular, #line renaming also affects its level-1 rule.
+    pub fn unused_file_const(&mut self, name: &str, span: Span) {
+        let config = self.warning_config_at(span);
+        let in_header = self.source_manager.as_ref().is_some_and(|sm| {
+            sm.main_file_name()
+                .is_some_and(|main| sm.resolve_span(span).file != main)
+        });
+        if config.unused_const_level == 1 && in_header {
+            return;
+        }
+        self.warning_with_kind(
+            format!("'{name}' defined but not used"),
+            span,
+            WarningKind::UnusedConstVariable,
+        );
+    }
+
+    pub fn unused_set_variable(&mut self, name: &str, span: Span, minimum_level: u8) {
+        if self.warning_config_at(span).unused_but_set_level < minimum_level {
+            return;
+        }
+        self.warning_with_kind(
+            format!("variable '{name}' set but not used"),
+            span,
+            WarningKind::UnusedButSetVariable,
+        );
+    }
+
     pub fn warning_with_kind(&mut self, message: impl Into<String>, span: Span, kind: WarningKind) {
         let diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
         self.emit(&diag);
@@ -1930,6 +2065,10 @@ mod dialect_severity_redteam_tests {
             WarningKind::OldStyleDefinition,
             WarningKind::DateTime,
             WarningKind::MissingIncludeDirs,
+            WarningKind::PackedNotAligned,
+            WarningKind::EnumConversion,
+            WarningKind::UnusedConstVariable,
+            WarningKind::UnusedButSetVariable,
             WarningKind::DivByZero,
             WarningKind::StrictPrototypes,
             WarningKind::Format,
@@ -2084,7 +2223,16 @@ mod dialect_severity_redteam_tests {
             .filter(|entry| !entry.default_on && entry.groups.contains(&WarningGroup::All))
             .map(|entry| entry.name)
             .collect();
-        assert_eq!(wall, ["return-type", "unused-variable", "format"]);
+        assert_eq!(
+            wall,
+            [
+                "packed-not-aligned",
+                "unused-but-set-variable",
+                "return-type",
+                "unused-variable",
+                "format"
+            ]
+        );
         let wextra: Vec<&str> = WARNING_REGISTRY
             .iter()
             .filter(|entry| !entry.default_on && entry.groups.contains(&WarningGroup::Extra))
