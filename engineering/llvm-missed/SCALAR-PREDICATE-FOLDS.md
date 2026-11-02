@@ -1077,6 +1077,26 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
 
 ## What is not done
 
+* **The measured queue from §17's sweep** (2026-11-02, x86-64 `-O2`, `ret`
+  counted, GCC 12.2 / Clang 22.1.8 in this sandbox; the shapes are
+  `__builtin`-heavy and come from browser code -- Firefox's `mfbt/CheckedInt.h`
+  is built on `__builtin_{add,sub,mul}_overflow`, `mfbt/MathAlgorithms.h` on
+  `__builtin_{clz,ctz,popcount}`, Chromium's `base/numerics/clamped_math_impl.h`
+  on `< 0 ? -v : v`):
+  `__builtin_add_overflow` 10 vs 5 (both oracles: `add; seto` -- the IR's
+  widen-add-truncate-sext-compare shape cannot reach the flag, so this needs an
+  IR instruction that *is* a flag, and a target without flags needs the widened
+  form as a fallback: a cross-backend design, not a peephole);
+  `abs(x)` 6 vs 4 (`xor/sar/sub` where `neg; cmovs` reuses the negation's flags);
+  `if (0 == (i >> 3))` 6 vs 4 (two `ret`s instead of one `cmov`);
+  `x / 7u` 9 vs 8 (64-bit magic arithmetic where 32-bit suffices, plus a copy);
+  `ctz32`/`clz32` 3/4 vs 3/3 (LCCC defines `ctz(0)`/`clz(0)` as the width; the
+  oracles emit `rep bsf`/`bsr;xor` and leave zero undefined -- equal on ctz,
+  one worse on clz, and both are 2 where `tzcnt`/`lzcnt` exist);
+  `-x` at 8/16 bits 4 vs 3 (the narrow return convention: the upper half of a
+  narrow return is dead, LCCC extends on both sides);
+  `pop32` 17 vs 5/2 (libgcc call vs inlined SWAR vs `popcnt`, the linking
+  decision this list already describes).
 * **`(x ^ 1 << n) ^ 1 << n` as a *fold* rather than a copy** — handled at 2
   instructions (see §12), but only when the two masks are the same value. A
   spelling whose two `1u << n` are not CSE'd produces two `BitToggle`s that the
