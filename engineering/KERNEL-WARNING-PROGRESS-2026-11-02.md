@@ -553,3 +553,10 @@ positive/negative controls, alternatives and limits. The authenticated ICX
 2026.2 lane passed on 86b0b1a57, not yet this newer cohort. Main integration,
 mitigation-option defects, warning/options completion and current full kernel/
 QEMU/all-green acceptance remain pending.
+
+Main 27ae9f4c6 is now integrated (0582ec6f8): 7643 lib units pass, with 10
+existing ignores; 251 contracts, the all-target DWARF dialect/version gate,
+all-target Clippy and strict usercopy checks pass. New red-team i686 evidence
+finds fastcall function-pointer ABI loss (wrong O0 result, O2/Os crashes;
+GCC16.2/Clang23.1.4 pass), plus an indirect fastcall spill-hook mismatch.
+These are added to the open follow-up work, not hidden or marked passing.

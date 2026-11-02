@@ -75,3 +75,25 @@ option defects, CS-prefix/register-only forwarding, remaining warning families
 and optimization options, full strict kernel build and current QEMU acceptance
 remain open. Kernel compilation still emits inventoried unsupported-option
 warnings; a single-object validator pass is not zero-warning kernel acceptance.
+
+## Subsequent main integration
+
+Main 27ae9f4c6 was integrated as 0582ec6f8 with a three-way merge, preserving
+60 branch-only commits and their existing validation/checkpoint identities
+rather than rewriting that history. The integrated tree passes **7643 lib
+units / 10 existing ignores**, normal optimized fastbuild, **251 contracts**,
+the expanded DWARF 2/3/4/5 all-target/dialect/GCC-16.2 round-trip gate,
+all-target Clippy with warnings denied, and both strict usercopy validators.
+The kernel source invocation still emits the already inventoried unsupported
+option warnings. Those are not counted as fixed by these validator passes.
+
+A further standalone, non-kernel i686 probe has confirmed another open ABI
+failure: a volatile fastcall function pointer called with four integer
+arguments returns a wrong result at O0 and segfaults at O2/Os. GCC 16.2 and
+Clang 23.1.4 i386 executables pass. Assembly inspection shows that fastcall
+is lost from the pointer's function type (the caller emits cdecl arguments).
+The fastcall-specific indirect-call emitter also invokes the inherited no-op
+pointer-spill hook while its later reload/cleanup assumes a four-byte spill;
+that path requires a separate regression after typed ABI propagation is fixed.
+Neither defect is claimed fixed. The current checkpoint is not a production
+acceptance delivery and does not claim every callable ABI path is correct.
