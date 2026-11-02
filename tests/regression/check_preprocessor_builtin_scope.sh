@@ -362,22 +362,42 @@ for name in __GNUC__ __STDC_VERSION__ __x86_64__; do
     fi
 done
 # ... but a definition the source supplied IS listed, exactly as both oracles
-# list `-D__DATE__="x"`. A name-based filter would hide it.
-user_dump=$("$CCC" -dM -E -D__DATE__='"x"' -D__FILE__='"y"' -D__TIMESTAMP__='"z"' -x c /dev/null)
-for spec in '__DATE__ "x"' '__FILE__ "y"' '__TIMESTAMP__ "z"'; do
-    if ! printf '%s\n' "$user_dump" | grep -qF "#define $spec"; then
-        fail "-dM: a user-supplied definition must be listed: '#define $spec'"
+# list `-D__DATE__="x"`. A name-based filter would hide it. All eight names are
+# covered, because each one reaches the table by a different route: four are
+# materialised, `__LINE__`/`__COUNTER__` are computed per token, and
+# `__BASE_FILE__` is installed once at startup.
+user_defs=''
+specs=''
+for name in __FILE__ __LINE__ __COUNTER__ __DATE__ __TIME__ __TIMESTAMP__ \
+            __INCLUDE_LEVEL__ __BASE_FILE__; do
+    user_defs="$user_defs -D$name=\"x\""
+    specs="$specs $name"
+done
+# shellcheck disable=SC2086
+user_dump=$("$CCC" -dM -E $user_defs -x c /dev/null)
+for name in $specs; do
+    if ! printf '%s\n' "$user_dump" | grep -qF "#define $name \"x\""; then
+        fail "-dM: a user-supplied definition must be listed: '#define $name \"x\"'"
     fi
 done
-if [ "$have_gcc" -eq 1 ]; then
-    ref_dump=$("$GCC" -dM -E -D__DATE__='"x"' -D__FILE__='"y"' -D__TIMESTAMP__='"z"' -x c /dev/null)
-    for name in __DATE__ __FILE__ __TIMESTAMP__; do
+# And exactly once: a second definition of the same name would mean the
+# compiler's value was re-materialised over the source's.
+for name in $specs; do
+    listed=$(printf '%s\n' "$user_dump" | grep -c "^#define $name ")
+    [ "$listed" = "1" ] || fail "-dM: '$name' is listed $listed time(s), want 1"
+done
+for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
+    oracle_bin=${oracle%:*}
+    [ "${oracle##*:}" = "1" ] || continue
+    # shellcheck disable=SC2086
+    ref_dump=$("$oracle_bin" -dM -E $user_defs -x c /dev/null 2>/dev/null)
+    for name in $specs; do
         mine_listed=$(printf '%s\n' "$user_dump" | grep -c "^#define $name ")
         ref_listed=$(printf '%s\n' "$ref_dump" | grep -c "^#define $name ")
         [ "$mine_listed" = "$ref_listed" ] \
-            || fail "-dM: '$name' listing ($mine_listed) differs from gcc-16 ($ref_listed)"
+            || fail "-dM: '$name' listing ($mine_listed) differs from $oracle_bin ($ref_listed)"
     done
-fi
+done
 
 if [ "$have_gcc" -eq 1 ]; then
     ref=$("$GCC" -dM -E -x c /dev/null)
