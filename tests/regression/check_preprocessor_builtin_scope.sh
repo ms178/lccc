@@ -281,7 +281,7 @@ check_stamp() {
 out=$(TZ=UTC "$CCC" -E -P "$tmp/stamp.c")
 expect_line "$out" "timestamp/UTC" 'const char *stamp_a = "Sat Feb  3 04:05:06 2001";'
 expect_line "$out" "timestamp/UTC" 'const char *stamp_b = "Fri Dec 31 23:59:58 1999";'
-expect_line "$out" "timestamp/UTC" 'const char *stamp_main = "Fri Feb 13 23:31:30 2009";' 
+expect_line "$out" "timestamp/UTC" 'const char *stamp_main = "Fri Feb 13 23:31:30 2009";'
 if [ "$have_gcc" -eq 1 ]; then
     ref=$(TZ=UTC "$GCC" -E -P "$tmp/stamp.c" 2>/dev/null | norm)
     mine=$(printf '%s\n' "$out" | norm)
@@ -305,7 +305,7 @@ done
 # UTC, so the same source reproduces byte for byte in any zone.
 out=$(TZ=Asia/Kolkata SOURCE_DATE_EPOCH=1000000000 "$CCC" -E -P "$tmp/stamp.c")
 expect_line "$out" "timestamp/SOURCE_DATE_EPOCH" 'const char *stamp_a = "Sun Sep  9 01:46:40 2001";'
-expect_line "$out" "timestamp/SOURCE_DATE_EPOCH" 'const char *stamp_main = "Sun Sep  9 01:46:40 2001";' 
+expect_line "$out" "timestamp/SOURCE_DATE_EPOCH" 'const char *stamp_main = "Sun Sep  9 01:46:40 2001";'
 if [ "$have_clang" -eq 1 ]; then
     mine=$(printf '%s\n' "$out" | norm)
     ref=$(TZ=Asia/Kolkata SOURCE_DATE_EPOCH=1000000000 "$CLANG" -E -P "$tmp/stamp.c" 2>/dev/null | norm)
@@ -314,7 +314,7 @@ fi
 
 # No readable mtime: the documented placeholder, not a guess about the process.
 out=$(printf 'const char *stamp = __TIMESTAMP__;\n' | "$CCC" -E -P -x c - 2>/dev/null)
-expect_line "$out" "timestamp/stdin" 'const char *stamp = "??? ??? ?? ??:??:?? ????";' 
+expect_line "$out" "timestamp/stdin" 'const char *stamp = "??? ??? ?? ??:??:?? ????";'
 
 # --- 4. __DATE__ and __TIME__ follow the host's zone ------------------------
 printf 'const char *d = __DATE__;\nconst char *t = __TIME__;\n' >"$tmp/dt.c"
@@ -346,7 +346,7 @@ done
 # SOURCE_DATE_EPOCH makes both reproducible in UTC regardless of zone.
 out=$(TZ=America/New_York SOURCE_DATE_EPOCH=1000000000 "$CCC" -E -P "$tmp/dt.c")
 expect_line "$out" "date/SOURCE_DATE_EPOCH" 'const char *d = "Sep  9 2001";'
-expect_line "$out" "time/SOURCE_DATE_EPOCH" 'const char *t = "01:46:40";' 
+expect_line "$out" "time/SOURCE_DATE_EPOCH" 'const char *t = "01:46:40";'
 
 # --- 5. -dM excludes the builtins, and includes the feature macros ----------
 dump=$("$CCC" -dM -E -x c /dev/null)
