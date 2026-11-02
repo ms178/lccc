@@ -840,7 +840,7 @@ impl ArmCodegen {
                 IrBinOp::UMulHigh | IrBinOp::SMulHigh => {
                     crate::ir::ops::mul_high_unsupported_here()
                 }
-                IrBinOp::BitTest => self.emit_bit_test(rhs, false),
+                IrBinOp::BitTest => self.emit_bit_test(rhs, ty),
                 IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
                     self.emit_bit_modify(op, rhs, ty)
                 }
@@ -894,7 +894,7 @@ impl ArmCodegen {
                 IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
                 IrBinOp::UMulHigh => self.state.emit("    umulh x0, x1, x2"),
                 IrBinOp::SMulHigh => self.state.emit("    smulh x0, x1, x2"),
-                IrBinOp::BitTest => self.emit_bit_test(rhs, true),
+                IrBinOp::BitTest => self.emit_bit_test(rhs, ty),
                 IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
                     self.emit_bit_modify(op, rhs, ty)
                 }
@@ -1038,13 +1038,19 @@ impl ArmCodegen {
     /// index of W or more (an undefined C shift that may sit in dead code)
     /// must still assemble, and the reduction is exactly what the register
     /// form does (LSRV takes its amount modulo the register size).
-    fn emit_bit_test(&mut self, rhs: &Operand, is_64: bool) {
-        let (r, width) = if is_64 { ('x', 64) } else { ('w', 32) };
+    fn emit_bit_test(&mut self, rhs: &Operand, ty: IrType) {
+        let width = (ty.size() * 8) as i64;
+        debug_assert!(matches!(width, 8 | 16 | 32 | 64));
+        let r = if width < 64 { 'w' } else { 'x' };
         if let Some(imm) = Self::const_as_imm12(rhs) {
-            let bit = imm & (width - 1);
+            let bit = (imm as i64).rem_euclid(width);
             self.state
                 .emit_fmt(format_args!("    ubfx {r}0, {r}1, #{bit}, #1"));
         } else {
+            if width < 32 {
+                self.state
+                    .emit_fmt(format_args!("    and w2, w2, #{}", width - 1));
+            }
             self.state
                 .emit_fmt(format_args!("    lsr {r}0, {r}1, {r}2"));
             self.state.emit_fmt(format_args!("    and {r}0, {r}0, #1"));
@@ -1179,6 +1185,22 @@ mod bit_modify_width_tests {
                     "{op:?} {ty:?} must build the mask in the 32-bit view:\n{asm}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn narrow_bit_test_uses_the_operation_width() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            let width = (ty.size() * 8) as u32;
+            let asm = emit(IrBinOp::BitTest, ty);
+            assert!(
+                asm.contains(&format!("and w2, w2, #{}", width - 1)),
+                "BitTest {ty:?} must reduce the index modulo {width}:\n{asm}"
+            );
+            assert!(
+                asm.contains("lsr w0, w1, w2") && asm.contains("and w0, w0, #1"),
+                "BitTest {ty:?} must extract a 0/1 result in the 32-bit view:\n{asm}"
+            );
         }
     }
 

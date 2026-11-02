@@ -594,3 +594,226 @@ fn an_index_above_the_width_wraps_to_the_same_bit() {
         }
     }
 }
+
+#[cfg(test)]
+mod shared_mask_tests {
+    use super::*;
+    use crate::common::types::{
+        set_target_elf_machine, set_target_ptr_size, target_elf_machine, target_ptr_size,
+    };
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    struct TargetGuard {
+        machine: u16,
+        ptr: usize,
+    }
+    impl TargetGuard {
+        fn x86_64() -> Self {
+            let g = Self {
+                machine: target_elf_machine(),
+                ptr: target_ptr_size(),
+            };
+            set_target_elf_machine(62);
+            set_target_ptr_size(8);
+            g
+        }
+        fn i686() -> Self {
+            let g = Self {
+                machine: target_elf_machine(),
+                ptr: target_ptr_size(),
+            };
+            set_target_elf_machine(3);
+            set_target_ptr_size(4);
+            g
+        }
+        fn aarch64() -> Self {
+            let g = Self {
+                machine: target_elf_machine(),
+                ptr: target_ptr_size(),
+            };
+            set_target_elf_machine(183);
+            set_target_ptr_size(8);
+            g
+        }
+    }
+    impl Drop for TargetGuard {
+        fn drop(&mut self) {
+            set_target_elf_machine(self.machine);
+            set_target_ptr_size(self.ptr);
+        }
+    }
+
+    fn binop(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty,
+        }
+    }
+    fn func(insts: Vec<Instruction>, term: Terminator) -> IrFunction {
+        let mut f = IrFunction::new("shared".to_string(), IrType::U32, vec![], false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }];
+        f.next_value_id = 32;
+        f
+    }
+    fn shared_three() -> Vec<Instruction> {
+        vec![
+            binop(3, IrBinOp::Shl, one(IrType::U32), v(2), IrType::U32),
+            binop(4, IrBinOp::Or, v(1), v(3), IrType::U32),
+            binop(5, IrBinOp::Xor, v(1), v(3), IrType::U32),
+            binop(6, IrBinOp::And, v(1), v(3), IrType::U32),
+            Instruction::Cmp {
+                dest: Value(7),
+                op: IrCmpOp::Ne,
+                lhs: v(6),
+                rhs: zero(IrType::U32),
+                ty: IrType::U32,
+            },
+        ]
+    }
+    fn op_at(f: &IrFunction, i: usize) -> IrBinOp {
+        match &f.blocks[0].instructions[i] {
+            Instruction::BinOp { op, .. } => *op,
+            other => panic!("expected binop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_set_toggle_test_rewrites_the_whole_group() {
+        let _g = TargetGuard::x86_64();
+        let mut f = func(shared_three(), Terminator::Return(Some(v(7))));
+        let n = fold_bit_select_shared_for_test(&mut f);
+        assert_eq!(n, 3);
+        assert_eq!(op_at(&f, 1), IrBinOp::BitSet);
+        assert_eq!(op_at(&f, 2), IrBinOp::BitToggle);
+        assert_eq!(op_at(&f, 4), IrBinOp::BitTest);
+    }
+
+    #[test]
+    fn an_escaping_mask_refuses_the_group() {
+        let _g = TargetGuard::x86_64();
+        let mut f = func(shared_three(), Terminator::Return(Some(v(3))));
+        assert_eq!(fold_bit_select_shared_for_test(&mut f), 0);
+        assert_eq!(op_at(&f, 1), IrBinOp::Or);
+    }
+
+    #[test]
+    fn a_shared_complement_rewrites_every_clear() {
+        let _g = TargetGuard::x86_64();
+        let insts = vec![
+            binop(3, IrBinOp::Shl, one(IrType::U32), v(2), IrType::U32),
+            Instruction::UnaryOp {
+                dest: Value(4),
+                op: IrUnaryOp::Not,
+                src: v(3),
+                ty: IrType::U32,
+            },
+            binop(5, IrBinOp::And, v(1), v(4), IrType::U32),
+            binop(6, IrBinOp::And, v(7), v(4), IrType::U32),
+        ];
+        let mut f = func(insts, Terminator::Return(Some(v(6))));
+        assert_eq!(fold_bit_select_shared_for_test(&mut f), 2);
+        assert_eq!(op_at(&f, 2), IrBinOp::BitClear);
+        assert_eq!(op_at(&f, 3), IrBinOp::BitClear);
+    }
+
+    #[test]
+    fn copy_aliases_are_closed_over() {
+        let _g = TargetGuard::x86_64();
+        let insts = vec![
+            binop(3, IrBinOp::Shl, one(IrType::U32), v(2), IrType::U32),
+            Instruction::Copy {
+                dest: Value(4),
+                src: v(3),
+            },
+            binop(5, IrBinOp::Or, v(1), v(4), IrType::U32),
+            binop(6, IrBinOp::Xor, v(1), v(4), IrType::U32),
+        ];
+        let mut f = func(insts, Terminator::Return(Some(v(6))));
+        assert_eq!(fold_bit_select_shared_for_test(&mut f), 2);
+        assert_eq!(op_at(&f, 2), IrBinOp::BitSet);
+        assert_eq!(op_at(&f, 3), IrBinOp::BitToggle);
+    }
+
+    #[test]
+    fn cross_block_readers_are_rewritten() {
+        let _g = TargetGuard::x86_64();
+        let mut f = func(
+            vec![binop(3, IrBinOp::Shl, one(IrType::U32), v(2), IrType::U32)],
+            Terminator::Branch(BlockId(1)),
+        );
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                binop(4, IrBinOp::Or, v(1), v(3), IrType::U32),
+                binop(5, IrBinOp::Xor, v(1), v(3), IrType::U32),
+            ],
+            terminator: Terminator::Return(Some(v(5))),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(fold_bit_select_shared_for_test(&mut f), 2);
+        assert_eq!(op_at(&f, 0), IrBinOp::Shl);
+        match &f.blocks[1].instructions[0] {
+            Instruction::BinOp { op, .. } => assert_eq!(*op, IrBinOp::BitSet),
+            other => panic!("expected BitSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aarch64_keeps_the_shared_mask() {
+        let _g = TargetGuard::aarch64();
+        let mut f = func(shared_three(), Terminator::Return(Some(v(7))));
+        assert_eq!(fold_bit_select_shared_for_test(&mut f), 0);
+    }
+
+    #[test]
+    fn i686_refuses_64_bit_groups() {
+        let _g = TargetGuard::i686();
+        let insts = vec![
+            binop(3, IrBinOp::Shl, one(IrType::U64), v(2), IrType::U64),
+            binop(4, IrBinOp::Or, v(1), v(3), IrType::U64),
+            binop(5, IrBinOp::Xor, v(1), v(3), IrType::U64),
+        ];
+        let mut f = func(insts, Terminator::Return(Some(v(5))));
+        assert_eq!(fold_bit_select_shared_for_test(&mut f), 0);
+    }
+
+    #[test]
+    fn a_non_bit_reader_of_the_test_and_refuses_the_group() {
+        let _g = TargetGuard::x86_64();
+        let mut insts = shared_three();
+        // Make the intermediate `x & m` escape through the return; the Cmp
+        // still reads it, but the group is no longer all-bit-family.
+        insts.push(Instruction::Copy {
+            dest: Value(8),
+            src: v(6),
+        });
+        let mut f = func(insts, Terminator::Return(Some(v(8))));
+        assert_eq!(fold_bit_select_shared_for_test(&mut f), 0);
+    }
+
+    #[test]
+    fn duplicate_mask_operands_are_refused() {
+        let _g = TargetGuard::x86_64();
+        let insts = vec![
+            binop(3, IrBinOp::Shl, one(IrType::U32), v(2), IrType::U32),
+            binop(4, IrBinOp::Or, v(3), v(3), IrType::U32),
+            binop(5, IrBinOp::Xor, v(1), v(3), IrType::U32),
+        ];
+        let mut f = func(insts, Terminator::Return(Some(v(5))));
+        assert_eq!(fold_bit_select_shared_for_test(&mut f), 0);
+    }
+
+    // The production entry point is private to the parent module; expose it
+    // through a thin wrapper so these tests exercise exactly the shipped pass.
+    fn fold_bit_select_shared_for_test(f: &mut IrFunction) -> usize {
+        super::super::bit_select::fold_shared_bit_select(f)
+    }
+}

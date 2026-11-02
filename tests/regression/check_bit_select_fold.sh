@@ -61,6 +61,33 @@ u64 btog64(u64 x, u64 n)     { return x ^ (1ul << n); }
    `btc`s, which is exactly the pessimisation this row pins. */
 u32 btog_twice(u32 x, u32 n) { return x ^ (1u << n) ^ (1u << n); }
 
+/* Shared one-hot mask: on x86 every reader is a bit-family operation, so the
+   whole group can drop the materialized mask.  The escaping control keeps the
+   mask live and must refuse the group. */
+u32 shared_set_tog_test(u32 x, u32 n, u32 *out) {
+    u32 m = 1u << n;
+    *out = x | m;
+    return (x ^ m) + ((x & m) != 0);
+}
+u32 shared_four(u32 x, u32 n, u32 *out) {
+    u32 m = 1u << n;
+    out[0] = x | m;
+    out[1] = x & ~m;
+    out[2] = x ^ m;
+    return (x & m) != 0;
+}
+u32 shared_escape(u32 x, u32 n, u32 *out) {
+    u32 m = 1u << n;
+    *out = m;
+    return (x | m) + (x ^ m);
+}
+u64 shared64(u64 x, u64 n, u64 *out) {
+    u64 m = 1ull << n;
+    out[0] = x | m;
+    out[1] = x & ~m;
+    return (x ^ m) + ((x & m) != 0);
+}
+
 /* Controls: none of these is a single-bit operation on the base. */
 u32 keep_two(u32 x, u32 n)   { return x & (3u << n); }
 u32 keep_xor_two(u32 x, u32 n) { return x ^ (3u << n); }
@@ -137,6 +164,19 @@ refuse on.s btest32 'and[lq][[:space:]]' "the mask must be dead"
 refuse on.s btog32 'sh[lq][[:space:]]' "the constant shift must be dead"
 refuse on.s btog32 'xor[lq][[:space:]]' "the XOR must be the bit instruction"
 
+# Shared-mask groups: x86 selects the whole family and kills the mask producer.
+want on.s shared_four 'bts[lq][[:space:]]'
+want on.s shared_four 'btr[lq][[:space:]]'
+want on.s shared_four 'btc[lq][[:space:]]'
+want on.s shared_four 'bt[lq][[:space:]]'
+refuse on.s shared_four 'sh[lq][[:space:]]' "the shared mask producer must be dead"
+refuse on.s shared_four 'not[lq][[:space:]]' "the shared complement must be dead"
+want on.s shared64 'btsq[[:space:]]'
+want on.s shared64 'btrq[[:space:]]'
+# An escaping mask is not an all-bit group; keep the shared materialization.
+refuse on.s shared_escape 'bts[lq][[:space:]]' "escaping mask must not be duplicated"
+refuse on.s shared_escape 'btc[lq][[:space:]]' "escaping mask must not be duplicated"
+
 # ── 2. Controls keep their shape in BOTH builds ────────────────────────────
 for build in on.s off.s; do
     expect keep_two 6 "$build"
@@ -160,7 +200,7 @@ expect btest32 7 off.s
 expect btest64 7 off.s
 expect btog32 6 off.s
 expect btog64 6 off.s
-for label in bset32 bset64 bclr32 bclr64 btest32 btest64 btog32 btog64; do
+for label in bset32 bset64 bclr32 bclr64 btest32 btest64 btog32 btog64 shared_set_tog_test shared_four shared64; do
     refuse off.s "$label" '(^|[[:space:]])bt[s]?[lq]?[[:space:]]' \
         "CCC_NO_BIT_SELECT must remove the bit instruction"
 done
@@ -222,6 +262,21 @@ static u32 keep_two(u32 x, u32 n) { return x & (3u << n); }
 static u32 keep_xor_two(u32 x, u32 n) { return x ^ (3u << n); }
 static u32 keep_xor_not(u32 x, u32 n) { return x ^ ~(1u << n); }
 static int keep_eq4(u32 x, u32 n) { return (x & (1u << n)) == 4; }
+static u32 shared_four(u32 x, u32 n, u32 *o) {
+    u32 m = 1u << n;
+    o[0] = x | m; o[1] = x & ~m; o[2] = x ^ m;
+    return (x & m) != 0;
+}
+static u32 shared_escape(u32 x, u32 n, u32 *o) {
+    u32 m = 1u << n;
+    *o = m;
+    return (x | m) + (x ^ m);
+}
+static u64 shared64(u64 x, u64 n, u64 *o) {
+    u64 m = 1ull << n;
+    o[0] = x | m; o[1] = x & ~m;
+    return (x ^ m) + ((x & m) != 0);
+}
 
 static unsigned h = 2166136261u;
 static void mix(uint64_t v) {
@@ -239,6 +294,8 @@ int main(void) {
             mix(x ^ (1u << n) ^ (1u << n));
             mix((unsigned)keep_xor_not(x, n));
             mix((unsigned)keep_eq4(x, n));
+            { u32 o[3]; mix(shared_four(x, n, o)); mix(o[0]); mix(o[1]); mix(o[2]);
+              mix(shared_escape(x, n, o)); mix(o[0]); }
         }
     }
     for (unsigned p = 0; p < 5; p++) {
@@ -246,6 +303,7 @@ int main(void) {
         for (u64 n = 0; n < 64; n++) {
             mix(bset64(x, n)); mix(bclr64(x, n)); mix((unsigned)btest64(x, n));
             mix(btog64(x, n)); mix(btog64(btog64(x, n), n));
+            { u64 o[2]; mix(shared64(x, n, o)); mix(o[0]); mix(o[1]); }
         }
     }
     printf("%08x\n", h);
@@ -265,10 +323,22 @@ done
 CCC_NO_BIT_SELECT=1 "$CCC" -O2 "$tmp/exec.c" -o "$tmp/exoff"
 got=$("$tmp/exoff")
 [ "$got" = "$sum" ] || { echo "CCC_NO_BIT_SELECT=1 checksum $got differs from $sum" >&2; exit 1; }
-if command -v gcc >/dev/null 2>&1; then
-    gcc -O2 "$tmp/exec.c" -o "$tmp/exgcc"
+GCC=${GCC:-gcc-16}
+if command -v "$GCC" >/dev/null 2>&1; then
+    "$GCC" -O2 "$tmp/exec.c" -o "$tmp/exgcc"
     got=$("$tmp/exgcc")
-    [ "$got" = "$sum" ] || { echo "gcc checksum $got differs from $sum" >&2; exit 1; }
+    [ "$got" = "$sum" ] || { echo "$GCC checksum $got differs from $sum" >&2; exit 1; }
+fi
+CLANG=${CLANG:-clang-23}
+if command -v "$CLANG" >/dev/null 2>&1; then
+    "$CLANG" -O2 "$tmp/exec.c" -o "$tmp/exclang"
+    got=$("$tmp/exclang")
+    [ "$got" = "$sum" ] || { echo "$CLANG checksum $got differs from $sum" >&2; exit 1; }
+fi
+if [ -n "${ICX:-}" ] && command -v "$ICX" >/dev/null 2>&1; then
+    "$ICX" -O2 "$tmp/exec.c" -o "$tmp/exicx"
+    got=$("$tmp/exicx")
+    [ "$got" = "$sum" ] || { echo "$ICX checksum $got differs from $sum" >&2; exit 1; }
 fi
 
 echo "OK bit_select_fold ($sum)"
