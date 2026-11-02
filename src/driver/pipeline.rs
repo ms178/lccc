@@ -5447,7 +5447,13 @@ mod loop_idiom_capability_tests {
         assert!(!driver.resolved_fast_popcount());
         driver.target = Target::Riscv64;
         driver.general_regs_only = false;
-        assert!(!driver.resolved_fast_popcount());
+        // RISC-V has no scalar population count, and this predicate used to be
+        // false for it: `Popcount` lowered to Kernighan's loop, so folding the
+        // loop idiom into it traded a straight-line loop for a worse one.  The
+        // backend now emits the branch-free SWAR sequence it shares with the
+        // other targets (`0x55555555`/`0x33333333`/`0x0f0f0f0f` masks, one
+        // `mul`), which is what makes the fold profitable there too.
+        assert!(driver.resolved_fast_popcount());
     }
 }
 
