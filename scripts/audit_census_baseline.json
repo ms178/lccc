@@ -3,7 +3,7 @@
   "fns_over_300": 232,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 553,
+  "knob_literals": 554,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -236,6 +236,7 @@
     "CCC_NO_I686_DEAD_FRAME_ELISION",
     "CCC_NO_I686_EPILOGUE_MERGE",
     "CCC_NO_I686_PEEPHOLE",
+    "CCC_NO_I686_PUSH_POP",
     "CCC_NO_I686_SIB",
     "CCC_NO_I686_SIGN_JCC",
     "CCC_NO_IDENTICAL_BLOCK_MERGE",
@@ -560,7 +561,7 @@
     "LCCC_WHY_NOT_VECTORIZE"
   ],
   "knobs_undocumented": 262,
-  "panic_sites": 877,
+  "panic_sites": 879,
   "panic_sites_hot": 101,
   "unsafe_sites": 25
 }

@@ -3143,6 +3143,16 @@ fn simplify_cast(
     // be `setne; movzbl; movslq; negq; movl` where `testl; setne; negl` is the
     // whole answer (GCC: 3, LCCC 6 either way around the intermediate).
     //
+    // The upper end of that shape is gone: the lowering now negates at the
+    // PROMOTED type, so a C unary `-` arrives at the width its result is
+    // observed at and this fold no longer matches anything a C frontend
+    // produces.  Measured, not assumed -- disabling it changes no byte of the
+    // 1,212-file regression corpus.  It is kept because it is a sound rewrite
+    // over a shape any producer may build again, and because it costs one
+    // `get_neg_def` match; `check_narrow_negate_fold.sh` pins the current
+    // ownership by requiring the two builds to agree, so a reintroduced wide
+    // negate fails a gate instead of quietly costing two instructions a site.
+    //
     // The fold is deliberately restricted to a 64-bit source and a 32-bit
     // destination, which is the ONE width pair where it measured as a pure
     // win.  The two shapes it does not touch were measured too, and both were

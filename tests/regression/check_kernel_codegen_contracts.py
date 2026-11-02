@@ -7,6 +7,7 @@ QEMU execution. Missing target compilers or emulators are failures, not passes.
 """
 from pathlib import Path
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -53,8 +54,8 @@ def sections(obj):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--gcc', default=shutil.which('gcc-16') or shutil.which('gcc'))
-    parser.add_argument('--clang', default=shutil.which('clang-23') or shutil.which('clang'))
+    parser.add_argument('--gcc', default=os.environ.get('GCC') or shutil.which('gcc-16') or shutil.which('gcc'))
+    parser.add_argument('--clang', default=os.environ.get('CLANG') or shutil.which('clang-23') or shutil.which('clang'))
     parser.add_argument('--icx', default=shutil.which('icx'))
     args = parser.parse_args()
     assert args.gcc and args.clang, 'GCC and Clang oracles are required'
@@ -144,7 +145,17 @@ def main():
                     if architecture in ('x86', 'i686'):
                         disassembly = run(['objdump', '-d', '--disassemble=asm_only', output])
                         count = len(re.findall(r'\bendbr(?:32|64)\b', disassembly))
-                        assert count == int(enabled), (name, opt, mode, disassembly)
+                        if name in ('clang', 'icx') and enabled:
+                            # Some reviewed LLVM builds conservatively mark a
+                            # direct asm-goto target as an indirect destination.
+                            # This is redundant, not incorrect. Keep LCCC's
+                            # stricter entry-only code-size contract below;
+                            # the executable fixture independently verifies IBT
+                            # on every genuinely address-taken destination.
+                            assert count in (1, 2), (name, opt, mode, disassembly)
+                            print(f'OBSERVED {name} {opt} {mode}: asm-only ENDBR count={count}')
+                        else:
+                            assert count == int(enabled), (name, opt, mode, disassembly)
                     checks += 1
             print(f'PASS {name}: sections, weak alias, computed goto, function entry, asm-goto')
         # GCC applies a section declared after the body, whereas Clang warns

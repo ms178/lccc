@@ -1657,29 +1657,24 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         // and adding via secondary register. Instead, directly compute
         // base_addr + constant using efficient addressing modes.
         if let Operand::Const(c) = offset {
-            let const_offset = match c {
-                IrConst::I64(n) => Some(*n),
-                IrConst::I32(n) => Some(*n as i64),
-                IrConst::I16(n) => Some(*n as i64),
-                IrConst::I8(n) => Some(*n as i64),
-                _ => None,
-            };
-            // Backend displacement fields are signed 32-bit (x86 disp32, ARM imm9/12,
-            // RISC-V imm12).  If the offset doesn't fit in i32, sign-narrow it:
-            // unsigned type constants (e.g. U32 -1 stored as 4294967295) must be
-            // re-interpreted as signed 32-bit for pointer arithmetic.  Offsets that
-            // truly exceed i32 after narrowing fall through to the general (register)
-            // path.
-            let const_offset = const_offset.and_then(|off| {
-                if off >= i32::MIN as i64 && off <= i32::MAX as i64 {
-                    Some(off)
-                } else if off > i32::MAX as i64 && off <= u32::MAX as i64 {
-                    // U32-range: reinterpret as signed 32-bit
-                    Some(off as i32 as i64)
-                } else {
-                    None
-                }
-            });
+            // Backend displacement fields are signed 32-bit (x86 disp32, ARM
+            // imm9/12, RISC-V imm12), so a constant that no field can hold must
+            // take the general register path below.
+            //
+            // The one reinterpretation that is legitimate is the ILP32 address
+            // ring: on a 32-bit-pointer target `base + 0xFFFF_FFFF` IS
+            // `base - 1`, so a constant in (i32::MAX, u32::MAX] narrows to its
+            // signed 32-bit value. On an LP64 target the same constant is a
+            // genuine +2..4 GiB displacement: narrowing it addressed four
+            // gibibytes in the wrong direction (found via a 6 GiB frame whose
+            // `big[2*G]` probe read back what `big[1.5*G]` had stored, both
+            // self-consistently, so only a pointer-walk cross-check exposed
+            // it). `foldable_const_disp` is the single source of truth for the
+            // rule; the pointer ring decides the wrap, not the constant.
+            let const_offset = crate::backend::generation::foldable_const_disp(
+                c,
+                crate::common::types::target_ptr_size() == 4,
+            );
             if let Some(off) = const_offset {
                 // Register-direct path: base and dest both register-assigned —
                 // emit a single add/sub with no accumulator round-trip.

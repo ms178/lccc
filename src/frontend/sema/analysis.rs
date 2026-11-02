@@ -276,6 +276,13 @@ pub struct SemanticAnalyzer {
     /// The dialect predates C99 (`-std=c90`/`gnu89`/`iso9899:199409`): GCC
     /// then still treats an overflowing signed left shift as a constant.
     pre_c99: bool,
+    /// Whether GNU89 inline semantics are in effect (`-fgnu89-inline`,
+    /// `-std=c89`/`gnu89`). An `extern inline` body under those semantics is a
+    /// husk: it never provides the external definition, so a plain definition of
+    /// the same function may legally follow it.
+    gnu89_inline: bool,
+    /// Names whose only definition so far was a GNU89 `extern inline` husk.
+    inline_husk_definitions: FxHashSet<String>,
     pending_loop_labels: Vec<String>,
     active_break_targets: Vec<Vec<String>>,
     active_continue_targets: Vec<Vec<String>>,
@@ -337,6 +344,8 @@ impl SemanticAnalyzer {
             file_scope_unused_diagnostics: true,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             pre_c99: false,
+            gnu89_inline: false,
+            inline_husk_definitions: FxHashSet::default(),
             pending_loop_labels: Vec::new(),
             active_break_targets: Vec::new(),
             active_continue_targets: Vec::new(),
@@ -489,6 +498,16 @@ impl SemanticAnalyzer {
 
     pub fn set_pre_c99_dialect(&mut self, pre_c99: bool) {
         self.pre_c99 = pre_c99;
+    }
+
+    /// Install the CLI's GNU89 inline mode (`-fgnu89-inline`, `-std=gnu89`).
+    ///
+    /// The duplicate-definition rule needs it: an `extern inline` body is a
+    /// definition that does not provide the external definition, so the plain
+    /// definition that follows it is legal (glibc's libio idiom). Without the
+    /// mode, sema would reject a translation unit GCC accepts.
+    pub fn set_gnu89_inline(&mut self, gnu89_inline: bool) {
+        self.gnu89_inline = gnu89_inline;
     }
 
     /// Take the diagnostic engine back from the analyzer.
@@ -753,6 +772,33 @@ impl SemanticAnalyzer {
             }
         }
         let calling_convention = self.function_definition_cc(func);
+        // C11 6.9p5: one external definition per identifier per translation
+        // unit, and 6.9.1p2 says the same for internal linkage. Only a
+        // *previous definition* can trip this -- `is_defined` is set by
+        // definitions alone, so a preceding prototype (or one of the prelude's
+        // implicit declarations) leaves it false. Both oracles diagnose the
+        // second body; without the check lccc lowered two bodies for one
+        // symbol, which at best duplicated work and at worst emitted two
+        // definitions of the same label.
+        let is_inline_husk = func.attrs.is_inline()
+            && func.attrs.is_extern()
+            && (func.attrs.is_gnu_inline() || self.gnu89_inline);
+        let previously_defined = self
+            .result
+            .functions
+            .get(&func.name)
+            .is_some_and(|info| info.is_defined);
+        if previously_defined
+            && !is_inline_husk
+            && !self.inline_husk_definitions.contains(&func.name)
+        {
+            self.diagnostics
+                .borrow_mut()
+                .error(&format!("redefinition of '{}'", func.name), func.span);
+        }
+        if is_inline_husk {
+            self.inline_husk_definitions.insert(func.name.clone());
+        }
         let return_type = self.function_def_return_ctype(func);
         if func.is_kr {
             for p in &func.params {

@@ -2470,6 +2470,106 @@ pub(super) fn implicit_write_refs(b: &[u8]) -> u16 {
     classify_implicit_operands(b).1
 }
 
+/// The mnemonic of a line with any `lock`/`rep` prefix removed.
+///
+/// Mirrors the prefix skipping in [`classify_implicit_operands`] so the two
+/// agree about which word is the instruction.
+#[inline]
+pub(super) fn unadorned_mnemonic(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        let (head, tail) = match rest.split_once([' ', '\t']) {
+            Some((head, tail)) => (head, tail.trim_start()),
+            None => (rest, ""),
+        };
+        match head {
+            "lock" | "rep" | "repe" | "repz" | "repne" | "repnz" => rest = tail,
+            _ => return head,
+        }
+    }
+}
+
+/// Two-operand read-modify-write forms that write *both* named operands, so the
+/// AT&T "the last operand is the destination" rule under-reports them.
+///
+/// `xchgl %eax, %ebx` swaps, `xaddl %eax, %ebx` leaves the old value in the
+/// register operand, and `cmpxchg` writes its explicit operand on success (its
+/// accumulator half is in the table). Both operands are named in the text, so a
+/// mention of the family in `reg_refs` — the union of explicit and
+/// architectural mentions — is the precise test for the *other* destination.
+#[inline]
+pub(super) fn names_a_second_destination(text: &str, info: &LineInfo, fam: RegId) -> bool {
+    if fam > REG_GP_MAX {
+        return false;
+    }
+    let mnemonic = unadorned_mnemonic(text);
+    let multi_destination = matches!(
+        mnemonic,
+        "xchg"
+            | "xchgb"
+            | "xchgw"
+            | "xchgl"
+            | "xchgq"
+            | "xadd"
+            | "xaddb"
+            | "xaddw"
+            | "xaddl"
+            | "xaddq"
+            | "cmpxchg"
+            | "cmpxchgb"
+            | "cmpxchgw"
+            | "cmpxchgl"
+            | "cmpxchgq"
+    );
+    multi_destination && (info.reg_refs >> fam) & 1 != 0
+}
+
+/// Does this line write register family `fam` — by its classified destination,
+/// by an architectural implicit write, or through a two-destination form?
+///
+/// This is the exact "modifies the register" oracle every push/pop and
+/// flag-window pass needs. Reading the family is deliberately *not* a write:
+/// the coarse `has_implicit_reg_usage` veto answers "yes" for `cqto` (writes
+/// `%rdx` only), `mulx` (reads `%rdx`), `shld` (reads `%cl`) and `rep` (writes
+/// `%rcx`), which loses fold opportunities that name a different family.
+#[inline]
+pub(super) fn line_writes_gp_family(info: &LineInfo, text: &str, fam: RegId) -> bool {
+    if fam > REG_GP_MAX || info.is_nop() {
+        return false;
+    }
+    let bit = 1u16 << fam;
+    // Both exact halves come from ONE classification of the mnemonic: the
+    // oracle is a table lookup plus a prefix walk, and this predicate is called
+    // once per line of every push/pop span, so asking it twice for the two
+    // halves would double the work of the hottest query in the file.
+    let (implicit_reads, implicit_writes) = classify_implicit_operands(text.as_bytes());
+    // The architectural write set is exact and wins over everything else: an
+    // instruction that both reads and writes a family implicitly (`idivq` on
+    // `%rax`, `cltq`) is decided here.
+    if implicit_writes & bit != 0 {
+        return true;
+    }
+    // The classified destination is only trusted when the line does not
+    // implicitly READ the same family. `parse_dest_reg_fast` names `%rax` as the
+    // primary destination of `cqto`/`cdq`/`cqo`/`cltd`, but `%rax` is those
+    // instructions' implicit INPUT — their only output is `%rdx`, which the
+    // write set above already reported. This is the same suppression
+    // `passes::helpers::writes_family` applies, and the two are cross-checked by
+    // `helpers::writes_family_tests::agrees_with_the_shared_oracle`.
+    let dest_is_a_write = matches!(info.kind, LineKind::Other { dest_reg } if dest_reg == fam)
+        && implicit_reads & bit == 0;
+    match info.kind {
+        LineKind::Other { .. } => dest_is_a_write || names_a_second_destination(text, info, fam),
+        LineKind::LoadRbp { reg, .. } => reg == fam,
+        LineKind::SetCC { reg } => reg == fam,
+        LineKind::Pop { reg } => reg == fam,
+        // Calls, inline asm, indirect jumps and every other barrier kind are
+        // deliberately NOT answered here: their clobber sets belong to the
+        // caller's window proof, which is stricter than "this family".
+        _ => false,
+    }
+}
+
 /// Combined `(reads, writes, full_writes)` query so `liveness::straight_effect`
 /// classifies each instruction once instead of three times.
 #[inline]
@@ -2486,7 +2586,7 @@ pub(super) fn implicit_r_w_full(b: &[u8]) -> (u16, u16, u16) {
 /// EXACT for every instruction listed; unknown mnemonics yield (0, 0) —
 /// callers that need a MAY model must add their own conservative fallback
 /// (that is what `load_op_fuse::may_write_families` layers on top).
-fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
+pub(super) fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
     const RAX: u16 = 1 << 0;
     const RCX: u16 = 1 << 1;
     const RDX: u16 = 1 << 2;
@@ -2579,6 +2679,11 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
             (RAX | RDI, RDI)
         }
         b"lodsb" | b"lodsw" | b"lodsl" | b"lodsq" => (RSI, RAX | RSI),
+        // SSE4.2 string compares return their index in %ecx; the explicit-length
+        // form takes both lengths from %eax and %edx. PCMPISTRI derives the
+        // lengths from the strings themselves, but over-declaring the read is
+        // the safe direction for every consumer of this table.
+        b"pcmpistri" | b"pcmpestri" => (RAX | RDX, RCX),
         // Suffix-less ATT spellings default to the attribute/operand width.
         b"movs" => (RSI | RDI, RSI | RDI),
         b"stos" => (RAX | RDI, RDI),

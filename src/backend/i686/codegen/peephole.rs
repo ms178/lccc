@@ -719,7 +719,48 @@ fn classify_implicit_operands(s: &str) -> (u8, u8) {
         rest = r2;
     }
     let has_comma = rest.contains(',');
-    let table: (u8, u8) = match m {
+    // Fast path, ported from the x86-64 oracle: the highest-frequency
+    // mnemonics of a stack-machine backend name every register they touch, so
+    // the table lookup below is pure overhead for them. This matters because
+    // `line_reg_use_def` asks the oracle once per register family (eight times
+    // per line) and every windowed pass asks it again for every line it walks.
+    //
+    // Membership rule: a mnemonic may appear here only if its real table entry
+    // is `(0, 0)`. The list is a *performance* device, so an mnemonic that is
+    // missing costs a table lookup, while a mnemonic that is wrongly present
+    // would hide an implicit operand — hence the deliberately boring entries.
+    match m {
+        "movl" | "movw" | "movb" | "movzbl" | "movzwl" | "movsbl" | "movswl" | "leal" | "addl"
+        | "subw" | "subl" | "andl" | "orl" | "xorl" | "cmpl" | "cmpw" | "cmpb" | "testl"
+        | "testw" | "testb" | "jmp" | "je" | "jne" | "jl" | "jle" | "jg" | "jge" | "ja" | "jae"
+        | "jb" | "jbe" | "js" | "jns" | "pushl" | "popl" | "call" | "ret" | "nop" => {
+            return (reads, writes);
+        }
+        _ => {}
+    }
+    let (table_reads, table_writes) = implicit_operand_table(m, has_comma);
+    (reads | table_reads, writes | table_writes)
+}
+
+/// The architectural implicit-operand table: one instruction mnemonic in, its
+/// non-textual `(reads, writes)` register families out.
+///
+/// Split out of [`classify_implicit_operands`] so the prefix logic and the ISA
+/// knowledge stay independently readable — and so neither function crosses the
+/// 300-line review threshold this tree ratchets. Membership is exact per the
+/// ISA: a mnemonic absent from this table costs a missed veto (a conservative
+/// pass keeps a line it could have removed), never a wrong answer.
+fn implicit_operand_table(m: &str, has_comma: bool) -> (u8, u8) {
+    const EAX: u8 = 1 << REG_EAX;
+    const ECX: u8 = 1 << REG_ECX;
+    const EDX: u8 = 1 << REG_EDX;
+    const EBX: u8 = 1 << REG_EBX;
+    const ESP: u8 = 1 << REG_ESP;
+    const EBP: u8 = 1 << REG_EBP;
+    const ESI: u8 = 1 << REG_ESI;
+    const EDI: u8 = 1 << REG_EDI;
+    const ALL: u8 = 0xFF;
+    match m {
         // Sign-extension of the accumulator in place.  GAS's AT&T spellings
         // (cbtw/cwtl) and Intel's (cbw/cwde) name the same encodings.
         "cbw" | "cbtw" | "cwde" | "cwtl" | "cdqe" => (EAX, EAX),
@@ -742,6 +783,11 @@ fn classify_implicit_operands(s: &str) -> (u8, u8) {
         "movsb" | "movsw" | "movsl" | "cmpsb" | "cmpsw" | "cmpsl" => (ESI | EDI, ESI | EDI),
         "stosb" | "stosw" | "stosl" | "scasb" | "scasw" | "scasl" => (EAX | EDI, EDI),
         "lodsb" | "lodsw" | "lodsl" => (ESI, EAX | ESI),
+        // SSE4.2 string compares return their index in %ecx; the explicit-length
+        // form takes both lengths from %eax and %edx. PCMPISTRI derives the
+        // lengths from the strings themselves, but over-declaring the read is
+        // the safe direction for every consumer of this table.
+        "pcmpistri" | "pcmpestri" => (EAX | EDX, ECX),
         "insb" | "insw" | "insl" | "insd" => (EDX, EDI),
         "outsb" | "outsw" | "outsl" | "outsd" => (EDX | ESI, ESI),
         "in" | "inb" | "inw" | "inl" | "ind" => (EDX, EAX),
@@ -782,6 +828,30 @@ fn classify_implicit_operands(s: &str) -> (u8, u8) {
         "sahf" => (EAX, 0),
         "loop" | "loope" | "loopz" | "loopne" | "loopnz" => (ECX, ECX),
         "jecxz" => (ECX, 0),
+        // Flags pushes/pops read and write the stack pointer implicitly; the
+        // GP payload is untouched, but a window may not step over them.
+        "pushf" | "pushfl" | "pushfw" => (ESP, ESP),
+        "popf" | "popfl" | "popfw" => (ESP, ESP),
+        // Trap returns restore the whole interrupt frame through %esp.
+        "iret" | "iretl" | "iretw" => (ESP, ESP),
+        // Traps whose handler contract is unknown, exactly like `int`.
+        "int1" | "int3" | "into" => (
+            EAX | EBX | ECX | EDX | ESI | EDI | EBP,
+            EAX | EBX | ECX | EDX | ESI | EDI | EBP,
+        ),
+        // RTM: the abort status lands in %eax on the abort path.
+        "xbegin" => (0, EAX),
+        // MONITORX/MWAITX mirror MONITOR/MWAIT on EAX/ECX(/EDX); SKINIT and
+        // CLZERO address through EAX.
+        "monitorx" => (EAX | ECX | EDX, 0),
+        "mwaitx" => (EAX | EBX | ECX, 0),
+        "skinit" | "clzero" => (EAX, 0),
+        // PKRU access: ECX selects the domain, EAX/EDX carry the value.
+        "rdpkru" => (ECX, EAX | EDX),
+        "wrpkru" | "wrmsrns" => (EAX | ECX | EDX, 0),
+        "rdpru" => (ECX, EAX | EDX),
+        // PCONFIG leaves: leaf in EAX, payload/result across EBX/ECX/EDX.
+        "pconfig" => (EAX | EBX | ECX | EDX, EAX | EBX | ECX | EDX),
         // Frame instructions.
         "enter" => (0, ESP | EBP),
         // `leave` copies %ebp into %esp (pure write of %esp) and pops %ebp
@@ -792,8 +862,7 @@ fn classify_implicit_operands(s: &str) -> (u8, u8) {
         "pusha" | "pushad" => (ALL, ESP),
         "popa" | "popad" => (ESP, ALL & !ESP),
         _ => (0, 0),
-    };
-    (reads | table.0, writes | table.1)
+    }
 }
 
 /// The string primitives the `rep` prefix can legally drive (used to decide
@@ -6162,9 +6231,17 @@ fn line_reg_use_def(store: &LineStore, infos: &[LineInfo], idx: usize) -> (u16, 
     let info = infos[idx];
     let line = trimmed(store, &info, idx);
     let bit = |reg: RegId| -> u16 { if reg <= REG_GP_MAX { 1 << reg } else { 0 } };
-    let mut uses = 0u16;
+    // `line_references_reg(line, reg)` is exactly "the text names `reg`, or the
+    // architectural oracle mentions it (read OR write)". Querying it once per
+    // family meant nine `classify_implicit_operands` calls per line -- eight
+    // here plus the exact-halves call below -- in the innermost loop of the
+    // CFG fixpoint. One call supplies the whole union instead, and the exact
+    // halves are reused further down, so the answers are identical by
+    // construction rather than by coincidence.
+    let (imp_reads, imp_writes) = classify_implicit_operands(line);
+    let mut uses = u16::from(imp_reads | imp_writes);
     for reg in 0..=REG_GP_MAX {
-        if line_references_reg(line, reg) {
+        if line_references_reg_explicit(line, reg) {
             uses |= bit(reg);
         }
     }
@@ -6260,7 +6337,6 @@ fn line_reg_use_def(store: &LineStore, infos: &[LineInfo], idx: usize) -> (u16, 
     // delete a live dividend or string pointer.  The central oracle supplies
     // the exact halves (see `classify_implicit_operands`); the XCHG arm below
     // covers the explicit second destination the oracle knows nothing about.
-    let (imp_reads, imp_writes) = classify_implicit_operands(line);
     uses |= u16::from(imp_reads);
     defs |= u16::from(imp_writes);
     let mnemonic = line.split_ascii_whitespace().next().unwrap_or("");
@@ -6294,6 +6370,24 @@ fn direct_jump_target(line: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// The two private return-use markers a function may carry: `ret` reads more
+/// than `%eax` when a wide (`long long`) or three-word aggregate return needs
+/// `%edx` and/or `%ecx` as well.
+fn return_use_markers(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+) -> (bool, bool) {
+    let has = |marker: &str| {
+        (start..end).any(|i| !infos[i].is_nop() && trimmed(store, &infos[i], i) == marker)
+    };
+    (
+        has("# lccc-i686-return-uses-edx"),
+        has("# lccc-i686-return-uses-ecx"),
+    )
 }
 
 /// Whole-function GPR liveness oracle shared by every peephole that must
@@ -6347,12 +6441,7 @@ impl GprLiveness {
         };
         let extents = function_extents(store, infos);
         for &(start, end) in &extents {
-            let return_uses_edx = (start..end).any(|i| {
-                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
-            });
-            let return_uses_ecx = (start..end).any(|i| {
-                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-ecx"
-            });
+            let (return_uses_edx, return_uses_ecx) = return_use_markers(store, infos, start, end);
             let lo =
                 compute_gpr_live_out(store, infos, start, end, return_uses_edx, return_uses_ecx);
             for local in 0..(end - start) {
@@ -6368,12 +6457,7 @@ impl GprLiveness {
         // so an empty live-out at EOF is sound here. Without this fallback
         // every fold would be refused on uncovered lines (conservative ALL).
         if extents.is_empty() && len > 0 {
-            let return_uses_edx = (0..len).any(|i| {
-                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
-            });
-            let return_uses_ecx = (0..len).any(|i| {
-                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-ecx"
-            });
+            let (return_uses_edx, return_uses_ecx) = return_use_markers(store, infos, 0, len);
             let lo = compute_gpr_live_out(store, infos, 0, len, return_uses_edx, return_uses_ecx);
             for i in 0..len {
                 lv.live_out[i] = lo[i];
@@ -6387,6 +6471,54 @@ impl GprLiveness {
     #[inline]
     fn dead_after(&self, i: usize, reg: RegId) -> bool {
         reg <= REG_GP_MAX && self.covered[i] && self.live_out[i] & (1u16 << reg) == 0
+    }
+
+    /// The live-out set at `idx`, re-derived as if the reads of `mask` on lines
+    /// `lo..=hi` did not happen.
+    ///
+    /// This is the "what if that line were deleted" question. Liveness is a
+    /// per-register gen/kill problem, so suppressing one instruction's reads can
+    /// only shrink the answer for the registers in `mask` and leaves every other
+    /// family's solution untouched; writes are kept, which is the conservative
+    /// direction. The enclosing function is re-solved from scratch, so the
+    /// answer never inherits the caller's unmodified-program solution. `None`
+    /// when `idx` is not inside an analysed function: nothing is proved.
+    fn live_after_dropping_region(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+        lo: usize,
+        hi: usize,
+        mask: u16,
+    ) -> Option<u16> {
+        if idx >= infos.len() || lo > hi || hi >= infos.len() || !*self.covered.get(idx)? {
+            return None;
+        }
+        // Same fragment fallback as `GprLiveness::compute`: a text with no
+        // global label is a unit-test fragment whose dataflow is exact for its
+        // own content (there is no external continuation keeping a register
+        // live past its end).
+        let extents = function_extents(store, infos);
+        let (start, end) = if extents.is_empty() {
+            (0, infos.len())
+        } else {
+            extents.into_iter().find(|&(s, e)| idx >= s && idx < e)?
+        };
+        if lo < start || hi >= end {
+            return None;
+        }
+        let (return_uses_edx, return_uses_ecx) = return_use_markers(store, infos, start, end);
+        let probe = compute_gpr_live_out_hypothetical(
+            store,
+            infos,
+            start,
+            end,
+            return_uses_edx,
+            return_uses_ecx,
+            Some((lo, hi, mask)),
+        );
+        probe.get(idx - start).copied()
     }
 }
 
@@ -6497,6 +6629,30 @@ fn compute_gpr_live_out(
     return_uses_edx: bool,
     return_uses_ecx: bool,
 ) -> Vec<u16> {
+    compute_gpr_live_out_hypothetical(
+        store,
+        infos,
+        start,
+        end,
+        return_uses_edx,
+        return_uses_ecx,
+        None,
+    )
+}
+
+/// [`compute_gpr_live_out`] with one hypothesised deletion: the reads of
+/// `neutral`'s register mask on its line range are treated as absent (its
+/// writes stay). The only user is the loop-carried scratch-save proof, which
+/// neutralises the `push R` that reads the register it is proving dead.
+fn compute_gpr_live_out_hypothetical(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+    return_uses_edx: bool,
+    return_uses_ecx: bool,
+    neutral: Option<(usize, usize, u16)>,
+) -> Vec<u16> {
     let n = end - start;
     let mut labels = std::collections::HashMap::<&str, usize>::new();
     for i in start..end {
@@ -6506,6 +6662,44 @@ fn compute_gpr_live_out(
                 i - start,
             );
         }
+    }
+    // Everything the fixpoint needs per line is a function of the line alone:
+    // the use/def pair, the hypothesised-deletion mask, the return-use markers
+    // and the resolved branch target. Computing them once turns O(rounds x n)
+    // oracle calls into n -- the rounds only move bits now. `direct_jump_target`
+    // is likewise only called for the two kinds that carry one, where the
+    // previous loop ran it on every non-nop line of every round.
+    let mut uses_of = Vec::with_capacity(n);
+    let mut defs_of = Vec::with_capacity(n);
+    let mut targets = Vec::with_capacity(n);
+    for i in start..end {
+        let is_nop = infos[i].is_nop();
+        let (mut uses, defs) = if is_nop {
+            (0u16, 0u16)
+        } else {
+            line_reg_use_def(store, infos, i)
+        };
+        if let Some((lo, hi, mask)) = neutral {
+            if (lo..=hi).contains(&i) {
+                uses &= !mask;
+            }
+        }
+        if matches!(infos[i].kind, LineKind::Ret | LineKind::RetN) {
+            if return_uses_edx {
+                uses |= 1u16 << REG_EDX;
+            }
+            if return_uses_ecx {
+                uses |= 1u16 << REG_ECX;
+            }
+        }
+        let target = match infos[i].kind {
+            LineKind::Jmp | LineKind::CondJmp => direct_jump_target(trimmed(store, &infos[i], i))
+                .and_then(|name| labels.get(name).copied()),
+            _ => None,
+        };
+        uses_of.push(uses);
+        defs_of.push(defs);
+        targets.push(target);
     }
     let mut live_in = vec![0u16; n];
     let mut live_out = vec![0u16; n];
@@ -6524,8 +6718,7 @@ fn compute_gpr_live_out(
                 continue;
             }
             let fallthrough = (local + 1 < n).then_some(local + 1);
-            let target = direct_jump_target(trimmed(store, &infos[i], i))
-                .and_then(|name| labels.get(name).copied());
+            let target = targets[local];
             let mut out = 0u16;
             match infos[i].kind {
                 LineKind::Ret | LineKind::RetN => {}
@@ -6558,16 +6751,7 @@ fn compute_gpr_live_out(
                     }
                 }
             }
-            let (mut uses, defs) = line_reg_use_def(store, infos, i);
-            if matches!(infos[i].kind, LineKind::Ret | LineKind::RetN) {
-                if return_uses_edx {
-                    uses |= 1u16 << REG_EDX;
-                }
-                if return_uses_ecx {
-                    uses |= 1u16 << REG_ECX;
-                }
-            }
-            let input = uses | (out & !defs);
+            let input = uses_of[local] | (out & !defs_of[local]);
             if out != live_out[local] || input != live_in[local] {
                 live_out[local] = out;
                 live_in[local] = input;
@@ -6590,12 +6774,7 @@ fn optimize_cfg_register_liveness(
     let mut changed = false;
     for (start, end) in function_extents(store, infos) {
         let n = end - start;
-        let return_uses_edx = (start..end).any(|i| {
-            !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
-        });
-        let return_uses_ecx = (start..end).any(|i| {
-            !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-ecx"
-        });
+        let (return_uses_edx, return_uses_ecx) = return_use_markers(store, infos, start, end);
         let live_out =
             compute_gpr_live_out(store, infos, start, end, return_uses_edx, return_uses_ecx);
         // Retarget accumulator update/copy-back chains when EAX is dead after
@@ -7095,10 +7274,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 let has_ret = (fs..fe).any(|k| {
                     matches!(infos[k].kind, LineKind::Ret | LineKind::RetN) && !infos[k].is_nop()
                 });
-                let ret_uses_ecx = (fs..fe).any(|k| {
-                    !infos[k].is_nop()
-                        && trimmed(store, &infos[k], k) == "# lccc-i686-return-uses-ecx"
-                });
+                let (_, ret_uses_ecx) = return_use_markers(store, infos, fs, fe);
                 let ret_observes = has_ret
                     && (matches!(dst_reg, REG_EAX | REG_EDX)
                         || (dst_reg == REG_ECX && ret_uses_ecx));
@@ -13783,100 +13959,223 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
     }
 }
 
-#[expect(dead_code)]
+/// Facts about the span between a `push R` and the `pop R` that restores it.
+struct PushPopSpan {
+    /// Index of the matching `pop R`.
+    pop: usize,
+    /// The span writes `R` somewhere between the two.
+    writes_r: bool,
+}
+
+/// Longest span a save/restore pair may cover.
+const PUSH_POP_WINDOW: usize = 64;
+
+/// Scan from the `push R` at `push_idx` for the `pop R` that undoes it, and
+/// report what the span does.
+///
+/// Returns `None` unless the query is *sound to answer*, which is the part the
+/// previous disabled implementation got wrong ("callee-save/leal epilogue
+/// interactions"): deleting a pair removes two stack accesses, so the span must
+/// be blind to the stack depth and to control flow.
+///
+///   * no label, branch, call, `ret`, indirect jump or inline asm — a call in
+///     particular makes the callee's *stack arguments* move by four bytes under
+///     cdecl, which no register-based safety test would have noticed;
+///   * no `%esp`/`%sp` mention and no instruction that redefines the stack
+///     pointer (`leave`, `enter`, `leal -8(%ebp), %esp` in the epilogue);
+///   * no `pushf`/`popf` (they read and write the very slot the push owns);
+///   * no non-inert directive and no CFI directive: `.cfi_adjust_cfa_offset`
+///     inside the span describes the push being removed, and one immediately
+///     after the pop describes the pop;
+///   * nested `push`/`pop` pairs stay inside the span, so the depth is balanced.
+fn scan_push_pop_span(
+    store: &LineStore,
+    infos: &[LineInfo],
+    push_idx: usize,
+    r: RegId,
+) -> Option<PushPopSpan> {
+    let len = infos.len();
+    let mut depth = 0usize;
+    let mut writes_r = false;
+    for k in push_idx + 1..len.min(push_idx + 1 + PUSH_POP_WINDOW) {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let text = trimmed(store, &infos[k], k);
+        match infos[k].kind {
+            LineKind::Push { reg } if reg <= REG_GP_MAX => depth += 1,
+            LineKind::Pop { reg } if reg <= REG_GP_MAX => {
+                if depth == 0 {
+                    // The restore must be the one being removed: same register,
+                    // and no CFI adjustment hanging off it.
+                    if reg != r || cfi_follows_line(store, infos, k) {
+                        return None;
+                    }
+                    return Some(PushPopSpan { pop: k, writes_r });
+                }
+                depth -= 1;
+            }
+            // `pushf`/`popf` classify as Push/Pop with no register: they touch
+            // the slot this pair owns.
+            LineKind::Push { .. } | LineKind::Pop { .. } => return None,
+            LineKind::Label
+            | LineKind::Call
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp
+            | LineKind::Ret
+            | LineKind::RetN
+            | LineKind::InlineAsm => return None,
+            LineKind::Directive if !infos[k].inert_dir || text.starts_with(".cfi_") => return None,
+            _ => {
+                // Any stack-pointer dependence, textual or architectural.
+                if text.contains("%esp") || line_writes_reg_implicitly(text, REG_ESP) {
+                    return None;
+                }
+                if line_writes_family(store, infos, k, r) {
+                    writes_r = true;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether the first real line after `j` is a CFI directive other than
+/// `.cfi_endproc`: the frame adjustment that pairs with an annotated pop.
+fn cfi_follows_line(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
+    (j + 1..infos.len())
+        .find(|&k| !infos[k].is_nop())
+        .map(|k| trimmed(store, &infos[k], k))
+        .is_some_and(|t| t.starts_with(".cfi_") && !t.starts_with(".cfi_endproc"))
+}
+
+/// Does the line at `k` write register family `reg`?
+///
+/// The classified destination plus the architectural implicit writes, which is
+/// the same precise pair the x86-64 backend's push/pop pass uses. Reading a
+/// register is *not* a write: the old implementation asked
+/// `line_references_reg` (the union), so a span that merely read the saved
+/// register — `pushl %ecx; imull %ecx, %eax; popl %ecx` — kept the pair for no
+/// reason.
+///
+/// The classified destination is suppressed when the line implicitly READS the
+/// same family without writing it: `parse_dest_reg` names `%eax` as the primary
+/// destination of `cltd`/`cwtd`/`cwd`, but `%eax` is their implicit INPUT and
+/// their only output is `%edx` (which the write oracle already reported). The
+/// suppression is what makes `pushl %eax; cltd; popl %eax` provably redundant
+/// instead of merely "kept".
+#[inline]
+fn line_writes_family(store: &LineStore, infos: &[LineInfo], k: usize, reg: RegId) -> bool {
+    let text = trimmed(store, &infos[k], k);
+    match infos[k].kind {
+        LineKind::Move { dst, .. } => dst == reg,
+        LineKind::LoadEbp { reg: dst, .. } => dst == reg,
+        LineKind::SetCC { reg: dst } => dst == reg,
+        LineKind::Pop { reg: dst } => dst == reg,
+        LineKind::Other { dest_reg } => {
+            if line_writes_reg_implicitly(text, reg) {
+                return true;
+            }
+            reg <= REG_GP_MAX
+                && dest_reg == reg
+                && (classify_implicit_operands(text).0 & (1u8 << reg)) == 0
+        }
+        _ => false,
+    }
+}
+
+/// Eliminate redundant `push R` / `pop R` pairs.
+///
+/// Two rules, both imported from the x86-64 backend's push/pop pass (this file
+/// previously had neither: the pass was written, found unsafe, and disabled —
+/// see the note in the test module — while the emitter keeps saving scratch
+/// registers defensively):
+///
+///  1. **Untouched span.** The span leaves `R` alone, so save + restore are
+///     both dead weight: the register already holds its incoming value on both
+///     sides.
+///  2. **Dead restore value.** The span writes `R`, but nothing reads `R` after
+///     the `pop`, so the save cannot restore anything observable. Callee-saved
+///     registers are excluded — the caller owns their value at `ret`, which
+///     intra-function liveness cannot see — and so is a loop-carried save whose
+///     only reader is the next iteration's own `push` (the refinement asks
+///     liveness again with that single read neutralised).
+///
+/// Both rules depend on [`scan_push_pop_span`] having proved the span blind to
+/// the stack depth. Kill switch: `CCC_NO_I686_PUSH_POP`.
 fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_I686_PUSH_POP").is_some() {
+        return false;
+    }
+    /// Each loop-carried proof re-solves the enclosing function's dataflow, so
+    /// the number of re-solves per invocation is bounded; past the budget the
+    /// pair is simply kept.
+    const REANALYSIS_BUDGET: usize = 64;
     let len = infos.len();
     let mut changed = false;
-
+    let mut liveness: Option<GprLiveness> = None;
+    let mut reanalyses = 0usize;
+    // Registers whose cached dataflow answer is no longer trustworthy. A `pop R`
+    // is a DEFINITION of `R`: deleting one lets the value defined before the
+    // pair flow further, so removing a dead store *decreases* liveness while
+    // removing a dead definition can *increase* it. Liveness is a backwards
+    // problem, so that increase propagates backwards -- and, through a loop's
+    // backedge, forwards again, which is exactly where a cached "R is dead after
+    // that later pop" answer would be unsound rather than merely stale. So each
+    // register whose pair was actually removed is marked dirty and its next
+    // rule-2 query re-solves the CFG -- one re-solve per register between two
+    // removals of that register, instead of one per deleted pair.
+    let mut dirty = 0u16;
     for i in 0..len {
         if infos[i].is_nop() {
             continue;
         }
-        let push_reg = match infos[i].kind {
-            LineKind::Push { reg } if reg <= REG_GP_MAX => reg,
+        let r = match infos[i].kind {
+            // `%esp` is the stack itself and `%ebp` the frame pointer in
+            // framed functions: saving either is not a scratch save.
+            LineKind::Push { reg } if reg <= REG_GP_MAX && reg != REG_ESP => reg,
             _ => continue,
         };
-
-        // Scan forward for matching pop, checking reg is unmodified
-        let mut j = i + 1;
-        let mut depth = 0; // Track nested push/pops
-        let mut safe = true;
-        while j < len {
-            if infos[j].is_nop() {
-                j += 1;
-                continue;
+        let Some(span) = scan_push_pop_span(store, infos, i, r) else {
+            continue;
+        };
+        let removable = if !span.writes_r {
+            true
+        } else if is_callee_saved_reg(r) {
+            false
+        } else {
+            let bit = 1u16 << r;
+            if dirty & bit != 0 {
+                dirty &= !bit;
+                liveness = Some(GprLiveness::compute(store, infos));
             }
-
-            match infos[j].kind {
-                LineKind::Push { .. } => {
-                    depth += 1;
+            let lv = liveness.get_or_insert_with(|| GprLiveness::compute(store, infos));
+            if lv.dead_after(span.pop, r) {
+                true
+            } else {
+                // In a loop the next iteration's `push` reads `R`, so `R`
+                // looks live through the save alone. Ask again without that one
+                // read; a read of `R` inside the span before any write still
+                // keeps the pair, because the next iteration would then see the
+                // span's value instead of the restored one.
+                let mask = bit;
+                if reanalyses >= REANALYSIS_BUDGET {
+                    false
+                } else {
+                    reanalyses += 1;
+                    lv.live_after_dropping_region(store, infos, span.pop, i, i, mask)
+                        .is_some_and(|live| live & mask == 0)
                 }
-                LineKind::Pop { reg: _ } if depth > 0 => {
-                    depth -= 1;
-                }
-                LineKind::Pop { reg } if reg == push_reg && depth == 0 => {
-                    // Found matching pop
-                    if safe {
-                        infos[i].kind = LineKind::Nop;
-                        infos[j].kind = LineKind::Nop;
-                        changed = true;
-                    }
-                    break;
-                }
-                LineKind::Pop { .. } if depth == 0 => {
-                    break;
-                } // Different register popped
-                _ => {}
             }
-
-            // Check if the register is modified
-            match infos[j].kind {
-                LineKind::Move { dst, .. } if dst == push_reg => {
-                    safe = false;
-                }
-                LineKind::LoadEbp { reg, .. } if reg == push_reg => {
-                    safe = false;
-                }
-                LineKind::Other { dest_reg } if dest_reg == push_reg => {
-                    safe = false;
-                }
-                LineKind::Other { .. } => {
-                    // For unknown instructions, check if the raw text references the register
-                    // or if it's an instruction that implicitly clobbers registers (rep movsb, etc.)
-                    let raw = store.get(j).trim();
-                    if raw.starts_with("rep") || raw.starts_with("cld") {
-                        // rep movsb/movsl/stosb etc. clobber esi, edi, ecx
-                        if push_reg == REG_ESI || push_reg == REG_EDI || push_reg == REG_ECX {
-                            safe = false;
-                        }
-                    }
-                    if line_references_reg(raw, push_reg) {
-                        safe = false;
-                    }
-                }
-                LineKind::Call => {
-                    if is_caller_saved(push_reg) {
-                        safe = false;
-                    }
-                }
-                LineKind::SetCC { reg } if reg == push_reg => {
-                    safe = false;
-                }
-                _ => {}
-            }
-
-            // Stop at barriers that change control flow
-            if matches!(
-                infos[j].kind,
-                LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret | LineKind::Label
-            ) {
-                break;
-            }
-
-            j += 1;
+        };
+        if removable {
+            infos[i].kind = LineKind::Nop;
+            infos[span.pop].kind = LineKind::Nop;
+            dirty |= 1u16 << r;
+            changed = true;
         }
     }
-
     changed
 }
 
@@ -14461,6 +14760,27 @@ pub fn peephole_optimize(asm: String) -> String {
     forward_slot_loads_cfg(&mut store, &mut infos);
     eliminate_never_read_stores(&store, &mut infos);
     optimize_cfg_register_liveness(&mut store, &mut infos, true);
+    // Scratch-save pair elimination, now that the dead-move and dead-store
+    // sweeps have made spans short enough to prove things about.  It runs on
+    // fresh liveness of its own (rule 2), so it must come after the pass that
+    // establishes the CFG solution and before the callee-save elimination that
+    // reclaims whatever the prologue/epilogue pair left behind.
+    // Kill switch: CCC_NO_I686_PUSH_POP.
+    let push_pop_removed = eliminate_push_pop_pairs(&store, &mut infos);
+    if push_pop_removed {
+        // The pairs are gone; let the dead-move machinery reclaim the staging
+        // lines that only fed them, then re-run the pair pass on the shorter
+        // spans it exposes (a bounded fixpoint, as everywhere else here).
+        let mut pass_count_pp = 0;
+        let mut changed_pp = true;
+        while changed_pp && pass_count_pp < MAX_POST_GLOBAL_ITERATIONS {
+            changed_pp = false;
+            changed_pp |= eliminate_dead_reg_moves(&store, &mut infos);
+            changed_pp |= eliminate_dead_stores(&store, &mut infos);
+            changed_pp |= eliminate_push_pop_pairs(&store, &mut infos);
+            pass_count_pp += 1;
+        }
+    }
     eliminate_unused_callee_saves(&mut store, &mut infos);
     eliminate_dead_frame_allocation(&mut store, &mut infos);
 
@@ -19083,8 +19403,142 @@ mod tests {
         );
     }
 
-    // Note: push/pop elimination test removed - eliminate_push_pop_pairs is disabled
-    // due to callee-save/leal epilogue interactions.
+    // ── Scratch-save pair elimination ───────────────────────────────────
+    //
+    // The pass used to be dead code ("disabled due to callee-save/leal epilogue
+    // interactions"). It is now wired in, and the epilogue interaction is one of
+    // the invariants `scan_push_pop_span` enforces: a span that redefines `%esp`
+    // is refused, so removing the pair can never move an epilogue's stack
+    // restoration.
+
+    fn push_pop_asm(body: &str) -> String {
+        peephole_optimize(format!("f:\n{body}    ret\n"))
+    }
+
+    #[test]
+    fn untouched_span_drops_the_scratch_save() {
+        let out = push_pop_asm("    pushl %ecx\n    addl %ebx, %eax\n    popl %ecx\n");
+        assert!(!out.contains("pushl"), "{out}");
+        assert!(!out.contains("popl"), "{out}");
+        assert!(out.contains("addl %ebx, %eax"), "{out}");
+    }
+
+    #[test]
+    fn a_span_that_only_reads_the_saved_register_still_drops_the_pair() {
+        // Reading `%ecx` proves nothing about writing it; the old union test
+        // (`line_references_reg`) refused this and every similar span.
+        let out = push_pop_asm("    pushl %ecx\n    imull %ecx, %eax\n    popl %ecx\n");
+        assert!(!out.contains("pushl"), "{out}");
+        assert!(out.contains("imull %ecx, %eax"), "{out}");
+    }
+
+    #[test]
+    fn a_read_only_cltd_still_counts_as_untouched() {
+        // `cltd` is classified with `%eax` as its primary destination, but
+        // `%eax` is its implicit INPUT; the only family it writes is `%edx`.
+        // The restored `%eax` is read afterwards, so rule 2 cannot apply and
+        // only the exact write oracle makes this pair provably redundant.
+        let out = push_pop_asm("    pushl %eax\n    cltd\n    popl %eax\n    addl %eax, %ebx\n");
+        assert!(!out.contains("pushl %eax"), "{out}");
+        assert!(!out.contains("popl %eax"), "{out}");
+    }
+
+    #[test]
+    fn a_dead_restored_value_drops_the_pair() {
+        // The span writes `%ecx` and nothing reads it after the `pop`, so the
+        // restore cannot restore anything observable.
+        let out =
+            push_pop_asm("    pushl %ecx\n    movl %eax, %ecx\n    shrl $1, %ecx\n    popl %ecx\n");
+        assert!(!out.contains("pushl"), "{out}");
+        assert!(out.contains("shrl $1, %ecx"), "{out}");
+    }
+
+    #[test]
+    fn a_live_restored_value_keeps_the_pair() {
+        // `imull %esi, %ecx` is a genuine read-modify-write, so the span cannot
+        // be copy-propagated into an untouched one; the restored value is read
+        // after the `pop`, so rule 2 does not apply either. (A span whose write
+        // is never read is not a counterexample: the dead-move sweep deletes
+        // the write, the span becomes untouched, and rule 1 then removes the
+        // pair soundly.)
+        let out = push_pop_asm(
+            "    pushl %ecx\n    imull %esi, %ecx\n    addl %ecx, %edx\n    \
+             popl %ecx\n    addl %ecx, %eax\n",
+        );
+        assert!(out.contains("pushl %ecx"), "{out}");
+        assert!(out.contains("popl %ecx"), "{out}");
+    }
+
+    #[test]
+    fn callee_saved_scratch_saves_are_kept() {
+        // The span clobbers `%ebx` for its own use, so rule 1 does not apply;
+        // rule 2 must not apply either, because the caller owns `%ebx` at
+        // `ret` and intra-function liveness cannot see that the restore is
+        // still owed to it. The register is used again after the `pop`, which
+        // also keeps the (sound) unused-callee-save sweep from reclaiming the
+        // pair for a different reason.
+        let out = push_pop_asm(
+            "    pushl %ebx\n    imull %esi, %ebx\n    addl %ebx, %edx\n    \
+             popl %ebx\n    addl %ebx, %eax\n",
+        );
+        assert!(out.contains("pushl %ebx"), "{out}");
+        assert!(out.contains("popl %ebx"), "{out}");
+    }
+
+    #[test]
+    fn a_call_inside_the_span_keeps_the_pair() {
+        // Under cdecl the callee's stack arguments sit four bytes higher with
+        // the push in place; deleting the pair moves every one of them. The
+        // saved register is `%ebx` because it must survive the call, which is
+        // also what stops the unused-callee-save sweep from deleting the pair
+        // for its own (unrelated, sound) reason.
+        let out = push_pop_asm(
+            "    pushl %ebx\n    movl %eax, %ebx\n    call g\n    addl %ebx, %eax\n    popl %ebx\n",
+        );
+        assert!(out.contains("pushl %ebx"), "{out}");
+        assert!(out.contains("popl %ebx"), "{out}");
+    }
+
+    #[test]
+    fn stack_pointer_dependence_keeps_the_pair() {
+        for body in [
+            "    pushl %ecx\n    movl 4(%esp), %ecx\n    popl %ecx\n",
+            "    pushl %ecx\n    leal -8(%ebp), %esp\n    popl %ecx\n",
+            "    pushl %ecx\n    pushfl\n    popfl\n    popl %ecx\n",
+            "    pushl %ecx\n.Lin:\n    movl %eax, %ecx\n    popl %ecx\n",
+            "    pushl %ecx\n    .cfi_adjust_cfa_offset 4\n    movl %eax, %ecx\n    popl %ecx\n",
+        ] {
+            let out = push_pop_asm(body);
+            assert!(out.contains("pushl %ecx"), "{body} -> {out}");
+        }
+    }
+
+    #[test]
+    fn a_loop_carried_save_drops_when_the_span_writes_first() {
+        // After the `pop`, the only reader of `%ecx` is the next iteration's own
+        // `push`. With that one read neutralised the register is dead, so the
+        // save restores nothing any iteration observes.
+        let out = peephole_optimize(
+            "f:\n    xorl %edx, %edx\n.LBB1:\n    pushl %ecx\n    movl %eax, %ecx\n    \
+             shrl $1, %ecx\n    addl %ecx, %edx\n    popl %ecx\n    subl $1, %eax\n    \
+             jnz .LBB1\n    movl %edx, %eax\n    ret\n"
+                .to_string(),
+        );
+        assert!(!out.contains("pushl %ecx"), "{out}");
+        assert!(!out.contains("popl %ecx"), "{out}");
+    }
+
+    #[test]
+    fn a_loop_carried_save_that_the_span_reads_first_is_kept() {
+        // Here the span reads `%ecx` before writing it, so every iteration needs
+        // the value the save restored.
+        let out = peephole_optimize(
+            "f:\n    movl $3, %ecx\n.LBB1:\n    pushl %ecx\n    addl %ecx, %eax\n    \
+             movl $5, %ecx\n    popl %ecx\n    subl $1, %esi\n    jnz .LBB1\n    ret\n"
+                .to_string(),
+        );
+        assert!(out.contains("pushl %ecx"), "{out}");
+    }
 
     #[test]
     fn test_addl_1_to_incl() {

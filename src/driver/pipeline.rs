@@ -1132,10 +1132,15 @@ impl Driver {
                 // output before exiting non-zero, and many configure scripts
                 // (e.g., privoxy) rely on grepping this output while ignoring
                 // the exit code.
+                // `-E` is a product, not an internal channel: translate the
+                // synthetic pragma tokens back into `#pragma` directives so the
+                // text is a valid C translation unit for every other consumer.
+                let preprocessed =
+                    crate::frontend::preprocessor::pragmas::render_pragma_markers(&preprocessed);
                 let output = if self.suppress_line_markers {
                     Self::strip_line_markers(&preprocessed)
                 } else {
-                    preprocessed
+                    preprocessed.into_owned()
                 };
 
                 if self.output_path_set {
@@ -1350,6 +1355,7 @@ impl Driver {
             sema.set_file_scope_unused_diagnostics(false);
             sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_pre_c99_dialect(self.pre_c99_dialect());
+            sema.set_gnu89_inline(self.gnu89_inline);
             sema.set_weak_pragma_names(
                 preprocessor
                     .weak_pragmas
@@ -2456,6 +2462,7 @@ impl Driver {
         let mut sema = SemanticAnalyzer::new();
         sema.set_builtin_policy(self.builtin_policy.clone());
         sema.set_pre_c99_dialect(self.pre_c99_dialect());
+        sema.set_gnu89_inline(self.gnu89_inline);
         sema.set_weak_pragma_names(
             preprocessor
                 .weak_pragmas

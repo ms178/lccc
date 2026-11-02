@@ -258,6 +258,23 @@ fn expand_condition_macros(expr: &str, macros: &MacroTable) -> String {
     result
 }
 
+#[cfg(test)]
+/// Evaluate a constant expression for #if directives.
+/// Supports: integer literals, defined(X), !, &&, ||, ==, !=, <, >, <=, >=, +, -, *, /, %, (), unary -, ~
+/// Per C99 6.10.1, preprocessor integer expressions use intmax_t (signed) or uintmax_t (unsigned)
+/// depending on whether any operand has a 'u'/'U' suffix.
+pub fn eval_const_expr(expr: &str) -> bool {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return false;
+    }
+
+    let tokens = tokenize_expr(expr);
+    let mut parser = ExprParser::new(&tokens);
+    let (result, _is_unsigned) = parser.parse_comma();
+    result != 0
+}
+
 /// Simple token for expression evaluation.
 /// Num holds (value_as_i64, is_unsigned). The i64 stores the bit pattern;
 /// for unsigned values, interpret as u64 via `as u64`.
@@ -566,6 +583,10 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
                 tokens.push(ExprToken::Op(":"));
                 i += 1;
             }
+            b',' => {
+                tokens.push(ExprToken::Op(","));
+                i += 1;
+            }
             b'<' => {
                 tokens.push(ExprToken::Op("<"));
                 i += 1;
@@ -623,6 +644,24 @@ impl<'a> ExprParser<'a> {
     /// Check if the next token matches a given operator string
     fn peek_op(&self, op: &str) -> bool {
         matches!(self.peek(), Some(ExprToken::Op(s)) if *s == op)
+    }
+
+    /// The comma operator (C11 6.5.17p3): left-associative, lower precedence
+    /// than every other operator, and its value is its RIGHT operand.
+    ///
+    /// A constant *expression* excludes the comma operator (6.6p3), but both
+    /// oracles evaluate `#if (A, B)` as `B` rather than diagnosing the line,
+    /// and macro-generated condition lists do reach this form. Without the
+    /// production the `, B` was simply left unparsed, so lccc tested `A` --
+    /// `#if (3, 0)` took the true branch where GCC and Clang both take the
+    /// false one.
+    fn parse_comma(&mut self) -> PpVal {
+        let mut value = self.parse_ternary();
+        while self.peek_op(",") {
+            self.advance();
+            value = self.parse_ternary();
+        }
+        value
     }
 
     fn parse_ternary(&mut self) -> PpVal {
@@ -922,7 +961,7 @@ impl<'a> ExprParser<'a> {
             }
             Some(ExprToken::LParen) => {
                 self.advance();
-                let val = self.parse_ternary();
+                let val = self.parse_comma();
                 if self.peek() == Some(&ExprToken::RParen) {
                     self.advance();
                 }
@@ -970,5 +1009,33 @@ impl<'a> ExprParser<'a> {
                 (0, false)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod comma_operator_tests {
+    use super::eval_const_expr;
+
+    #[test]
+    fn the_value_is_the_right_operand() {
+        // Measured on gcc-16.2 and clang-23.1.4: both take the false branch for
+        // `#if (3, 0)`, i.e. the comma yields its right operand.
+        assert!(!eval_const_expr("(3, 0)"));
+        assert!(eval_const_expr("(0, 1)"));
+        assert!(eval_const_expr("0, 1"));
+        assert!(!eval_const_expr("1, 0"));
+    }
+
+    #[test]
+    fn comma_binds_looser_than_every_other_operator() {
+        assert!(eval_const_expr("1 + 2, 4 > 3"));
+        assert!(!eval_const_expr("1 + 2, 3 > 4"));
+        assert!(eval_const_expr("(1 ? 0 : 1), 2"));
+    }
+
+    #[test]
+    fn nested_parentheses_keep_their_own_comma() {
+        assert!(eval_const_expr("((1, 2), 3)"));
+        assert!(!eval_const_expr("((1, 2), 0)"));
     }
 }

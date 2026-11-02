@@ -343,6 +343,72 @@ impl Preprocessor {
     }
 }
 
+/// Render the synthetic pragma tokens back into `#pragma` directives for
+/// `-E` output.
+///
+/// The preprocessor translates the two pragmas the C parser cares about
+/// into identifiers the lexer turns into dedicated tokens
+/// (`__ccc_pack_push_2 ;`). That is the right internal representation, but
+/// `-E` is a *product*: its output must be a valid C translation unit that
+/// any other compiler, linter or `#include`-harvesting tool can consume, so
+/// the markers are translated back on the way out. Each becomes its own
+/// line, because a `#pragma` directive may not share a line with code.
+///
+/// Only the printed form is affected: the tokens the parser consumes are
+/// untouched, so `-E` and `-c` agree on the program's meaning.
+pub(crate) fn render_pragma_markers(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("__ccc_") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let marker_pos = trimmed
+            .find("__ccc_pack_")
+            .or_else(|| trimmed.find("__ccc_visibility_"));
+        let Some(pos) = marker_pos else {
+            out.push_str(line);
+            continue;
+        };
+        let (before, marker) = trimmed.split_at(pos);
+        let marker = marker.trim_end_matches(|c: char| c == ' ' || c == '\t' || c == ';');
+        let directive = if let Some(rest) = marker.strip_prefix("__ccc_pack_") {
+            match rest {
+                "reset" => Some("#pragma pack()".to_string()),
+                "pop" => Some("#pragma pack(pop)".to_string()),
+                "push_only" => Some("#pragma pack(push)".to_string()),
+                other => other
+                    .strip_prefix("push_")
+                    .map(|n| format!("#pragma pack(push, {})", n))
+                    .or_else(|| {
+                        other
+                            .strip_prefix("set_")
+                            .map(|n| format!("#pragma pack({})", n))
+                    }),
+            }
+        } else {
+            marker
+                .strip_prefix("__ccc_visibility_")
+                .map(|rest| match rest {
+                    "pop" => "#pragma GCC visibility pop".to_string(),
+                    other => other.strip_prefix("push_").map_or_else(
+                        || format!("#pragma GCC visibility {}", rest),
+                        |vis| format!("#pragma GCC visibility push({})", vis),
+                    ),
+                })
+        };
+        let Some(directive) = directive else {
+            out.push_str(line);
+            continue;
+        };
+        out.push_str(before);
+        out.push('\n');
+        out.push_str(&directive);
+        out.push('\n');
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod fp_environment_tests {
     use super::*;
@@ -366,5 +432,65 @@ mod fp_environment_tests {
             assert_eq!(pp.fenv_access_requested, expected, "{source}");
         }
         assert!(!Preprocessor::new().fenv_access_requested);
+    }
+}
+
+#[cfg(test)]
+mod pragma_marker_rendering_tests {
+    use super::render_pragma_markers;
+
+    #[test]
+    fn every_marker_becomes_its_directive_on_its_own_line() {
+        let text = "int a; __ccc_pack_push_1 ;\nint b; __ccc_pack_pop ;\n__ccc_pack_set_4 ;\n";
+        let rendered = render_pragma_markers(text);
+        // A marker line becomes the text that preceded the marker, then the
+        // directive at the head of the NEXT line -- the marker and the `;`
+        // that followed it disappear, and the line break that ended the
+        // marker line is the one that breaks after the residual text. So a
+        // marker sitting alone on its line leaves an empty line above its
+        // directive, which is exactly the shape `-E` is allowed to show.
+        assert_eq!(
+            rendered,
+            "int a; \n#pragma pack(push, 1)\nint b; \n#pragma pack(pop)\n\n#pragma pack(4)\n"
+        );
+        // The invariant that matters is ownership, not line count: no text
+        // survives in front of a directive that reaches the compiler's
+        // `#pragma` handler, so every emitted directive starts its line.
+        let directives: Vec<&str> = rendered.lines().filter(|l| l.contains("#pragma")).collect();
+        assert_eq!(directives.len(), 3, "{rendered:?}");
+        for line in directives {
+            assert!(
+                line.starts_with("#pragma"),
+                "directive shares its line: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_only_and_reset_keep_their_parentheses() {
+        assert_eq!(
+            render_pragma_markers("__ccc_pack_push_only ;\n__ccc_pack_reset ;\n"),
+            "\n#pragma pack(push)\n\n#pragma pack()\n"
+        );
+    }
+
+    #[test]
+    fn visibility_markers_round_trip() {
+        assert_eq!(
+            render_pragma_markers("__ccc_visibility_push_hidden ;\n"),
+            "\n#pragma GCC visibility push(hidden)\n"
+        );
+        assert_eq!(
+            render_pragma_markers("__ccc_visibility_pop ;\n"),
+            "\n#pragma GCC visibility pop\n"
+        );
+    }
+
+    #[test]
+    fn text_without_markers_is_borrowed_untouched() {
+        let text = "int main(void) { return 0; }\n";
+        let rendered = render_pragma_markers(text);
+        assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(rendered, text);
     }
 }

@@ -911,11 +911,24 @@ impl Lowerer {
                     return Operand::Value(dest);
                 }
                 let ty = self.get_expr_type(inner);
-                let inner_ty = self.infer_expr_type(inner);
+                // Compute the negation at the C result type of `-x` — the
+                // PROMOTED type of the operand (C11 6.5.3.3p1) — not at the
+                // operand's 64-bit IR carrier. The carrier is a storage
+                // artefact on LP64 (`12 * 0xFFFFu` is `unsigned int`, but
+                // get_expr_type reports I64 because the int literal's carrier
+                // is 64-bit); negating at that width computes `-x` mod 2^64
+                // instead of mod 2^32, so an unsigned result silently became a
+                // negative 64-bit number: `(long long)(-(u + 1))` for
+                // `unsigned u = 0xFFFFFFF0u` printed -4294967281 instead of the
+                // wrapped 15 (expression fuzzer, seed 11000088). The value type
+                // (`value_ir_type`) is the operand's real C type, so the
+                // wrapping width is exact, and `value_ir_type` of the result
+                // reports the same type (see expr_types.rs).
+                let inner_ty = self.value_ir_type(inner);
                 let neg_ty = if ty.is_float() || ty.is_128bit() {
                     ty
                 } else {
-                    widened_op_type(ty)
+                    widened_op_type(Self::integer_promote(inner_ty))
                 };
                 let val = self.lower_expr(inner);
                 // C integer promotion (C11 6.3.1.1): sign-extend (or zero-extend
@@ -963,12 +976,16 @@ impl Lowerer {
                 if inner_ct.is_complex() {
                     return self.lower_complex_conj(inner);
                 }
-                let inner_ty = self.infer_expr_type(inner);
+                let inner_ty = self.value_ir_type(inner);
                 let ty = self.get_expr_type(inner);
+                // Same rule as `-x` above: `~x` has the operand's PROMOTED
+                // type (C11 6.5.3.3p4), so the complement is computed — and
+                // wraps — at that width, never at the 64-bit IR carrier
+                // (`(long long)(~(u + 1))` printed -4294967282 instead of 14).
                 let not_ty = if ty.is_128bit() {
                     ty
                 } else {
-                    widened_op_type(ty)
+                    widened_op_type(Self::integer_promote(inner_ty))
                 };
                 let val = self.lower_expr(inner);
                 // C integer promotion: widen sub-int types before bitwise NOT,
@@ -1171,6 +1188,29 @@ impl Lowerer {
             );
         }
 
+        // Aggregate-shape decision for the arms (struct, union or GNU vector):
+        // such a `?:` needs both arms in the same representation. Compound
+        // literals and struct derefs produce alloca addresses while a function
+        // call returning a small (<= 8 byte) struct produces packed data in
+        // registers, so when one arm produces packed data and the other an
+        // address, `needs_structure_load` makes the merge load the packed data
+        // from the address-producing arm.  The decision is taken here -- from
+        // the arms' C types, before either is lowered, because the
+        // constant-condition fold below lowers only the live arm and still has
+        // to finish it the way the merge would.  It is restricted to aggregates:
+        // expr_produces_packed_struct_data() answers from the return ABI and the
+        // size alone, so it is also true for scalar-returning calls.
+        let result_is_aggregate = then_ct.is_struct_or_union()
+            || then_ct.is_vector()
+            || else_ct.is_struct_or_union()
+            || else_ct.is_vector();
+        let (needs_struct_load, then_produces_packed) = if result_is_aggregate {
+            let tp = self.expr_produces_packed_struct_data(then_expr);
+            let ep = self.expr_produces_packed_struct_data(else_expr);
+            (tp != ep, tp)
+        } else {
+            (false, false)
+        };
         // Constant-fold the condition at lowering time. If the condition is a
         // compile-time constant (e.g., sizeof(x)==4, __builtin_constant_p(v)),
         // skip generating code for the dead branch entirely. This is critical
@@ -1180,45 +1220,36 @@ impl Lowerer {
         // errors when always_inline functions can't be inlined.
         if let Some(const_val) = self.eval_const_expr(cond) {
             let is_true = self.const_truth(&const_val, cond);
-            if is_true {
-                let then_val = self.lower_aggregate_rvalue(then_expr);
-                if result_is_complex {
-                    // Convert to the common complex type if the branch types differ
-                    let common_ct = self.common_complex_type(&then_ct, &else_ct);
-                    return self.convert_to_complex(then_val, &then_ct, &common_ct);
-                }
-                let then_ty = if self.expr_is_pointer(then_expr) {
-                    IrType::Ptr
-                } else {
-                    self.get_expr_type(then_expr)
-                };
-                let else_ty = if self.expr_is_pointer(else_expr) {
-                    IrType::Ptr
-                } else {
-                    self.get_expr_type(else_expr)
-                };
-                let common_ty = Self::common_type(then_ty, else_ty);
-                return self.emit_implicit_cast(then_val, then_ty, common_ty);
+            let (live_expr, live_ct) = if is_true {
+                (then_expr, &then_ct)
             } else {
-                let else_val = self.lower_aggregate_rvalue(else_expr);
-                if result_is_complex {
-                    // Convert to the common complex type if the branch types differ
-                    let common_ct = self.common_complex_type(&then_ct, &else_ct);
-                    return self.convert_to_complex(else_val, &else_ct, &common_ct);
-                }
-                let then_ty = if self.expr_is_pointer(then_expr) {
-                    IrType::Ptr
-                } else {
-                    self.get_expr_type(then_expr)
-                };
-                let else_ty = if self.expr_is_pointer(else_expr) {
-                    IrType::Ptr
-                } else {
-                    self.get_expr_type(else_expr)
-                };
-                let common_ty = Self::common_type(then_ty, else_ty);
-                return self.emit_implicit_cast(else_val, else_ty, common_ty);
+                (else_expr, &else_ct)
+            };
+            let live_val = self.lower_aggregate_rvalue(live_expr);
+            if result_is_complex {
+                // Convert to the common complex type if the branch types differ
+                let common_ct = self.common_complex_type(&then_ct, &else_ct);
+                return self.convert_to_complex(live_val, live_ct, &common_ct);
             }
+            if result_is_aggregate {
+                // An aggregate arm already yields the address (or the packed
+                // data) the merge below would produce; normalising it needs
+                // both arms, and the dead one is not lowered here.
+                return live_val;
+            }
+            // Arm types follow C value semantics (`ternary_arm_type`), exactly
+            // as in the non-constant path below -- never storage types. Typing
+            // the live arm by its storage width merged `1 ? -1 : 1u` as
+            // I64/U64, so the -1 arm kept its sign through a later 64-bit
+            // conversion: `(unsigned long long)(1 ? -1 : 1u)` printed
+            // 18446744073709551615 and `(long long)` printed -1, where both
+            // oracles give 4294967295 (`unsigned int`, C11 6.5.15p5).
+            let live_ty = self.ternary_arm_type(live_expr);
+            let common_ty = Self::common_type(
+                self.ternary_arm_type(then_expr),
+                self.ternary_arm_type(else_expr),
+            );
+            return self.emit_implicit_cast(live_val, live_ty, common_ty);
         }
 
         // For complex types, both branches produce Ptr values; use Ptr as the
@@ -1249,26 +1280,6 @@ impl Lowerer {
         let else_ty = self.ternary_arm_type(else_expr);
         let common_ty = Self::common_type(then_ty, else_ty);
 
-        // Detect struct-typed ternary where branches produce inconsistent
-        // representations: compound literals and struct derefs produce alloca
-        // addresses, while function calls returning small (≤8 byte) structs
-        // produce packed data in registers.  When one branch produces packed
-        // data and the other produces an address, normalize by loading packed
-        // data from address-producing branches so both branches produce data
-        // values.
-        //
-        // Only for aggregate-typed conditionals (struct, union or GNU vector):
-        // expr_produces_packed_struct_data() answers from the return ABI and
-        // the size alone, so it is true for scalar-returning calls as well.
-        let is_aggregate = |ct: &CType| ct.is_struct_or_union() || ct.is_vector();
-        let result_is_aggregate = is_aggregate(&then_ct) || is_aggregate(&else_ct);
-        let (needs_struct_load, then_produces_packed) = if result_is_aggregate {
-            let tp = self.expr_produces_packed_struct_data(then_expr);
-            let ep = self.expr_produces_packed_struct_data(else_expr);
-            (tp != ep, tp)
-        } else {
-            (false, false)
-        };
         // Both arms yield the address of the aggregate's bytes: the merge is a
         // pointer whatever the arms' IR value types say (an x87-class call
         // result is typed F128 but lowered to its result buffer's address).

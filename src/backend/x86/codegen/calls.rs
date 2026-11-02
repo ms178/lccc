@@ -398,9 +398,7 @@ impl X86Codegen {
             sp_adjust += 8;
             // Adjust RSP frame size so operand_to_rax slot conversions
             // are correct after the alignment subq.
-            if self.state.out.use_rsp_addressing {
-                self.state.out.rsp_frame_size += 8;
-            }
+            self.state.out.rsp_frame_size += 8;
         }
         let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(
             arg_classes,
@@ -436,9 +434,7 @@ impl X86Codegen {
                             // address the pre-subtraction stack location.
                             self.state.emit("    subq $16, %rsp");
                             sp_adjust += 16;
-                            if self.state.out.use_rsp_addressing {
-                                self.state.out.rsp_frame_size += 16;
-                            }
+                            self.state.out.rsp_frame_size += 16;
                             let lo = u64::from_le_bytes(x87_bytes[0..8].try_into().unwrap());
                             let hi_2bytes =
                                 u16::from_le_bytes(x87_bytes[8..10].try_into().unwrap());
@@ -456,9 +452,7 @@ impl X86Codegen {
                             if self.state.f128_direct_slots.contains(&v.0) {
                                 self.state.emit("    subq $16, %rsp");
                                 sp_adjust += 16;
-                                if self.state.out.use_rsp_addressing {
-                                    self.state.out.rsp_frame_size += 16;
-                                }
+                                self.state.out.rsp_frame_size += 16;
                                 if let Some(slot) = self.state.get_slot(v.0) {
                                     self.state.out.emit_instr_rbp("    fldt", slot.0);
                                     self.state.emit("    fstpt (%rsp)");
@@ -467,9 +461,7 @@ impl X86Codegen {
                                 if self.state.is_alloca(v.0) {
                                     self.state.emit("    subq $16, %rsp");
                                     sp_adjust += 16;
-                                    if self.state.out.use_rsp_addressing {
-                                        self.state.out.rsp_frame_size += 16;
-                                    }
+                                    self.state.out.rsp_frame_size += 16;
                                     self.state.out.emit_instr_rbp("    fldt", slot.0);
                                     self.state.emit("    fstpt (%rsp)");
                                 } else {
@@ -480,9 +472,7 @@ impl X86Codegen {
                                     self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
                                     self.state.emit("    subq $16, %rsp");
                                     sp_adjust += 16;
-                                    if self.state.out.use_rsp_addressing {
-                                        self.state.out.rsp_frame_size += 16;
-                                    }
+                                    self.state.out.rsp_frame_size += 16;
                                     self.state.emit("    movq %rax, (%rsp)");
                                     self.state.emit("    fldl (%rsp)");
                                     self.state.emit("    fstpt (%rsp)");
@@ -490,9 +480,7 @@ impl X86Codegen {
                             } else {
                                 self.state.emit("    subq $16, %rsp");
                                 sp_adjust += 16;
-                                if self.state.out.use_rsp_addressing {
-                                    self.state.out.rsp_frame_size += 16;
-                                }
+                                self.state.out.rsp_frame_size += 16;
                             }
                             self.state.reg_cache.invalidate_all();
                             self.flush_pending_vec_store_impl();
@@ -519,14 +507,9 @@ impl X86Codegen {
                                 // Under %rsp addressing the first push moves
                                 // the slot 8 bytes further away.
                                 self.state.out.emit_instr_rbp("    pushq", slot.0 + 8);
-                                let rsp_rel = self.state.out.use_rsp_addressing;
-                                if rsp_rel {
-                                    self.state.out.rsp_frame_size += 8;
-                                }
+                                self.state.out.rsp_frame_size += 8;
                                 self.state.out.emit_instr_rbp("    pushq", slot.0);
-                                if rsp_rel {
-                                    self.state.out.rsp_frame_size -= 8;
-                                }
+                                self.state.out.rsp_frame_size -= 8;
                             } else {
                                 self.state.emit("    pushq $0");
                                 self.state.emit("    pushq $0");
@@ -563,9 +546,7 @@ impl X86Codegen {
                     // Subsequent stack arguments and register arguments see
                     // the two pushed qwords at their new RSP-relative offsets.
                     sp_adjust += 16;
-                    if self.state.out.use_rsp_addressing {
-                        self.state.out.rsp_frame_size += 16;
-                    }
+                    self.state.out.rsp_frame_size += 16;
                 }
                 CallArgClass::StructByValStack { size: 16 }
                     if crate::backend::call_abi::is_scalar_f128_sse_arg(
@@ -581,9 +562,7 @@ impl X86Codegen {
                     // limb and dereferenced it (binary128 9.0 -> NULL).
                     self.state.emit("    subq $16, %rsp");
                     sp_adjust += 16;
-                    if self.state.out.use_rsp_addressing {
-                        self.state.out.rsp_frame_size += 16;
-                    }
+                    self.state.out.rsp_frame_size += 16;
                     self.emit_f128_sse_stack_arg(&args[si]);
                 }
                 CallArgClass::StructByValStack { size }
@@ -626,9 +605,7 @@ impl X86Codegen {
                         }
                     }
                     let push_bytes = (n_qwords * 8) as i64;
-                    if self.state.out.use_rsp_addressing {
-                        self.state.out.rsp_frame_size += push_bytes;
-                    }
+                    self.state.out.rsp_frame_size += push_bytes;
                     sp_adjust += push_bytes;
                 }
                 CallArgClass::Stack => {
@@ -647,9 +624,7 @@ impl X86Codegen {
                         self.operand_to_rax(&args[si]);
                         self.state.emit("    pushq %rax");
                     }
-                    if self.state.out.use_rsp_addressing {
-                        self.state.out.rsp_frame_size += 8;
-                    }
+                    self.state.out.rsp_frame_size += 8;
                     sp_adjust += 8;
                 }
                 _ => {}
@@ -660,18 +635,14 @@ impl X86Codegen {
                     .out
                     .emit_instr_imm_reg("    subq", pad as i64, "rsp");
                 sp_adjust += pad as i64;
-                if self.state.out.use_rsp_addressing {
-                    self.state.out.rsp_frame_size += pad as i64;
-                }
+                self.state.out.rsp_frame_size += pad as i64;
             }
         }
         // Restore the original RSP frame size. The total adjustment is
         // tracked in sp_adjust and returned to emit_call_reg_args. (The
         // dynamic realignment delta is NOT tracked — it is invisible to the
         // rbp-relative addressing that such functions are pinned to.)
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size -= sp_adjust;
-        }
+        self.state.out.rsp_frame_size -= sp_adjust;
         // Return the total STATIC RSP adjustment so emit_call_reg_args can
         // compensate stack slot offsets when loading register arguments.
         sp_adjust
@@ -844,9 +815,7 @@ impl X86Codegen {
         self.operand_to_rax(func_ptr);
         self.state.emit("    subq $16, %rsp");
         self.state.emit("    movq %rax, (%rsp)");
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size += 16;
-        }
+        self.state.out.rsp_frame_size += 16;
         self.indirect_fptr_on_stack = true;
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
@@ -882,9 +851,7 @@ impl X86Codegen {
             // immediately; the flag must be clear before the next emission.
             self.state.emit("    movq (%rsp), %r10");
             self.state.emit("    addq $16, %rsp");
-            if self.state.out.use_rsp_addressing {
-                self.state.out.rsp_frame_size -= 16;
-            }
+            self.state.out.rsp_frame_size -= 16;
             self.indirect_fptr_on_stack = false;
         } else {
             // Regular call with stack args: the slot sits ABOVE the pushed
@@ -980,9 +947,7 @@ impl X86Codegen {
         // Stack args (Phase 2) may have adjusted rsp. Temporarily increase
         // the RSP frame size so rbp-to-rsp offset conversion is correct
         // when loading register arguments from stack slots.
-        if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size += total_sp_adjust;
-        }
+        self.state.out.rsp_frame_size += total_sp_adjust;
         let xmm_regs = [
             "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
         ];
@@ -1173,9 +1138,7 @@ impl X86Codegen {
             // arg1 and stack garbage for args 2-3. rbp-addressed frames are
             // unaffected (slot_ref ignores rsp there), which is why the
             // session-25 hazard tests missed it.
-            if self.state.out.use_rsp_addressing {
-                self.state.out.rsp_frame_size += hazard_area as i64;
-            }
+            self.state.out.rsp_frame_size += hazard_area as i64;
             for (k, (arg_i, phys, is_fp)) in hazards.iter().enumerate() {
                 let off = (k * 8) as i64;
                 hazard_slot.insert(*arg_i, off);
@@ -1647,9 +1610,7 @@ impl X86Codegen {
         if hazard_area > 0 {
             self.state
                 .emit_fmt(format_args!("    addq ${}, %rsp", hazard_area));
-            if self.state.out.use_rsp_addressing {
-                self.state.out.rsp_frame_size -= hazard_area as i64;
-            }
+            self.state.out.rsp_frame_size -= hazard_area as i64;
         }
         if self.state.call_calling_convention
             == crate::common::types::CallingConvention::MicrosoftX64
@@ -1665,9 +1626,7 @@ impl X86Codegen {
             self.state.call_gp_arg_count = 6;
         }
         // Restore the original RSP frame size.
-        if total_sp_adjust != 0 && self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size -= total_sp_adjust;
-        }
+        self.state.out.rsp_frame_size -= total_sp_adjust;
     }
 
     /// Clean dirty upper YMM state before an ordinary call, as GCC 16.2 and
@@ -2003,17 +1962,13 @@ impl X86Codegen {
             if self.indirect_fptr_on_stack {
                 self.indirect_fptr_on_stack = false;
                 self.state.emit("    addq $16, %rsp");
-                if self.state.out.use_rsp_addressing {
-                    self.state.out.rsp_frame_size -= 16;
-                }
+                self.state.out.rsp_frame_size -= 16;
             }
             return;
         }
         let fptr_extra = if self.indirect_fptr_on_stack {
             self.indirect_fptr_on_stack = false;
-            if self.state.out.use_rsp_addressing {
-                self.state.out.rsp_frame_size -= 16;
-            }
+            self.state.out.rsp_frame_size -= 16;
             16
         } else {
             0

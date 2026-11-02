@@ -4217,6 +4217,50 @@ impl CType {
         }
     }
 
+    /// Interpret an integer constant that came from one arm of a `?:` as the
+    /// value of the operator's C common type (C11 6.5.15p5).
+    ///
+    /// Constant folding must not skip the conversion the operator performs.
+    /// `1 ? -1 : 1u` has type `unsigned int` and value 4294967295, so an
+    /// enclosing 64-bit conversion has to zero-extend it; folding the arm to a
+    /// bare `-1` made `(unsigned long long)(1 ? -1 : 1u)` 18446744073709551615
+    /// and `(long long)(...)` -1, where both oracles give 4294967295. The value
+    /// is returned zero- or sign-extended to 64 bits, i.e. exactly what
+    /// `as i64` of a correctly-typed constant yields.
+    ///
+    /// Non-integer common types (floating arms, pointers, aggregates) are
+    /// returned unchanged: their folding performs its own conversion, and a
+    /// pointer arm must keep its integer bit pattern, not be width-masked.
+    pub fn ternary_value_as_i64(then_ct: &CType, else_ct: &CType, value: i64) -> i64 {
+        if !(then_ct.is_integer() && else_ct.is_integer()) {
+            return value;
+        }
+        let common = Self::conditional_composite_type(
+            Some(then_ct.clone()),
+            Some(else_ct.clone()),
+            false,
+            false,
+        )
+        .unwrap_or_else(|| then_ct.clone());
+        if !common.is_integer() {
+            return value;
+        }
+        let bytes = common.size();
+        if bytes == 0 || bytes >= 8 {
+            // `long`/`long long`/`__int128` keep all 64 significant bits.
+            return value;
+        }
+        let bits = bytes * 8;
+        if common.is_unsigned() {
+            // Zero-extension: the low `bits` bits are the value.
+            ((value as u64) & ((1u64 << bits) - 1)) as i64
+        } else {
+            // Sign-extension from the type's width.
+            let shift = 64 - bits;
+            (value << shift) >> shift
+        }
+    }
+
     /// The *value* conversion of an expression: array-to-pointer and
     /// function-to-pointer decay (C11 6.3.2.1p3 and p4).
     ///
@@ -5376,5 +5420,95 @@ mod pointer_qualifier_contract_tests {
         let ret_b = function(CType::Int, "x", pointer(Some(PtrQuals::CONST)));
         assert!(recorded_qualifiers_conflict(&ret_a, &ret_b));
         assert!(!ctypes_compatible(&ret_a, &ret_b));
+    }
+}
+
+#[cfg(test)]
+mod ternary_common_type_tests {
+    use super::{CType, PtrQuals};
+
+    // The common type is the *usual arithmetic conversion* of the two arms
+    // (C11 6.5.15p5), so integer promotion happens first: two `unsigned char`
+    // arms are an `int` conditional, not an `unsigned char` one. Everything here
+    // is also checked end to end by `tests/frontend_audit/run/100_uint_conv.c`
+    // (which both oracles validate); these cases pin the arithmetic down
+    // without a link step.
+
+    #[test]
+    fn int_and_unsigned_pick_the_unsigned_value() {
+        // `1 ? -1 : 1u` is an `unsigned int` whose value is 4294967295.
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::Int, &CType::UInt, -1),
+            0xffff_ffff
+        );
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::UInt, &CType::Int, -1),
+            0xffff_ffff
+        );
+    }
+
+    #[test]
+    fn narrow_unsigned_arms_promote_to_int_first() {
+        // Integer promotion wins over the arm's own width:
+        // `1 ? (unsigned char)255 : (unsigned char)1` is an `int` conditional.
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::UChar, &CType::UChar, -1),
+            -1
+        );
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::UShort, &CType::UShort, -1),
+            -1
+        );
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::Char, &CType::Char, 200),
+            200
+        );
+        // A 32-bit unsigned sibling outranks the promoted arm.
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::UChar, &CType::UInt, -1),
+            0xffff_ffff
+        );
+    }
+
+    #[test]
+    fn signed_arms_keep_their_sign() {
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::Int, &CType::Int, -1),
+            -1
+        );
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::Char, &CType::Int, -1),
+            -1
+        );
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::Short, &CType::Int, -32768),
+            -32768
+        );
+    }
+
+    #[test]
+    fn wide_arms_keep_all_sixty_four_bits() {
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::Long, &CType::Long, -1),
+            -1
+        );
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::ULongLong, &CType::LongLong, i64::MIN),
+            i64::MIN
+        );
+    }
+
+    #[test]
+    fn non_integer_arms_are_left_alone() {
+        // A pointer arm keeps its integer bit pattern: width-masking it would
+        // truncate a real address.
+        let ptr = CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC);
+        assert_eq!(CType::ternary_value_as_i64(&ptr, &CType::Int, -1), -1);
+        assert_eq!(CType::ternary_value_as_i64(&CType::Int, &ptr, 0), 0);
+        // Floating arms fold through their own conversion.
+        assert_eq!(
+            CType::ternary_value_as_i64(&CType::Double, &CType::Int, -1),
+            -1
+        );
     }
 }
